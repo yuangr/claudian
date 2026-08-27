@@ -100,6 +100,48 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+function extractExecutionErrorMessage(error: unknown): string {
+  if (!error) return 'Execution failed';
+  let rawMessage = '';
+  if (typeof error === 'string') {
+    rawMessage = error;
+  } else if (error instanceof Error) {
+    rawMessage = error.message;
+  } else if (typeof error === 'object') {
+    const errorRecord = error as Record<string, unknown>;
+    const innerPayload = errorRecord.error as Record<string, unknown> | undefined;
+    if (innerPayload && typeof innerPayload.message === 'string' && innerPayload.message) {
+      rawMessage = innerPayload.message;
+    } else if (typeof errorRecord.message === 'string' && errorRecord.message) {
+      rawMessage = errorRecord.message;
+    } else if (typeof errorRecord.errorMessage === 'string' && errorRecord.errorMessage) {
+      rawMessage = errorRecord.errorMessage;
+    } else {
+      rawMessage = String(error);
+    }
+  }
+
+  // Try to extract nested JSON error message if present (e.g. Google 503 API error responses)
+  if (rawMessage.includes('{') && rawMessage.includes('}')) {
+    try {
+      const jsonStart = rawMessage.indexOf('{');
+      const jsonStr = rawMessage.slice(jsonStart);
+      const parsed: unknown = JSON.parse(jsonStr);
+      if (parsed && typeof parsed === 'object' && 'error' in parsed) {
+        const err = (parsed).error;
+        if (err && typeof err === 'object' && 'message' in err) {
+          const msg = (err).message;
+          if (typeof msg === 'string') return msg;
+        }
+      }
+    } catch {
+      // Ignore JSON parse failure
+    }
+  }
+
+  return rawMessage || 'Execution failed';
+}
+
 export interface InputControllerDeps {
   plugin: FeatureHost;
   state: ChatState;
@@ -496,6 +538,7 @@ export class InputController {
     let shouldReportReviewableSettlement = false;
     let currentReviewableSettlementReporter: (() => void) | null = null;
     let didCancelThisTurn = false;
+    let hadExecutionError = false;
     let planApprovalInvalidated = false;
     let scheduledContinuation = false;
     let continuationStaysInCurrentController = false;
@@ -582,8 +625,14 @@ export class InputController {
                 : 'The provider session no longer exists. Send again to start a new session.';
         new Notice(notice);
         wasInvalidated = true;
-      } else if (result.status === 'error' && result.error) {
-        await streamController.appendText(`\n\n**Error:** ${result.error.message}`);
+      } else if (result.status === 'error') {
+        hadExecutionError = true;
+        const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
+        if (state.currentThinkingState) {
+          await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
+        }
+        const errorMsg = extractExecutionErrorMessage(result.error);
+        await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
       }
     } catch (error) {
       if (error instanceof ChatExecutionPreHandoffError) {
@@ -596,8 +645,13 @@ export class InputController {
         new Notice('Message was not sent. Please try again.');
         this.reportDeferredReviewableSettlement();
       } else {
+        hadExecutionError = true;
         shouldReportReviewableSettlement = true;
-        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+        const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
+        if (state.currentThinkingState) {
+          await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
+        }
+        const errorMsg = extractExecutionErrorMessage(error);
         await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
         currentReviewableSettlementReporter =
           this.deps.captureReviewableSettlement?.('error') ?? null;
@@ -626,9 +680,9 @@ export class InputController {
           state.isStreaming = false;
           state.cancelRequested = false;
 
-          // Capture response duration before resetting state (skip for interrupted responses and compaction)
+          // Capture response duration before resetting state (skip for interrupted responses, errors, and compaction)
           const hasCompactBoundary = finalAssistantMsg.contentBlocks?.some(b => b.type === 'context_compacted');
-          if (!didCancelThisTurn && !hasCompactBoundary) {
+          if (!didCancelThisTurn && !hadExecutionError && !hasCompactBoundary) {
             const durationSeconds = state.responseStartTime
               ? Math.floor((performance.now() - state.responseStartTime) / 1000)
               : 0;

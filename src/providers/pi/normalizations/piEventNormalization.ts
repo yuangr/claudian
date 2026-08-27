@@ -41,9 +41,8 @@ export function normalizePiRpcEvent(
     case 'compaction_end':
       return [{ type: 'context_compacted' }];
     case 'auto_retry_start':
-      return [{ type: 'notice', content: 'Pi is retrying the turn.', level: 'warning' }];
     case 'auto_retry_end':
-      return [{ type: 'notice', content: 'Pi retry finished.', level: 'info' }];
+      return [];
     case 'extension_error':
       return [{ type: 'notice', content: getString(event.error) ?? 'Pi extension error.', level: 'warning' }];
     default:
@@ -99,9 +98,8 @@ function normalizeMessageUpdate(event: Record<string, unknown>): StreamChunk[] {
   return [];
 }
 
-function normalizeTerminalError(event: Record<string, unknown>): StreamChunk[] {
-  const message = getPiTerminalErrorMessage(event);
-  return message ? [{ type: 'error', content: message }] : [];
+function normalizeTerminalError(_event: Record<string, unknown>): StreamChunk[] {
+  return [];
 }
 
 function normalizeToolUse(

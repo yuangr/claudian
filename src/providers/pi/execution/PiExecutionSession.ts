@@ -126,6 +126,7 @@ interface ActiveRun {
   sequence: number;
   terminal: boolean;
   terminalSignal: Deferred<void>;
+  pendingError?: string | null;
 }
 
 interface Deferred<T> {
@@ -371,6 +372,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       sequence: 0,
       terminal: false,
       terminalSignal: createDeferred<void>(),
+      pendingError: null,
     };
   }
 
@@ -695,7 +697,11 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     }
     if (event.type === 'agent_end') {
       this.ensureAccepted(active);
-      active.terminalSignal.resolve();
+      if (active.pendingError) {
+        active.terminalSignal.reject(new Error(active.pendingError));
+      } else {
+        active.terminalSignal.resolve();
+      }
       return;
     }
     if (event.type === 'error') {
@@ -703,6 +709,9 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         getString(event.error) ?? 'Pi runtime error.',
       ));
       return;
+    }
+    if (event.type === 'auto_retry_start') {
+      active.pendingError = null;
     }
 
     const chunks = normalizePiRpcEvent(event, this.normalizationState);
@@ -712,7 +721,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     }
     const terminalError = getPiTerminalErrorMessage(event);
     if (terminalError) {
-      active.terminalSignal.reject(new Error(terminalError));
+      active.pendingError = terminalError;
     }
   }
 
@@ -726,8 +735,11 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (!active || active.terminal) return;
     if (chunk.type === 'done') return;
     if (chunk.type === 'error') {
-      active.terminalSignal.reject(new Error(chunk.content));
+      active.pendingError = chunk.content;
       return;
+    }
+    if (chunk.type === 'text' || chunk.type === 'tool_use' || chunk.type === 'thinking') {
+      active.pendingError = null;
     }
     this.ensureAccepted(active);
     if (isAssistantChunk(chunk) && !active.assistantStarted) {

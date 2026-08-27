@@ -155,14 +155,14 @@ describe('Pi event normalization', () => {
     }]);
   });
 
-  it('surfaces terminal Pi stop-reason errors', () => {
+  it('ignores intermediate stop-reason errors from stream chunks', () => {
     const state = createPiEventNormalizationState();
 
     expect(normalizePiRpcEvent({
       errorMessage: 'Invalid image',
       stopReason: 'error',
       type: 'message_end',
-    }, state)).toEqual([{ type: 'error', content: 'Invalid image' }]);
+    }, state)).toEqual([]);
 
     expect(normalizePiRpcEvent({
       assistant_message_event: {
@@ -170,6 +170,6 @@ describe('Pi event normalization', () => {
         stop_reason: 'error',
       },
       type: 'turn_end',
-    }, state)).toEqual([{ type: 'error', content: 'Authentication failed' }]);
+    }, state)).toEqual([]);
   });
 });

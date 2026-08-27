@@ -32,7 +32,7 @@ function findMatches(roots, pattern) {
   for (const root of roots) {
     for (const file of listTypeScriptFiles(root)) {
       if (pattern.test(fs.readFileSync(file, 'utf8'))) {
-        matches.push(path.relative(process.cwd(), file));
+        matches.push(path.relative(process.cwd(), file).replace(/\\/g, '/'));
       }
     }
   }
@@ -59,7 +59,7 @@ function inspectForbiddenSymbolInventory(entries, pattern, allowedOccurrences) {
 function findForbiddenSymbolInventoryViolations(pattern, allowedOccurrences) {
   return inspectForbiddenSymbolInventory(
     listTypeScriptFiles(sourceRoot).map(file => ({
-      file: path.relative(process.cwd(), file),
+      file: path.relative(process.cwd(), file).replace(/\\/g, '/'),
       source: fs.readFileSync(file, 'utf8'),
     })),
     pattern,
@@ -440,7 +440,7 @@ test('persisted settings changes use the coordinator boundary', () => {
   const matches = findMatches([sourceRoot], /\.saveSettings\(\)/).filter(file => ![
     'src/main.ts',
     'src/app/providers/ClaudianProviderHost.ts',
-  ].includes(file));
+  ].includes(file.replace(/\\/g, '/')));
   assert.deepEqual(matches, []);
 });
 
@@ -474,7 +474,7 @@ test('tab runtime construction stays private to the factory boundary', () => {
     new RegExp(`\\b${assemblySymbol}\\b`),
   ).sort();
 
-  assert.deepEqual(assemblyReferences, [path.relative(process.cwd(), factorySource)]);
+  assert.deepEqual(assemblyReferences, [path.relative(process.cwd(), factorySource).replace(/\\/g, '/')]);
   assert.equal(fs.existsSync(tabSource), false);
 
   const factory = fs.readFileSync(factorySource, 'utf8');
@@ -549,8 +549,8 @@ test('only TabRuntimeFactory can register runtime resource ownership', () => {
   ).sort();
 
   assert.deepEqual(registrationReferences, [
-    path.relative(process.cwd(), factorySource),
-    path.relative(process.cwd(), lifecycleSource),
+    path.relative(process.cwd(), factorySource).replace(/\\/g, '/'),
+    path.relative(process.cwd(), lifecycleSource).replace(/\\/g, '/'),
   ].sort());
 });
 
@@ -617,7 +617,7 @@ test('active Collab consumers use protocol-owned semantic identity predicates', 
     ...listTypeScriptFiles(path.join(appRoot, 'collab')),
     ...listTypeScriptFiles(path.join(featuresRoot, 'collab')),
   ].map(file => ({
-    file: path.relative(process.cwd(), file),
+    file: path.relative(process.cwd(), file).replace(/\\/g, '/'),
     source: fs.readFileSync(file, 'utf8'),
   }));
 
@@ -825,8 +825,8 @@ test('TypeScript resolves the Collab protocol through the installed registry pac
   ).resolvedModule;
 
   assert.equal(
-    resolution?.resolvedFileName,
-    path.join(process.cwd(), 'node_modules', '@claudian-collab', 'protocol', 'dist', 'index.d.ts'),
+    resolution?.resolvedFileName ? path.normalize(resolution.resolvedFileName) : undefined,
+    path.normalize(path.join(process.cwd(), 'node_modules', '@claudian-collab', 'protocol', 'dist', 'index.d.ts')),
   );
 });
 
