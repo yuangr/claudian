@@ -36,9 +36,20 @@ const CLEANUP = {
   workspacePath: 'workspace/project-one',
 } as const satisfies LocalCleanupRecord;
 
+async function admitProjectRecovery(
+  _projectId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  await operation();
+}
+
 describe('RetirementLocalRecovery', () => {
   it('resumes a durable retirement record even when the index still says Active', async () => {
     const handler = { resume: jest.fn(async () => undefined) };
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
     const recovery = new RetirementLocalRecovery({
       loadIndex: jest.fn(async () => ({
         projects: [{
@@ -60,11 +71,15 @@ describe('RetirementLocalRecovery', () => {
     }, {
       listProjectIds: jest.fn(async () => []),
       load: jest.fn(async () => null),
-    }, handler, { finalize: jest.fn(async () => undefined) });
+    }, handler, { finalize: jest.fn(async () => undefined) }, projectRecoveryAdmission);
 
     await recovery.resume();
 
     expect(handler.resume).toHaveBeenCalledWith(RETIREMENT.projectId);
+    expect(projectRecoveryAdmission).toHaveBeenCalledWith(
+      RETIREMENT.projectId,
+      expect.any(Function),
+    );
   });
 
   it('removes an applied cleanup journal after its projection is already gone', async () => {
@@ -84,7 +99,7 @@ describe('RetirementLocalRecovery', () => {
       load: jest.fn(async () => CLEANUP),
     }, {
       resume: jest.fn(async () => undefined),
-    }, { finalize });
+    }, { finalize }, admitProjectRecovery);
 
     await recovery.resume();
 
@@ -111,7 +126,7 @@ describe('RetirementLocalRecovery', () => {
       load: jest.fn(async () => CLEANUP),
     }, {
       resume: jest.fn(async () => undefined),
-    }, { finalize });
+    }, { finalize }, admitProjectRecovery);
 
     await recovery.resume();
 
@@ -134,7 +149,7 @@ describe('RetirementLocalRecovery', () => {
     }, {
       listProjectIds: jest.fn(async () => ['project-one']),
       load: jest.fn(async () => CLEANUP),
-    }, handler, { finalize });
+    }, handler, { finalize }, admitProjectRecovery);
 
     await recovery.resume();
 
@@ -171,7 +186,7 @@ describe('RetirementLocalRecovery', () => {
     }, {
       listProjectIds: jest.fn(async () => ['project-one']),
       load: jest.fn(async () => CLEANUP),
-    }, handler, { finalize });
+    }, handler, { finalize }, admitProjectRecovery);
 
     await recovery.resume();
 
@@ -208,7 +223,7 @@ describe('RetirementLocalRecovery', () => {
     }, {
       listProjectIds: jest.fn(async () => ['project-one']),
       load: jest.fn(async () => CLEANUP),
-    }, handler, { finalize });
+    }, handler, { finalize }, admitProjectRecovery);
 
     await recovery.resume();
 

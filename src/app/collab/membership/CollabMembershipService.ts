@@ -14,6 +14,9 @@ import type {
   PromoteManagerResponse,
 } from '@/app/collab/lan/LanCollabControlOperations';
 import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
+import type {
   ManagerResponsibilityOperationPort,
 } from '@/app/collab/membership/ManagerResponsibilityOperationCoordinator';
 import {
@@ -101,6 +104,7 @@ export interface CollabMembershipManagerReceiptPort {
 }
 
 export interface CollabMembershipSafetyContext {
+  readonly managerResponsibilityAdmission: CollabProjectLifecycleAdmission;
   readonly managerResponsibilityOperations: ManagerResponsibilityOperationPort;
   readonly managerReceipts: CollabMembershipManagerReceiptPort;
   readonly pendingLeaves: CollabMembershipPendingLeavePort;
@@ -204,18 +208,20 @@ export class CollabMembershipService {
     request: CollabPromoteManagerRequest,
     options: CollabOperationOptions = {},
   ): Promise<void> {
-    const session = await this.loadSession(request.projectId);
-    await session.client.promoteManager({
-      idempotencyKey: administrationIntentKey(
-        'promote-manager',
-        request.intentId,
-        this.createIdempotencyKey,
-      ),
-      managerResponsibilityOfferId: request.managerResponsibilityOfferId,
-      memberCredential: session.membership.member.credential,
-      projectId: request.projectId,
-      targetMemberId: request.targetMemberId,
-      ...(options.signal ? { signal: options.signal } : {}),
+    await this.safety.managerResponsibilityAdmission(request.projectId, async () => {
+      const session = await this.loadSession(request.projectId);
+      await session.client.promoteManager({
+        idempotencyKey: administrationIntentKey(
+          'promote-manager',
+          request.intentId,
+          this.createIdempotencyKey,
+        ),
+        managerResponsibilityOfferId: request.managerResponsibilityOfferId,
+        memberCredential: session.membership.member.credential,
+        projectId: request.projectId,
+        targetMemberId: request.targetMemberId,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
     });
     await this.refreshProjection(request.projectId, options);
   }

@@ -25,17 +25,52 @@ describe('HostTransferLifecycleOrchestrator', () => {
       run: jest.fn().mockResolvedValue(undefined),
     };
     const onBackgroundError = jest.fn();
+    const projectLifecycleAdmissionState: { error: Error | null } = { error: null };
+    const projectLifecycleAdmission = async <T>(
+      _projectId: string,
+      operation: () => Promise<T>,
+    ): Promise<T> => {
+      if (projectLifecycleAdmissionState.error) {
+        throw projectLifecycleAdmissionState.error;
+      }
+      return operation();
+    };
     return {
       lifecycle,
       onBackgroundError,
       orchestrator: new HostTransferLifecycleOrchestrator(
         lifecycle,
         outgoing,
-        { onBackgroundError },
+        { onBackgroundError, projectLifecycleAdmission },
       ),
       outgoing,
+      projectLifecycleAdmission,
+      projectLifecycleAdmissionState,
     };
   }
+
+  it('acquires source lifecycle ownership before accepting authority transfer', async () => {
+    const {
+      lifecycle,
+      orchestrator,
+      outgoing,
+      projectLifecycleAdmissionState,
+    } = create();
+    projectLifecycleAdmissionState.error = new Error('competing lifecycle owner');
+
+    await expect(orchestrator.acceptHostTransfer('member-target', {
+      idempotencyKey: 'accept-a',
+      projectId: 'project-a',
+      receiverCredential: Buffer.alloc(32, 1).toString('base64url'),
+      targetCaCertificatePem: '-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n',
+      targetCaFingerprint: 'b'.repeat(64),
+      targetEndpoint: 'https://192.168.1.20:27001',
+      transferId: 'transfer-a',
+    })).rejects.toThrow('competing lifecycle owner');
+
+    expect(lifecycle.acceptHostTransfer).not.toHaveBeenCalled();
+    expect(outgoing.prepareAccepted).not.toHaveBeenCalled();
+  });
 
   it('starts outgoing transfer only after the Accept response is flushed', async () => {
     const { lifecycle, orchestrator, outgoing } = create();
@@ -155,6 +190,26 @@ describe('HostTransferLifecycleOrchestrator', () => {
     expect(outgoing.prepareCancellation.mock.invocationCallOrder[0]).toBeLessThan(
       lifecycle.cancelHostTransfer.mock.invocationCallOrder[0],
     );
+  });
+
+  it('acquires source lifecycle ownership before cancellation recovery', async () => {
+    const {
+      lifecycle,
+      orchestrator,
+      outgoing,
+      projectLifecycleAdmissionState,
+    } = create();
+    projectLifecycleAdmissionState.error = new Error('competing lifecycle owner');
+
+    await expect(orchestrator.cancelHostTransfer('member-source', {
+      expectedHostMemberId: 'member-source',
+      idempotencyKey: 'cancel-a',
+      projectId: 'project-a',
+      transferId: 'transfer-a',
+    })).rejects.toThrow('competing lifecycle owner');
+
+    expect(outgoing.prepareCancellation).not.toHaveBeenCalled();
+    expect(lifecycle.cancelHostTransfer).not.toHaveBeenCalled();
   });
 
   it('does not discard the authority credential when cancellation recovery cannot persist', async () => {

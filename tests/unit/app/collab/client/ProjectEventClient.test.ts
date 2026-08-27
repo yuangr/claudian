@@ -152,6 +152,38 @@ describe('ProjectEventClient', () => {
     expect(socket.close).toHaveBeenCalledWith(1000, 'Client stopped');
     expect(scheduled).toEqual([]);
   });
+
+  it('reconnects from the prior cursor when terminal retirement delivery rejects', async () => {
+    const sockets = [new FakeClientSocket(), new FakeClientSocket()];
+    const createSocket = jest.fn(() => sockets.shift()!);
+    const scheduled: Array<() => void> = [];
+    const onInvalidation = jest.fn().mockRejectedValue(new Error('lifecycle owner pending'));
+    const client = createClient(createSocket, onInvalidation, 3, {
+      random: () => 0,
+      setTimeout: callback => {
+        scheduled.push(callback);
+        return scheduled.length;
+      },
+    });
+    client.start();
+
+    createSocket.mock.results[0].value.emitMessage(JSON.stringify(event(
+      4,
+      'project-retired',
+      { retiredAt: CREATED_AT },
+    )));
+    await flushTasks();
+    expect(createSocket.mock.results[0].value.close)
+      .toHaveBeenCalledWith(1011, 'Event refresh failed');
+    expect(client.lastSequence).toBe(3);
+
+    createSocket.mock.results[0].value.emitClose(1011);
+    scheduled.shift()?.();
+    expect(createSocket).toHaveBeenLastCalledWith(expect.objectContaining({
+      lastSequence: 3,
+    }));
+    client.dispose();
+  });
 });
 
 function createClient(

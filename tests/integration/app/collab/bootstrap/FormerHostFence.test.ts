@@ -12,6 +12,7 @@ import {
   CloudBootstrapReadinessCollector,
   type CloudBootstrapReadinessObservation,
 } from '@/app/collab/bootstrap/CloudBootstrapReadiness';
+import { CloudBootstrapService } from '@/app/collab/bootstrap/CloudBootstrapService';
 import {
   createCloudBootstrapTransitionRecord,
   developmentBootstrapManifestSha256,
@@ -19,6 +20,7 @@ import {
   observeCloudBootstrapAttemptStatus,
 } from '@/app/collab/bootstrap/CloudBootstrapTransitionRecord';
 import { CloudBootstrapTransitionStore } from '@/app/collab/bootstrap/CloudBootstrapTransitionStore';
+import { CollabProjectLifecycleSubsystem } from '@/app/collab/lifecycle/CollabProjectLifecycleSubsystem';
 
 import {
   ATTEMPT_ID,
@@ -295,6 +297,47 @@ describe('Former Host Cloud bootstrap fence', () => {
       records: [valid],
       retryRequired: false,
     });
+    const inspectLifecycleOwner = (projectId: string) => (
+      transitionStore as unknown as {
+        inspectLifecycleOwner(candidateProjectId: string): Promise<
+          'absent' | 'nonterminal' | 'terminal'
+        >;
+      }
+    ).inspectLifecycleOwner(projectId);
+    await expect(inspectLifecycleOwner('project-corrupt')).resolves.toBe('nonterminal');
+    await expect(inspectLifecycleOwner('project-directory')).resolves.toBe('nonterminal');
+    const lifecycle = new CollabProjectLifecycleSubsystem({
+      closeRecovery: async () => undefined,
+      durableOwners: [{
+        inspect: inspectLifecycleOwner,
+        name: 'cloud-bootstrap',
+      }],
+      hostTransfer: {} as never,
+      localExit: {} as never,
+      recoveryStages: [],
+      retirement: {} as never,
+    });
+    const fenceUncertainProject = jest.fn(async (_projectId: string) => undefined);
+    const bootstrap = new CloudBootstrapService({
+      createCoordinator: () => ({}) as never,
+      fenceUncertainProject,
+      projectRecoveryAdmission: (projectId, operation) => lifecycle.runExclusive(
+        projectId,
+        'cloud-bootstrap',
+        'recovery',
+        operation,
+      ),
+      recoverLocalArtifacts: async () => undefined,
+      transitions: transitionStore,
+    });
+    await expect(bootstrap.prepareLocalRecovery()).resolves.toBeUndefined();
+    expect(fenceUncertainProject.mock.calls.map(([projectId]) => projectId).sort()).toEqual([
+      PROJECT_ID,
+      'project-corrupt',
+      'project-directory',
+    ]);
+    await bootstrap.close();
+    await lifecycle.lifecycleRecovery.close();
     await expect(transitionStore.load('project-corrupt')).rejects.toMatchObject({
       safeContext: {
         projectId: 'project-corrupt',
@@ -309,6 +352,7 @@ describe('Former Host Cloud bootstrap fence', () => {
       records: [],
       retryRequired: true,
     });
+    await expect(inspectLifecycleOwner(PROJECT_ID)).resolves.toBe('nonterminal');
     await chmod(validPath, 0o600);
   });
 

@@ -689,7 +689,15 @@ describe('LocalProjectExitCoordinator', () => {
       cleanupChoice: 'keep-files',
       projectId: 'project-alpha',
     });
-    const worker = new PendingLeaveWorker(pending, coordinator);
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
+    const worker = new PendingLeaveWorker(
+      pending,
+      coordinator,
+      projectRecoveryAdmission,
+    );
 
     await expect(worker.runOnce()).resolves.toEqual({
       attempted: ['project-alpha'],
@@ -700,6 +708,10 @@ describe('LocalProjectExitCoordinator', () => {
       .toEqual(['leave-stable', 'leave-stable']);
     expect(authority.prepareLeave).toHaveBeenCalledTimes(1);
     expect(pending.records.size).toBe(0);
+    expect(projectRecoveryAdmission).toHaveBeenCalledWith(
+      'project-alpha',
+      expect.any(Function),
+    );
   });
 
   it('retains a prepared Manager Leave after timeout and resumes its exact accepted offer', async () => {
@@ -806,7 +818,11 @@ describe('LocalProjectExitCoordinator', () => {
       projectId: 'project-alpha',
     });
 
-    await expect(new PendingLeaveWorker(pending, coordinator).runOnce()).resolves.toEqual({
+    await expect(new PendingLeaveWorker(
+      pending,
+      coordinator,
+      async (_projectId, operation) => operation(),
+    ).runOnce()).resolves.toEqual({
       attempted: ['project-alpha'],
       failed: ['project-alpha'],
     });

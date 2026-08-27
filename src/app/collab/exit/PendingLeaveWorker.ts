@@ -2,6 +2,9 @@ import type { CollabProjectId } from '@claudian-collab/protocol';
 
 import type { LocalProjectExitCoordinator } from '@/app/collab/exit/LocalProjectExitCoordinator';
 import type { PendingLeaveJournalPort } from '@/app/collab/lifecycle/CollabLifecycleJournalStore';
+import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 
 export interface PendingLeaveWorkerResult {
   readonly attempted: readonly CollabProjectId[];
@@ -14,6 +17,7 @@ export class PendingLeaveWorker {
   constructor(
     private readonly pendingLeaves: Pick<PendingLeaveJournalPort, 'list'>,
     private readonly exits: Pick<LocalProjectExitCoordinator, 'resume'>,
+    private readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission,
   ) {}
 
   async runOnce(signal?: AbortSignal): Promise<PendingLeaveWorkerResult> {
@@ -34,9 +38,14 @@ export class PendingLeaveWorker {
       if (signal?.aborted) break;
       attempted.push(pending.projectId);
       try {
-        await this.exits.resume(
+        await this.projectRecoveryAdmission(
           pending.projectId,
-          signal ? { signal } : {},
+          async () => {
+            await this.exits.resume(
+              pending.projectId,
+              signal ? { signal } : {},
+            );
+          },
         );
       } catch {
         failed.push(pending.projectId);

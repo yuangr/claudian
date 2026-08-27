@@ -6,6 +6,9 @@ import type {
 import type {
   CollabControlDeferredResult,
 } from '@/app/collab/lan/routes/RouteTypes';
+import type {
+  CollabProjectLifecycleAuthorityAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { SerialTaskQueue } from '@/app/collab/SerialTaskQueue';
 import type { CollabHostTransferSummary } from '@/core/collab';
 
@@ -30,6 +33,7 @@ export interface OutgoingHostTransferLifecyclePort {
 
 export interface HostTransferLifecycleOrchestratorOptions {
   readonly onBackgroundError?: (error: unknown) => void;
+  readonly projectLifecycleAdmission: CollabProjectLifecycleAuthorityAdmission;
 }
 
 export class HostTransferLifecycleOrchestrator {
@@ -41,7 +45,7 @@ export class HostTransferLifecycleOrchestrator {
       'acceptHostTransfer' | 'cancelHostTransfer'
     >,
     private readonly outgoing: OutgoingHostTransferLifecyclePort,
-    private readonly options: HostTransferLifecycleOrchestratorOptions = {},
+    private readonly options: HostTransferLifecycleOrchestratorOptions,
   ) {}
 
   async acceptHostTransfer(
@@ -49,7 +53,10 @@ export class HostTransferLifecycleOrchestrator {
     request: Parameters<HostedLifecycleControlPort['acceptHostTransfer']>[1],
   ): Promise<CollabControlDeferredResult<CollabHostTransferSummary>> {
     return this.operationQueue.run(
-      () => this.acceptHostTransferUnlocked(actorMemberId, request),
+      () => this.options.projectLifecycleAdmission(
+        request.projectId,
+        () => this.acceptHostTransferUnlocked(actorMemberId, request),
+      ),
     );
   }
 
@@ -84,7 +91,10 @@ export class HostTransferLifecycleOrchestrator {
     request: Parameters<HostedLifecycleControlPort['cancelHostTransfer']>[1],
   ): Promise<CollabHostTransferSummary> {
     return this.operationQueue.run(
-      () => this.cancelHostTransferUnlocked(actorMemberId, request),
+      () => this.options.projectLifecycleAdmission(
+        request.projectId,
+        () => this.cancelHostTransferUnlocked(actorMemberId, request),
+      ),
     );
   }
 

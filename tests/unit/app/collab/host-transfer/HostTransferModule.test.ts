@@ -81,6 +81,10 @@ describe('HostTransferModule', () => {
       finalizeOldAuthority: jest.fn(),
       lanHost: {},
       projects,
+      projectRecoveryAdmission: async (
+        _projectId: string,
+        operation: () => Promise<void>,
+      ) => operation(),
       requireGitFoundation: jest.fn(),
       snapshots: { readCoordinationSnapshot: jest.fn().mockResolvedValue(coordination) },
       workspace: {},
@@ -158,6 +162,10 @@ describe('HostTransferModule', () => {
           projects: [{ id: 'project-a', name: 'Project A', workspacePath: 'workspace/a' }],
         })),
       },
+      projectRecoveryAdmission: async (
+        _projectId: string,
+        operation: () => Promise<void>,
+      ) => operation(),
       requireGitFoundation: jest.fn(),
       snapshots: { readCoordinationSnapshot: jest.fn() },
       workspace: {},

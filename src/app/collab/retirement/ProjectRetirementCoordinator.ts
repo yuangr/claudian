@@ -1,6 +1,9 @@
 import type { CollabMemberId, CollabProjectId } from '@claudian-collab/protocol';
 
 import type { ProjectRetirementAuthorityRequest } from '@/app/collab/authority/ProjectRetirementAuthorityService';
+import type {
+  CollabProjectLifecycleAuthorityAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import type { CollabRetirementResult } from '@/core/collab';
 
 export interface ProjectRetirementAdmissionPort {
@@ -43,6 +46,7 @@ export class ProjectRetirementCoordinator {
     private readonly terminal: ProjectRetirementTerminalPort,
     private readonly delivery: ProjectRetirementDeliveryPort,
     private readonly activeResources: ProjectRetirementActiveResourcesPort,
+    private readonly projectLifecycleAdmission: CollabProjectLifecycleAuthorityAdmission,
   ) {}
 
   retire(
@@ -51,7 +55,10 @@ export class ProjectRetirementCoordinator {
   ): Promise<CollabRetirementResult> {
     const existing = this.operations.get(request.projectId);
     if (existing) return existing;
-    const pending = this.retireUnlocked(actorMemberId, request);
+    const pending = this.projectLifecycleAdmission(
+      request.projectId,
+      () => this.retireUnlocked(actorMemberId, request),
+    );
     this.operations.set(request.projectId, pending);
     const clear = () => {
       if (this.operations.get(request.projectId) === pending) {

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
 import ts from 'typescript';
 
 import {
-  cloudAuthorityBindingAllowanceBytes,
   evaluationIndicatorMs,
   evaluationReviewThresholdMs,
   inspectArtifactSize,
@@ -13,9 +14,13 @@ import {
   inspectPluginArtifactReferences,
   mainBudgetBytes,
   preCollabReferenceMainBytes,
-  privateCloudBootstrapAllowanceBytes,
-  standaloneProtocolPackagingAllowanceBytes,
+  preStep11BundleHealthBaselineBytes,
 } from './check-startup-performance.mjs';
+import {
+  bundleCriticalRuntimeDependencies,
+  inspectRuntimeDependencyParity,
+  parseBunLock,
+} from './runtimeDependencyParity.mjs';
 
 function listTypeScriptFiles(root) {
   const files = [];
@@ -565,17 +570,21 @@ test('Claudian consumes the standalone Collab protocol only from the exact regis
     'utf8',
   ));
 
-  assert.equal(manifest.dependencies?.[protocolPackageName], '1.0.0');
+  assert.equal(manifest.dependencies?.[protocolPackageName], '3.0.0');
   assert.equal(manifest.dependencies?.['@lezer/markdown'], '1.7.2');
   assert.equal(protocolManifest.dependencies?.['@lezer/markdown'], '1.7.2');
   assert.equal(manifest.dependencies?.['@claudian/collab-protocol'], undefined);
   assert.equal(manifest.workspaces, undefined);
-  assert.equal(lockfile.packages?.['']?.dependencies?.[protocolPackageName], '1.0.0');
-  assert.equal(lockfile.packages?.[protocolInstallPath]?.version, '1.0.0');
+  assert.equal(lockfile.packages?.['']?.dependencies?.[protocolPackageName], '3.0.0');
+  assert.equal(lockfile.packages?.[protocolInstallPath]?.version, '3.0.0');
+  assert.equal(
+    lockfile.packages?.[protocolInstallPath]?.integrity,
+    'sha512-PNmHr3YI/w272Gh0fHcpMoAhDN7oZYSNa+796UuQxXbLrpDB+Lv2Y4Le8pDYR+GMpWOK3Zk03MSnYtQKzvpsSg==',
+  );
   assert.equal(lockfile.packages?.['node_modules/@lezer/markdown']?.version, '1.7.2');
   assert.match(
     lockfile.packages?.[protocolInstallPath]?.resolved ?? '',
-    /^https:\/\/registry\.npmjs\.org\/@claudian-collab\/protocol\/-\/protocol-1\.0\.0\.tgz$/u,
+    /^https:\/\/registry\.npmjs\.org\/@claudian-collab\/protocol\/-\/protocol-3\.0\.0\.tgz$/u,
   );
 
   for (const retiredPath of [
@@ -709,7 +718,7 @@ test('production consumes protocol-owned canonical Collab Git refs', () => {
   ), []);
   assert.deepEqual(findForbiddenSymbolInventoryViolations(
     /refs\/heads\/members\//,
-    new Map([['src/app/collab/authority/AuthoritySchema.ts', 1]]),
+    new Map(),
   ), []);
   assert.deepEqual(findForbiddenSymbolInventoryViolations(
     /refs\/remotes\/origin\/main/,
@@ -830,13 +839,12 @@ test('TypeScript resolves the Collab protocol through the installed registry pac
   );
 });
 
-test('performance policy enforces the main bundle budget and reports the pre-Collab delta', () => {
-  assert.equal(cloudAuthorityBindingAllowanceBytes, 50_000);
-  assert.equal(privateCloudBootstrapAllowanceBytes, 100_000);
-  assert.equal(standaloneProtocolPackagingAllowanceBytes, 20_000);
+test('performance policy enforces the main bundle budget and reports health deltas', () => {
+  assert.equal(preStep11BundleHealthBaselineBytes, 4_896_000);
   assert.equal(mainBudgetBytes, 5_170_000);
   assert.deepEqual(inspectArtifactSize(mainBudgetBytes), {
     budgetExceeded: false,
+    healthBaselineDeltaBytes: mainBudgetBytes - preStep11BundleHealthBaselineBytes,
     referenceDeltaBytes: mainBudgetBytes - preCollabReferenceMainBytes,
   });
   assert.equal(inspectArtifactSize(mainBudgetBytes + 1).budgetExceeded, true);
@@ -846,6 +854,140 @@ test('performance policy enforces the main bundle budget and reports the pre-Col
     inspectEvaluationDuration(evaluationReviewThresholdMs + 1),
     'review-required',
   );
+});
+
+test('bundle-critical runtime dependencies require exact manifest and lock agreement', () => {
+  assert.deepEqual(bundleCriticalRuntimeDependencies, [
+    '@anthropic-ai/claude-agent-sdk',
+    'smol-toml',
+  ]);
+  const packageJson = {
+    dependencies: {
+      '@anthropic-ai/claude-agent-sdk': '0.3.226',
+      'smol-toml': '1.7.1',
+    },
+  };
+  const packageLock = {
+    packages: {
+      '': { dependencies: { ...packageJson.dependencies } },
+      'node_modules/@anthropic-ai/claude-agent-sdk': { version: '0.3.226' },
+      'node_modules/smol-toml': { version: '1.7.1' },
+    },
+  };
+  const bunLock = {
+    workspaces: {
+      '': { dependencies: { ...packageJson.dependencies } },
+    },
+    packages: {
+      '@anthropic-ai/claude-agent-sdk': ['@anthropic-ai/claude-agent-sdk@0.3.226'],
+      'smol-toml': ['smol-toml@1.7.1'],
+    },
+  };
+
+  assert.deepEqual(inspectRuntimeDependencyParity({ bunLock, packageJson, packageLock }), []);
+
+  const rangedManifest = structuredClone(packageJson);
+  rangedManifest.dependencies['@anthropic-ai/claude-agent-sdk'] = '^0.3.220';
+  assert.deepEqual(
+    inspectRuntimeDependencyParity({ bunLock, packageJson: rangedManifest, packageLock }),
+    [{
+      actual: '^0.3.220',
+      dependency: '@anthropic-ai/claude-agent-sdk',
+      expected: 'an exact version',
+      source: 'package.json',
+    }],
+  );
+
+  const staleNpmLock = structuredClone(packageLock);
+  staleNpmLock.packages['node_modules/smol-toml'].version = '1.6.1';
+  assert.deepEqual(
+    inspectRuntimeDependencyParity({ bunLock, packageJson, packageLock: staleNpmLock }),
+    [{
+      actual: '1.6.1',
+      dependency: 'smol-toml',
+      expected: '1.7.1',
+      source: 'package-lock.json resolution',
+    }],
+  );
+
+  const staleBunLock = structuredClone(bunLock);
+  staleBunLock.packages['@anthropic-ai/claude-agent-sdk'][0] = '@anthropic-ai/claude-agent-sdk@0.3.220';
+  assert.deepEqual(
+    inspectRuntimeDependencyParity({ bunLock: staleBunLock, packageJson, packageLock }),
+    [{
+      actual: '0.3.220',
+      dependency: '@anthropic-ai/claude-agent-sdk',
+      expected: '0.3.226',
+      source: 'bun.lock resolution',
+    }],
+  );
+});
+
+test('Bun lock parsing accepts the repository JSONC shape without weakening JSON validation', () => {
+  assert.deepEqual(parseBunLock(`{
+    "literal": "preserve ,} and escaped \\\"text\\\"",
+    "workspaces": { "": { "dependencies": { "smol-toml": "1.7.1", }, }, },
+    "packages": { "smol-toml": ["smol-toml@1.7.1",], },
+  }`), {
+    literal: 'preserve ,} and escaped "text"',
+    workspaces: { '': { dependencies: { 'smol-toml': '1.7.1' } } },
+    packages: { 'smol-toml': ['smol-toml@1.7.1'] },
+  });
+  assert.throws(
+    () => parseBunLock('{ "packages": /* unsupported */ {} }'),
+    /bun\.lock is not valid JSONC/,
+  );
+});
+
+test('production artifact entry rejects dependency drift before emitting main.js', () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claudian-build-parity-'));
+  try {
+    fs.writeFileSync(path.join(fixtureRoot, 'package.json'), JSON.stringify({
+      dependencies: {
+        '@anthropic-ai/claude-agent-sdk': '0.3.226',
+        'smol-toml': '1.7.1',
+      },
+    }));
+    fs.writeFileSync(path.join(fixtureRoot, 'package-lock.json'), JSON.stringify({
+      packages: {
+        '': {
+          dependencies: {
+            '@anthropic-ai/claude-agent-sdk': '0.3.226',
+            'smol-toml': '1.7.1',
+          },
+        },
+        'node_modules/@anthropic-ai/claude-agent-sdk': { version: '0.3.226' },
+        'node_modules/smol-toml': { version: '1.6.1' },
+      },
+    }));
+    fs.writeFileSync(path.join(fixtureRoot, 'bun.lock'), `{
+      "workspaces": { "": { "dependencies": {
+        "@anthropic-ai/claude-agent-sdk": "0.3.226",
+        "smol-toml": "1.7.1",
+      }, }, },
+      "packages": {
+        "@anthropic-ai/claude-agent-sdk": ["@anthropic-ai/claude-agent-sdk@0.3.226"],
+        "smol-toml": ["smol-toml@1.7.1"],
+      },
+    }`);
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(process.cwd(), 'esbuild.config.mjs'), 'production'],
+      {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        env: { ...process.env, OBSIDIAN_VAULT: '' },
+      },
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Bundle-critical runtime dependency parity failed/);
+    assert.match(result.stderr, /package-lock\.json resolution: smol-toml/);
+    assert.equal(fs.existsSync(path.join(fixtureRoot, 'main.js')), false);
+  } finally {
+    fs.rmSync(fixtureRoot, { force: true, recursive: true });
+  }
 });
 
 test('production bundle policy rejects plugin artifact filename references', () => {

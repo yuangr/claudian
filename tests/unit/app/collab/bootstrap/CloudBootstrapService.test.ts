@@ -28,14 +28,26 @@ function pendingTransition(
   } as CloudBootstrapTransitionRecord;
 }
 
+function admitProjectRecovery(
+  _projectId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  return operation();
+}
+
 describe('CloudBootstrapService', () => {
   it('fences every uncertain transition before local recovery preparation completes', async () => {
     const fenceUncertainProject = jest.fn(async (_projectId: string) => undefined);
     const recoverLocalArtifacts = jest.fn(async () => undefined);
     const createCoordinator = jest.fn();
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
     const service = new CloudBootstrapService({
       createCoordinator,
       fenceUncertainProject,
+      projectRecoveryAdmission,
       recoverLocalArtifacts,
       transitions: {
         load: async () => null,
@@ -66,6 +78,11 @@ describe('CloudBootstrapService', () => {
     await service.prepareLocalRecovery();
 
     expect(fenceUncertainProject.mock.calls.map(([projectId]) => projectId).sort()).toEqual([
+      'project-cancelling',
+      'project-corrupt',
+      'project-pending',
+    ]);
+    expect(projectRecoveryAdmission.mock.calls.map(([projectId]) => projectId).sort()).toEqual([
       'project-cancelling',
       'project-corrupt',
       'project-pending',
@@ -143,6 +160,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       transitions,
     });
@@ -168,10 +186,18 @@ describe('CloudBootstrapService', () => {
     const fenceUncertainProject = jest.fn(async (projectId: string) => {
       events.push(`fence:${projectId}`);
     });
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
     const service = new CloudBootstrapService({
       createCoordinator,
       fenceUncertainProject,
-      recoverLocalArtifacts: async () => { events.push('artifacts'); },
+      projectRecoveryAdmission,
+      recoverLocalArtifacts: async admit => admit(
+        'project-artifact',
+        async () => { events.push('artifacts'); },
+      ),
       transitions: {
         load: async () => null,
         list: async () => ({
@@ -221,6 +247,15 @@ describe('CloudBootstrapService', () => {
       'project-complete',
       expect.any(AbortSignal),
     );
+    expect(projectRecoveryAdmission.mock.calls.map(([projectId]) => projectId))
+      .toEqual([
+        'project-corrupt',
+        PROJECT_ID,
+        'project-complete',
+        'project-artifact',
+        PROJECT_ID,
+        'project-complete',
+      ]);
   });
 
   it('fails closed before recovery or cancellation with a mismatched durable actor', async () => {
@@ -228,6 +263,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       transitions: {
         load: async () => ({
@@ -267,6 +303,7 @@ describe('CloudBootstrapService', () => {
         submitParticipant,
       }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       transitions: {
         list: async () => ({ blockedProjectIds: [], records: [], retryRequired: false }),
@@ -312,6 +349,7 @@ describe('CloudBootstrapService', () => {
         startFormerHost,
       }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -359,6 +397,7 @@ describe('CloudBootstrapService', () => {
         startFormerHost,
       }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -393,6 +432,7 @@ describe('CloudBootstrapService', () => {
         startFormerHost,
       }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -413,6 +453,7 @@ describe('CloudBootstrapService', () => {
 
   it('continues bounded Project polling after a successful pending recovery', async () => {
     const record = pendingTransition();
+    const projectRecoveryAdmission = jest.fn(admitProjectRecovery);
     const recoverProject = jest.fn()
       .mockResolvedValueOnce(record)
       .mockResolvedValueOnce({ ...record, attemptState: 'activated' as const });
@@ -424,6 +465,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator: () => ({ recoverProject }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -441,6 +483,16 @@ describe('CloudBootstrapService', () => {
     expect(scheduleRetry).toHaveBeenCalledWith(PROJECT_ID, expect.any(Function), 1_000);
     await retry?.();
     expect(recoverProject).toHaveBeenCalledTimes(2);
+    expect(projectRecoveryAdmission).toHaveBeenNthCalledWith(
+      1,
+      PROJECT_ID,
+      expect.any(Function),
+    );
+    expect(projectRecoveryAdmission).toHaveBeenNthCalledWith(
+      2,
+      PROJECT_ID,
+      expect.any(Function),
+    );
     await service.close();
   });
 
@@ -469,6 +521,7 @@ describe('CloudBootstrapService', () => {
           : recoverOther,
       }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -517,6 +570,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator: () => ({ recoverProject }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       scheduleRetry,
       transitions: {
@@ -562,6 +616,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator: () => ({ recoverProject }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts,
       scheduleRetry,
       transitions: { list, load: async () => null },
@@ -603,6 +658,7 @@ describe('CloudBootstrapService', () => {
     const service = new CloudBootstrapService({
       createCoordinator: () => ({ recoverProject }) as unknown as CloudBootstrapCoordinator,
       fenceUncertainProject: async () => undefined,
+      projectRecoveryAdmission: admitProjectRecovery,
       recoverLocalArtifacts: async () => undefined,
       transitions: {
         load: async () => null,

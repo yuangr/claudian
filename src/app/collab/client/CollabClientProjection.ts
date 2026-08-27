@@ -102,14 +102,29 @@ export type CollabClientProjectionEventFactory = (
   onInvalidation: (invalidation: ProjectEventInvalidation) => Promise<number>,
 ) => CollabClientProjectionEventPort;
 
-export interface CollabClientProjectionOptions {
+interface CollabClientProjectionBaseOptions {
   readonly authoritySessions?: CollabAuthoritySessionFactory;
   readonly createEventClient?: CollabClientProjectionEventFactory;
   readonly managerResponsibility?: CollabManagerResponsibilityProjectionPort;
   readonly now?: () => Date;
-  readonly retirement?: Pick<RetirementClientHandler, 'handle'>;
   readonly sessions?: CollabProjectWorkSessionRegistry;
 }
+
+export type CollabClientProjectionOptions = CollabClientProjectionBaseOptions & (
+  | {
+      readonly retirement?: undefined;
+      readonly retirementAdmission?: undefined;
+    }
+  | {
+      readonly retirement: Pick<RetirementClientHandler, 'handle'>;
+      readonly retirementAdmission: CollabClientRetirementAdmission;
+    }
+);
+
+export type CollabClientRetirementAdmission = (
+  projectId: string,
+  operation: () => Promise<void>,
+) => Promise<void>;
 
 export interface CollabManagerResponsibilityProjectionPort {
   reconcileSnapshot(
@@ -353,6 +368,7 @@ export class CollabClientProjection {
   private readonly now: () => Date;
   private readonly ownsSessions: boolean;
   private readonly retirement?: Pick<RetirementClientHandler, 'handle'>;
+  private readonly retirementAdmission?: CollabClientRetirementAdmission;
   private readonly sessions: CollabProjectWorkSessionRegistry;
 
   constructor(
@@ -367,6 +383,7 @@ export class CollabClientProjection {
     this.now = options.now ?? (() => new Date());
     this.ownsSessions = options.sessions === undefined;
     this.retirement = options.retirement;
+    this.retirementAdmission = options.retirementAdmission;
     this.sessions = options.sessions ?? new CollabProjectWorkSessionRegistry();
   }
 
@@ -695,9 +712,8 @@ export class CollabClientProjection {
     result: { readonly projectId: string; readonly retiredAt: string },
     source: 'response' | 'terminal-fallback',
   ): Promise<void> {
-    if (!this.retirement) return;
-    this.stopProjectConnection(result.projectId);
-    await this.retirement.handle(result, source);
+    if (!this.retirement || !this.retirementAdmission) return;
+    await this.deliverRetirement(result, source);
   }
 
   private readOnlineCoalesced(projectId: string): Promise<CollabProjectSnapshot> {
@@ -817,19 +833,19 @@ export class CollabClientProjection {
     );
   }
 
-  private async handleRetirementEvent(
+  private handleRetirementEvent(
     projectId: string,
     invalidation: Extract<ProjectEventInvalidation, { readonly kind: 'retired' }>,
   ): Promise<number> {
+    // The event callback is owned by this Project session. Detach it before
+    // convergence closes and drains that session, then let the lifecycle-owned
+    // handler settle independently so the callback cannot await itself.
+    this.resetProjectConnection(projectId);
     this.scheduleRetirement({
       projectId,
       retiredAt: invalidation.retiredAt,
     }, 'event');
-    return invalidation.sequence;
-  }
-
-  private stopProjectConnection(projectId: string): void {
-    this.sessions.acquire(projectId).resetProjection();
+    return Promise.resolve(invalidation.sequence);
   }
 
   private async runWithRetirementFallback<T>(
@@ -851,9 +867,18 @@ export class CollabClientProjection {
     result: { readonly projectId: string; readonly retiredAt: string },
     source: 'event' | 'terminal-fallback',
   ): void {
-    if (!this.retirement) return;
-    this.stopProjectConnection(result.projectId);
-    void this.retirement.handle(result, source).catch(() => undefined);
+    if (!this.retirement || !this.retirementAdmission) return;
+    void this.deliverRetirement(result, source).catch(() => undefined);
+  }
+
+  private deliverRetirement(
+    result: { readonly projectId: string; readonly retiredAt: string },
+    source: 'event' | 'response' | 'terminal-fallback',
+  ): Promise<void> {
+    if (!this.retirement || !this.retirementAdmission) return Promise.resolve();
+    return this.retirementAdmission(result.projectId, async () => {
+      await this.retirement!.handle(result, source);
+    });
   }
 
   private assertOpen(): void {

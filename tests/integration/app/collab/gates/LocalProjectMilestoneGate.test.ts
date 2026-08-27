@@ -6,6 +6,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { type CollabAuthorityTransferStatus } from '@claudian-collab/protocol';
 import initSqlJs, { type SqlJsStatic } from 'sql.js';
 
 import {
@@ -14,6 +15,9 @@ import {
   createCollabFeatureSubcomposition,
 } from '@/app/collab';
 import { SqlJsProjectDatabase } from '@/app/collab/authority/SqlJsProjectDatabase';
+import {
+  createAuthorityTransferRecord,
+} from '@/app/collab/authority-transfer/AuthorityTransferRecord';
 
 const PROJECT_ID = 'project-m2';
 const MEMBER_ID = 'member-host';
@@ -138,5 +142,61 @@ describe('G3 local Project milestone gate', () => {
       });
     await reopenedFeature.close();
     await reopenedFoundation.close();
+  });
+
+  it('registers transfer recovery and fences ordinary LAN Host restart', async () => {
+    const foundation = createFoundation();
+    const transferStatus = (
+      phase: 'collecting-readiness' | 'source-quiesced',
+    ): CollabAuthorityTransferStatus => ({
+      batchRevision: null,
+      batchSha256: null,
+      checkpointSha256: null,
+      createdAt: '2026-08-26T00:00:00.000Z',
+      direction: 'lan-to-cloud',
+      expiresAt: '2026-09-26T00:00:00.000Z',
+      phase,
+      projectId: PROJECT_ID,
+      relinquishmentProof: null,
+      sourceAuthority: { generation: 1, kind: 'lan' },
+      state: 'active',
+      targetAuthority: { generation: 2, kind: 'cloud' },
+      targetUrl: 'https://cloud.example.test/',
+      transferId: 'transfer-l2',
+      updatedAt: phase === 'collecting-readiness'
+        ? '2026-08-26T00:00:00.000Z'
+        : '2026-08-26T00:01:00.000Z',
+    });
+    const collecting = createAuthorityTransferRecord({
+      lifecycleOwnership: 'owned',
+      localRole: 'source',
+      operationIntentId: 'intent-l2',
+      stagingDirectoryName: '.claudian-authority-transfer-transfer-l2',
+      status: transferStatus('collecting-readiness'),
+    });
+    await foundation.authorityTransfers.create(collecting);
+    const feature = createCollabFeatureSubcomposition({
+      foundation,
+      projectSetup: new CollabProjectSetupService(foundation, { vaultRoot }),
+      vaultRoot,
+    }).feature;
+
+    await expect(feature.restoreLifecycle()).rejects.toMatchObject({
+      code: 'durable-progress-recovery-required',
+      safeContext: { reason: 'authority-transfer-runtime-not-composed' },
+    });
+    await foundation.authorityTransfers.advance(createAuthorityTransferRecord({
+      localRole: 'source',
+      operationIntentId: 'intent-l2',
+      stagingDirectoryName: '.claudian-authority-transfer-transfer-l2',
+      status: transferStatus('source-quiesced'),
+    }), 'collecting-readiness');
+    await expect(foundation.lanHost.startProject(PROJECT_ID)).rejects.toMatchObject({
+      code: 'durable-progress-recovery-required',
+      safeContext: { reason: 'authority-transfer-authority-quiesced' },
+    });
+
+    await feature.close();
+    await foundation.close();
   });
 });

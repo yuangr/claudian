@@ -119,6 +119,7 @@ type PublicationOptionsOverrides = {
   >;
   readonly reconnect?: Partial<CollabPublicationServiceOptions['reconnect']>;
   readonly retirement?: Partial<CollabPublicationServiceOptions['retirement']>;
+  readonly retirementAdmission?: CollabPublicationServiceOptions['retirementAdmission'];
   readonly vaultRoot: string;
 };
 
@@ -345,6 +346,8 @@ export function completeCollabPublicationOptions(
       handle: () => Promise.resolve(),
       ...overrides.retirement,
     },
+    retirementAdmission: overrides.retirementAdmission
+      ?? ((_projectId, operation) => operation()),
     vaultRoot: overrides.vaultRoot,
   };
 }

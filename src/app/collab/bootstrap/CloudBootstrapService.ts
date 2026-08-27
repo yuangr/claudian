@@ -20,7 +20,13 @@ export interface CloudBootstrapServiceOptions {
     readonly serverUrl: string;
   }) => CloudBootstrapCoordinator;
   readonly fenceUncertainProject: (projectId: CollabProjectId) => Promise<void>;
-  readonly recoverLocalArtifacts: () => Promise<void>;
+  readonly projectRecoveryAdmission: (
+    projectId: CollabProjectId,
+    operation: () => Promise<void>,
+  ) => Promise<void>;
+  readonly recoverLocalArtifacts: (
+    projectRecoveryAdmission: CloudBootstrapServiceOptions['projectRecoveryAdmission'],
+  ) => Promise<void>;
   readonly scheduleRetry?: (
     retryKey: string,
     retry: () => Promise<void>,
@@ -150,14 +156,17 @@ export class CloudBootstrapService {
     }
     let retryRequired = catalog.retryRequired;
     try {
-      await this.options.recoverLocalArtifacts();
+      await this.options.recoverLocalArtifacts(this.options.projectRecoveryAdmission);
     } catch {
       retryRequired = true;
     }
     if (retryRequired) this.requestCatalogRetry();
     else this.clearRetry('catalog');
     await Promise.allSettled(
-      catalog.records.map(record => this.recoverRecord(record, signal)),
+      catalog.records.map(record => this.options.projectRecoveryAdmission(
+        record.projectId,
+        () => this.recoverRecord(record, signal),
+      )),
     );
   }
 
@@ -179,7 +188,10 @@ export class CloudBootstrapService {
     }
     const fenceResults = await Promise.allSettled(
       [...uncertainProjects].map(projectId => (
-        this.options.fenceUncertainProject(projectId)
+        this.options.projectRecoveryAdmission(
+          projectId,
+          () => this.options.fenceUncertainProject(projectId),
+        )
       )),
     );
     if (signal.aborted) throw new CollabError({ code: 'cancelled' });
@@ -271,7 +283,10 @@ export class CloudBootstrapService {
       this.retryCancellations.delete(retryKey);
       this.retryScheduled.delete(retryKey);
       if (this.closing) return;
-      await this.run(signal => this.recoverRecord(record, signal));
+      await this.run(signal => this.options.projectRecoveryAdmission(
+        record.projectId,
+        () => this.recoverRecord(record, signal),
+      ));
     }, delayMs);
     if (cancellation) this.retryCancellations.set(retryKey, cancellation);
   }

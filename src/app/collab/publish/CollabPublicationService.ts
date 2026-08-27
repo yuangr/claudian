@@ -12,6 +12,7 @@ import type {
 } from '@/app/collab/ClaudianCollabService';
 import {
   CollabClientProjection,
+  type CollabClientRetirementAdmission,
   type CollabManagerResponsibilityProjectionPort,
 } from '@/app/collab/client/CollabClientProjection';
 import type {
@@ -92,6 +93,7 @@ export interface CollabPublicationServiceOptions {
   readonly managerResponsibility: CollabManagerResponsibilityProjectionPort;
   readonly reconnect: CollabPublicationReconnectPort;
   readonly retirement: Pick<RetirementClientHandler, 'handle'>;
+  readonly retirementAdmission: CollabClientRetirementAdmission;
   readonly vaultRoot: string;
 }
 
@@ -176,6 +178,7 @@ export class CollabPublicationService {
       authoritySessions: this.authoritySessions,
       managerResponsibility: options.managerResponsibility,
       retirement: options.retirement,
+      retirementAdmission: options.retirementAdmission,
       sessions: this.sessions,
     });
   }

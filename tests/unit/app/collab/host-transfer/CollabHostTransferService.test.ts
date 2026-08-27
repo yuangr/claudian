@@ -89,10 +89,14 @@ describe('CollabHostTransferService', () => {
         projectId: 'project-a',
       }),
     };
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
     const resumeOutgoing = jest.fn().mockResolvedValue(undefined);
     const resumeCompletedOutgoing = jest.fn().mockResolvedValue(undefined);
     const snapshots = { readCoordinationSnapshot: jest.fn().mockResolvedValue(snapshot) };
-    const service = new CollabHostTransferService({
+    const serviceOptions = {
       createControlClient: () => control,
       ...(useInjectedIdempotency
         ? { createIdempotencyKey: (kind: string) => `${kind}-key` }
@@ -103,10 +107,13 @@ describe('CollabHostTransferService', () => {
       resumeCompletedOutgoing,
       resumeOutgoing,
       snapshots,
-    });
+      projectRecoveryAdmission,
+    };
+    const service = new CollabHostTransferService(serviceOptions);
     return {
       control,
       incoming,
+      projectRecoveryAdmission,
       projects,
       recovery,
       resumeCompletedOutgoing,
@@ -221,11 +228,24 @@ describe('CollabHostTransferService', () => {
   });
 
   it('restores incoming provisional state during nonblocking startup recovery', async () => {
-    const { incoming, service } = create();
+    const { incoming, projectRecoveryAdmission, service } = create();
 
     await service.resume();
 
+    expect(projectRecoveryAdmission).toHaveBeenCalledWith(
+      'project-a',
+      expect.any(Function),
+    );
     expect(incoming.resume).toHaveBeenCalledWith('project-a');
+  });
+
+  it('does not touch Host state when Project recovery admission fails closed', async () => {
+    const { incoming, projectRecoveryAdmission, service } = create();
+    projectRecoveryAdmission.mockRejectedValueOnce(new Error('ambiguous lifecycle owners'));
+
+    await expect(service.resume()).rejects.toThrow('ambiguous lifecycle owners');
+
+    expect(incoming.resume).not.toHaveBeenCalled();
   });
 
   it('finishes completed outgoing recovery without reopening deleted authority', async () => {
@@ -325,6 +345,7 @@ describe('CollabHostTransferService', () => {
       createControlClient: () => harness.control,
       createIncomingCoordinator,
       projects: harness.projects,
+      projectRecoveryAdmission: async (_projectId, operation) => operation(),
       recovery: harness.recovery,
       snapshots: harness.snapshots,
     });
@@ -369,6 +390,7 @@ describe('CollabHostTransferService', () => {
         return construction;
       },
       projects: harness.projects,
+      projectRecoveryAdmission: async (_projectId, operation) => operation(),
       recovery: harness.recovery,
       snapshots: harness.snapshots,
     });

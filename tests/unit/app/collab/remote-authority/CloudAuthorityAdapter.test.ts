@@ -1,4 +1,7 @@
+import { createServer } from 'node:http';
+
 import {
+  COLLAB_CHECKPOINT_ARTIFACT_LIMITS,
   COLLAB_CLOUD_PROJECT_SNAPSHOT_CODEC,
   COLLAB_LIMITS,
   collabCloudCapabilityDocument,
@@ -9,10 +12,12 @@ import type { CollabLocalCloudMembershipRecord } from '@/app/collab/CollabLocalP
 import { COLLAB_LOCAL_PROJECT_SCHEMA_VERSION } from '@/app/collab/CollabSchemaVersions';
 import {
   CloudAuthorityAdapter,
-  type CloudAuthorityHttpRequest,
   CloudProjectEventClient,
   type CloudProjectEventSocket,
 } from '@/app/collab/remote-authority/CloudAuthorityAdapter';
+import type {
+  CloudAuthorityHttpRequest,
+} from '@/app/collab/remote-authority/NodeCloudAuthorityHttpTransport';
 
 const PROJECT_ID = 'project-cloud';
 const ACTOR_ID = 'member-alice';
@@ -67,12 +72,12 @@ function ticketDetail(overrides: Readonly<Record<string, unknown>> = {}) {
 function membership(): CollabLocalCloudMembershipRecord {
   return {
     authority: {
-      bindingVersion: 1,
+      bindingVersion: 2,
       developmentActorId: ACTOR_ID,
-      gitRemoteUrl: `https://cloud.example.test/v1/projects/${PROJECT_ID}/repository.git`,
+      gitRemoteUrl: `https://cloud.example.test/v2/projects/${PROJECT_ID}/repository.git`,
       kind: 'cloud',
       serverUrl: 'https://cloud.example.test',
-      wireVersion: 4,
+      wireVersion: 6,
     },
     createdAt: '2026-08-22T00:00:00.000Z',
     lastEventSequence: 3,
@@ -94,6 +99,11 @@ function membership(): CollabLocalCloudMembershipRecord {
 }
 
 const limits = {
+  maxCheckpointCoordinationBytes: COLLAB_CHECKPOINT_ARTIFACT_LIMITS.maxCoordinationBytes,
+  maxCheckpointManifestUtf8Bytes: COLLAB_CHECKPOINT_ARTIFACT_LIMITS.maxManifestBytes,
+  maxCheckpointRepositoryBundleBytes:
+    COLLAB_CHECKPOINT_ARTIFACT_LIMITS.maxRepositoryBundleBytes,
+  maxCheckpointStagingBytes: COLLAB_CHECKPOINT_ARTIFACT_LIMITS.maxStagingBytes,
   maxDevelopmentBootstrapGitBundleBytes: 1_024,
   maxDevelopmentBootstrapManifestUtf8Bytes: 1_024,
   maxDevelopmentBootstrapReportUtf8Bytes: 1_024,
@@ -138,6 +148,63 @@ function cloudSnapshot() {
 }
 
 describe('CloudAuthorityAdapter', () => {
+  it('uses the desktop transport for default capability and snapshot reads', async () => {
+    const requests: Array<{ readonly actor: string | undefined; readonly url: string }> = [];
+    const server = createServer((request, response) => {
+      requests.push({
+        actor: typeof request.headers['x-claudian-development-actor'] === 'string'
+          ? request.headers['x-claudian-development-actor']
+          : undefined,
+        url: request.url ?? '',
+      });
+      response.setHeader('content-type', 'application/json; charset=utf-8');
+      if (request.method === 'GET') {
+        response.end(JSON.stringify(collabCloudCapabilityDocument([
+          'project-snapshot',
+        ], limits)));
+        return;
+      }
+      response.end(JSON.stringify(collabCloudSuccessEnvelope(
+        'request-snapshot',
+        cloudSnapshot(),
+      )));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('server address missing');
+    const fetchMock = jest.spyOn(globalThis, 'fetch').mockRejectedValue(
+      new Error('renderer fetch is disabled'),
+    );
+    const localMembership = {
+      ...membership(),
+      authority: {
+        ...membership().authority,
+        serverUrl: `http://127.0.0.1:${address.port}`,
+      },
+    } satisfies CollabLocalCloudMembershipRecord;
+
+    try {
+      const session = await new CloudAuthorityAdapter().create(localMembership);
+      await expect(session.control.readSnapshot(PROJECT_ID)).resolves.toMatchObject({
+        currentMember: { id: ACTOR_ID },
+        project: { authorityKind: 'cloud', id: PROJECT_ID },
+      });
+      expect(requests).toEqual([
+        { actor: ACTOR_ID, url: '/collab/capabilities' },
+        {
+          actor: ACTOR_ID,
+          url: `/v2/projects/${PROJECT_ID}/operations/getProjectSnapshot`,
+        },
+      ]);
+    } finally {
+      fetchMock.mockRestore();
+      await new Promise<void>((resolve, reject) => server.close(error => {
+        if (error) reject(error);
+        else resolve();
+      }));
+    }
+  });
+
   it('negotiates package capabilities and maps the strict Cloud snapshot', async () => {
     const requests: CloudAuthorityHttpRequest[] = [];
     const request = jest.fn(async (input: CloudAuthorityHttpRequest) => {
@@ -186,7 +253,7 @@ describe('CloudAuthorityAdapter', () => {
         sensitive: false,
         value: ACTOR_ID,
       }],
-      remoteUrl: `https://cloud.example.test/v1/projects/${PROJECT_ID}/repository.git`,
+      remoteUrl: `https://cloud.example.test/v2/projects/${PROJECT_ID}/repository.git`,
     });
     expect(requests).toEqual([
       expect.objectContaining({
@@ -198,7 +265,7 @@ describe('CloudAuthorityAdapter', () => {
         body: expect.objectContaining({ data: { projectId: PROJECT_ID } }),
         headers: { 'x-claudian-development-actor': ACTOR_ID },
         method: 'POST',
-        url: `https://cloud.example.test/v1/projects/${PROJECT_ID}/operations/getProjectSnapshot`,
+        url: `https://cloud.example.test/v2/projects/${PROJECT_ID}/operations/getProjectSnapshot`,
       }),
     ]);
   });
@@ -246,13 +313,13 @@ describe('CloudAuthorityAdapter', () => {
           idempotencyKey: 'publish-head',
           projectId: PROJECT_ID,
         },
-        protocolVersion: 4,
+        protocolVersion: 6,
         requestId: 'request-ensure',
       },
       headers: { 'x-claudian-development-actor': ACTOR_ID },
       method: 'POST',
       signal: controller.signal,
-      url: `https://cloud.example.test/v1/projects/${PROJECT_ID}/operations/ensureMyRequest`,
+      url: `https://cloud.example.test/v2/projects/${PROJECT_ID}/operations/ensureMyRequest`,
     });
   });
 
@@ -304,13 +371,13 @@ describe('CloudAuthorityAdapter', () => {
           projectId: PROJECT_ID,
           requestId: 'request-one',
         },
-        protocolVersion: 4,
+        protocolVersion: 6,
         requestId: expect.any(String),
       },
       headers: { 'x-claudian-development-actor': ACTOR_ID },
       method: 'POST',
       signal: controller.signal,
-      url: `https://cloud.example.test/v1/projects/${PROJECT_ID}/operations/acceptRequest`,
+      url: `https://cloud.example.test/v2/projects/${PROJECT_ID}/operations/acceptRequest`,
     });
   });
 
@@ -640,7 +707,7 @@ describe('CloudAuthorityAdapter', () => {
     const document = collabCloudCapabilityDocument(['project-snapshot'], limits);
     const adapter = new CloudAuthorityAdapter({
       request: async () => ({
-        body: { ...document, bindingVersions: [2] },
+        body: { ...document, bindingVersions: [1] },
         contentType: 'application/json',
         status: 200,
       }),
@@ -670,51 +737,6 @@ describe('CloudAuthorityAdapter', () => {
     });
   });
 
-  it('cancels a chunked JSON response as soon as the payload limit is crossed', async () => {
-    let pullCount = 0;
-    let cancelled = false;
-    const chunk = new Uint8Array(Math.floor(COLLAB_LIMITS.maxJsonPayloadUtf8Bytes / 2) + 1);
-    const body = new ReadableStream<Uint8Array>({
-      cancel: () => { cancelled = true; },
-      pull: controller => {
-        pullCount += 1;
-        if (pullCount <= 2) controller.enqueue(chunk);
-        else controller.close();
-      },
-    }, { highWaterMark: 0 });
-    const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(body, {
-      headers: { 'content-type': 'application/json' },
-      status: 200,
-    }));
-
-    await expect(new CloudAuthorityAdapter().create(membership())).rejects.toMatchObject({
-      code: 'protocol-payload-invalid',
-      safeContext: { reason: 'cloud-authority-response-too-large' },
-    });
-    expect(cancelled).toBe(true);
-    fetchMock.mockRestore();
-  });
-
-  it('cancels a response rejected by its declared content length', async () => {
-    let cancelled = false;
-    const body = new ReadableStream<Uint8Array>({
-      cancel: () => { cancelled = true; },
-    });
-    const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(body, {
-      headers: {
-        'content-length': String(COLLAB_LIMITS.maxJsonPayloadUtf8Bytes + 1),
-        'content-type': 'application/json',
-      },
-      status: 200,
-    }));
-
-    await expect(new CloudAuthorityAdapter().create(membership())).rejects.toMatchObject({
-      code: 'protocol-payload-invalid',
-      safeContext: { reason: 'cloud-authority-response-too-large' },
-    });
-    expect(cancelled).toBe(true);
-    fetchMock.mockRestore();
-  });
 });
 
 describe('CloudProjectEventClient', () => {
@@ -733,7 +755,7 @@ describe('CloudProjectEventClient', () => {
         sockets.push(socket);
         expect(input).toEqual({
           headers: { 'x-claudian-development-actor': ACTOR_ID },
-          url: `wss://cloud.example.test/v1/projects/${PROJECT_ID}/events?afterSequence=${
+          url: `wss://cloud.example.test/v2/projects/${PROJECT_ID}/events?afterSequence=${
             sockets.length === 1 ? 3 : 5
           }`,
         });
@@ -781,7 +803,7 @@ describe('CloudProjectEventClient', () => {
         const socket = new FakeSocket();
         sockets.push(socket);
         expect(input.url).toBe(
-          `wss://cloud.example.test/v1/projects/${PROJECT_ID}/events?afterSequence=${
+          `wss://cloud.example.test/v2/projects/${PROJECT_ID}/events?afterSequence=${
             sockets.length === 1 ? 3 : 4
           }`,
         );
@@ -801,7 +823,7 @@ describe('CloudProjectEventClient', () => {
       occurredAt: '2026-08-22T00:00:00.000Z',
       payload: { requestId: 'request-one' },
       projectId: PROJECT_ID,
-      protocolVersion: 4,
+      protocolVersion: 6,
       sequence: 4,
     }));
     sockets[0]!.closed(1006);
@@ -839,7 +861,7 @@ describe('CloudProjectEventClient', () => {
         occurredAt: '2026-08-22T00:00:00.000Z',
         payload: { requestId: `request-${sequence}` },
         projectId: PROJECT_ID,
-        protocolVersion: 4,
+        protocolVersion: 6,
         sequence,
       }));
     }
@@ -875,7 +897,7 @@ describe('CloudProjectEventClient', () => {
       occurredAt: '2026-08-22T00:00:00.000Z',
       payload: { requestId: 'request-four' },
       projectId: PROJECT_ID,
-      protocolVersion: 4,
+      protocolVersion: 6,
       sequence: 4,
     }));
     await flush();

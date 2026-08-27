@@ -16,6 +16,9 @@ import type {
   IncomingHostTransferCoordinator,
 } from '@/app/collab/host-transfer/IncomingHostTransferCoordinator';
 import type { HostTransferControlClient } from '@/app/collab/lan/HostTransferControlClient';
+import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { type CollabCoordinationSnapshot, type CollabCreateHostTransferRequest, type CollabHostTransferIntentRequest, type CollabLanProjectSnapshot, type CollabOperationOptions, isCollabLanProjectSnapshot } from '@/core/collab';
 import { CollabError } from '@/core/collab/ClaudianCollabError';
 
@@ -42,6 +45,7 @@ export interface CollabHostTransferServiceOptions {
     CollabLocalProjectRepository,
     'loadIndex' | 'loadMembership'
   >;
+  readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission;
   readonly recovery: Pick<HostTransferRecoveryStorePort, 'load'>;
   readonly resumeOutgoing?: (projectId: CollabProjectId) => Promise<void>;
   readonly resumeCompletedOutgoing?: (record: HostTransferRecoveryRecord) => Promise<void>;
@@ -175,28 +179,41 @@ export class CollabHostTransferService {
         const record = await this.options.recovery.load(project.id, 'outgoing')
           ?? await this.options.recovery.load(project.id, 'incoming');
         if (!record) continue;
-        if (record.direction === 'outgoing') {
-          if (
-            record.phase === 'completed'
-            && record.targetTerminalResponseReceived
-            && this.options.resumeCompletedOutgoing
-          ) {
-            await this.options.resumeCompletedOutgoing(record);
-            continue;
-          }
-          await this.options.resumeOutgoing?.(project.id);
-          continue;
-        }
-        const membership = await this.requireMembership(project.id);
-        const incoming = await this.incomingCoordinator(membership);
-        if (options.signal) await incoming.resume(project.id, options.signal);
-        else await incoming.resume(project.id);
+        await this.options.projectRecoveryAdmission(
+          project.id,
+          () => this.resumeProject(project.id, options.signal),
+        );
       } catch (error) {
         firstError ??= error;
       }
     }
     if (firstError instanceof Error) throw firstError;
     if (firstError) throw serviceError('host-transfer-recovery-failed');
+  }
+
+  private async resumeProject(
+    projectId: CollabProjectId,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const record = await this.options.recovery.load(projectId, 'outgoing')
+      ?? await this.options.recovery.load(projectId, 'incoming');
+    if (!record) return;
+    if (record.direction === 'outgoing') {
+      if (
+        record.phase === 'completed'
+        && record.targetTerminalResponseReceived
+        && this.options.resumeCompletedOutgoing
+      ) {
+        await this.options.resumeCompletedOutgoing(record);
+        return;
+      }
+      await this.options.resumeOutgoing?.(projectId);
+      return;
+    }
+    const membership = await this.requireMembership(projectId);
+    const incoming = await this.incomingCoordinator(membership);
+    if (signal) await incoming.resume(projectId, signal);
+    else await incoming.resume(projectId);
   }
 
   close(): Promise<void> {

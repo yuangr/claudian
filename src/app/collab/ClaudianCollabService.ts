@@ -22,6 +22,9 @@ import { RequestQueryGitPolicy } from '@/app/collab/authority/RequestQueryGitPol
 import { RequestQueryService } from '@/app/collab/authority/RequestQueryService';
 import { SqlJsProjectDatabase } from '@/app/collab/authority/SqlJsProjectDatabase';
 import { TicketService } from '@/app/collab/authority/TicketService';
+import {
+  AuthorityTransferPersistence,
+} from '@/app/collab/authority-transfer/persistence/AuthorityTransferPersistence';
 import { CloudBootstrapTransitionStore } from '@/app/collab/bootstrap/CloudBootstrapTransitionStore';
 import {
   type CollabFilesystemDiagnosticSink,
@@ -77,6 +80,10 @@ import {
 import type {
   CollabTerminalProjectService,
 } from '@/app/collab/lan/routes/RouteTypes';
+import type {
+  CollabProjectLifecycleAdmission,
+  CollabProjectLifecycleAuthorityAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { LanHostTransitionProofClient } from '@/app/collab/reconnect/LanHostTransitionProofClient';
 import { ReconnectProjectCoordinator } from '@/app/collab/reconnect/ReconnectProjectCoordinator';
 import { ProjectRetirementCoordinator } from '@/app/collab/retirement/ProjectRetirementCoordinator';
@@ -142,6 +149,7 @@ export interface ClaudianCollabServiceOptions {
 }
 
 interface RetirementCoordinatorFactoryInput {
+  readonly projectLifecycleAdmission: CollabProjectLifecycleAuthorityAdmission;
   readonly admission: {
     quiesceAndDrain(projectId: CollabProjectId): Promise<void>;
     resume(projectId: CollabProjectId): Promise<void>;
@@ -179,6 +187,7 @@ function environmentPath(environment: NodeJS.ProcessEnv): string | undefined {
 }
 
 export class ClaudianCollabService {
+  readonly authorityTransfers: AuthorityTransferPersistence;
   readonly cloudBootstrapTransitions: CloudBootstrapTransitionStore;
   readonly discovery: CollabLanDiscoveryService;
   readonly hostTransitionCandidates: HostTransitionCandidateResolver;
@@ -223,6 +232,7 @@ export class ClaudianCollabService {
     const projects = new CollabLocalProjectRepository(options.vaultRoot, {
       onDiagnostic: options.onDiagnostic,
     });
+    this.authorityTransfers = new AuthorityTransferPersistence(projects);
     this.local = Object.freeze({
       pathPolicy,
       projects,
@@ -270,9 +280,23 @@ export class ClaudianCollabService {
       discovery: this.discovery,
       localProjects: projects,
       openProject: projectId => this.openLanHostProject(projectId),
-      runWithProjectStartGuard: (projectId, operation) => (
-        this.cloudBootstrapTransitions.runWithLanHostStartGuard(projectId, operation)
-      ),
+      runWithProjectStartGuard: async (projectId, operation) => {
+        const tombstone = await projects.loadRetirementTombstone(projectId);
+        if (tombstone) {
+          throw new CollabError({
+            code: 'project-retired',
+            safeContext: {
+              projectId,
+              reason: 'retirement-tombstone-durable',
+              retiredAt: tombstone.retiredAt,
+            },
+          });
+        }
+        return this.cloudBootstrapTransitions.runWithLanHostStartGuard(
+          projectId,
+          () => this.authorityTransfers.runWithAuthorityStartGuard(projectId, operation),
+        );
+      },
       vaultRoot: options.vaultRoot,
     });
   }
@@ -392,17 +416,25 @@ export class ClaudianCollabService {
     this.retirementHandler = handler;
   }
 
-  async restoreRetirementResponders(): Promise<void> {
+  async restoreRetirementResponders(
+    projectRecoveryAdmission: CollabProjectLifecycleAdmission,
+  ): Promise<void> {
     this.assertOpen();
     const restored = await this.retirementTombstones.restore();
     let firstError: unknown;
     for (const projectId of restored.expiredProjectIds) {
-      await this.restoreExpiredRetirementResponder(projectId).catch(error => {
+      await projectRecoveryAdmission(
+        projectId,
+        () => this.restoreExpiredRetirementResponder(projectId),
+      ).catch(error => {
         firstError ??= error;
       });
     }
     for (const tombstone of restored.tombstones) {
-      await this.restoreRetirementResponder(tombstone).catch(error => {
+      await projectRecoveryAdmission(
+        tombstone.projectId,
+        () => this.restoreRetirementResponder(tombstone),
+      ).catch(error => {
         firstError ??= error;
       });
     }
@@ -413,6 +445,24 @@ export class ClaudianCollabService {
   }
 
   private async restoreExpiredRetirementResponder(projectId: CollabProjectId): Promise<void> {
+    const tombstone = await this.local.projects.loadRetirementTombstone(projectId);
+    if (!tombstone) {
+      throw new CollabError({
+        code: 'durable-progress-recovery-required',
+        recoveryActions: ['resume', 'open-diagnostics'],
+        safeContext: { projectId, reason: 'retirement-tombstone-missing' },
+      });
+    }
+    const [index, retirement] = await Promise.all([
+      this.local.projects.loadIndex(),
+      this.local.projects.loadRetirementRecord(projectId),
+    ]);
+    if (retirement !== null || index.projects.some(project => project.id === projectId)) {
+      if (!this.retirementHandler) {
+        throw collabServiceError('not-initialized', 'retirement-handler-missing');
+      }
+      await this.retirementHandler.handle(tombstone.result, 'terminal-fallback');
+    }
     await this.lanHost.stopTerminalProject(projectId).catch(() => undefined);
     await this.closeAuthority(projectId).catch(() => undefined);
     await this.local.projects.removeAuthorityDirectory(projectId);
@@ -484,6 +534,7 @@ export class ClaudianCollabService {
 
   createHostTransferService(
     snapshots: HostTransferModuleOptions['snapshots'],
+    projectRecoveryAdmission: CollabProjectLifecycleAdmission,
   ): CollabHostTransferService {
     this.assertOpen();
     if (this.hostTransferModule) {
@@ -510,6 +561,7 @@ export class ClaudianCollabService {
       },
       lanHost: this.lanHost,
       projects: this.local.projects,
+      projectRecoveryAdmission,
       requireGitFoundation: () => this.requireGitFoundation(),
       snapshots,
       workspace: this.local.workspace,
@@ -530,6 +582,9 @@ export class ClaudianCollabService {
       this.retirementResponders.clear();
       this.retirementResponderCleanupPending.clear();
       this.retiredAuthorityCleanupComplete.clear();
+      await this.authorityTransfers.close().catch(error => {
+        firstError ??= error;
+      });
       await this.lanHost.close().catch(error => {
         firstError ??= error;
       });
@@ -727,6 +782,7 @@ export class ClaudianCollabService {
             },
           },
           { teardown: retiredProjectId => input.teardown(retiredProjectId) },
+          input.projectLifecycleAdmission,
         );
         return {
           retireProject: (actorMemberId, request) => coordinator.retire(actorMemberId, {

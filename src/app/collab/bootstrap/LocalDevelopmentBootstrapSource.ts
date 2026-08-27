@@ -346,29 +346,38 @@ export class LocalDevelopmentBootstrapSource {
     });
   }
 
-  recoverArtifacts(
+  async recoverArtifacts(
     isOwned: (manifest: DevelopmentBootstrapManifest) => Promise<boolean>,
+    projectRecoveryAdmission: (
+      projectId: string,
+      operation: () => Promise<void>,
+    ) => Promise<void>,
   ): Promise<void> {
-    return this.#queue.run(async () => {
+    const projectIds = await this.#queue.run(async () => {
       const directory = await resolveCollabVaultPath(this.#vaultRoot, ARTIFACT_DIRECTORY);
       const entries = await readdir(directory, { withFileTypes: true }).catch(error => {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
         throw sourceOperationError('cloud-bootstrap-source-artifact-list-failed');
       });
-      for (const entry of entries.sort((left, right) => (
+      return entries.sort((left, right) => (
         left.name.localeCompare(right.name, 'en-US')
-      ))) {
-        if (/^\..+\.tmp$/u.test(entry.name) || entry.name.endsWith('.bundle')) continue;
+      )).flatMap(entry => {
+        if (/^\..+\.tmp$/u.test(entry.name) || entry.name.endsWith('.bundle')) return [];
         const match = /^(.+)\.json$/u.exec(entry.name);
         if (!match || !entry.isFile() || entry.isSymbolicLink() || !isCollabProjectId(match[1])) {
           throw sourceError('cloud-bootstrap-source-artifact-directory-invalid');
         }
-        const intent = await this.#loadIntent(match[1]);
-        if (!intent) continue;
-        if (intent.manifest && await isOwned(intent.manifest)) continue;
-        await this.#discardIntent(intent);
-      }
+        return [match[1]];
+      });
     });
+    for (const projectId of projectIds) {
+      await projectRecoveryAdmission(projectId, () => this.#queue.run(async () => {
+          const intent = await this.#loadIntent(projectId);
+          if (!intent) return;
+          if (intent.manifest && await isOwned(intent.manifest)) return;
+          await this.#discardIntent(intent);
+      }));
+    }
   }
 
   async #loadIntent(projectId: string): Promise<BootstrapArtifactIntent | null> {

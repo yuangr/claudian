@@ -130,6 +130,7 @@ function safetyContext(
   overrides: Partial<CollabMembershipSafetyContext> = {},
 ): CollabMembershipSafetyContext {
   return {
+    managerResponsibilityAdmission: async (_projectId, operation) => operation(),
     managerReceipts: {
       load: jest.fn(async () => null),
       remove: jest.fn(async () => false),
@@ -223,6 +224,34 @@ describe('CollabMembershipService', () => {
       projectId: 'project-alpha',
     });
     expect(snapshot.readCoordinationSnapshot).toHaveBeenCalledTimes(3);
+  });
+
+  it('fails closed before promotion when another Project lifecycle owns admission', async () => {
+    const control = client();
+    const managerResponsibilityAdmission = jest.fn().mockRejectedValue(new CollabError({
+      code: 'durable-progress-recovery-required',
+      recoveryActions: ['resume'],
+      safeContext: { reason: 'lifecycle-owner-pending' },
+    }));
+    const snapshot: jest.Mocked<CollabMembershipSnapshotPort> = {
+      readCoordinationSnapshot: jest.fn().mockResolvedValue(coordination()),
+    };
+    const service = new CollabMembershipService({
+      loadMembership: jest.fn().mockResolvedValue(membership()),
+    }, snapshot, {
+      createClient: () => control,
+    }, safetyContext({ managerResponsibilityAdmission }));
+
+    await expect(service.promoteManager({
+      managerResponsibilityOfferId: 'offer-transfer',
+      projectId: 'project-alpha',
+      targetMemberId: 'member-a',
+    })).rejects.toMatchObject({
+      safeContext: { reason: 'lifecycle-owner-pending' },
+    });
+
+    expect(control.promoteManager).not.toHaveBeenCalled();
+    expect(snapshot.readCoordinationSnapshot).not.toHaveBeenCalled();
   });
 
   it('reuses a caller mutation intent after a lost administration response', async () => {

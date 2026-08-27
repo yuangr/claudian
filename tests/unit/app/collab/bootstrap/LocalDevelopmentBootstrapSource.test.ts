@@ -19,6 +19,13 @@ import {
   PROJECT_ID,
 } from './fixtures';
 
+function admitProjectRecovery(
+  _projectId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  return operation();
+}
+
 describe('LocalDevelopmentBootstrapSource', () => {
   let vaultRoot: string;
 
@@ -218,15 +225,39 @@ describe('LocalDevelopmentBootstrapSource', () => {
     sourceEventSequence = 12;
     latestEventActorMemberId = sourceHostMemberId;
     const ownership = jest.fn(async () => true);
-    await expect(source.recoverArtifacts(ownership)).resolves.toBeUndefined();
+    const projectRecoveryAdmission = jest.fn(admitProjectRecovery);
+    await expect(source.recoverArtifacts(ownership, projectRecoveryAdmission))
+      .resolves.toBeUndefined();
     expect(ownership).toHaveBeenCalledWith(manifest);
+    expect(projectRecoveryAdmission).toHaveBeenCalledWith(
+      PROJECT_ID,
+      expect.any(Function),
+    );
     const preservedChunks: Buffer[] = [];
     for await (const chunk of source.openBundle(manifest)) {
       preservedChunks.push(Buffer.from(chunk));
     }
     expect(Buffer.concat(preservedChunks)).toEqual(Buffer.from([1, 2, 3]));
 
-    await expect(source.recoverArtifacts(async () => false)).resolves.toBeUndefined();
+    const rejectedAdmission = jest.fn(async () => {
+      throw new Error('lifecycle owner conflict');
+    });
+    await expect(source.recoverArtifacts(async () => false, rejectedAdmission))
+      .rejects.toThrow('lifecycle owner conflict');
+    const stillPreservedChunks: Buffer[] = [];
+    for await (const chunk of source.openBundle(manifest)) {
+      stillPreservedChunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(stillPreservedChunks)).toEqual(Buffer.from([1, 2, 3]));
+
+    const recovery = source.recoverArtifacts(async () => false, async (_projectId, operation) => {
+      await source.discardBundle(manifest);
+      await operation();
+    });
+    await expect(Promise.race([
+      recovery.then(() => 'complete'),
+      new Promise(resolve => setTimeout(() => resolve('deadlocked'), 100)),
+    ])).resolves.toBe('complete');
     await expect(source.discardBundle(manifest)).resolves.toBeUndefined();
     await expect(source.discardBundle(manifest)).resolves.toBeUndefined();
     await expect(lstat(path.join(

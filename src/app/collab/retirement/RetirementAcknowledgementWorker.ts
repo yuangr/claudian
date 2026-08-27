@@ -1,6 +1,9 @@
 import { type CollabProjectId } from '@claudian-collab/protocol';
 
 import type { AcknowledgeRetirementResponse } from '@/app/collab/lan/LanCollabControlOperations';
+import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import type { RetirementRecord } from '@/app/collab/retirement/RetirementRecord';
 import { CollabError } from '@/core/collab/ClaudianCollabError';
 
@@ -32,6 +35,7 @@ export interface RetirementAcknowledgementScheduler {
 
 export interface RetirementAcknowledgementWorkerOptions {
   readonly now?: () => Date;
+  readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission;
   readonly scheduleRetry?: (
     projectId: CollabProjectId,
     retry: () => Promise<void>,
@@ -63,6 +67,7 @@ implements RetirementAcknowledgementScheduler {
   private readonly controller = new AbortController();
   private closed = false;
   private readonly now: () => Date;
+  private readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission;
   private readonly retryScheduled = new Set<CollabProjectId>();
   private readonly retryAttempts = new Map<CollabProjectId, number>();
   private readonly retryCancellations = new Map<CollabProjectId, () => void>();
@@ -71,9 +76,10 @@ implements RetirementAcknowledgementScheduler {
   constructor(
     private readonly store: RetirementClientStore,
     private readonly client: RetirementAcknowledgementClientPort,
-    options: RetirementAcknowledgementWorkerOptions = {},
+    options: RetirementAcknowledgementWorkerOptions,
   ) {
     this.now = options.now ?? (() => new Date());
+    this.projectRecoveryAdmission = options.projectRecoveryAdmission;
     this.scheduleRetry = options.scheduleRetry ?? ((_projectId, retry, delayMs) => {
       const timer = window.setTimeout(() => void retry().catch(() => undefined), delayMs);
       return () => window.clearTimeout(timer);
@@ -89,7 +95,7 @@ implements RetirementAcknowledgementScheduler {
     if (this.closed) return Promise.resolve('cancelled');
     const existing = this.active.get(projectId);
     if (existing) return existing;
-    const pending = this.runUnlocked(projectId);
+    const pending = this.runAdmitted(projectId);
     this.active.set(projectId, pending);
     const clear = () => {
       if (this.active.get(projectId) === pending) this.active.delete(projectId);
@@ -196,6 +202,21 @@ implements RetirementAcknowledgementScheduler {
     await this.store.removeRetirementAcknowledgement(projectId);
     this.clearRetry(projectId);
     return 'acknowledged';
+  }
+
+  private async runAdmitted(
+    projectId: CollabProjectId,
+  ): Promise<RetirementAcknowledgementRunResult> {
+    let result: RetirementAcknowledgementRunResult | null = null;
+    await this.projectRecoveryAdmission(projectId, async () => {
+      result = await this.runUnlocked(projectId);
+    });
+    if (result !== null) return result;
+    throw new CollabError({
+      code: 'durable-progress-recovery-required',
+      recoveryActions: ['resume'],
+      safeContext: { reason: 'retirement-acknowledgement-admission-incomplete' },
+    });
   }
 
   private requestRetry(projectId: CollabProjectId): void {

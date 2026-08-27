@@ -67,6 +67,9 @@ import type { ProjectEventSocket } from '@/app/collab/lan/ProjectEventHub';
 import type {
   CollabTerminalProjectService,
 } from '@/app/collab/lan/routes/RouteTypes';
+import type {
+  CollabProjectLifecycleAuthorityAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { SerialTaskQueue } from '@/app/collab/SerialTaskQueue';
 import type { CollabRetirementResult } from '@/core/collab';
 import { type CollabHostSession, type CollabHostStatus, type CollabInvitationView } from '@/core/collab';
@@ -121,6 +124,7 @@ export interface LanHostProjectRuntime {
   readonly git: LanHostGitRuntime;
   readonly lifecycle: Omit<HostedLifecycleControlPort, 'retireProject'> & {
     createRetirementCoordinator(input: {
+      readonly projectLifecycleAdmission: CollabProjectLifecycleAuthorityAdmission;
       readonly admission: {
         quiesceAndDrain(projectId: CollabProjectId): Promise<void>;
         resume(projectId: CollabProjectId): Promise<void>;
@@ -195,6 +199,11 @@ export interface LanHostCoordinatorOptions {
 
 export interface LanHostConnectionProjectionPort {
   resetProjectConnection(projectId: CollabProjectId): void;
+}
+
+export interface LanHostProjectLifecycleAdmissions {
+  readonly hostTransfer: CollabProjectLifecycleAuthorityAdmission;
+  readonly retirement: CollabProjectLifecycleAuthorityAdmission;
 }
 
 interface HostLockRecord {
@@ -379,6 +388,7 @@ export class LanHostCoordinator {
     Extract<CollabHostStatus, 'starting' | 'stopping'>
   >();
   private readonly provisionalTransfers = new HostTransferProvisionalRouter();
+  private projectLifecycleAdmissions: LanHostProjectLifecycleAdmissions | null = null;
   private readonly recoveringHostTransfers = new Map<
     CollabProjectId,
     NonNullable<LanHostProjectRuntime['outgoingHostTransfer']>
@@ -405,6 +415,13 @@ export class LanHostCoordinator {
       throw new Error('LAN Host connection projection is already bound');
     }
     this.connectionProjection = projection;
+  }
+
+  bindProjectLifecycleAdmissions(admissions: LanHostProjectLifecycleAdmissions): void {
+    if (this.projectLifecycleAdmissions) {
+      throw new Error('LAN Host Project lifecycle admissions are already bound');
+    }
+    this.projectLifecycleAdmissions = admissions;
   }
 
   startProject(projectId: CollabProjectId): Promise<CollabHostSession & { endpoint: string }> {
@@ -887,6 +904,14 @@ export class LanHostCoordinator {
         ? new HostTransferLifecycleOrchestrator(
             openedRuntime.lifecycle,
             openedRuntime.outgoingHostTransfer,
+            {
+              projectLifecycleAdmission: (admissionProjectId, operation) => (
+                this.requireProjectLifecycleAdmissions().hostTransfer(
+                  admissionProjectId,
+                  operation,
+                )
+              ),
+            },
           )
         : null;
       const lifecycle = {
@@ -900,6 +925,12 @@ export class LanHostCoordinator {
           ),
         } : {}),
         ...openedRuntime.lifecycle.createRetirementCoordinator({
+          projectLifecycleAdmission: (admissionProjectId, operation) => (
+            this.requireProjectLifecycleAdmissions().retirement(
+              admissionProjectId,
+              operation,
+            )
+          ),
           admission: {
             quiesceAndDrain: async () => {
               await this.beginRetirement(projectId);
@@ -973,6 +1004,13 @@ export class LanHostCoordinator {
       }
       throw error;
     }
+  }
+
+  private requireProjectLifecycleAdmissions(): LanHostProjectLifecycleAdmissions {
+    if (!this.projectLifecycleAdmissions) {
+      throw hostError('host-stopped', 'project-lifecycle-admission-not-bound');
+    }
+    return this.projectLifecycleAdmissions;
   }
 
   private async stopProjectUnlocked(projectId: CollabProjectId): Promise<CollabHostSession> {

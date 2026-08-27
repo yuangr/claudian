@@ -31,6 +31,9 @@ import { PinnedCollabHttpClient } from '@/app/collab/lan/CollabHttpClient';
 import { HostTransferControlClient } from '@/app/collab/lan/HostTransferControlClient';
 import { HostTransferTargetTransport } from '@/app/collab/lan/HostTransferTargetTransport';
 import type { LanHostCoordinator } from '@/app/collab/lan/LanHostCoordinator';
+import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { type CollabCoordinationSnapshot, type CollabOperationOptions } from '@/core/collab';
 import { CollabError } from '@/core/collab/ClaudianCollabError';
 
@@ -86,6 +89,7 @@ export interface HostTransferModuleOptions {
     | 'loadMembership'
     | 'saveMembership'
   >;
+  readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission;
   readonly requireGitFoundation: () => Promise<HostTransferModuleGitFoundation>;
   readonly snapshots: {
     readCoordinationSnapshot(
@@ -129,6 +133,7 @@ export class HostTransferModule {
       createControlClient: membership => this.createControlClient(membership),
       createIncomingCoordinator: membership => this.createIncomingCoordinator(membership),
       projects: this.options.projects,
+      projectRecoveryAdmission: this.options.projectRecoveryAdmission,
       recovery: this.recovery,
       resumeCompletedOutgoing: async record => {
         await this.options.finalizeOldAuthority(record.projectId);

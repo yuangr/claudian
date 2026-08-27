@@ -106,6 +106,7 @@ function assertMonotonic(
 }
 
 export class CloudBootstrapTransitionStore implements CloudBootstrapTransitionStorePort {
+  private blockedLifecycleProjectIds = new Set<CollabProjectId>();
   private readonly queue = new SerialTaskQueue();
 
   constructor(private readonly vaultRoot: string) {}
@@ -156,6 +157,17 @@ export class CloudBootstrapTransitionStore implements CloudBootstrapTransitionSt
 
   load(projectId: CollabProjectId): Promise<CloudBootstrapTransitionRecord | null> {
     return this.queue.run(() => this.loadUnlocked(projectId));
+  }
+
+  inspectLifecycleOwner(
+    projectId: CollabProjectId,
+  ): Promise<'absent' | 'nonterminal' | 'terminal'> {
+    return this.queue.run(async () => {
+      if (this.blockedLifecycleProjectIds.has(projectId)) return 'nonterminal';
+      const record = await this.loadUnlocked(projectId);
+      if (!record) return 'absent';
+      return record.terminalCleanupCompleted ? 'terminal' : 'nonterminal';
+    });
   }
 
   runWithLanHostStartGuard<T>(
@@ -230,6 +242,7 @@ export class CloudBootstrapTransitionStore implements CloudBootstrapTransitionSt
           throw error;
         }
       }
+      this.blockedLifecycleProjectIds = new Set(blockedProjectIds);
       return Object.freeze({
         blockedProjectIds: Object.freeze(blockedProjectIds.sort((left, right) => (
           left.localeCompare(right, 'en-US')

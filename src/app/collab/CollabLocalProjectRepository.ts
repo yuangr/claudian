@@ -3,6 +3,21 @@ import { lstat, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { COLLAB_CLOUD_BINDING_VERSION, COLLAB_PROTOCOL_VERSION, type CollabIsoTimestamp, type CollabMemberId, collabMemberRef, type CollabProjectId, type CollabRole, isCollabMemberId, isCollabOpaqueId, isCollabProjectId } from '@claudian-collab/protocol';
 
 import {
+  decodeAuthorityTransferRecord,
+} from '@/app/collab/authority-transfer/AuthorityTransferRecord';
+import {
+  decodeAuthorityTransferClaimBatchCommitmentRecord,
+} from '@/app/collab/authority-transfer/persistence/AuthorityTransferClaimBatchCommitmentRecord';
+import {
+  decodeAuthorityTransferClaimCustodyRecord,
+} from '@/app/collab/authority-transfer/persistence/AuthorityTransferClaimCustodyRecord';
+import type {
+  AuthorityTransferClaimCommitmentStorePort,
+  AuthorityTransferClaimCustodyStorePort,
+  AuthorityTransferProjectCatalog,
+  AuthorityTransferRecordStorePort,
+} from '@/app/collab/authority-transfer/persistence/AuthorityTransferPersistenceStores';
+import {
   type CollabFilesystemDiagnosticSink,
   ensureCollabContainerGuard,
   ensureCollabVaultDirectory,
@@ -158,6 +173,9 @@ export interface CollabLocalProjectPaths {
   readonly authorityDirectory: string;
   readonly conflictDirectory: string;
   readonly hostTransferRecovery: string;
+  readonly authorityTransfer: string;
+  readonly authorityTransferClaimCommitment: string;
+  readonly authorityTransferClaims: string;
   readonly localCleanup: string;
   readonly managerResponsibilityReceipt: string;
   readonly retirement: string;
@@ -173,6 +191,9 @@ export type CollabLifecycleProjectDocumentKind =
   | 'manager-responsibility-receipt'
   | 'local-cleanup'
   | 'host-transfer-recovery'
+  | 'authority-transfer'
+  | 'authority-transfer-claim-commitment'
+  | 'authority-transfer-claims'
   | 'retirement';
 
 export interface CollabLocalProjectDocumentBase {
@@ -194,6 +215,14 @@ type UnknownRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isAuthorityTransferLifecycleKind(
+  kind: CollabLifecycleProjectDocumentKind,
+): kind is 'authority-transfer' | 'authority-transfer-claim-commitment' | 'authority-transfer-claims' {
+  return kind === 'authority-transfer'
+    || kind === 'authority-transfer-claim-commitment'
+    || kind === 'authority-transfer-claims';
 }
 
 function requireExactKeys(
@@ -651,6 +680,9 @@ function isJsonValue(value: unknown, seen = new WeakSet<object>()): boolean {
 }
 
 export class CollabLocalProjectRepository {
+  readonly authorityTransferClaimCommitments: AuthorityTransferClaimCommitmentStorePort;
+  readonly authorityTransferClaims: AuthorityTransferClaimCustodyStorePort;
+  readonly authorityTransferRecords: AuthorityTransferRecordStorePort;
   readonly hostTransferRecovery: HostTransferRecoveryStorePort;
   readonly localCleanup: LocalCleanupRecordPort;
   private readonly now: () => Date;
@@ -663,6 +695,64 @@ export class CollabLocalProjectRepository {
   ) {
     this.now = options.now ?? (() => new Date());
     this.onDiagnostic = options.onDiagnostic;
+    const authorityTransferRecords: AuthorityTransferRecordStorePort = {
+      listProjectIds: () => this.listAuthorityTransferProjectIds(),
+      scanProjectCatalog: () => this.scanAuthorityTransferProjectCatalog(),
+      load: projectId => this.loadLifecycleProjectDocument(
+        projectId,
+        'authority-transfer',
+        decodeAuthorityTransferRecord,
+      ),
+      remove: projectId => this.removeLifecycleProjectDocument(
+        projectId,
+        'authority-transfer',
+      ),
+      save: record => this.saveLifecycleProjectDocument(
+        record.projectId,
+        'authority-transfer',
+        record,
+        decodeAuthorityTransferRecord,
+      ),
+    };
+    this.authorityTransferRecords = Object.freeze(authorityTransferRecords);
+    const authorityTransferClaimCommitments: AuthorityTransferClaimCommitmentStorePort = {
+      load: projectId => this.loadLifecycleProjectDocument(
+        projectId,
+        'authority-transfer-claim-commitment',
+        decodeAuthorityTransferClaimBatchCommitmentRecord,
+      ),
+      remove: projectId => this.removeLifecycleProjectDocument(
+        projectId,
+        'authority-transfer-claim-commitment',
+      ),
+      save: record => this.saveLifecycleProjectDocument(
+        record.projectId,
+        'authority-transfer-claim-commitment',
+        record,
+        decodeAuthorityTransferClaimBatchCommitmentRecord,
+      ),
+    };
+    this.authorityTransferClaimCommitments = Object.freeze(
+      authorityTransferClaimCommitments,
+    );
+    const authorityTransferClaims: AuthorityTransferClaimCustodyStorePort = {
+      load: projectId => this.loadLifecycleProjectDocument(
+        projectId,
+        'authority-transfer-claims',
+        decodeAuthorityTransferClaimCustodyRecord,
+      ),
+      remove: projectId => this.removeLifecycleProjectDocument(
+        projectId,
+        'authority-transfer-claims',
+      ),
+      save: record => this.saveLifecycleProjectDocument(
+        record.projectId,
+        'authority-transfer-claims',
+        record,
+        decodeAuthorityTransferClaimCustodyRecord,
+      ),
+    };
+    this.authorityTransferClaims = Object.freeze(authorityTransferClaims);
     const hostTransferRecovery: HostTransferRecoveryStorePort = {
       load: async (projectId, direction) => {
         const record = await this.loadLifecycleProjectDocument(
@@ -1328,6 +1418,68 @@ export class CollabLocalProjectRepository {
     });
   }
 
+  listAuthorityTransferProjectIds(): Promise<readonly CollabProjectId[]> {
+    return this.operationQueue.run(async () => {
+      const catalog = await this.scanAuthorityTransferProjectCatalogUnlocked();
+      if (catalog.invalidEntryCount > 0) {
+        throw localRecordError('local-project-directory-invalid', 'authority-transfer');
+      }
+      return catalog.projectIds;
+    });
+  }
+
+  scanAuthorityTransferProjectCatalog(): Promise<AuthorityTransferProjectCatalog> {
+    return this.operationQueue.run(() => this.scanAuthorityTransferProjectCatalogUnlocked());
+  }
+
+  private async scanAuthorityTransferProjectCatalogUnlocked(
+  ): Promise<AuthorityTransferProjectCatalog> {
+    const projectsDirectory = await resolveCollabVaultPath(
+      this.vaultRoot,
+      `${PRIVATE_STATE_DIRECTORY}/projects`,
+    );
+    const entries = await readdir(projectsDirectory, { withFileTypes: true }).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw localRecordError('local-project-directory-read-failed', 'authority-transfer');
+    });
+    const projectIds: CollabProjectId[] = [];
+    let invalidEntryCount = 0;
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory()) {
+        if (entry.isSymbolicLink()) {
+          invalidEntryCount += 1;
+        }
+        continue;
+      }
+      if (!isCollabProjectId(entry.name)) {
+        invalidEntryCount += 1;
+        continue;
+      }
+      let documentNames: readonly string[];
+      try {
+        const projectDirectory = await resolveCollabVaultPath(
+          this.vaultRoot,
+          `${PRIVATE_STATE_DIRECTORY}/projects/${entry.name}`,
+        );
+        documentNames = await readdir(projectDirectory);
+      } catch {
+        // Preserve the valid Project ID so its ordinary per-Project load can
+        // fail closed without preventing recovery of the rest of the catalog.
+        projectIds.push(entry.name);
+        invalidEntryCount += 1;
+        continue;
+      }
+      if (documentNames.some(name => (
+        name === 'authority-transfer.json'
+        || name === 'authority-transfer-claims.json'
+        || name === 'authority-transfer-claim-commitment.json'
+      ))) {
+        projectIds.push(entry.name);
+      }
+    }
+    return { invalidEntryCount, projectIds };
+  }
+
   saveProjectDocument<T extends CollabLocalProjectDocumentBase>(
     projectId: CollabProjectId,
     kind: CollabLocalProjectDocumentKind,
@@ -1400,13 +1552,20 @@ export class CollabLocalProjectRepository {
       return Promise.reject(localRecordError('local-record-corrupt', kind, projectId));
     }
     return this.operationQueue.run(async () => {
-      await this.ensurePrivateProjectDirectory(projectId);
+      const durable = isAuthorityTransferLifecycleKind(kind);
+      await this.ensurePrivateProjectDirectory(projectId, durable);
       await writeCollabFileAtomically(
         this.vaultRoot,
         this.lifecycleDocumentPath(projectId, kind),
         serializeJson(decoded),
         { mode: 0o600, onDiagnostic: this.onDiagnostic },
       );
+      if (durable) {
+        await syncCollabVaultDirectoryDurably(
+          this.vaultRoot,
+          `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
+        );
+      }
     });
   }
 
@@ -1415,11 +1574,20 @@ export class CollabLocalProjectRepository {
     kind: CollabLifecycleProjectDocumentKind,
   ): Promise<boolean> {
     this.requireProjectId(projectId);
-    return this.operationQueue.run(() => removeCollabFileDurably(
-      this.vaultRoot,
-      this.lifecycleDocumentPath(projectId, kind),
-      this.onDiagnostic,
-    ));
+    return this.operationQueue.run(async () => {
+      const removed = await removeCollabFileDurably(
+        this.vaultRoot,
+        this.lifecycleDocumentPath(projectId, kind),
+        this.onDiagnostic,
+      );
+      if (removed && isAuthorityTransferLifecycleKind(kind)) {
+        await syncCollabVaultDirectoryDurably(
+          this.vaultRoot,
+          `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
+        );
+      }
+      return removed;
+    });
   }
 
   loadRetirementTombstone(
@@ -1510,6 +1678,9 @@ export class CollabLocalProjectRepository {
     const projectDirectory = `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`;
     return {
       authorityDirectory: `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`,
+      authorityTransfer: `${projectDirectory}/authority-transfer.json`,
+      authorityTransferClaimCommitment: `${projectDirectory}/authority-transfer-claim-commitment.json`,
+      authorityTransferClaims: `${projectDirectory}/authority-transfer-claims.json`,
       cache: `${projectDirectory}/cache.json`,
       conflictDirectory: this.getConflictDirectoryPath(),
       hostTransferRecovery: `${projectDirectory}/host-transfer-recovery.json`,
@@ -1742,12 +1913,15 @@ export class CollabLocalProjectRepository {
     });
   }
 
-  private async ensurePrivateProjectDirectory(projectId: CollabProjectId): Promise<void> {
+  private async ensurePrivateProjectDirectory(
+    projectId: CollabProjectId,
+    durable = false,
+  ): Promise<void> {
     await this.ensurePrivateStateContainer();
     await ensureCollabVaultDirectory(
       this.vaultRoot,
       `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
-      { mode: 0o700, onDiagnostic: this.onDiagnostic },
+      { durable, mode: 0o700, onDiagnostic: this.onDiagnostic },
     );
   }
 
@@ -1953,6 +2127,11 @@ export class CollabLocalProjectRepository {
     if (kind === 'manager-responsibility-receipt') return paths.managerResponsibilityReceipt;
     if (kind === 'local-cleanup') return paths.localCleanup;
     if (kind === 'host-transfer-recovery') return paths.hostTransferRecovery;
+    if (kind === 'authority-transfer') return paths.authorityTransfer;
+    if (kind === 'authority-transfer-claim-commitment') {
+      return paths.authorityTransferClaimCommitment;
+    }
+    if (kind === 'authority-transfer-claims') return paths.authorityTransferClaims;
     return paths.retirement;
   }
 

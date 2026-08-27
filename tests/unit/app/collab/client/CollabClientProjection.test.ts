@@ -24,6 +24,13 @@ import { CollabError } from '@/core/collab/ClaudianCollabError';
 const CREATED_AT = '2026-08-08T00:00:00.000Z';
 const HEAD = 'a'.repeat(40);
 
+function admitProjectRetirement(
+  _projectId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  return operation();
+}
+
 describe('CollabClientProjection', () => {
   it('coalesces online snapshot reads and durably projects cache plus event cursor', async () => {
     const store = new MemoryProjectionStore();
@@ -477,12 +484,14 @@ describe('CollabClientProjection', () => {
       start: jest.fn(),
     };
     const retirement = { handle: jest.fn().mockResolvedValue(undefined) };
+    const retirementAdmission = jest.fn(admitProjectRetirement);
     const projection = new CollabClientProjection(store, control, {
       createEventClient: (_input, callback) => {
         invalidate = callback;
         return eventClient;
       },
       retirement,
+      retirementAdmission,
     });
     await projection.subscribe('project-a', jest.fn());
 
@@ -508,7 +517,6 @@ describe('CollabClientProjection', () => {
       { projectId: 'project-a', retiredAt: CREATED_AT },
       'terminal-fallback',
     );
-
     control.readRequest.mockRejectedValue(new CollabError({
       code: 'project-retired',
       safeContext: { projectId: 'project-a', retiredAt: CREATED_AT },
@@ -519,6 +527,44 @@ describe('CollabClientProjection', () => {
       { projectId: 'project-a', retiredAt: CREATED_AT },
       'terminal-fallback',
     );
+    expect(retirementAdmission).toHaveBeenCalledTimes(3);
+  });
+
+  it('detaches a retired event session without awaiting its own convergence', async () => {
+    const store = new MemoryProjectionStore();
+    const control = controlPort();
+    let invalidate: ((event: ProjectEventInvalidation) => Promise<number>) | null = null;
+    const eventClient: CollabClientProjectionEventPort = {
+      dispose: jest.fn(),
+      start: jest.fn(),
+    };
+    const holder: { projection?: CollabClientProjection } = {};
+    const retirement = {
+      handle: jest.fn(() => holder.projection!.closeProject('project-a')),
+    };
+    const projection = new CollabClientProjection(store, control, {
+      createEventClient: (_input, callback) => {
+        invalidate = callback;
+        return eventClient;
+      },
+      retirement,
+      retirementAdmission: admitProjectRetirement,
+    });
+    holder.projection = projection;
+    await projection.subscribe('project-a', jest.fn());
+    const retired = {
+      kind: 'retired' as const,
+      retiredAt: CREATED_AT,
+      sequence: 6,
+    };
+
+    await expect(Promise.race([
+      invalidate!(retired),
+      new Promise(resolve => setTimeout(() => resolve('deadlocked'), 100)),
+    ])).resolves.toBe(6);
+    expect(eventClient.dispose).toHaveBeenCalledTimes(1);
+    await expect(retirement.handle.mock.results[0]?.value).resolves.toBeUndefined();
+    expect(retirement.handle).toHaveBeenCalledTimes(1);
   });
 
   it('does not await terminal convergence from work owned by the closing Project session', async () => {
@@ -529,7 +575,10 @@ describe('CollabClientProjection', () => {
       safeContext: { projectId: 'project-a', retiredAt: CREATED_AT },
     }));
     const retirement = { handle: jest.fn(() => new Promise<void>(() => undefined)) };
-    const projection = new CollabClientProjection(store, control, { retirement });
+    const projection = new CollabClientProjection(store, control, {
+      retirement,
+      retirementAdmission: admitProjectRetirement,
+    });
 
     await expect(projection.readSnapshot('project-a')).rejects.toMatchObject({
       code: 'project-retired',
@@ -538,6 +587,52 @@ describe('CollabClientProjection', () => {
       { projectId: 'project-a', retiredAt: CREATED_AT },
       'terminal-fallback',
     );
+  });
+
+  it('leaves event and fallback retirement untouched when lifecycle admission rejects', async () => {
+    const store = new MemoryProjectionStore();
+    const control = controlPort();
+    let invalidate: ((event: ProjectEventInvalidation) => Promise<number>) | null = null;
+    const eventClient: CollabClientProjectionEventPort = {
+      dispose: jest.fn(),
+      start: jest.fn(),
+    };
+    const retirement = { handle: jest.fn().mockResolvedValue(undefined) };
+    const retirementAdmission = jest.fn(async () => {
+      throw new CollabError({
+        code: 'durable-progress-recovery-required',
+        safeContext: { reason: 'project-lifecycle-owner-conflict' },
+      });
+    });
+    const projection = new CollabClientProjection(store, control, {
+      createEventClient: (_input, callback) => {
+        invalidate = callback;
+        return eventClient;
+      },
+      retirement,
+      retirementAdmission,
+    });
+    await projection.subscribe('project-a', jest.fn());
+
+    await expect(invalidate!({
+      kind: 'retired',
+      retiredAt: CREATED_AT,
+      sequence: 6,
+    })).resolves.toBe(6);
+    await Promise.resolve();
+
+    control.readSnapshot.mockRejectedValue(new CollabError({
+      code: 'project-retired',
+      safeContext: { projectId: 'project-a', retiredAt: CREATED_AT },
+    }));
+    await expect(projection.readSnapshot('project-a')).rejects.toMatchObject({
+      code: 'project-retired',
+    });
+    await Promise.resolve();
+
+    expect(retirementAdmission).toHaveBeenCalledTimes(2);
+    expect(retirement.handle).not.toHaveBeenCalled();
+    expect(eventClient.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('disposes the old event client and reloads membership after a Project reset', async () => {
@@ -835,12 +930,12 @@ function membership(): CollabLocalLanMembershipRecord {
 function cloudMembership(): CollabLocalCloudMembershipRecord {
   return {
     authority: {
-      bindingVersion: 1,
+      bindingVersion: 2,
       developmentActorId: 'member-a',
-      gitRemoteUrl: 'https://cloud.example.test/v1/projects/project-a/repository.git',
+      gitRemoteUrl: 'https://cloud.example.test/v2/projects/project-a/repository.git',
       kind: 'cloud',
       serverUrl: 'https://cloud.example.test',
-      wireVersion: 4,
+      wireVersion: 6,
     },
     createdAt: CREATED_AT,
     lastEventSequence: 0,

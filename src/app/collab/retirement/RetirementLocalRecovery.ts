@@ -5,6 +5,9 @@ import type {
 } from '@/app/collab/CollabLocalProjectRepository';
 import type { LocalCleanupRecord } from '@/app/collab/exit/LocalCleanupRecord';
 import type { PendingLeaveRecord } from '@/app/collab/exit/PendingLeaveRecord';
+import type {
+  CollabProjectLifecycleAdmission,
+} from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import type { RetirementRecord } from '@/app/collab/retirement/RetirementRecord';
 import { type CollabOperationOptions } from '@/core/collab';
 import { CollabError } from '@/core/collab/ClaudianCollabError';
@@ -43,6 +46,7 @@ export class RetirementLocalRecovery {
     private readonly cleanupRecords: RetirementLocalRecoveryCleanupRecords,
     private readonly handler: { resume(projectId: CollabProjectId): Promise<void> },
     private readonly finalizer: RetirementLocalRecoveryFinalizer,
+    private readonly projectRecoveryAdmission: CollabProjectLifecycleAdmission,
   ) {}
 
   async resume(options: CollabOperationOptions = {}): Promise<void> {
@@ -70,7 +74,7 @@ export class RetirementLocalRecovery {
         && cleanupRecord?.purpose === 'retire'
         && cleanupRecord.phase === 'choice-applied'
       ) {
-        await this.finalizer.finalize({
+        await this.finalize({
           choice: cleanupRecord.choice,
           projectId: project.id,
         }, options).catch(error => {
@@ -79,7 +83,7 @@ export class RetirementLocalRecovery {
         continue;
       }
       if (retirement === null && (pendingLeave || project.lifecycle !== 'retired')) continue;
-      await this.handler.resume(project.id).catch(error => {
+      await this.resumeRetirement(project.id).catch(error => {
         firstError ??= error;
       });
     }
@@ -96,14 +100,14 @@ export class RetirementLocalRecovery {
         return [null, null, null] as const;
       });
       if (retirement && !acknowledgementOnly.has(projectId)) {
-        await this.handler.resume(projectId).catch(error => {
+        await this.resumeRetirement(projectId).catch(error => {
           firstError ??= error;
         });
         continue;
       }
       if (pendingLeave || !cleanupRecord) continue;
       if (cleanupRecord.purpose === 'retire' && cleanupRecord.phase === 'choice-applied') {
-        await this.finalizer.finalize({
+        await this.finalize({
           choice: cleanupRecord.choice,
           projectId,
         }, options).catch(error => {
@@ -128,6 +132,23 @@ export class RetirementLocalRecovery {
         safeContext: { reason: 'retirement-local-recovery-incomplete' },
       });
     }
+  }
+
+  private finalize(
+    intent: { readonly choice: 'delete-files' | 'keep-files'; readonly projectId: CollabProjectId },
+    options: CollabOperationOptions,
+  ): Promise<void> {
+    return this.projectRecoveryAdmission(
+      intent.projectId,
+      () => this.finalizer.finalize(intent, options),
+    );
+  }
+
+  private resumeRetirement(projectId: CollabProjectId): Promise<void> {
+    return this.projectRecoveryAdmission(
+      projectId,
+      () => this.handler.resume(projectId),
+    );
   }
 
 }

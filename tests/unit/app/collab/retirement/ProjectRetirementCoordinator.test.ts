@@ -8,8 +8,46 @@ import {
 } from '@/app/collab/retirement/ProjectRetirementCoordinator';
 
 const RETIRED_AT = '2026-08-13T00:00:00.000Z';
+const admitProjectLifecycle = <T>(
+  _projectId: string,
+  operation: () => Promise<T>,
+): Promise<T> => operation();
 
 describe('ProjectRetirementCoordinator', () => {
+  it('acquires authority lifecycle ownership before quiescing the Project', async () => {
+    const admission: jest.Mocked<ProjectRetirementAdmissionPort> = {
+      quiesceAndDrain: jest.fn().mockResolvedValue(undefined),
+      resume: jest.fn().mockResolvedValue(undefined),
+    };
+    const authority: jest.Mocked<ProjectRetirementAuthorityPort> = {
+      inspectDurableResult: jest.fn().mockResolvedValue(null),
+      retire: jest.fn().mockResolvedValue({ projectId: 'project-a', retiredAt: RETIRED_AT }),
+    };
+    const projectLifecycleAdmission = async <T>(): Promise<T> => {
+      throw new Error('competing lifecycle owner');
+    };
+    const coordinator = new ProjectRetirementCoordinator(
+      admission,
+      authority,
+      { activate: jest.fn().mockResolvedValue(undefined) },
+      { deliver: jest.fn().mockResolvedValue(undefined) },
+      { teardown: jest.fn().mockResolvedValue(undefined) },
+      projectLifecycleAdmission,
+    );
+
+    await expect(coordinator.retire('member-manager', {
+      expectedHostMemberId: 'member-host',
+      managerActorMemberId: 'member-manager',
+      idempotencyKey: 'retire-one',
+      operationId: 'retire-one',
+      projectId: 'project-a',
+      requestFingerprint: 'a'.repeat(64),
+    })).rejects.toThrow('competing lifecycle owner');
+
+    expect(admission.quiesceAndDrain).not.toHaveBeenCalled();
+    expect(authority.retire).not.toHaveBeenCalled();
+  });
+
   it('drains before terminal commit and exposes the tombstone before delivery or teardown', async () => {
     const order: string[] = [];
     const admission: jest.Mocked<ProjectRetirementAdmissionPort> = {
@@ -38,6 +76,7 @@ describe('ProjectRetirementCoordinator', () => {
       terminal,
       delivery,
       active,
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -69,6 +108,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn(async (_result) => undefined) },
       { deliver: jest.fn(async (_result) => undefined) },
       { teardown: jest.fn(async (_projectId) => undefined) },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -105,6 +145,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn(async (_result) => { order.push('terminal'); }) },
       { deliver: jest.fn(async (_result) => { order.push('deliver'); }) },
       { teardown: jest.fn(async (_projectId) => { order.push('teardown'); }) },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -142,6 +183,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn(async () => undefined) },
       { deliver: jest.fn(async () => { throw new Error('local cleanup failed'); }) },
       { teardown },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -174,6 +216,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn().mockResolvedValue(undefined) },
       { deliver: jest.fn(() => delivery) },
       { teardown },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -209,6 +252,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn(async (_result) => undefined) },
       { deliver: jest.fn(async (_result) => undefined) },
       { teardown: jest.fn(async (_projectId) => undefined) },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -243,6 +287,7 @@ describe('ProjectRetirementCoordinator', () => {
       terminal,
       { deliver: jest.fn(async (_result) => undefined) },
       { teardown: jest.fn(async (_projectId) => undefined) },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {
@@ -275,6 +320,7 @@ describe('ProjectRetirementCoordinator', () => {
       { activate: jest.fn(async (_result) => { throw new Error('terminal bind failed'); }) },
       { deliver: jest.fn(async (_result) => undefined) },
       { teardown: jest.fn(async (_projectId) => undefined) },
+      admitProjectLifecycle,
     );
 
     await expect(coordinator.retire('member-manager', {

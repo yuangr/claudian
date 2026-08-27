@@ -9,9 +9,20 @@ import { CollabError } from '@/core/collab/ClaudianCollabError';
 const RETIRED_AT = '2026-08-13T00:00:00.000Z';
 const ACKNOWLEDGED_AT = '2026-08-13T00:01:00.000Z';
 
+async function admitProjectRecovery(
+  _projectId: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  await operation();
+}
+
 describe('RetirementAcknowledgementWorker', () => {
   it('uses one durable acknowledgement identity and scrubs network credentials', async () => {
     const store = new MemoryRetirementStore(record());
+    const projectRecoveryAdmission = jest.fn(async (
+      _projectId: string,
+      operation: () => Promise<void>,
+    ) => operation());
     const client: jest.Mocked<RetirementAcknowledgementClientPort> = {
       acknowledge: jest.fn().mockResolvedValue({
         acknowledgedAt: ACKNOWLEDGED_AT,
@@ -19,7 +30,9 @@ describe('RetirementAcknowledgementWorker', () => {
         retiredAt: RETIRED_AT,
       }),
     };
-    const worker = new RetirementAcknowledgementWorker(store, client);
+    const worker = new RetirementAcknowledgementWorker(store, client, {
+      projectRecoveryAdmission,
+    });
 
     await expect(worker.run('project-a')).resolves.toBe('acknowledged');
     await expect(worker.run('project-a')).resolves.toBe('acknowledged');
@@ -40,6 +53,10 @@ describe('RetirementAcknowledgementWorker', () => {
       memberCredential: null,
     });
     expect(store.removed).toBe(true);
+    expect(projectRecoveryAdmission).toHaveBeenCalledWith(
+      'project-a',
+      expect.any(Function),
+    );
   });
 
   it.each(['endpoint-unreachable', 'tls-untrusted'] as const)(
@@ -57,6 +74,7 @@ describe('RetirementAcknowledgementWorker', () => {
         }),
     };
     const worker = new RetirementAcknowledgementWorker(store, client, {
+      projectRecoveryAdmission: admitProjectRecovery,
       scheduleRetry: retry,
     });
 
@@ -79,7 +97,10 @@ describe('RetirementAcknowledgementWorker', () => {
         throw new CollabError({ code: 'endpoint-unreachable' });
       }),
     };
-    const worker = new RetirementAcknowledgementWorker(store, client, { scheduleRetry });
+    const worker = new RetirementAcknowledgementWorker(store, client, {
+      projectRecoveryAdmission: admitProjectRecovery,
+      scheduleRetry,
+    });
 
     await expect(worker.run('project-a')).resolves.toBe('retry-pending');
     expect(observedSignal?.aborted).toBe(false);
@@ -97,6 +118,7 @@ describe('RetirementAcknowledgementWorker', () => {
     };
     const worker = new RetirementAcknowledgementWorker(store, client, {
       now: () => new Date('2026-09-12T00:00:00.000Z'),
+      projectRecoveryAdmission: admitProjectRecovery,
     });
 
     await expect(worker.run('project-a')).resolves.toBe('expired');
