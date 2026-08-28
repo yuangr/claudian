@@ -1215,6 +1215,9 @@ export class ClaudianView extends ItemView {
       onSetConversationArchived: (id: string, isArchived: boolean) => (
         this.setConversationArchived(id, isArchived)
       ),
+      onAssignConversationToDevice: async (id: string) => {
+        await this.plugin.assignConversationToCurrentDevice(id);
+      },
       ...(navigationMode === 'history'
         ? {
             onBeforeRestoreListState: (target: HTMLElement) => (
@@ -1695,6 +1698,11 @@ export class ClaudianView extends ItemView {
   private handleWorkspaceFileOpen(file: TFile | null): void {
     this.tabManager?.getActiveTab()?.ui.linkedContentController
       .handleActiveFileChanged(file, true);
+  }
+
+  private handleLinkedContentMetadataChanged(file: TFile | null): void {
+    this.tabManager?.getActiveTab()?.ui.linkedContentController
+      .handleActiveFileMetadataChanged(file);
   }
 
   handleLinkedContentRenamed(
@@ -2600,6 +2608,21 @@ export class ClaudianView extends ItemView {
     this.registerEvent(
       this.plugin.app.workspace.on('file-open', (file) => {
         this.handleWorkspaceFileOpen(file);
+      })
+    );
+    this.registerEvent(
+      this.plugin.app.metadataCache.on('changed', (file) => {
+        this.handleLinkedContentMetadataChanged(file);
+      })
+    );
+    this.registerEvent(
+      this.plugin.app.metadataCache.on('resolve', (file) => {
+        this.handleLinkedContentMetadataChanged(file);
+      })
+    );
+    this.registerEvent(
+      this.plugin.app.metadataCache.on('resolved', () => {
+        this.handleLinkedContentMetadataChanged(null);
       })
     );
 
