@@ -759,9 +759,6 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       ));
       return;
     }
-    if (event.type === 'auto_retry_start') {
-      active.pendingTerminalError = null;
-    }
 
     const terminalError = getPiTerminalErrorMessage(event);
     if (terminalError) {
@@ -787,11 +784,8 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (!active || active.terminal) return;
     if (chunk.type === 'done') return;
     if (chunk.type === 'error') {
-      active.pendingTerminalError = new Error(chunk.content);
+      active.terminalSignal.reject(new Error(chunk.content));
       return;
-    }
-    if (chunk.type === 'text' || chunk.type === 'tool_use' || chunk.type === 'thinking') {
-      active.pendingTerminalError = null;
     }
     this.ensureAccepted(active);
     if (isAssistantChunk(chunk) && !active.assistantStarted) {

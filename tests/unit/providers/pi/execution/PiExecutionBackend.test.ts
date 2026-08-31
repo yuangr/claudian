@@ -2347,7 +2347,7 @@ describe('PiExecutionBackend', () => {
     expect(forkFile).not.toBe(sourceFile);
     expect(path.dirname(forkFile)).toBe(tempDir);
     expect(await fs.readFile(forkFile, 'utf8')).toContain(
-      JSON.stringify(sourceFile).slice(1, -1),
+      `"parentSession":"${sourceFile}"`,
     );
     const snapshot = harness.session.getSnapshot();
     expect(snapshot.providerState).toMatchObject({
@@ -2375,84 +2375,6 @@ describe('PiExecutionBackend', () => {
       'forkSourceSessionFile',
     ]);
     await fs.rm(tempDir, { force: true, recursive: true });
-  });
-
-  it('continues streaming and updates progress when an intermediate attempt fails and auto-retries', async () => {
-    const harness = createHarness(createConfig({
-      lifecycle: 'ephemeral',
-      nativePersistence: 'disabled-if-supported',
-    }));
-    const run = harness.session.execute(createRequest({
-      input: [{ text: 'Run task', type: 'text' }],
-    }));
-    const eventsPromise = collect(run.events);
-    await flush();
-
-    harness.kernels[0].emit({ type: 'agent_start' });
-    // First attempt fails with 503 error
-    harness.kernels[0].emit({
-      errorMessage: '503 Service Unavailable',
-      stopReason: 'error',
-      type: 'message_end',
-    });
-    // Pi auto retries
-    harness.kernels[0].emit({
-      attempt: 1,
-      maxAttempts: 5,
-      type: 'auto_retry_start',
-    });
-    // Retry succeeds and emits tool call and text
-    harness.kernels[0].emit({
-      type: 'auto_retry_end',
-    });
-    harness.kernels[0].emit({
-      args: { command: 'ls' },
-      toolCallId: 'tool-1',
-      toolName: 'bash',
-      type: 'tool_execution_start',
-    });
-    harness.kernels[0].emit({
-      result: { content: [{ text: 'file.txt', type: 'text' }] },
-      toolCallId: 'tool-1',
-      toolName: 'bash',
-      type: 'tool_execution_end',
-    });
-    harness.kernels[0].emit({
-      assistantMessageEvent: { text_delta: 'Done!' },
-      type: 'message_update',
-    });
-    harness.kernels[0].emit({ type: 'agent_end' });
-
-    const events = await eventsPromise;
-    expect(events.map(event => event.type)).toContain('tool_started');
-    expect(events.map(event => event.type)).toContain('tool_completed');
-    expect(events.map(event => event.type)).toContain('text_delta');
-    expect(events.map(event => event.type)).toContain('turn_completed');
-  });
-
-  it('rejects the turn when agent ends with an unrecovered pending error', async () => {
-    const harness = createHarness(createConfig({
-      lifecycle: 'ephemeral',
-      nativePersistence: 'disabled-if-supported',
-    }));
-    const run = harness.session.execute(createRequest({
-      input: [{ text: 'Run task', type: 'text' }],
-    }));
-    const eventsPromise = collect(run.events);
-    await flush();
-
-    harness.kernels[0].emit({ type: 'agent_start' });
-    harness.kernels[0].emit({
-      errorMessage: 'Authentication failed',
-      stopReason: 'error',
-      type: 'message_end',
-    });
-    harness.kernels[0].emit({ type: 'agent_end' });
-
-    const events = await eventsPromise;
-    const errorEvent = events.find(event => event.type === 'execution_error');
-    expect(errorEvent).toBeDefined();
-    expect((errorEvent as any)?.message).toBe('Authentication failed');
   });
 
   it('cancels extension UI when no renderer is available to an auxiliary session', async () => {
