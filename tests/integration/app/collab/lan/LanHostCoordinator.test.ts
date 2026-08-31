@@ -19,6 +19,7 @@ import {
 import initSqlJs, { type SqlJsStatic } from 'sql.js';
 import { WebSocket } from 'ws';
 
+import { CollabProjectWorkSessionRegistry } from '@/app/collab/activity/CollabProjectWorkSession';
 import { AuthorityEventRepository } from '@/app/collab/authority/AuthorityEventRepository';
 import { AuthorityIdempotencyRepository } from '@/app/collab/authority/AuthorityIdempotencyRepository';
 import { ManagerResponsibilityService } from '@/app/collab/authority/ManagerResponsibilityService';
@@ -26,7 +27,7 @@ import { ProjectAuthorityRepository } from '@/app/collab/authority/ProjectAuthor
 import { RequestQueryService } from '@/app/collab/authority/RequestQueryService';
 import { SqlJsProjectDatabase } from '@/app/collab/authority/SqlJsProjectDatabase';
 import { TicketService } from '@/app/collab/authority/TicketService';
-import { CollabClientProjection } from '@/app/collab/client/CollabClientProjection';
+import { CollabClientProjection, type CollabClientProjectionOptions } from '@/app/collab/client/CollabClientProjection';
 import {
   CollabLocalProjectRepository,
   isCollabLocalLanMembership,
@@ -58,19 +59,48 @@ import {
   ProjectEventHub,
   SqlJsProjectEventSource,
 } from '@/app/collab/lan/ProjectEventHub';
+import { LanAuthorityProjectionTransitionCoordinator } from '@/app/collab/LanAuthorityProjectionTransitionCoordinator';
 import type {
   CollabProjectLifecycleAuthorityAdmission,
 } from '@/app/collab/lifecycle/CollabProjectLifecycleAdmission';
 import { CollabMembershipService } from '@/app/collab/membership/CollabMembershipService';
+import { LocalMembershipControlPort } from '@/app/collab/membership/LocalMembershipControlPort';
 import {
   ManagerResponsibilityOperationCoordinator,
 } from '@/app/collab/membership/ManagerResponsibilityOperationCoordinator';
 import { LocalProjectControlPort } from '@/app/collab/publish/LocalProjectControlPort';
 import { ReconnectProjectCoordinator } from '@/app/collab/reconnect/ReconnectProjectCoordinator';
+import { CollabAuthoritySessionFactory } from '@/app/collab/remote-authority/CollabAuthoritySessionFactory';
+import { LanAuthorityAdapter } from '@/app/collab/remote-authority/LanAuthorityAdapter';
+import { CollabError } from '@/core/collab/ClaudianCollabError';
+import { parseInstallationKey } from '@/core/device/InstallationKey';
 
 const HOST_CREDENTIAL = Buffer.alloc(32, 1).toString('base64url');
 const PROJECT_ID = 'project-alpha';
 const MAIN_OID = 'a'.repeat(40);
+const INSTALLATION_A = parseInstallationKey(`device-${'a'.repeat(64)}`);
+const INSTALLATION_B = parseInstallationKey(`device-${'b'.repeat(64)}`);
+const projectionRegistries = new Set<CollabProjectWorkSessionRegistry>();
+
+function projectionOptions(): Pick<CollabClientProjectionOptions, 'authoritySessions' | 'sessions'> {
+  const sessions = new CollabProjectWorkSessionRegistry();
+  projectionRegistries.add(sessions);
+  return {
+    authoritySessions: new CollabAuthoritySessionFactory([new LanAuthorityAdapter()]),
+    sessions,
+  };
+}
+
+function hostLockPath(root: string): string {
+  return path.join(
+    root,
+    '.claudian',
+    'collab',
+    'installations',
+    INSTALLATION_A,
+    'lan-host.lock',
+  );
+}
 
 function authorityTransferStatus(
   phase: 'collecting-readiness' | 'source-relinquished',
@@ -150,14 +180,15 @@ function readPinnedUrl(url: string, ca: string): Promise<string> {
   });
 }
 
-function membershipAccess(
+async function membershipAccess(
   projects: CollabLocalProjectRepository,
-): { readonly projection: CollabClientProjection; readonly service: CollabMembershipService } {
+): Promise<{ readonly projection: CollabClientProjection; readonly service: CollabMembershipService }> {
   const membership = { service: null as CollabMembershipService | null };
   const projection = new CollabClientProjection(
     projects,
     new LocalProjectControlPort(projects),
     {
+      ...projectionOptions(),
       managerResponsibility: {
         reconcileSnapshot: snapshot => {
           if (!membership.service) throw new Error('Membership service unavailable');
@@ -166,7 +197,11 @@ function membershipAccess(
       },
     },
   );
-  const service = new CollabMembershipService(projects, {
+  const record = await projects.loadMembership(PROJECT_ID);
+  if (!record || !isCollabLocalLanMembership(record)) {
+    throw new Error('LAN membership unavailable');
+  }
+  const service = new CollabMembershipService(new LocalMembershipControlPort(record), {
     readCoordinationSnapshot: (projectId, options) => (
       projection.readSnapshot(projectId, options)
     ),
@@ -206,6 +241,7 @@ describe('LanHostCoordinator production transport', () => {
   let issueServerIdentity: (address: string) => Promise<LanTlsServerIdentity>;
   let privateAddresses: readonly string[];
   let openProjectCount: number;
+  let assertHostInstallationOwned: jest.Mock;
   let resetProjectConnection: jest.Mock;
   let acceptHostTransferAuthority: jest.Mock;
   let cancelHostTransferAuthority: jest.Mock;
@@ -266,7 +302,9 @@ describe('LanHostCoordinator production transport', () => {
   beforeAll(async () => {
     SQL = await initSqlJs();
     tlsFixtureRoot = await mkdtemp(path.join(tmpdir(), 'claudian-lan-host-tls-'));
-    const identity = new LanTlsIdentity(tlsFixtureRoot);
+    const identity = new LanTlsIdentity(tlsFixtureRoot, {
+      installationKey: INSTALLATION_A,
+    });
     const serverIdentities = new Map<string, LanTlsServerIdentity>();
     serverIdentities.set(
       '127.0.0.1',
@@ -314,9 +352,12 @@ describe('LanHostCoordinator production transport', () => {
     admittedLifecycleOwners = [];
     lifecycleAdmissionErrors = { hostTransfer: null, retirement: null };
     openProjectCount = 0;
+    assertHostInstallationOwned = jest.fn().mockResolvedValue(undefined);
     resetProjectConnection = jest.fn();
     root = await mkdtemp(path.join(tmpdir(), 'claudian-lan-host-'));
-    localProjects = new CollabLocalProjectRepository(root);
+    localProjects = new CollabLocalProjectRepository(root, {
+      installationKey: INSTALLATION_A,
+    });
     await localProjects.saveMembership({
       authority: {
         endpoint: null,
@@ -343,7 +384,9 @@ describe('LanHostCoordinator production transport', () => {
       schemaVersion: COLLAB_LOCAL_PROJECT_SCHEMA_VERSION,
       updatedAt: '2026-08-08T00:00:00.000Z',
     });
-    const authorityDirectory = await localProjects.ensureAuthorityDirectory(PROJECT_ID);
+    const authorityDirectory = (
+      await localProjects.createOwnedAuthorityDirectory(PROJECT_ID)
+    ).authorityDirectory;
     authorityDatabase = new SqlJsProjectDatabase(authorityDirectory, {
       loadSqlJs: async () => SQL,
     });
@@ -369,6 +412,9 @@ describe('LanHostCoordinator production transport', () => {
     if (!address || typeof address === 'string') throw new Error('Occupied port missing');
     occupiedPort = address.port;
     coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned,
+      commitHostedRoute: (_expected, next) => localProjects.saveMembership(next),
+      installationKey: INSTALLATION_A,
       clearAuthorityTransferExpiryTimeout: handle => {
         if (!authorityTransferTimeoutOverride) window.clearTimeout(handle);
       },
@@ -500,6 +546,8 @@ describe('LanHostCoordinator production transport', () => {
   });
 
   afterEach(async () => {
+    await Promise.all([...projectionRegistries].map(registry => registry.close()));
+    projectionRegistries.clear();
     await coordinator.close();
     await authorityDatabase.close();
     await new Promise<void>(resolve => {
@@ -532,6 +580,7 @@ describe('LanHostCoordinator production transport', () => {
       endpoint: host.endpoint,
       projectId: PROJECT_ID,
     });
+    expect(resetProjectConnection).toHaveBeenCalledWith(PROJECT_ID);
     const localMembership = await localProjects.loadMembership(PROJECT_ID);
     if (!localMembership || !isCollabLocalLanMembership(localMembership)) {
       throw new Error('Stored LAN membership missing');
@@ -633,8 +682,8 @@ describe('LanHostCoordinator production transport', () => {
       schemaVersion: COLLAB_LOCAL_PROJECT_SCHEMA_VERSION,
       updatedAt: '2026-08-08T00:00:00.000Z',
     });
-    const hostAccess = membershipAccess(localProjects);
-    const memberAccess = membershipAccess(memberProjects);
+    const hostAccess = await membershipAccess(localProjects);
+    const memberAccess = await membershipAccess(memberProjects);
     const events = new WebSocket(
       `${host.endpoint.replace('https:', 'wss:')}/v9/projects/${PROJECT_ID}/events`,
       {
@@ -679,7 +728,7 @@ describe('LanHostCoordinator production transport', () => {
       projectId: PROJECT_ID,
       targetMemberId: join.joinAttempt.member.id,
     });
-    await memberAccess.service.listMembers(PROJECT_ID);
+    await memberAccess.projection.readSnapshot(PROJECT_ID);
     expect(await localProjects.loadMembership(PROJECT_ID)).toMatchObject({
       member: { role: 'manager' },
     });
@@ -698,7 +747,7 @@ describe('LanHostCoordinator production transport', () => {
       projectId: PROJECT_ID,
       targetMemberId: join.joinAttempt.member.id,
     });
-    await memberAccess.service.listMembers(PROJECT_ID);
+    await memberAccess.projection.readSnapshot(PROJECT_ID);
     expect(await memberProjects.loadMembership(PROJECT_ID)).toMatchObject({
       member: { role: 'member' },
     });
@@ -781,6 +830,44 @@ describe('LanHostCoordinator production transport', () => {
     });
     await expect(fetch(`${host.endpoint}/v9/projects/${PROJECT_ID}/snapshot`))
       .rejects.toThrow();
+  });
+
+  it('publishes an active data route only while the Project route is live', async () => {
+    const host = await coordinator.startProject(PROJECT_ID);
+    const membership = await localProjects.loadMembership(PROJECT_ID);
+    if (!membership || !isCollabLocalLanMembership(membership)) {
+      throw new Error('Stored LAN membership missing');
+    }
+
+    expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toEqual({
+      caCertificatePem: membership.authority.hostCaCertificatePem,
+      caFingerprint: membership.authority.hostCaFingerprint,
+      endpoint: host.endpoint,
+      projectId: PROJECT_ID,
+    });
+
+    resetProjectConnection.mockImplementation(() => {
+      expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toBeNull();
+    });
+    await coordinator.stopProject(PROJECT_ID);
+    expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toBeNull();
+    expect(resetProjectConnection).toHaveBeenCalledWith(PROJECT_ID);
+  });
+
+  it('rejects explicit stop on a foreign installation before changing stop intent', async () => {
+    const before = await localProjects.loadMembership(PROJECT_ID);
+    assertHostInstallationOwned.mockRejectedValueOnce(new CollabError({
+      code: 'authorization-denied',
+      safeContext: { reason: 'host-installation-owner-mismatch' },
+    }));
+
+    await expect(coordinator.stopProject(PROJECT_ID)).rejects.toMatchObject({
+      code: 'authorization-denied',
+      safeContext: { reason: 'host-installation-owner-mismatch' },
+    });
+
+    await expect(localProjects.loadMembership(PROJECT_ID)).resolves.toEqual(before);
+    expect(resetProjectConnection).not.toHaveBeenCalled();
   });
 
   it('rejects listener Host acceptance before authority mutation under a competing owner', async () => {
@@ -943,6 +1030,10 @@ describe('LanHostCoordinator production transport', () => {
 
   it('quiesces and closes one old-Host route without reopening after cutover', async () => {
     await coordinator.startProject(PROJECT_ID);
+    resetProjectConnection.mockClear();
+    resetProjectConnection.mockImplementation(() => {
+      expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toBeNull();
+    });
 
     await coordinator.quiesceProjectForHostTransfer(PROJECT_ID);
     await coordinator.reopenProjectBeforeHostTransfer(PROJECT_ID);
@@ -951,6 +1042,7 @@ describe('LanHostCoordinator production transport', () => {
     await coordinator.closeProjectForHostTransfer(PROJECT_ID);
 
     expect(coordinator.isProjectRunning(PROJECT_ID)).toBe(false);
+    expect(resetProjectConnection).toHaveBeenCalledWith(PROJECT_ID);
     await expect(coordinator.reopenProjectBeforeHostTransfer(PROJECT_ID))
       .rejects.toMatchObject({ code: 'project-not-found' });
     await expect(coordinator.completeProjectHostTransfer(PROJECT_ID)).resolves.toBeUndefined();
@@ -1328,6 +1420,7 @@ describe('LanHostCoordinator production transport', () => {
     });
     await coordinator.quiesceProjectForHostTransfer(PROJECT_ID);
     await coordinator.closeProjectForHostTransfer(PROJECT_ID);
+    expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toBeNull();
 
     await expect(client.requestWithMember('getProjectAuthorityTransfer', {
       projectId: PROJECT_ID,
@@ -1552,10 +1645,11 @@ describe('LanHostCoordinator production transport', () => {
         requestLanToCloudTransfer: jest.fn(async () => status),
       },
       state: 'source-active' as const,
-    };
-    const first = await coordinator.startAuthorityTransferRoute(registration);
+      };
+      const first = await coordinator.startAuthorityTransferRoute(registration);
+      expect(coordinator.getActiveProjectRoute(PROJECT_ID)).toBeNull();
 
-    privateAddresses = [nextAddress];
+      privateAddresses = [nextAddress];
     await checkHostAddress();
     const repeated = await coordinator.startAuthorityTransferRoute(registration);
 
@@ -1907,7 +2001,7 @@ describe('LanHostCoordinator production transport', () => {
   it('reads a maximal-body Ticket detail through the real Host and client', async () => {
     await coordinator.startProject(PROJECT_ID);
     const control = new LocalProjectControlPort(localProjects);
-    const projection = new CollabClientProjection(localProjects, control);
+    const projection = new CollabClientProjection(localProjects, control, projectionOptions());
     await projection.readSnapshot(PROJECT_ID);
 
     // Quotes maximize escaping for this body while remaining valid Markdown;
@@ -1939,6 +2033,7 @@ describe('LanHostCoordinator production transport', () => {
     await coordinator.startProject(PROJECT_ID);
     const control = new LocalProjectControlPort(localProjects);
     const projection = new CollabClientProjection(localProjects, control, {
+      ...projectionOptions(),
       now: () => new Date('2026-08-08T00:10:00.000Z'),
     });
     await projection.readSnapshot(PROJECT_ID);
@@ -2096,7 +2191,7 @@ describe('LanHostCoordinator production transport', () => {
     await expect(localProjects.loadMembership(PROJECT_ID)).resolves.toMatchObject({
       authority: { endpoint: first.endpoint },
     });
-    await expect(access(path.join(root, '.claudian', 'collab', 'lan-host.lock')))
+    await expect(access(hostLockPath(root)))
       .rejects.toMatchObject({ code: 'ENOENT' });
   }, 30_000);
 
@@ -2138,7 +2233,7 @@ describe('LanHostCoordinator production transport', () => {
     await expect(localProjects.loadMembership(PROJECT_ID)).resolves.toMatchObject({
       authority: { endpoint: first.endpoint },
     });
-    await expect(access(path.join(root, '.claudian', 'collab', 'lan-host.lock')))
+    await expect(access(hostLockPath(root)))
       .rejects.toMatchObject({ code: 'ENOENT' });
   }, 30_000);
 
@@ -2173,7 +2268,7 @@ describe('LanHostCoordinator production transport', () => {
     expect(internals.hostLock).toBeNull();
     expect(internals.terminalProjects.size).toBe(0);
     expect(advertiseProject).not.toHaveBeenCalled();
-    await expect(access(path.join(root, '.claudian', 'collab', 'lan-host.lock')))
+    await expect(access(hostLockPath(root)))
       .rejects.toMatchObject({ code: 'ENOENT' });
   }, 30_000);
 
@@ -2215,7 +2310,7 @@ describe('LanHostCoordinator production transport', () => {
     expect(internals.hostLock).toBeNull();
     expect(internals.provisionalTransfers.size).toBe(0);
     expect(advertiseProject).not.toHaveBeenCalled();
-    await expect(access(path.join(root, '.claudian', 'collab', 'lan-host.lock')))
+    await expect(access(hostLockPath(root)))
       .rejects.toMatchObject({ code: 'ENOENT' });
   }, 30_000);
 
@@ -2358,6 +2453,10 @@ describe('LanHostCoordinator production transport', () => {
           },
         } as never),
       }, {
+        authorityProjectionTransitions: new LanAuthorityProjectionTransitionCoordinator(),
+        hostInstallation: {
+          inspect: async () => 'absent',
+        },
         invitationCodec: codec,
         vaultRoot: memberRoot,
       });
@@ -2403,6 +2502,9 @@ describe('LanHostCoordinator production transport', () => {
     await coordinator.startProject(PROJECT_ID);
     const secondOpen = jest.fn();
     const second = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => undefined,
+      commitHostedRoute: (_expected, next) => localProjects.saveMembership(next),
+      installationKey: INSTALLATION_A,
       createGitProxy,
       createInvitationCodec: () => new InvitationCodec({
         isAddressAllowed: addressValue => addressValue === '127.0.0.1',
@@ -2423,7 +2525,15 @@ describe('LanHostCoordinator production transport', () => {
 
   it('reclaims an orphaned Host lock left by an earlier renderer context', async () => {
     await localProjects.ensurePrivateStateContainer();
-    const lockPath = path.join(root, '.claudian', 'collab', 'lan-host.lock');
+    const lockPath = path.join(
+      root,
+      '.claudian',
+      'collab',
+      'installations',
+      INSTALLATION_A,
+      'lan-host.lock',
+    );
+    await mkdir(path.dirname(lockPath), { recursive: true });
     await writeFile(lockPath, JSON.stringify({
       nonce: 'orphaned-renderer-lock',
       pid: process.pid,
@@ -2434,6 +2544,29 @@ describe('LanHostCoordinator production transport', () => {
       status: 'running',
     });
     expect(await readFile(lockPath, 'utf8')).not.toContain('orphaned-renderer-lock');
+  });
+
+  it('never reads or reclaims a copied same-PID lock from another installation', async () => {
+    const foreignLockPath = path.join(
+      root,
+      '.claudian',
+      'collab',
+      'installations',
+      INSTALLATION_B,
+      'lan-host.lock',
+    );
+    const foreignLock = `${JSON.stringify({
+      nonce: 'copied-foreign-renderer-lock',
+      pid: process.pid,
+    })}\n`;
+    await mkdir(path.dirname(foreignLockPath), { recursive: true });
+    await writeFile(foreignLockPath, foreignLock, { mode: 0o600 });
+
+    await expect(coordinator.startProject(PROJECT_ID)).resolves.toMatchObject({
+      projectId: PROJECT_ID,
+      status: 'running',
+    });
+    await expect(readFile(foreignLockPath, 'utf8')).resolves.toBe(foreignLock);
   });
 
   it('multiplexes only explicitly started Projects on one listener', async () => {
@@ -2464,7 +2597,9 @@ describe('LanHostCoordinator production transport', () => {
       schemaVersion: COLLAB_LOCAL_PROJECT_SCHEMA_VERSION,
       updatedAt: '2026-08-08T00:00:00.000Z',
     });
-    const betaDirectory = await localProjects.ensureAuthorityDirectory(betaId);
+    const betaDirectory = (
+      await localProjects.createOwnedAuthorityDirectory(betaId)
+    ).authorityDirectory;
     const betaDatabase = new SqlJsProjectDatabase(betaDirectory, {
       loadSqlJs: async () => SQL,
     });
@@ -2483,6 +2618,9 @@ describe('LanHostCoordinator production transport', () => {
 
     await coordinator.close();
     coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => undefined,
+      commitHostedRoute: (_expected, next) => localProjects.saveMembership(next),
+      installationKey: INSTALLATION_A,
       createGitProxy,
       createInvitationCodec: () => new InvitationCodec({
         isAddressAllowed: addressValue => addressValue === '127.0.0.1',
@@ -2606,8 +2744,13 @@ describe('LanHostCoordinator production transport', () => {
       oldEndpointBlocker.once('error', reject);
       oldEndpointBlocker.listen(oldPort, '127.0.0.1', resolve);
     });
-    const authorityDirectory = await localProjects.ensureAuthorityDirectory(PROJECT_ID);
+    const authorityDirectory = (
+      await localProjects.createOwnedAuthorityDirectory(PROJECT_ID)
+    ).authorityDirectory;
     coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => undefined,
+      commitHostedRoute: (_expected, next) => localProjects.saveMembership(next),
+      installationKey: INSTALLATION_A,
       createGitProxy,
       createInvitationCodec: () => new InvitationCodec({
         isAddressAllowed: addressValue => addressValue === '127.0.0.1',
@@ -2661,7 +2804,8 @@ describe('LanHostCoordinator production transport', () => {
 
   it('reclaims a stale Vault Host lock without touching durable Project state', async () => {
     await localProjects.ensurePrivateStateContainer();
-    const lockPath = path.join(root, '.claudian', 'collab', 'lan-host.lock');
+    const lockPath = hostLockPath(root);
+    await mkdir(path.dirname(lockPath), { recursive: true });
     await writeFile(lockPath, JSON.stringify({
       nonce: 'stale-lock',
       pid: 2_000_000_000,
@@ -2684,10 +2828,17 @@ describe('LanHostCoordinator lazy construction', () => {
   it('applies the durable Project start guard before every Host recovery path', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'claudian-lan-host-guard-'));
     const openProject = jest.fn();
+    const admissionOrder: string[] = [];
     const runWithProjectStartGuard = jest.fn(async () => {
+      admissionOrder.push('durable-guard');
       throw new Error('durable Cloud fence');
     });
     const coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => {
+        admissionOrder.push('installation-binding');
+      },
+      commitHostedRoute: async () => undefined,
+      installationKey: INSTALLATION_A,
       localProjects: {
         ensurePrivateStateContainer: jest.fn(),
         hostTransferRecovery: { load: jest.fn() },
@@ -2701,6 +2852,7 @@ describe('LanHostCoordinator lazy construction', () => {
 
     await expect(coordinator.startProject(PROJECT_ID)).rejects.toThrow('durable Cloud fence');
     expect(runWithProjectStartGuard).toHaveBeenCalledWith(PROJECT_ID, expect.any(Function));
+    expect(admissionOrder).toEqual(['installation-binding', 'durable-guard']);
     expect(openProject).not.toHaveBeenCalled();
     await coordinator.close();
     await rm(root, { force: true, recursive: true });
@@ -2710,6 +2862,7 @@ describe('LanHostCoordinator lazy construction', () => {
     const root = await mkdtemp(path.join(tmpdir(), 'claudian-lan-host-incoming-'));
     const openProject = jest.fn();
     const recovery = createHostTransferRecoveryRecord({
+      ownerInstallationKey: "device-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       createdAt: '2026-08-13T00:00:00.000Z',
       direction: 'incoming',
       projectId: PROJECT_ID,
@@ -2723,6 +2876,9 @@ describe('LanHostCoordinator lazy construction', () => {
       transferId: 'transfer-incoming',
     });
     const coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => undefined,
+      commitHostedRoute: async () => undefined,
+      installationKey: INSTALLATION_A,
       localProjects: {
         ensurePrivateStateContainer: jest.fn(),
         hostTransferRecovery: {
@@ -2749,6 +2905,9 @@ describe('LanHostCoordinator lazy construction', () => {
   it('does not create private state or start network work in its constructor', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'claudian-lan-host-lazy-'));
     const coordinator = new LanHostCoordinator({
+      assertHostInstallationOwned: async () => undefined,
+      commitHostedRoute: async () => undefined,
+      installationKey: INSTALLATION_A,
       getPrivateIpv4Addresses: () => {
         throw new Error('Network selection must stay lazy');
       },

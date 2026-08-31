@@ -1265,7 +1265,6 @@ export class TabManager implements TabManagerInterface {
         id: tab.id,
         index: index++,
         title: getTabTitle(tab, this.plugin),
-        providerId: getTabProviderId(tab, this.plugin),
         isActive: tab.id === this.activeTabId,
         isWorking: this.isTabWorking(tab.id),
         attention: tab.state.attention,
@@ -2262,6 +2261,15 @@ export class TabManager implements TabManagerInterface {
       {
         onBeforeRetry: () => {
           this.advanceTabCommandContextRevision(tabId);
+        },
+        resolveTimeoutMs: () => {
+          const tab = this.tabs.get(tabId);
+          if (!tab || !this.isTabAlive(tab)) return undefined;
+          const providerId = getTabProviderId(tab, this.plugin);
+          return ProviderRegistry.getCapabilities(providerId).commandDiscoveryDeadline
+            === 'provider-owned'
+            ? null
+            : undefined;
         },
       },
     );

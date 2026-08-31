@@ -44,6 +44,41 @@ function findMatches(roots, pattern) {
   return matches;
 }
 
+const step12ProjectMembershipOperations = Object.freeze([
+  'createCloudProject',
+  'createProjectInvitation',
+  'listProjectInvitations',
+  'revokeProjectInvitation',
+  'joinCloudProject',
+  'listProjectMembers',
+  'reissueTransferredMembershipClaim',
+  'revokeTransferredMembershipClaim',
+  'createManagerResponsibilityOffer',
+  'listCurrentManagerResponsibilityOffers',
+  'getManagerResponsibilityOffer',
+  'acknowledgeManagerResponsibility',
+  'declineManagerResponsibility',
+  'cancelManagerResponsibilityOffer',
+  'promoteManager',
+  'demoteManager',
+  'removeMember',
+  'leaveProject',
+]);
+
+const step12CloudCapabilityTokens = Object.freeze([
+  'cloud-imported-membership-claims',
+  'cloud-project-create',
+  'cloud-project-invitations',
+  'cloud-project-join',
+  'cloud-project-leave',
+  'cloud-project-manager-responsibility',
+  'cloud-project-membership',
+]);
+
+function symbolPattern(symbols) {
+  return new RegExp(`\\b(?:${symbols.join('|')})\\b`, 'u');
+}
+
 function inspectForbiddenSymbolInventory(entries, pattern, allowedOccurrences) {
   const counts = new Map();
   const matcherFlags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
@@ -300,6 +335,59 @@ test('app avoids features and provider implementations outside default assembly'
 test('features are independent from the composition root and app adapters', () => {
   const pattern = /from\s+['"][^'"]*(?:main['"]|app\/)/;
   assert.deepEqual(findMatches([path.join(sourceRoot, 'features')], pattern), []);
+});
+
+test('Collab Host installation authority stays outside membership and presentation', () => {
+  const collabAppRoot = path.join(appRoot, 'collab');
+  const repositorySource = fs.readFileSync(
+    path.join(collabAppRoot, 'CollabLocalProjectRepository.ts'),
+    'utf8',
+  );
+  const membershipStart = repositorySource.indexOf('interface CollabLocalMembershipRecordBase');
+  const membershipEnd = repositorySource.indexOf('export interface CollabLocalProjectPaths');
+  assert.notEqual(membershipStart, -1);
+  assert.notEqual(membershipEnd, -1);
+  const membershipSource = repositorySource.slice(membershipStart, membershipEnd);
+
+  assert.doesNotMatch(membershipSource, /ownerInstallationKey|installationKey|deviceId|deviceRole/);
+  assert.equal(
+    fs.existsSync(path.join(collabAppRoot, 'host-installation', 'HostInstallationBindingService.ts')),
+    true,
+  );
+  assert.deepEqual(findMatches(
+    [path.join(featuresRoot, 'collab')],
+    /HostInstallationBindingService|CollabLocalProjectRepository|getInstallationKey/,
+  ), []);
+  assert.deepEqual(findMatches(
+    [collabAppRoot],
+    /isRecoveryOwner\?|bindEligibleLegacyRecovery\?|prepareLegacyRuntime\?|commitHostedRoute\?/,
+  ), []);
+});
+
+test('Collab LAN data lanes retain one adapter and no Host-only authority bypass', () => {
+  const collabAppRoot = path.join(appRoot, 'collab');
+  const dataPlaneRoots = [
+    path.join(collabAppRoot, 'accept'),
+    path.join(collabAppRoot, 'conflicts'),
+    path.join(collabAppRoot, 'membership'),
+    path.join(collabAppRoot, 'publish'),
+    path.join(collabAppRoot, 'reconnect'),
+    path.join(collabAppRoot, 'remote-authority'),
+    path.join(collabAppRoot, 'review'),
+  ];
+
+  assert.deepEqual(findForbiddenSymbolInventoryViolations(
+    /new LanAuthorityAdapter\b/,
+    new Map([['src/app/collab/publish/CollabPublicationService.ts', 1]]),
+  ), []);
+  assert.deepEqual(findMatches(
+    dataPlaneRoots,
+    /allowHostRemoteRepair|collabStoppedHostRemoteUrl|\.openAuthority\(|\.createAuthority\(|\.inspectAuthority\(/,
+  ), []);
+  assert.deepEqual(findMatches(
+    [path.join(collabAppRoot, 'publish'), path.join(collabAppRoot, 'remote-authority')],
+    /hostOwnership\.ownsAuthority/,
+  ), []);
 });
 
 test('Collab modal and shared code do not depend on detail or sidebar surfaces', () => {
@@ -559,7 +647,7 @@ test('only TabRuntimeFactory can register runtime resource ownership', () => {
   ].sort());
 });
 
-test('Claudian consumes the standalone Collab protocol only from the exact registry package', () => {
+test('Claudian consumes the standalone Collab protocol only from the exact registry package', async () => {
   const root = process.cwd();
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   const lockfile = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
@@ -570,21 +658,34 @@ test('Claudian consumes the standalone Collab protocol only from the exact regis
     'utf8',
   ));
 
-  assert.equal(manifest.dependencies?.[protocolPackageName], '3.1.0');
+  const protocol = await import(protocolPackageName);
+
+  assert.equal(manifest.dependencies?.[protocolPackageName], '3.3.2');
   assert.equal(manifest.dependencies?.['@lezer/markdown'], '1.7.2');
   assert.equal(protocolManifest.dependencies?.['@lezer/markdown'], '1.7.2');
   assert.equal(manifest.dependencies?.['@claudian/collab-protocol'], undefined);
   assert.equal(manifest.workspaces, undefined);
-  assert.equal(lockfile.packages?.['']?.dependencies?.[protocolPackageName], '3.1.0');
-  assert.equal(lockfile.packages?.[protocolInstallPath]?.version, '3.1.0');
+  assert.equal(lockfile.packages?.['']?.dependencies?.[protocolPackageName], '3.3.2');
+  assert.equal(lockfile.packages?.[protocolInstallPath]?.version, '3.3.2');
   assert.equal(
     lockfile.packages?.[protocolInstallPath]?.integrity,
-    'sha512-5ko6hcz/3Dr6eCMdyyZXQK62QY0GgEH9yP9Kur8OGXLwDW2qsN8D3b4j+3kqOB5KzP8RnzoMOv0oMskn4hc2mQ==',
+    'sha512-oOSfYrCZNSjVbDK9tE2d8wlhvIf9nUi5mCHf/lLQwQ2jeZ4sW7dLgygE+NEhZFqfICXwF3V++UTsAfcle5AAdg==',
   );
   assert.equal(lockfile.packages?.['node_modules/@lezer/markdown']?.version, '1.7.2');
   assert.match(
     lockfile.packages?.[protocolInstallPath]?.resolved ?? '',
-    /^https:\/\/registry\.npmjs\.org\/@claudian-collab\/protocol\/-\/protocol-3\.1\.0\.tgz$/u,
+    /^https:\/\/registry\.npmjs\.org\/@claudian-collab\/protocol\/-\/protocol-3\.3\.2\.tgz$/u,
+  );
+  assert.equal(protocol.COLLAB_PROTOCOL_VERSION, 6);
+  assert.equal(protocol.COLLAB_CLOUD_BINDING_VERSION, 2);
+  assert.equal(protocol.COLLAB_PROJECT_BACKUP_COORDINATION_FORMAT_VERSION, 3);
+  assert.deepEqual(
+    protocol.COLLAB_PROJECT_MEMBERSHIP_OPERATIONS,
+    step12ProjectMembershipOperations,
+  );
+  assert.deepEqual(
+    Object.keys(protocol.COLLAB_PROJECT_MEMBERSHIP_OPERATION_CODECS),
+    protocol.COLLAB_PROJECT_MEMBERSHIP_OPERATIONS,
   );
 
   for (const retiredPath of [
@@ -619,6 +720,43 @@ test('Claudian consumes the standalone Collab protocol only from the exact regis
 test('standalone Collab protocol registry and contract constants are not redefined', () => {
   const pattern = /export\s+(?:const|interface|type|class|function)\s+(?:COLLAB_CONTROL_OPERATION_CODECS|CollabControlOperationMap|COLLAB_EVENT_KINDS|COLLAB_ERROR_CODES|COLLAB_LIMITS|COLLAB_PROTOCOL_VERSION|COLLAB_MAIN_REF|COLLAB_MEMBER_REF_PREFIX)\b/;
   assert.deepEqual(findMatches([sourceRoot], pattern), []);
+});
+
+test('the protocol pin does not expose Step 12 Cloud management behavior', () => {
+  const cloudAuthorityAdapterSource = fs.readFileSync(path.join(
+    appRoot,
+    'collab',
+    'remote-authority',
+    'CloudAuthorityAdapter.ts',
+  ), 'utf8');
+  const packageManagementSurface = [
+    'COLLAB_PROJECT_MEMBERSHIP_LIMITS',
+    'COLLAB_PROJECT_MEMBERSHIP_OPERATIONS',
+    'COLLAB_PROJECT_MEMBERSHIP_OPERATION_CODECS',
+    'decodeCollabProjectMembershipOperationRequest',
+    'decodeCollabProjectMembershipOperationResponse',
+  ];
+  const cloudAdapterSurface = symbolPattern([
+    ...step12CloudCapabilityTokens,
+    ...step12ProjectMembershipOperations,
+    ...packageManagementSurface,
+  ]);
+  const cloudPresentationSurface = symbolPattern([
+    ...step12CloudCapabilityTokens,
+    'createCloudProject',
+    'createProjectInvitation',
+    'joinCloudProject',
+    'listCurrentManagerResponsibilityOffers',
+    'listProjectInvitations',
+    'listProjectMembers',
+    'reissueTransferredMembershipClaim',
+    'revokeProjectInvitation',
+    'revokeTransferredMembershipClaim',
+    ...packageManagementSurface,
+  ]);
+
+  assert.doesNotMatch(cloudAuthorityAdapterSource, cloudAdapterSurface);
+  assert.deepEqual(findMatches([featuresRoot], cloudPresentationSurface), []);
 });
 
 test('active Collab consumers use protocol-owned semantic identity predicates', () => {
@@ -841,7 +979,7 @@ test('TypeScript resolves the Collab protocol through the installed registry pac
 
 test('performance policy enforces the main bundle budget and reports health deltas', () => {
   assert.equal(preStep11BundleHealthBaselineBytes, 4_896_000);
-  assert.equal(mainBudgetBytes, 5_170_000);
+  assert.equal(mainBudgetBytes, 5_000_000);
   assert.deepEqual(inspectArtifactSize(mainBudgetBytes), {
     budgetExceeded: false,
     healthBaselineDeltaBytes: mainBudgetBytes - preStep11BundleHealthBaselineBytes,

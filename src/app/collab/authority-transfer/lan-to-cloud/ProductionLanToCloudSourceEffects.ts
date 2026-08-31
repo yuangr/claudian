@@ -8,9 +8,7 @@ import { createReadStream } from 'node:fs';
 import {
   lstat,
   mkdir,
-  open,
   readFile,
-  rename,
   rm,
   writeFile,
 } from 'node:fs/promises';
@@ -48,6 +46,7 @@ import {
 import {
   AuthorityTransferCheckpointRepository,
 } from '@/app/collab/authority-transfer/checkpoint/AuthorityTransferCheckpointRepository';
+import { writeDurablePrivateFile } from '@/app/collab/authority-transfer/DurablePrivateFile';
 import type {
   LanToCloudCapturedCheckpoint,
   LanToCloudSourceEffects,
@@ -179,29 +178,10 @@ async function writePrivateFileAtomically(
   filePath: string,
   contents: string | Uint8Array,
 ): Promise<void> {
-  const partialPath = `${filePath}.partial`;
-  let handle: Awaited<ReturnType<typeof open>> | null = null;
-  try {
-    await rm(partialPath, { force: true });
-    handle = await open(partialPath, 'wx', 0o600);
-    await handle.writeFile(contents);
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    await rename(partialPath, filePath);
-    const promoted = await lstat(filePath);
-    if (!promoted.isFile() || promoted.isSymbolicLink()) {
-      throw effectsError('authority-transfer-staging-file-invalid');
-    }
-    const directory = await open(path.dirname(filePath), 'r').catch(() => null);
-    await directory?.sync().catch(() => undefined);
-    await directory?.close().catch(() => undefined);
-  } catch (error) {
-    await handle?.close().catch(() => undefined);
-    await rm(partialPath, { force: true }).catch(() => undefined);
-    if (error instanceof CollabError) throw error;
-    throw effectsError('authority-transfer-staging-write-failed');
-  }
+  await writeDurablePrivateFile(filePath, contents, {
+    invalidFile: () => effectsError('authority-transfer-staging-file-invalid'),
+    writeFailed: () => effectsError('authority-transfer-staging-write-failed'),
+  });
 }
 
 async function stagedArtifactsMatch(

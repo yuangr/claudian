@@ -35,7 +35,7 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 **Tabs & Session Management** — Use multiple tabs in single-panel mode or a persistent session manager beside the chat in dual-pane mode.
 
-**Collab Mode** — Collaborate on shared projects with other Claudian users. [Learn more](https://claudian.md/docs/collab-mode/).
+**Collab Mode** (Experimental) — Collaborate on shared projects with other Claudian users. [Learn more](https://claudian.md/docs/collab-mode/).
 
 ## Requirements
 

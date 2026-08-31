@@ -1,4 +1,5 @@
-import { lstat, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, readdir, readFile, rename, rm } from 'node:fs/promises';
 
 import { COLLAB_CLOUD_BINDING_VERSION, COLLAB_PROTOCOL_VERSION, type CollabIsoTimestamp, type CollabMemberId, collabMemberRef, type CollabProjectId, type CollabRole, isCollabMemberId, isCollabOpaqueId, isCollabProjectId } from '@claudian-collab/protocol';
 
@@ -60,11 +61,17 @@ import { SerialTaskQueue } from '@/app/collab/SerialTaskQueue';
 import type { CollabAuthorityKind } from '@/core/collab';
 import { type CollabLocalCleanupStatus, type CollabProjectLifecycle, parseCollabProjectsFolder } from '@/core/collab';
 import { CollabError } from '@/core/collab/ClaudianCollabError';
+import {
+  type InstallationKey,
+  isInstallationKey,
+  parseInstallationKey,
+} from '@/core/device/InstallationKey';
 
 const PRIVATE_STATE_DIRECTORY = '.claudian/collab';
 const RETIREMENT_ACKNOWLEDGEMENT_DIRECTORY = `${PRIVATE_STATE_DIRECTORY}/retirement-acknowledgements`;
 const AUTHORITY_OWNERSHIP_MARKER = '.claudian-authority.json';
-const AUTHORITY_OWNERSHIP_SCHEMA_VERSION = 1 as const;
+const LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION = 1 as const;
+const AUTHORITY_OWNERSHIP_SCHEMA_VERSION = 2 as const;
 const AUTHORITY_OWNERSHIP_MARKER_MAX_BYTES = 1_024;
 const LEGACY_AUTHORITY_ROOT_ENTRIES = new Set([
   'collab.db',
@@ -209,9 +216,41 @@ export interface CollabLocalProjectDocumentBase {
 }
 
 export interface CollabLocalProjectRepositoryOptions {
+  readonly installationKey?: InstallationKey;
   readonly now?: () => Date;
   readonly onDiagnostic?: CollabFilesystemDiagnosticSink;
 }
+
+export type CollabAuthorityInstallationStatus =
+  | 'absent'
+  | 'hosted-here'
+  | 'hosted-elsewhere'
+  | 'legacy-unbound';
+
+export interface OwnedAuthorityDirectoryCapability {
+  readonly authorityDirectory: string;
+  readonly projectId: CollabProjectId;
+}
+
+export interface ProvisionalAuthorityDirectoryCapability {
+  readonly authorityDirectory: string;
+  readonly projectId: CollabProjectId;
+}
+
+interface LegacyAuthorityOwnershipMarker {
+  readonly projectId: CollabProjectId;
+  readonly schemaVersion: typeof LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION;
+}
+
+interface AuthorityOwnershipMarker {
+  readonly ownerInstallationKey: InstallationKey;
+  readonly projectId: CollabProjectId;
+  readonly schemaVersion: typeof AUTHORITY_OWNERSHIP_SCHEMA_VERSION;
+}
+
+type AnyAuthorityOwnershipMarker =
+  | LegacyAuthorityOwnershipMarker
+  | AuthorityOwnershipMarker;
 
 interface DecodeResult<T> {
   readonly value: T;
@@ -703,15 +742,21 @@ export class CollabLocalProjectRepository {
   readonly hostTransferRecovery: HostTransferRecoveryStorePort;
   readonly localCleanup: LocalCleanupRecordPort;
   private readonly now: () => Date;
-  private readonly onDiagnostic?: CollabFilesystemDiagnosticSink;
-  private readonly operationQueue = new SerialTaskQueue();
+   readonly #onDiagnostic?: CollabFilesystemDiagnosticSink;
+   readonly #operationQueue = new SerialTaskQueue();
+   readonly #ownedAuthorityCapabilities = new WeakSet<object>();
+   readonly #provisionalAuthorityCapabilities = new WeakSet<object>();
+   readonly #installationKey?: InstallationKey;
 
   constructor(
     private readonly vaultRoot: string,
     options: CollabLocalProjectRepositoryOptions = {},
   ) {
+    this.#installationKey = options.installationKey === undefined
+      ? undefined
+      : parseInstallationKey(options.installationKey);
     this.now = options.now ?? (() => new Date());
-    this.onDiagnostic = options.onDiagnostic;
+    this.#onDiagnostic = options.onDiagnostic;
     const authorityTransferRecords: AuthorityTransferRecordStorePort = {
       listProjectIds: () => this.listAuthorityTransferProjectIds(),
       scanProjectCatalog: () => this.scanAuthorityTransferProjectCatalog(),
@@ -833,14 +878,14 @@ export class CollabLocalProjectRepository {
   }
 
   loadIndex(): Promise<CollabLocalProjectIndex> {
-    return this.operationQueue.run(() => this.loadIndexUnlocked(true));
+    return this.#operationQueue.run(() => this.#loadIndexUnlocked(true));
   }
 
   repairIndexFromMemberships(): Promise<CollabLocalProjectIndex> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       let existing: CollabLocalProjectIndex | null;
       try {
-        existing = await this.loadIndexUnlocked(false);
+        existing = await this.#loadIndexUnlocked(false);
       } catch (error) {
         if (
           !(error instanceof CollabError)
@@ -867,7 +912,7 @@ export class CollabLocalProjectRepository {
         ) {
           throw localRecordError('local-project-directory-invalid', 'index');
         }
-        const retirement = await this.loadRetirementRecordUnlocked(entry.name);
+        const retirement = await this.#loadRetirementRecordUnlocked(entry.name);
         if (retirement) {
           const terminal = existing?.projects.find(project => project.id === entry.name);
           if (!terminal || terminal.lifecycle !== 'retired') {
@@ -886,7 +931,7 @@ export class CollabLocalProjectRepository {
           });
           continue;
         }
-        const membership = await this.loadMembershipUnlocked(entry.name, true);
+        const membership = await this.#loadMembershipUnlocked(entry.name, true);
         if (!membership) continue;
         membershipProjects.push({
           authorityKind: membership.authority.kind,
@@ -922,7 +967,7 @@ export class CollabLocalProjectRepository {
         schemaVersion: COLLAB_LOCAL_PROJECT_SCHEMA_VERSION,
         selectedProjectId,
       };
-      await this.saveIndexUnlocked(repaired);
+      await this.#saveIndexUnlocked(repaired);
       return repaired;
     });
   }
@@ -934,11 +979,11 @@ export class CollabLocalProjectRepository {
     } catch {
       return Promise.reject(localRecordError('local-record-corrupt', 'index'));
     }
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
       const projects = index.projects.filter(project => project.id !== normalized.id);
       projects.push(normalized);
-      await this.saveIndexUnlocked({
+      await this.#saveIndexUnlocked({
         ...index,
         projects,
       });
@@ -946,23 +991,23 @@ export class CollabLocalProjectRepository {
   }
 
   selectProject(projectId: CollabProjectId | null): Promise<void> {
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
       if (projectId !== null && !index.projects.some(project => project.id === projectId)) {
         throw new CollabError({
           code: 'project-not-found',
           safeContext: { projectId },
         });
       }
-      await this.saveIndexUnlocked({ ...index, selectedProjectId: projectId });
+      await this.#saveIndexUnlocked({ ...index, selectedProjectId: projectId });
     });
   }
 
   removeProject(projectId: CollabProjectId): Promise<void> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
-      await this.saveIndexUnlocked({
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
+      await this.#saveIndexUnlocked({
         ...index,
         projects: index.projects.filter(project => project.id !== projectId),
         selectedProjectId: index.selectedProjectId === projectId
@@ -973,14 +1018,14 @@ export class CollabLocalProjectRepository {
   }
 
   discardPendingOperation(projectId: CollabProjectId): Promise<void> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
       if (
         index.selectedProjectId === projectId
         || index.projects.some(project => project.id === projectId)
       ) {
-        await this.saveIndexUnlocked({
+        await this.#saveIndexUnlocked({
           ...index,
           projects: index.projects.filter(project => project.id !== projectId),
           selectedProjectId: index.selectedProjectId === projectId
@@ -990,24 +1035,24 @@ export class CollabLocalProjectRepository {
       }
       await removeCollabFileDurably(
         this.vaultRoot,
-        this.projectDocumentPath(projectId, 'pending-operation'),
-        this.onDiagnostic,
+        this.#projectDocumentPath(projectId, 'pending-operation'),
+        this.#onDiagnostic,
       );
     });
   }
 
   purgeProjectPrivateState(projectId: CollabProjectId): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(() => removeCollabDirectoryDurably(
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => removeCollabDirectoryDurably(
       this.vaultRoot,
       `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
-      this.onDiagnostic,
+      this.#onDiagnostic,
     ));
   }
 
   pruneProjectPrivateDirectoryIfEmpty(projectId: CollabProjectId): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
       const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`;
       const absoluteDirectory = await resolveCollabVaultPath(
         this.vaultRoot,
@@ -1026,9 +1071,9 @@ export class CollabLocalProjectRepository {
   }
 
   finalizeRetiredProject(projectId: CollabProjectId): Promise<void> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
       const entry = index.projects.find(project => project.id === projectId);
       if (
         !entry
@@ -1042,32 +1087,32 @@ export class CollabLocalProjectRepository {
               safeContext: { projectId, reason: 'local-retirement-projection-missing' },
             });
       }
-      const record = await this.loadRetirementRecordUnlocked(projectId);
+      const record = await this.#loadRetirementRecordUnlocked(projectId);
       if (record?.acknowledgementStatus === 'pending') {
         await ensureCollabVaultDirectory(
           this.vaultRoot,
           RETIREMENT_ACKNOWLEDGEMENT_DIRECTORY,
-          { mode: 0o700, onDiagnostic: this.onDiagnostic },
+          { mode: 0o700, onDiagnostic: this.#onDiagnostic },
         );
         await writeCollabFileAtomically(
           this.vaultRoot,
-          this.retirementAcknowledgementPath(projectId),
+          this.#retirementAcknowledgementPath(projectId),
           serializeJson(record),
-          { mode: 0o600, onDiagnostic: this.onDiagnostic },
+          { mode: 0o600, onDiagnostic: this.#onDiagnostic },
         );
       } else {
         await removeCollabFileDurably(
           this.vaultRoot,
-          this.retirementAcknowledgementPath(projectId),
-          this.onDiagnostic,
+          this.#retirementAcknowledgementPath(projectId),
+          this.#onDiagnostic,
         );
       }
       await removeCollabDirectoryDurably(
         this.vaultRoot,
         `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
-        this.onDiagnostic,
+        this.#onDiagnostic,
       );
-      await this.saveIndexUnlocked({
+      await this.#saveIndexUnlocked({
         ...index,
         projects: index.projects.filter(project => project.id !== projectId),
         selectedProjectId: index.selectedProjectId === projectId
@@ -1092,12 +1137,12 @@ export class CollabLocalProjectRepository {
       ));
     }
     const projectId = retirement.projectId;
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const index = await this.loadIndexUnlocked(false);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const index = await this.#loadIndexUnlocked(false);
       const entry = index.projects.find(project => project.id === projectId);
-      const existingValue = await this.readJson(
-        this.lifecycleDocumentPath(projectId, 'retirement'),
+      const existingValue = await this.#readJson(
+        this.#lifecycleDocumentPath(projectId, 'retirement'),
         'retirement',
         projectId,
       );
@@ -1138,16 +1183,16 @@ export class CollabLocalProjectRepository {
       ) {
         throw localRecordError('local-project-not-active', 'index', projectId);
       }
-      await this.ensurePrivateProjectDirectory(projectId);
+      await this.#ensurePrivateProjectDirectory(projectId);
       if (!existing) {
         await writeCollabFileAtomically(
           this.vaultRoot,
-          this.lifecycleDocumentPath(projectId, 'retirement'),
+          this.#lifecycleDocumentPath(projectId, 'retirement'),
           serializeJson(authoritative),
-          { mode: 0o600, onDiagnostic: this.onDiagnostic },
+          { mode: 0o600, onDiagnostic: this.#onDiagnostic },
         );
       }
-      await this.saveIndexUnlocked({
+      await this.#saveIndexUnlocked({
         ...index,
         projects: entry
           ? index.projects.map(project => project.id === projectId
@@ -1173,7 +1218,7 @@ export class CollabLocalProjectRepository {
         this.getProjectPaths(projectId).hostTransferRecovery,
       ];
       for (const relativePath of activeDocuments) {
-        await removeCollabFileDurably(this.vaultRoot, relativePath, this.onDiagnostic);
+        await removeCollabFileDurably(this.vaultRoot, relativePath, this.#onDiagnostic);
       }
     });
   }
@@ -1182,14 +1227,14 @@ export class CollabLocalProjectRepository {
     projectId: CollabProjectId,
     update: (record: RetirementRecord) => RetirementRecord,
   ): Promise<RetirementRecord> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const activePath = this.lifecycleDocumentPath(projectId, 'retirement');
-      const activeValue = await this.readJson(activePath, 'retirement', projectId);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const activePath = this.#lifecycleDocumentPath(projectId, 'retirement');
+      const activeValue = await this.#readJson(activePath, 'retirement', projectId);
       const relativePath = activeValue === null
-        ? this.retirementAcknowledgementPath(projectId)
+        ? this.#retirementAcknowledgementPath(projectId)
         : activePath;
-      const value = activeValue ?? await this.readJson(relativePath, 'retirement', projectId);
+      const value = activeValue ?? await this.#readJson(relativePath, 'retirement', projectId);
       if (value === null) throw localRecordError('local-retirement-missing', 'retirement', projectId);
       let current: RetirementRecord;
       let next: RetirementRecord;
@@ -1211,11 +1256,11 @@ export class CollabLocalProjectRepository {
         this.vaultRoot,
         relativePath,
         serializeJson(next),
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
-      const index = await this.loadIndexUnlocked(false);
+      const index = await this.#loadIndexUnlocked(false);
       if (index.projects.some(project => project.id === projectId && project.lifecycle === 'retired')) {
-        await this.saveIndexUnlocked({
+        await this.#saveIndexUnlocked({
           ...index,
           projects: index.projects.map(project => project.id === projectId
             ? { ...project, cleanupStatus: next.cleanupStatus, updatedAt: next.updatedAt }
@@ -1227,12 +1272,12 @@ export class CollabLocalProjectRepository {
   }
 
   loadRetirementRecord(projectId: CollabProjectId): Promise<RetirementRecord | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(() => this.loadRetirementRecordUnlocked(projectId));
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => this.#loadRetirementRecordUnlocked(projectId));
   }
 
   listRetirementAcknowledgementProjectIds(): Promise<readonly CollabProjectId[]> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const directory = await resolveCollabVaultPath(
         this.vaultRoot,
         RETIREMENT_ACKNOWLEDGEMENT_DIRECTORY,
@@ -1253,23 +1298,23 @@ export class CollabLocalProjectRepository {
   }
 
   removeRetirementAcknowledgement(projectId: CollabProjectId): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(() => removeCollabFileDurably(
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => removeCollabFileDurably(
       this.vaultRoot,
-      this.retirementAcknowledgementPath(projectId),
-      this.onDiagnostic,
+      this.#retirementAcknowledgementPath(projectId),
+      this.#onDiagnostic,
     ));
   }
 
   async loadWorkspacePath(projectId: CollabProjectId): Promise<string | null> {
-    this.requireProjectId(projectId);
+    this.#requireProjectId(projectId);
     const index = await this.loadIndex();
     return index.projects.find(project => project.id === projectId)?.workspacePath ?? null;
   }
 
   loadMembership(projectId: CollabProjectId): Promise<CollabLocalMembershipRecord | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(() => this.loadMembershipUnlocked(projectId, true));
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => this.#loadMembershipUnlocked(projectId, true));
   }
 
   saveMembership(record: CollabLocalMembershipRecord): Promise<void> {
@@ -1286,13 +1331,13 @@ export class CollabLocalProjectRepository {
           : undefined,
       ));
     }
-    return this.operationQueue.run(async () => {
-      await this.ensurePrivateProjectDirectory(normalized.project.id);
+    return this.#operationQueue.run(async () => {
+      await this.#ensurePrivateProjectDirectory(normalized.project.id);
       await writeCollabFileAtomically(
         this.vaultRoot,
         this.getProjectPaths(normalized.project.id).membership,
         serializeJson(normalized),
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
     });
   }
@@ -1303,7 +1348,7 @@ export class CollabLocalProjectRepository {
     role: CollabRole,
     sequence: number,
   ): Promise<CollabLocalMembershipRecord> {
-    this.requireProjectId(projectId);
+    this.#requireProjectId(projectId);
     if (!isCollabMemberId(memberId)) {
       return Promise.reject(localRecordError(
         'local-membership-member-invalid',
@@ -1325,14 +1370,14 @@ export class CollabLocalProjectRepository {
         projectId,
       ));
     }
-    return this.updateMembershipProjectionFields(projectId, {
+    return this.#updateMembershipProjectionFields(projectId, {
       memberId,
       role,
       sequence,
     });
   }
 
-  private updateMembershipProjectionFields(
+   #updateMembershipProjectionFields(
     projectId: CollabProjectId,
     projection: {
       readonly memberId: CollabMemberId;
@@ -1340,9 +1385,9 @@ export class CollabLocalProjectRepository {
       readonly sequence: number;
     },
   ): Promise<CollabLocalMembershipRecord> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const relativePath = this.getProjectPaths(projectId).membership;
-      const value = await this.readJson(relativePath, 'membership', projectId);
+      const value = await this.#readJson(relativePath, 'membership', projectId);
       if (value === null) {
         throw localRecordError('local-membership-missing', 'membership', projectId);
       }
@@ -1383,12 +1428,12 @@ export class CollabLocalProjectRepository {
           member: { ...membership.member, role: projection.role },
           updatedAt: this.now().toISOString(),
         };
-      await this.ensurePrivateProjectDirectory(projectId);
+      await this.#ensurePrivateProjectDirectory(projectId);
       await writeCollabFileAtomically(
         this.vaultRoot,
         relativePath,
         serializeJson(updated),
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
       return updated;
     });
@@ -1399,9 +1444,9 @@ export class CollabLocalProjectRepository {
     kind: CollabLocalProjectDocumentKind,
     decode: (value: unknown) => T,
   ): Promise<T | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const value = await this.readJson(this.projectDocumentPath(projectId, kind), kind, projectId);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const value = await this.#readJson(this.#projectDocumentPath(projectId, kind), kind, projectId);
       if (value === null) return null;
       try {
         const decoded = decode(value);
@@ -1421,7 +1466,7 @@ export class CollabLocalProjectRepository {
   }
 
   listPendingOperationProjectIds(): Promise<readonly CollabProjectId[]> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const kind = 'pending-operation' as const;
       const projectsDirectory = await resolveCollabVaultPath(
         this.vaultRoot,
@@ -1443,8 +1488,8 @@ export class CollabLocalProjectRepository {
           throw localRecordError('local-project-directory-invalid', kind, entry.name);
         }
         const projectId = entry.name;
-        const value = await this.readJson(
-          this.projectDocumentPath(projectId, kind),
+        const value = await this.#readJson(
+          this.#projectDocumentPath(projectId, kind),
           kind,
           projectId,
         );
@@ -1455,12 +1500,12 @@ export class CollabLocalProjectRepository {
   }
 
   listAuthorityTransferClaimantProjectIds(): Promise<readonly CollabProjectId[]> {
-    return this.listProjectDocumentProjectIds('authority-transfer-claimant');
+    return this.#listProjectDocumentProjectIds('authority-transfer-claimant');
   }
 
   listAuthorityTransferProjectIds(): Promise<readonly CollabProjectId[]> {
-    return this.operationQueue.run(async () => {
-      const catalog = await this.scanAuthorityTransferProjectCatalogUnlocked();
+    return this.#operationQueue.run(async () => {
+      const catalog = await this.#scanAuthorityTransferProjectCatalogUnlocked();
       if (catalog.invalidEntryCount > 0) {
         throw localRecordError('local-project-directory-invalid', 'authority-transfer');
       }
@@ -1469,10 +1514,10 @@ export class CollabLocalProjectRepository {
   }
 
   scanAuthorityTransferProjectCatalog(): Promise<AuthorityTransferProjectCatalog> {
-    return this.operationQueue.run(() => this.scanAuthorityTransferProjectCatalogUnlocked());
+    return this.#operationQueue.run(() => this.#scanAuthorityTransferProjectCatalogUnlocked());
   }
 
-  private async scanAuthorityTransferProjectCatalogUnlocked(
+   async #scanAuthorityTransferProjectCatalogUnlocked(
   ): Promise<AuthorityTransferProjectCatalog> {
     const projectsDirectory = await resolveCollabVaultPath(
       this.vaultRoot,
@@ -1525,7 +1570,7 @@ export class CollabLocalProjectRepository {
     kind: CollabLocalProjectDocumentKind,
     document: T,
   ): Promise<void> {
-    this.requireProjectId(projectId);
+    this.#requireProjectId(projectId);
     if (
       document.projectId !== projectId
       || !Number.isSafeInteger(document.schemaVersion)
@@ -1535,13 +1580,13 @@ export class CollabLocalProjectRepository {
       return Promise.reject(localRecordError('local-record-corrupt', kind, projectId));
     }
     const serialized = serializeJson(document);
-    return this.operationQueue.run(async () => {
-      await this.ensurePrivateProjectDirectory(projectId);
+    return this.#operationQueue.run(async () => {
+      await this.#ensurePrivateProjectDirectory(projectId);
       await writeCollabFileAtomically(
         this.vaultRoot,
-        this.projectDocumentPath(projectId, kind),
+        this.#projectDocumentPath(projectId, kind),
         serialized,
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
     });
   }
@@ -1550,11 +1595,11 @@ export class CollabLocalProjectRepository {
     projectId: CollabProjectId,
     kind: CollabLocalProjectDocumentKind,
   ): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(() => removeCollabFileDurably(
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => removeCollabFileDurably(
       this.vaultRoot,
-      this.projectDocumentPath(projectId, kind),
-      this.onDiagnostic,
+      this.#projectDocumentPath(projectId, kind),
+      this.#onDiagnostic,
     ));
   }
 
@@ -1563,9 +1608,9 @@ export class CollabLocalProjectRepository {
     kind: CollabLifecycleProjectDocumentKind,
     decode: (value: unknown) => T,
   ): Promise<T | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const value = await this.readJson(this.lifecycleDocumentPath(projectId, kind), kind, projectId);
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const value = await this.#readJson(this.#lifecycleDocumentPath(projectId, kind), kind, projectId);
       if (value === null) return null;
       try {
         const decoded = decode(value);
@@ -1583,7 +1628,7 @@ export class CollabLocalProjectRepository {
     document: T,
     decode: (value: unknown) => T,
   ): Promise<void> {
-    this.requireProjectId(projectId);
+    this.#requireProjectId(projectId);
     let decoded: T;
     try {
       decoded = decode(document);
@@ -1591,14 +1636,14 @@ export class CollabLocalProjectRepository {
     } catch {
       return Promise.reject(localRecordError('local-record-corrupt', kind, projectId));
     }
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const durable = isAuthorityTransferLifecycleKind(kind);
-      await this.ensurePrivateProjectDirectory(projectId, durable);
+      await this.#ensurePrivateProjectDirectory(projectId, durable);
       await writeCollabFileAtomically(
         this.vaultRoot,
-        this.lifecycleDocumentPath(projectId, kind),
+        this.#lifecycleDocumentPath(projectId, kind),
         serializeJson(decoded),
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
       if (durable) {
         await syncCollabVaultDirectoryDurably(
@@ -1613,12 +1658,12 @@ export class CollabLocalProjectRepository {
     projectId: CollabProjectId,
     kind: CollabLifecycleProjectDocumentKind,
   ): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
       const removed = await removeCollabFileDurably(
         this.vaultRoot,
-        this.lifecycleDocumentPath(projectId, kind),
-        this.onDiagnostic,
+        this.#lifecycleDocumentPath(projectId, kind),
+        this.#onDiagnostic,
       );
       if (removed && isAuthorityTransferLifecycleKind(kind)) {
         await syncCollabVaultDirectoryDurably(
@@ -1633,10 +1678,10 @@ export class CollabLocalProjectRepository {
   loadRetirementTombstone(
     projectId: CollabProjectId,
   ): Promise<RetirementTombstoneRecord | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const value = await this.readJson(
-        this.retirementTombstonePath(projectId),
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const value = await this.#readJson(
+        this.#retirementTombstonePath(projectId),
         'retirement-tombstone',
         projectId,
       );
@@ -1658,30 +1703,30 @@ export class CollabLocalProjectRepository {
     } catch {
       return Promise.reject(localRecordError('local-record-corrupt', 'retirement-tombstone'));
     }
-    return this.operationQueue.run(async () => {
-      await this.ensureRetirementTombstoneDirectory();
+    return this.#operationQueue.run(async () => {
+      await this.#ensureRetirementTombstoneDirectory();
       await writeCollabFileAtomically(
         this.vaultRoot,
-        this.retirementTombstonePath(decoded.projectId),
+        this.#retirementTombstonePath(decoded.projectId),
         serializeJson(decoded),
-        { mode: 0o600, onDiagnostic: this.onDiagnostic },
+        { mode: 0o600, onDiagnostic: this.#onDiagnostic },
       );
     });
   }
 
   removeRetirementTombstone(projectId: CollabProjectId): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
       return removeCollabFileDurably(
         this.vaultRoot,
-        this.retirementTombstonePath(projectId),
-        this.onDiagnostic,
+        this.#retirementTombstonePath(projectId),
+        this.#onDiagnostic,
       );
     });
   }
 
   listRetirementTombstoneProjectIds(): Promise<readonly CollabProjectId[]> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const directory = await resolveCollabVaultPath(
         this.vaultRoot,
         `${PRIVATE_STATE_DIRECTORY}/retirement-tombstones`,
@@ -1714,7 +1759,7 @@ export class CollabLocalProjectRepository {
   }
 
   getProjectPaths(projectId: CollabProjectId): CollabLocalProjectPaths {
-    this.requireProjectId(projectId);
+    this.#requireProjectId(projectId);
     const projectDirectory = `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`;
     return {
       authorityDirectory: `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`,
@@ -1741,43 +1786,27 @@ export class CollabLocalProjectRepository {
 
   async ensurePrivateStateContainer(): Promise<void> {
     await ensureCollabContainerGuard(this.vaultRoot, PRIVATE_STATE_DIRECTORY, {
-      onDiagnostic: this.onDiagnostic,
+      onDiagnostic: this.#onDiagnostic,
       privateContainer: true,
     });
   }
 
-  async findAuthorityDirectory(projectId: CollabProjectId): Promise<string | null> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
-      const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
-      const authorityDirectory = await resolveCollabVaultPath(
-        this.vaultRoot,
-        relativeDirectory,
-      );
-      const directoryStat = await lstat(authorityDirectory).catch(error => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-        throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
-      });
-      if (directoryStat === null) return null;
-      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
-        throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
-      }
-      return authorityDirectory;
-    });
+  inspectAuthorityInstallation(
+    projectId: CollabProjectId,
+  ): Promise<CollabAuthorityInstallationStatus> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(() => this.#inspectAuthorityInstallationUnlocked(projectId));
   }
 
-  async ensureAuthorityDirectory(
+  createOwnedAuthorityDirectory(
     projectId: CollabProjectId,
-    options: { readonly claimLegacyOwnedDirectory?: boolean } = {},
-  ): Promise<string> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
+  ): Promise<OwnedAuthorityDirectoryCapability> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const installationKey = this.#requireInstallationKey();
       await this.ensurePrivateStateContainer();
       const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
-      const unresolvedDirectory = await resolveCollabVaultPath(
-        this.vaultRoot,
-        relativeDirectory,
-      );
+      const unresolvedDirectory = await resolveCollabVaultPath(this.vaultRoot, relativeDirectory);
       const existingDirectory = await lstat(unresolvedDirectory).catch(error => {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
         throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
@@ -1788,79 +1817,181 @@ export class CollabLocalProjectRepository {
       ) {
         throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
       }
+      if (existingDirectory) {
+        const marker = await this.#loadAuthorityOwnershipMarker(
+          `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
+        );
+        if (
+          marker?.schemaVersion === AUTHORITY_OWNERSHIP_SCHEMA_VERSION
+          && marker.projectId === projectId
+          && marker.ownerInstallationKey === installationKey
+        ) {
+          return this.#issueOwnedAuthorityCapability(projectId, unresolvedDirectory);
+        }
+        if (marker !== null || !await this.#isEmptyDirectory(unresolvedDirectory)) {
+          throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+        }
+      }
       const authorityDirectory = await ensureCollabVaultDirectory(
         this.vaultRoot,
         relativeDirectory,
-        { mode: 0o700, onDiagnostic: this.onDiagnostic },
+        { mode: 0o700, onDiagnostic: this.#onDiagnostic },
       );
-      const markerPath = `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`;
-      const marker = await this.loadAuthorityOwnershipMarker(markerPath);
-      if (marker === null) {
-        if (
-          existingDirectory !== null
-          && !options.claimLegacyOwnedDirectory
-        ) {
-          throw localRecordError('authority-ownership-marker-missing', 'index', projectId);
-        }
-        if (existingDirectory !== null) {
-          await this.assertLegacyAuthorityDirectoryClaimable(authorityDirectory, projectId);
-        }
-        await writeCollabFileAtomically(
-          this.vaultRoot,
-          markerPath,
-          `${JSON.stringify({
-            projectId,
-            schemaVersion: AUTHORITY_OWNERSHIP_SCHEMA_VERSION,
-          })}\n`,
-          { mode: 0o600, onDiagnostic: this.onDiagnostic },
-        );
-      } else if (
-        marker.projectId !== projectId
-        || marker.schemaVersion !== AUTHORITY_OWNERSHIP_SCHEMA_VERSION
-      ) {
-        throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
-      }
-      return authorityDirectory;
+      await this.#writeCurrentAuthorityOwnershipMarker(projectId, installationKey);
+      return this.#issueOwnedAuthorityCapability(projectId, authorityDirectory);
     });
   }
 
-  removeAuthorityDirectory(projectId: CollabProjectId): Promise<boolean> {
-    this.requireProjectId(projectId);
-    return this.operationQueue.run(async () => {
+  prepareProvisionalAuthorityDirectory(
+    projectId: CollabProjectId,
+  ): Promise<ProvisionalAuthorityDirectoryCapability> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      this.#requireInstallationKey();
+      await this.ensurePrivateStateContainer();
       const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
-      const authorityDirectory = await resolveCollabVaultPath(
+      const authorityDirectory = await ensureCollabVaultDirectory(
         this.vaultRoot,
         relativeDirectory,
+        { mode: 0o700, onDiagnostic: this.#onDiagnostic },
       );
+      const marker = await this.#loadAuthorityOwnershipMarker(
+        `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      );
+      if (marker !== null) {
+        throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+      }
+      await this.#assertProvisionalAuthorityDirectory(authorityDirectory, projectId);
+      return this.#issueProvisionalAuthorityCapability(projectId, authorityDirectory);
+    });
+  }
+
+  recoverProvisionalAuthorityDirectory(
+    projectId: CollabProjectId,
+  ): Promise<ProvisionalAuthorityDirectoryCapability | null> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      this.#requireInstallationKey();
+      const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
+      const authorityDirectory = await resolveCollabVaultPath(this.vaultRoot, relativeDirectory);
       const directoryStat = await lstat(authorityDirectory).catch(error => {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
         throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
       });
-      if (directoryStat === null) return false;
+      if (directoryStat === null) return null;
       if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
         throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
       }
-      const marker = await this.loadAuthorityOwnershipMarker(
+      const marker = await this.#loadAuthorityOwnershipMarker(
         `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
       );
-      if (
-        marker?.projectId !== projectId
-        || marker.schemaVersion !== AUTHORITY_OWNERSHIP_SCHEMA_VERSION
-      ) {
-        throw localRecordError('authority-ownership-marker-missing', 'index', projectId);
+      if (marker !== null) {
+        throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
       }
-      await rm(authorityDirectory, { recursive: true }).catch(() => {
-        throw localRecordError('authority-directory-remove-failed', 'index', projectId);
+      await this.#assertProvisionalAuthorityDirectory(authorityDirectory, projectId, true);
+      return this.#issueProvisionalAuthorityCapability(projectId, authorityDirectory);
+    });
+  }
+
+  bindProvisionalAuthorityDirectory(
+    capability: ProvisionalAuthorityDirectoryCapability,
+  ): Promise<OwnedAuthorityDirectoryCapability> {
+    return this.#operationQueue.run(async () => {
+      this.#assertIssuedProvisionalAuthorityCapability(capability);
+      const marker = await this.#loadAuthorityOwnershipMarker(
+        `${PRIVATE_STATE_DIRECTORY}/authorities/${capability.projectId}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      );
+      if (marker !== null) {
+        throw localRecordError(
+          'authority-ownership-marker-mismatch',
+          'index',
+          capability.projectId,
+        );
+      }
+      await this.#assertProvisionalAuthorityDirectory(
+        capability.authorityDirectory,
+        capability.projectId,
+        true,
+      );
+      await this.#writeCurrentAuthorityOwnershipMarker(
+        capability.projectId,
+        this.#requireInstallationKey(),
+      );
+      return this.#issueOwnedAuthorityCapability(
+        capability.projectId,
+        capability.authorityDirectory,
+      );
+    });
+  }
+
+  removeProvisionalAuthorityDirectory(
+    capability: ProvisionalAuthorityDirectoryCapability,
+  ): Promise<boolean> {
+    return this.#operationQueue.run(async () => {
+      this.#assertIssuedProvisionalAuthorityCapability(capability);
+      const marker = await this.#loadAuthorityOwnershipMarker(
+        `${PRIVATE_STATE_DIRECTORY}/authorities/${capability.projectId}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      );
+      if (marker !== null) {
+        throw localRecordError(
+          'authority-ownership-marker-mismatch',
+          'index',
+          capability.projectId,
+        );
+      }
+      await this.#assertProvisionalAuthorityDirectory(
+        capability.authorityDirectory,
+        capability.projectId,
+      );
+      await rm(capability.authorityDirectory, { recursive: true }).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw localRecordError(
+          'authority-directory-remove-failed',
+          'index',
+          capability.projectId,
+        );
       });
       return true;
     });
   }
 
-  retireAuthorityDirectory(
+  assertOwnedAuthorityDirectory(
+    projectId: CollabProjectId,
+  ): Promise<OwnedAuthorityDirectoryCapability> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const installationKey = this.#requireInstallationKey();
+      const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
+      const authorityDirectory = await resolveCollabVaultPath(this.vaultRoot, relativeDirectory);
+      const directoryStat = await lstat(authorityDirectory).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
+      });
+      if (directoryStat === null) {
+        throw localRecordError('authority-directory-missing', 'index', projectId);
+      }
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+        throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
+      }
+      const marker = await this.#loadAuthorityOwnershipMarker(
+        `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      );
+      if (
+        marker?.schemaVersion !== AUTHORITY_OWNERSHIP_SCHEMA_VERSION
+        || marker.projectId !== projectId
+        || marker.ownerInstallationKey !== installationKey
+      ) {
+        throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+      }
+      return this.#issueOwnedAuthorityCapability(projectId, authorityDirectory);
+    });
+  }
+
+  assertOwnedAuthorityRetirement(
     projectId: CollabProjectId,
     attemptId: string,
-  ): Promise<string | null> {
-    this.requireProjectId(projectId);
+  ): Promise<OwnedAuthorityDirectoryCapability> {
+    this.#requireProjectId(projectId);
     if (!isCollabOpaqueId(attemptId)) {
       return Promise.reject(localRecordError(
         'authority-directory-boundary-invalid',
@@ -1868,58 +1999,116 @@ export class CollabLocalProjectRepository {
         projectId,
       ));
     }
-    return this.operationQueue.run(async () => {
-      const sourceRelative = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
-      const retiredParentRelative = `${PRIVATE_STATE_DIRECTORY}/retired-lan-authorities/${projectId}`;
-      const retiredRelative = `${retiredParentRelative}/${attemptId}`;
-      const source = await resolveCollabVaultPath(this.vaultRoot, sourceRelative);
-      const retired = await resolveCollabVaultPath(this.vaultRoot, retiredRelative);
-      const inspect = async (absolutePath: string, relativePath: string) => {
-        const info = await lstat(absolutePath).catch(error => {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-          throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
-        });
-        if (info && (!info.isDirectory() || info.isSymbolicLink())) {
-          throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
-        }
-        if (info) {
-          const marker = await this.loadAuthorityOwnershipMarker(
-            `${relativePath}/${AUTHORITY_OWNERSHIP_MARKER}`,
-          );
-          if (
-            marker?.projectId !== projectId
-            || marker.schemaVersion !== AUTHORITY_OWNERSHIP_SCHEMA_VERSION
-          ) {
-            throw localRecordError('authority-ownership-marker-missing', 'index', projectId);
-          }
-        }
-        return info;
-      };
-      const [sourceInfo, retiredInfo] = await Promise.all([
-        inspect(source, sourceRelative),
-        inspect(retired, retiredRelative),
-      ]);
-      if (sourceInfo && retiredInfo) {
+    return this.#operationQueue.run(async () => {
+      const { source } = await this.#inspectOwnedAuthorityRetirement(projectId, attemptId);
+      return this.#issueOwnedAuthorityCapability(projectId, source);
+    });
+  }
+
+  claimLegacyAuthorityDirectory(
+    projectId: CollabProjectId,
+  ): Promise<OwnedAuthorityDirectoryCapability> {
+    this.#requireProjectId(projectId);
+    return this.#operationQueue.run(async () => {
+      const installationKey = this.#requireInstallationKey();
+      const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
+      const authorityDirectory = await resolveCollabVaultPath(this.vaultRoot, relativeDirectory);
+      const directoryStat = await lstat(authorityDirectory).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
+      });
+      if (!directoryStat || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
         throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
       }
-      if (retiredInfo) {
-        await ensureCollabVaultDirectory(this.vaultRoot, retiredParentRelative, {
-          durable: true,
-          mode: 0o700,
-          onDiagnostic: this.onDiagnostic,
-        });
-        await syncCollabVaultDirectoryDurably(
-          this.vaultRoot,
-          `${PRIVATE_STATE_DIRECTORY}/authorities`,
-        );
-        await syncCollabVaultDirectoryDurably(this.vaultRoot, retiredParentRelative);
-        return retired;
+      const marker = await this.#loadAuthorityOwnershipMarker(
+        `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      );
+      if (
+        marker?.schemaVersion === AUTHORITY_OWNERSHIP_SCHEMA_VERSION
+        && marker.projectId === projectId
+        && marker.ownerInstallationKey === installationKey
+      ) {
+        return this.#issueOwnedAuthorityCapability(projectId, authorityDirectory);
       }
-      if (!sourceInfo) return null;
+      if (
+        marker?.schemaVersion !== LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION
+        || marker.projectId !== projectId
+      ) {
+        throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+      }
+      await this.#assertLegacyAuthorityDirectoryClaimable(authorityDirectory, projectId);
+      await this.#writeCurrentAuthorityOwnershipMarker(projectId, installationKey);
+      return this.#issueOwnedAuthorityCapability(projectId, authorityDirectory);
+    });
+  }
+
+  removeOwnedAuthorityDirectory(
+    capability: OwnedAuthorityDirectoryCapability,
+  ): Promise<boolean> {
+    return this.#operationQueue.run(async () => {
+      this.#assertIssuedAuthorityCapability(capability);
+      const current = await this.#inspectAuthorityInstallationUnlocked(capability.projectId);
+      if (current !== 'hosted-here') {
+        throw localRecordError(
+          'authority-ownership-marker-mismatch',
+          'index',
+          capability.projectId,
+        );
+      }
+      const directoryStat = await lstat(capability.authorityDirectory).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw localRecordError(
+          'authority-directory-inspection-failed',
+          'index',
+          capability.projectId,
+        );
+      });
+      if (directoryStat === null) return false;
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+        throw localRecordError(
+          'authority-directory-boundary-invalid',
+          'index',
+          capability.projectId,
+        );
+      }
+      await rm(capability.authorityDirectory, { recursive: true }).catch(() => {
+        throw localRecordError(
+          'authority-directory-remove-failed',
+          'index',
+          capability.projectId,
+        );
+      });
+      return true;
+    });
+  }
+
+  retireOwnedAuthorityDirectory(
+    capability: OwnedAuthorityDirectoryCapability,
+    attemptId: string,
+  ): Promise<string | null> {
+    this.#assertIssuedAuthorityCapability(capability);
+    const projectId = capability.projectId;
+    if (!isCollabOpaqueId(attemptId)) {
+      return Promise.reject(localRecordError(
+        'authority-directory-boundary-invalid',
+        'index',
+        projectId,
+      ));
+    }
+    return this.#operationQueue.run(async () => {
+      const {
+        retired,
+        retiredExists,
+        retiredParentRelative,
+        source,
+        sourceExists,
+      } = await this.#inspectOwnedAuthorityRetirement(projectId, attemptId);
+      if (retiredExists) return retired;
+      if (!sourceExists) return null;
       await ensureCollabVaultDirectory(this.vaultRoot, retiredParentRelative, {
         durable: true,
         mode: 0o700,
-        onDiagnostic: this.onDiagnostic,
+        onDiagnostic: this.#onDiagnostic,
       });
       await rename(source, retired).catch(() => {
         throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
@@ -1933,8 +2122,62 @@ export class CollabLocalProjectRepository {
     });
   }
 
+  async #inspectOwnedAuthorityRetirement(
+    projectId: CollabProjectId,
+    attemptId: string,
+  ): Promise<{
+    readonly retired: string;
+    readonly retiredExists: boolean;
+    readonly retiredParentRelative: string;
+    readonly source: string;
+    readonly sourceExists: boolean;
+  }> {
+    const installationKey = this.#requireInstallationKey();
+    const sourceRelative = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
+    const retiredParentRelative = `${PRIVATE_STATE_DIRECTORY}/retired-lan-authorities/${projectId}`;
+    const retiredRelative = `${retiredParentRelative}/${attemptId}`;
+    const source = await resolveCollabVaultPath(this.vaultRoot, sourceRelative);
+    const retired = await resolveCollabVaultPath(this.vaultRoot, retiredRelative);
+    const inspect = async (absolutePath: string, relativePath: string) => {
+      const info = await lstat(absolutePath).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
+      });
+      if (info && (!info.isDirectory() || info.isSymbolicLink())) {
+        throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
+      }
+      if (info) {
+        const marker = await this.#loadAuthorityOwnershipMarker(
+          `${relativePath}/${AUTHORITY_OWNERSHIP_MARKER}`,
+        );
+        if (
+          marker?.schemaVersion !== AUTHORITY_OWNERSHIP_SCHEMA_VERSION
+          || marker.projectId !== projectId
+          || marker.ownerInstallationKey !== installationKey
+        ) {
+          throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+        }
+      }
+      return info !== null;
+    };
+    const [sourceExists, retiredExists] = await Promise.all([
+      inspect(source, sourceRelative),
+      inspect(retired, retiredRelative),
+    ]);
+    if (sourceExists && retiredExists) {
+      throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
+    }
+    return {
+      retired,
+      retiredExists,
+      retiredParentRelative,
+      source,
+      sourceExists,
+    };
+  }
+
   async ensureGitEmptyConfig(): Promise<string> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       await this.ensurePrivateStateContainer();
       const relativePath = `${PRIVATE_STATE_DIRECTORY}/git-empty-config`;
       const absolutePath = await resolveCollabVaultPath(this.vaultRoot, relativePath);
@@ -1947,14 +2190,14 @@ export class CollabLocalProjectRepository {
           this.vaultRoot,
           relativePath,
           '',
-          { mode: 0o600, onDiagnostic: this.onDiagnostic },
+          { mode: 0o600, onDiagnostic: this.#onDiagnostic },
         );
       }
       return absolutePath;
     });
   }
 
-  private async ensurePrivateProjectDirectory(
+   async #ensurePrivateProjectDirectory(
     projectId: CollabProjectId,
     durable = false,
   ): Promise<void> {
@@ -1962,20 +2205,20 @@ export class CollabLocalProjectRepository {
     await ensureCollabVaultDirectory(
       this.vaultRoot,
       `${PRIVATE_STATE_DIRECTORY}/projects/${projectId}`,
-      { durable, mode: 0o700, onDiagnostic: this.onDiagnostic },
+      { durable, mode: 0o700, onDiagnostic: this.#onDiagnostic },
     );
   }
 
-  private async loadRetirementRecordUnlocked(
+   async #loadRetirementRecordUnlocked(
     projectId: CollabProjectId,
   ): Promise<RetirementRecord | null> {
-    const active = await this.readJson(
-      this.lifecycleDocumentPath(projectId, 'retirement'),
+    const active = await this.#readJson(
+      this.#lifecycleDocumentPath(projectId, 'retirement'),
       'retirement',
       projectId,
     );
-    const value = active ?? await this.readJson(
-      this.retirementAcknowledgementPath(projectId),
+    const value = active ?? await this.#readJson(
+      this.#retirementAcknowledgementPath(projectId),
       'retirement',
       projectId,
     );
@@ -1989,42 +2232,163 @@ export class CollabLocalProjectRepository {
     }
   }
 
-  private retirementAcknowledgementPath(projectId: CollabProjectId): string {
+   #retirementAcknowledgementPath(projectId: CollabProjectId): string {
     return `${RETIREMENT_ACKNOWLEDGEMENT_DIRECTORY}/${projectId}.json`;
   }
 
-  private async loadAuthorityOwnershipMarker(
-    relativePath: string,
-  ): Promise<{ readonly projectId: string; readonly schemaVersion: number } | null> {
-    const absolutePath = await resolveCollabVaultPath(this.vaultRoot, relativePath);
-    const fileStat = await lstat(absolutePath).catch(error => {
+   async #inspectAuthorityInstallationUnlocked(
+    projectId: CollabProjectId,
+  ): Promise<CollabAuthorityInstallationStatus> {
+    const installationKey = this.#requireInstallationKey();
+    const relativeDirectory = `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}`;
+    const authorityDirectory = await resolveCollabVaultPath(this.vaultRoot, relativeDirectory);
+    const directoryStat = await lstat(authorityDirectory).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw localRecordError('authority-ownership-marker-inspection-failed', 'index');
+      throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
     });
-    if (fileStat === null) return null;
-    if (
-      !fileStat.isFile()
-      || fileStat.isSymbolicLink()
-      || fileStat.size > AUTHORITY_OWNERSHIP_MARKER_MAX_BYTES
-    ) {
-      throw localRecordError('authority-ownership-marker-invalid', 'index');
+    if (directoryStat === null) return 'absent';
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw localRecordError('authority-directory-boundary-invalid', 'index', projectId);
     }
-    try {
-      const value: unknown = JSON.parse(await readFile(absolutePath, 'utf8'));
-      if (
-        !isRecord(value)
-        || typeof value.projectId !== 'string'
-        || typeof value.schemaVersion !== 'number'
-      ) {
-        throw new Error('invalid');
-      }
-      return { projectId: value.projectId, schemaVersion: value.schemaVersion };
-    } catch {
-      throw localRecordError('authority-ownership-marker-invalid', 'index');
+    const marker = await this.#loadAuthorityOwnershipMarker(
+      `${relativeDirectory}/${AUTHORITY_OWNERSHIP_MARKER}`,
+    );
+    if (marker === null) {
+      await this.#assertProvisionalAuthorityDirectory(authorityDirectory, projectId);
+      return 'absent';
+    }
+    if (marker.projectId !== projectId) {
+      throw localRecordError('authority-ownership-marker-mismatch', 'index', projectId);
+    }
+    if (marker.schemaVersion === LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION) {
+      return 'legacy-unbound';
+    }
+    return marker.ownerInstallationKey === installationKey
+      ? 'hosted-here'
+      : 'hosted-elsewhere';
+  }
+
+   #requireInstallationKey(): InstallationKey {
+    if (!this.#installationKey) {
+      throw localRecordError('installation-key-required', 'index');
+    }
+    return this.#installationKey;
+  }
+
+   #issueOwnedAuthorityCapability(
+    projectId: CollabProjectId,
+    authorityDirectory: string,
+  ): OwnedAuthorityDirectoryCapability {
+    const capability = Object.freeze({ authorityDirectory, projectId });
+    this.#ownedAuthorityCapabilities.add(capability);
+    return capability;
+  }
+
+   #issueProvisionalAuthorityCapability(
+    projectId: CollabProjectId,
+    authorityDirectory: string,
+  ): ProvisionalAuthorityDirectoryCapability {
+    const capability = Object.freeze({ authorityDirectory, projectId });
+    this.#provisionalAuthorityCapabilities.add(capability);
+    return capability;
+  }
+
+   #assertIssuedAuthorityCapability(
+    capability: OwnedAuthorityDirectoryCapability,
+  ): void {
+    if (!this.#ownedAuthorityCapabilities.has(capability)) {
+      throw localRecordError('authority-capability-invalid', 'index');
     }
   }
 
-  private async assertLegacyAuthorityDirectoryClaimable(
+   #assertIssuedProvisionalAuthorityCapability(
+    capability: ProvisionalAuthorityDirectoryCapability,
+  ): void {
+    if (!this.#provisionalAuthorityCapabilities.has(capability)) {
+      throw localRecordError('authority-capability-invalid', 'index');
+    }
+  }
+
+   async #isEmptyDirectory(authorityDirectory: string): Promise<boolean> {
+    const entries = await readdir(authorityDirectory, { withFileTypes: true }).catch(() => {
+      throw localRecordError('authority-directory-inspection-failed', 'index');
+    });
+    return entries.length === 0;
+  }
+
+   #writeCurrentAuthorityOwnershipMarker(
+    projectId: CollabProjectId,
+    installationKey: InstallationKey,
+  ): Promise<void> {
+    return writeCollabFileAtomically(
+      this.vaultRoot,
+      `${PRIVATE_STATE_DIRECTORY}/authorities/${projectId}/${AUTHORITY_OWNERSHIP_MARKER}`,
+      `${JSON.stringify({
+        ownerInstallationKey: installationKey,
+        projectId,
+        schemaVersion: AUTHORITY_OWNERSHIP_SCHEMA_VERSION,
+      })}\n`,
+      { mode: 0o600, onDiagnostic: this.#onDiagnostic },
+    );
+  }
+
+   async #loadAuthorityOwnershipMarker(
+    relativePath: string,
+  ): Promise<AnyAuthorityOwnershipMarker | null> {
+    const absolutePath = await resolveCollabVaultPath(this.vaultRoot, relativePath);
+    const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW;
+    const handle = await open(absolutePath, fsConstants.O_RDONLY | noFollow).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw localRecordError('authority-ownership-marker-inspection-failed', 'index');
+    });
+    if (handle === null) return null;
+    try {
+      const [handleStat, pathStat] = await Promise.all([
+        handle.stat(),
+        lstat(absolutePath),
+      ]).catch(() => {
+        throw localRecordError('authority-ownership-marker-inspection-failed', 'index');
+      });
+      if (
+        !handleStat.isFile()
+        || !pathStat.isFile()
+        || pathStat.isSymbolicLink()
+        || handleStat.dev !== pathStat.dev
+        || handleStat.ino !== pathStat.ino
+        || handleStat.size > AUTHORITY_OWNERSHIP_MARKER_MAX_BYTES
+      ) throw localRecordError('authority-ownership-marker-invalid', 'index');
+      const value: unknown = JSON.parse(await handle.readFile('utf8'));
+      if (!isRecord(value) || !isCollabProjectId(value.projectId)) {
+        throw new TypeError('invalid');
+      }
+      if (value.schemaVersion === LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION) {
+        requireExactKeys(value, ['projectId', 'schemaVersion']);
+        return {
+          projectId: value.projectId,
+          schemaVersion: LEGACY_AUTHORITY_OWNERSHIP_SCHEMA_VERSION,
+        };
+      }
+      if (value.schemaVersion === AUTHORITY_OWNERSHIP_SCHEMA_VERSION) {
+        requireExactKeys(value, ['ownerInstallationKey', 'projectId', 'schemaVersion']);
+        if (!isInstallationKey(value.ownerInstallationKey)) {
+          throw new TypeError('invalid');
+        }
+        return {
+          ownerInstallationKey: value.ownerInstallationKey,
+          projectId: value.projectId,
+          schemaVersion: AUTHORITY_OWNERSHIP_SCHEMA_VERSION,
+        };
+      }
+      throw new TypeError('invalid');
+    } catch (error) {
+      if (error instanceof CollabError) throw error;
+      throw localRecordError('authority-ownership-marker-invalid', 'index');
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+   async #assertLegacyAuthorityDirectoryClaimable(
     authorityDirectory: string,
     projectId: CollabProjectId,
   ): Promise<void> {
@@ -2034,7 +2398,8 @@ export class CollabLocalProjectRepository {
     if (
       entries.length === 0
       || entries.some(entry => (
-        !LEGACY_AUTHORITY_ROOT_ENTRIES.has(entry.name)
+        (entry.name !== AUTHORITY_OWNERSHIP_MARKER
+          && !LEGACY_AUTHORITY_ROOT_ENTRIES.has(entry.name))
         || entry.isSymbolicLink()
         || (entry.name === 'repository.git' ? !entry.isDirectory() : !entry.isFile())
       ))
@@ -2043,8 +2408,35 @@ export class CollabLocalProjectRepository {
     }
   }
 
-  private async loadIndexUnlocked(persistMigration: boolean): Promise<CollabLocalProjectIndex> {
-    const value = await this.readJson(`${PRIVATE_STATE_DIRECTORY}/index.json`, 'index');
+   async #assertProvisionalAuthorityDirectory(
+    authorityDirectory: string,
+    projectId: CollabProjectId,
+    requireComplete = false,
+  ): Promise<void> {
+    const entries = await readdir(authorityDirectory, { withFileTypes: true }).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw localRecordError('authority-directory-missing', 'index', projectId);
+      }
+      throw localRecordError('authority-directory-inspection-failed', 'index', projectId);
+    });
+    if (entries.some(entry => (
+      entry.isSymbolicLink()
+      || (entry.name !== 'collab.db' && entry.name !== 'repository.git')
+      || (entry.name === 'collab.db' ? !entry.isFile() : !entry.isDirectory())
+    ))) {
+      throw localRecordError('authority-provisional-directory-invalid', 'index', projectId);
+    }
+    if (
+      requireComplete
+      && (!entries.some(entry => entry.name === 'collab.db')
+        || !entries.some(entry => entry.name === 'repository.git'))
+    ) {
+      throw localRecordError('authority-provisional-directory-incomplete', 'index', projectId);
+    }
+  }
+
+   async #loadIndexUnlocked(persistMigration: boolean): Promise<CollabLocalProjectIndex> {
+    const value = await this.#readJson(`${PRIVATE_STATE_DIRECTORY}/index.json`, 'index');
     if (value === null) {
       return {
         projects: [],
@@ -2078,17 +2470,17 @@ export class CollabLocalProjectRepository {
       throw localRecordError('local-record-corrupt', 'index');
     }
     if (decoded.migrated && persistMigration) {
-      await this.saveIndexUnlocked(decoded.value);
+      await this.#saveIndexUnlocked(decoded.value);
     }
     return decoded.value;
   }
 
-  private async loadMembershipUnlocked(
+   async #loadMembershipUnlocked(
     projectId: CollabProjectId,
     persistMigration: boolean,
   ): Promise<CollabLocalMembershipRecord | null> {
     const relativePath = this.getProjectPaths(projectId).membership;
-    const value = await this.readJson(relativePath, 'membership', projectId);
+    const value = await this.#readJson(relativePath, 'membership', projectId);
     if (value === null) return null;
     try {
       const migrated = isRecord(value)
@@ -2098,12 +2490,12 @@ export class CollabLocalProjectRepository {
         throw new TypeError('Membership Project mismatch');
       }
       if (migrated && persistMigration) {
-        await this.ensurePrivateProjectDirectory(projectId);
+        await this.#ensurePrivateProjectDirectory(projectId);
         await writeCollabFileAtomically(
           this.vaultRoot,
           relativePath,
           serializeJson(membership),
-          { mode: 0o600, onDiagnostic: this.onDiagnostic },
+          { mode: 0o600, onDiagnostic: this.#onDiagnostic },
         );
       }
       return membership;
@@ -2113,7 +2505,7 @@ export class CollabLocalProjectRepository {
     }
   }
 
-  private async saveIndexUnlocked(index: CollabLocalProjectIndex): Promise<void> {
+   async #saveIndexUnlocked(index: CollabLocalProjectIndex): Promise<void> {
     let normalized: CollabLocalProjectIndex;
     try {
       normalized = normalizeIndex(index);
@@ -2125,11 +2517,11 @@ export class CollabLocalProjectRepository {
       this.vaultRoot,
       `${PRIVATE_STATE_DIRECTORY}/index.json`,
       serializeJson(normalized),
-      { mode: 0o600, onDiagnostic: this.onDiagnostic },
+      { mode: 0o600, onDiagnostic: this.#onDiagnostic },
     );
   }
 
-  private async readJson(
+   async #readJson(
     relativePath: string,
     recordKind: CollabLocalProjectDocumentKind | 'index' | 'membership' | CollabLifecycleProjectDocumentKind | 'retirement-tombstone',
     projectId?: string,
@@ -2149,7 +2541,7 @@ export class CollabLocalProjectRepository {
     }
   }
 
-  private projectDocumentPath(
+   #projectDocumentPath(
     projectId: CollabProjectId,
     kind: CollabLocalProjectDocumentKind,
   ): string {
@@ -2161,10 +2553,10 @@ export class CollabLocalProjectRepository {
     return paths.requestDraft;
   }
 
-  private listProjectDocumentProjectIds(
+   #listProjectDocumentProjectIds(
     kind: CollabLocalProjectDocumentKind,
   ): Promise<readonly CollabProjectId[]> {
-    return this.operationQueue.run(async () => {
+    return this.#operationQueue.run(async () => {
       const projectsDirectory = await resolveCollabVaultPath(
         this.vaultRoot,
         `${PRIVATE_STATE_DIRECTORY}/projects`,
@@ -2184,8 +2576,8 @@ export class CollabLocalProjectRepository {
         if (!isCollabProjectId(entry.name)) {
           throw localRecordError('local-project-directory-invalid', kind, entry.name);
         }
-        const value = await this.readJson(
-          this.projectDocumentPath(entry.name, kind),
+        const value = await this.#readJson(
+          this.#projectDocumentPath(entry.name, kind),
           kind,
           entry.name,
         );
@@ -2195,7 +2587,7 @@ export class CollabLocalProjectRepository {
     });
   }
 
-  private lifecycleDocumentPath(
+   #lifecycleDocumentPath(
     projectId: CollabProjectId,
     kind: CollabLifecycleProjectDocumentKind,
   ): string {
@@ -2211,20 +2603,20 @@ export class CollabLocalProjectRepository {
     return paths.retirement;
   }
 
-  private retirementTombstonePath(projectId: CollabProjectId): string {
+   #retirementTombstonePath(projectId: CollabProjectId): string {
     return `${PRIVATE_STATE_DIRECTORY}/retirement-tombstones/${projectId}.json`;
   }
 
-  private async ensureRetirementTombstoneDirectory(): Promise<void> {
+   async #ensureRetirementTombstoneDirectory(): Promise<void> {
     await this.ensurePrivateStateContainer();
     await ensureCollabVaultDirectory(
       this.vaultRoot,
       `${PRIVATE_STATE_DIRECTORY}/retirement-tombstones`,
-      { mode: 0o700, onDiagnostic: this.onDiagnostic },
+      { mode: 0o700, onDiagnostic: this.#onDiagnostic },
     );
   }
 
-  private requireProjectId(projectId: CollabProjectId): void {
+   #requireProjectId(projectId: CollabProjectId): void {
     if (!isCollabProjectId(projectId)) {
       throw localRecordError('project-id-invalid', 'index');
     }

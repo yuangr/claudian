@@ -33,7 +33,6 @@ export const TEST_COLLAB_FEATURE_PORT_METHODS = [
   'joinProject',
   'reconnectProject',
   'resumeSetup',
-  'readGitStatus',
   'readSnapshot',
   'readPublishDescription',
   'publish',
@@ -44,9 +43,9 @@ export const TEST_COLLAB_FEATURE_PORT_METHODS = [
   'readConflictFile',
   'createInvitation',
   'revokeInvitation',
+  'claimLegacyHostInstallation',
   'startHost',
   'stopHost',
-  'readRequest',
   'prepareReview',
   'preparePublicationReview',
   'readReviewFile',
@@ -61,7 +60,6 @@ export const TEST_COLLAB_FEATURE_PORT_METHODS = [
   'reopenTicket',
   'updateRequestMetadata',
   'acceptRequest',
-  'listMembers',
   'removeMember',
   'leaveProject',
   'createManagerResponsibilityOffer',
@@ -90,6 +88,7 @@ export const TEST_COLLAB_RESULT_STATUSES = [
 type FeatureOptionsOverrides = {
   readonly cloudBootstrap?: Partial<CollabCloudBootstrapPort>;
   readonly hostTransfer?: Partial<CollabHostTransferPort>;
+  readonly hostInstallation?: Partial<CollabFeatureServiceOptions['hostInstallation']>;
   readonly join?: Partial<CollabJoinProjectPort>;
   readonly lanHost?: Partial<CollabLanHostPort>;
   readonly lifecycleRecovery?: Partial<CollabLifecycleRecoveryPort>;
@@ -113,7 +112,8 @@ function defaultCloudBootstrap(): CollabCloudBootstrapPort {
 
 type PublicationOptionsOverrides = {
   readonly discovery?: Partial<CollabPublicationServiceOptions['discovery']>;
-  readonly isLocalHostRunning?: CollabPublicationServiceOptions['isLocalHostRunning'];
+  readonly inspectHostInstallation?: CollabPublicationServiceOptions['inspectHostInstallation'];
+  readonly readActiveLocalRoute?: CollabPublicationServiceOptions['readActiveLocalRoute'];
   readonly managerResponsibility?: Partial<
     CollabPublicationServiceOptions['managerResponsibility']
   >;
@@ -167,6 +167,13 @@ function defaultHostTransfer(): CollabHostTransferPort {
   };
 }
 
+function defaultHostInstallation(): CollabFeatureServiceOptions['hostInstallation'] {
+  return {
+    claimLegacy: () => unexpected('claimLegacyHostInstallation'),
+    inspect: () => Promise.resolve('hosted-here'),
+  };
+}
+
 function defaultJoin(): CollabJoinProjectPort {
   return {
     joinProject: () => unexpected('joinProject'),
@@ -202,7 +209,6 @@ function defaultMembership(): CollabMembershipPort {
     cancelManagerResponsibilityOffer: () => unexpected('cancelManagerResponsibilityOffer'),
     createInvitation: () => unexpected('createInvitation'),
     createManagerResponsibilityOffer: () => unexpected('createManagerResponsibilityOffer'),
-    listMembers: () => Promise.resolve([]),
     removeMember: () => Promise.resolve(),
     revokeInvitation: () => Promise.resolve(),
     promoteManager: () => Promise.resolve(),
@@ -272,7 +278,6 @@ function defaultPublication(): CollabPublicationPort {
     }),
     readPublicationReviewFile: () => unexpected('readPublicationReviewFile'),
     readPublishDescription: () => Promise.resolve(null),
-    readRequest: () => unexpected('readRequest'),
     readReviewFile: () => unexpected('readReviewFile'),
     readTicket: () => unexpected('readTicket'),
     readTicketPage: () => unexpected('readTicketPage'),
@@ -306,6 +311,10 @@ export function completeCollabFeatureOptions(
   return {
     cloudBootstrap: { ...defaultCloudBootstrap(), ...overrides.cloudBootstrap },
     hostTransfer: { ...defaultHostTransfer(), ...overrides.hostTransfer },
+    hostInstallation: {
+      ...defaultHostInstallation(),
+      ...overrides.hostInstallation,
+    },
     join: { ...defaultJoin(), ...overrides.join },
     lanHost: { ...defaultLanHost(), ...overrides.lanHost },
     lifecycleRecovery: { ...defaultLifecycleRecovery(), ...overrides.lifecycleRecovery },
@@ -336,7 +345,9 @@ export function completeCollabPublicationOptions(
       discoverProjectCandidates: () => Promise.resolve([]),
       ...overrides.discovery,
     },
-    isLocalHostRunning: overrides.isLocalHostRunning ?? (() => false),
+    inspectHostInstallation: overrides.inspectHostInstallation
+      ?? (() => Promise.resolve('absent')),
+    readActiveLocalRoute: overrides.readActiveLocalRoute ?? (() => null),
     managerResponsibility: {
       reconcileSnapshot: () => Promise.resolve(null),
       ...overrides.managerResponsibility,

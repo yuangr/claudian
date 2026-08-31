@@ -1,10 +1,7 @@
-const WINDOWS_CMD_ARGUMENT_CHARS = /[\s"&<>|{}^=;!'+,`~()%@]/u;
-
 export interface WindowsCmdShimSpawnSpec {
   args: string[];
   command: string;
   killProcessTree?: boolean;
-  windowsVerbatimArguments?: boolean;
 }
 
 interface KillableProcess {
@@ -48,15 +45,16 @@ export function resolveWindowsCmdShimSpawnSpec(
     };
   }
 
-  const shellCommand = [command, ...spec.args]
-    .map(value => quoteWindowsShellArgument(value))
-    .join(' ');
+  if (spec.args.some(value => /[\r\n]/u.test(value))) {
+    throw new Error(
+      'Windows command shims cannot safely receive multiline arguments. Use a native executable or launch the underlying script directly.',
+    );
+  }
 
   return {
-    args: ['/d', '/s', '/c', `"${shellCommand}"`],
-    command: process.env.ComSpec || process.env.comspec || 'cmd.exe',
+    args: spec.args,
+    command,
     killProcessTree: true,
-    windowsVerbatimArguments: true,
   };
 }
 
@@ -153,22 +151,4 @@ function isCompletionEmitterLike(value: unknown): value is CompletionEmitterLike
   return value !== null
     && typeof value === 'object'
     && typeof (value as { once?: unknown }).once === 'function';
-}
-
-function requiresWindowsShellQuoting(value: string): boolean {
-  return WINDOWS_CMD_ARGUMENT_CHARS.test(value)
-    || value.includes('[')
-    || value.includes(']');
-}
-
-function quoteWindowsShellArgument(value: string): string {
-  if (!value.length) {
-    return '""';
-  }
-
-  if (!requiresWindowsShellQuoting(value)) {
-    return value;
-  }
-
-  return `"${value.replace(/"/g, '""')}"`;
 }
