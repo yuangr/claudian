@@ -30,11 +30,9 @@ import { InstructionModal } from '../../../shared/modals/InstructionConfirmModal
 import type { BrowserSelectionContext } from '../../../utils/browser';
 import type { CanvasSelectionContext } from '../../../utils/canvas';
 import { extractUserDisplayContent } from '../../../utils/context';
-import { formatDurationMmSs } from '../../../utils/date';
 import type { EditorSelectionContext } from '../../../utils/editor';
 import { appendMarkdownSnippet } from '../../../utils/markdown';
 import type { FeatureHost } from '../../FeatureHost';
-import { COMPLETION_FLAVOR_WORDS } from '../constants';
 import {
   type ChatExecutionCoordinator,
   ChatExecutionPreHandoffError,
@@ -98,48 +96,6 @@ const DEFAULT_APPROVAL_DECISION_OPTIONS: ApprovalDecisionOption[] =
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-function extractExecutionErrorMessage(error: unknown): string {
-  if (!error) return 'Execution failed';
-  let rawMessage = '';
-  if (typeof error === 'string') {
-    rawMessage = error;
-  } else if (error instanceof Error) {
-    rawMessage = error.message;
-  } else if (typeof error === 'object') {
-    const errorRecord = error as Record<string, unknown>;
-    const innerPayload = errorRecord.error as Record<string, unknown> | undefined;
-    if (innerPayload && typeof innerPayload.message === 'string' && innerPayload.message) {
-      rawMessage = innerPayload.message;
-    } else if (typeof errorRecord.message === 'string' && errorRecord.message) {
-      rawMessage = errorRecord.message;
-    } else if (typeof errorRecord.errorMessage === 'string' && errorRecord.errorMessage) {
-      rawMessage = errorRecord.errorMessage;
-    } else {
-      rawMessage = String(error);
-    }
-  }
-
-  // Try to extract nested JSON error message if present (e.g. Google 503 API error responses)
-  if (rawMessage.includes('{') && rawMessage.includes('}')) {
-    try {
-      const jsonStart = rawMessage.indexOf('{');
-      const jsonStr = rawMessage.slice(jsonStart);
-      const parsed: unknown = JSON.parse(jsonStr);
-      if (parsed && typeof parsed === 'object' && 'error' in parsed) {
-        const err = (parsed).error;
-        if (err && typeof err === 'object' && 'message' in err) {
-          const msg = (err).message;
-          if (typeof msg === 'string') return msg;
-        }
-      }
-    } catch {
-      // Ignore JSON parse failure
-    }
-  }
-
-  return rawMessage || 'Execution failed';
 }
 
 export interface InputControllerDeps {
@@ -576,6 +532,18 @@ export class InputController {
         assistantMsg,
         dynamicSystemPromptSections,
       ));
+      if (result.status === 'completed') {
+        const checkpoint = result.nativeAssistantMessageId ?? result.nativeCheckpointId;
+        const finalAssistant = this.activeStreamingAssistantMessage ?? assistantMsg;
+        finalAssistant.completedAt = Date.now();
+        if (checkpoint) {
+          // The execution binding points to the original projection, before native message splits.
+          if (finalAssistant !== assistantMsg && assistantMsg.assistantMessageId === checkpoint) {
+            delete assistantMsg.assistantMessageId;
+          }
+          finalAssistant.assistantMessageId = checkpoint;
+        }
+      }
       didEnqueueToSdk = result.accepted;
       planCompleted = result.planCompleted;
       shouldReportReviewableSettlement = result.status === 'completed'
@@ -621,14 +589,9 @@ export class InputController {
                 : 'The provider session no longer exists. Send again to start a new session.';
         new Notice(notice);
         wasInvalidated = true;
-      } else if (result.status === 'error') {
+      } else if (result.status === 'error' && result.error) {
         hadExecutionError = true;
-        const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
-        if (state.currentThinkingState) {
-          await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
-        }
-        const errorMsg = extractExecutionErrorMessage(result.error);
-        await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
+        await streamController.appendText(`\n\n**Error:** ${result.error.message}`);
       }
     } catch (error) {
       if (error instanceof ChatExecutionPreHandoffError) {
@@ -643,11 +606,7 @@ export class InputController {
       } else {
         hadExecutionError = true;
         shouldReportReviewableSettlement = true;
-        const finalAssistantMsg = this.activeStreamingAssistantMessage ?? assistantMsg;
-        if (state.currentThinkingState) {
-          await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
-        }
-        const errorMsg = extractExecutionErrorMessage(error);
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
         await streamController.appendText(`\n\n**Error:** ${errorMsg}`);
         currentReviewableSettlementReporter =
           this.deps.captureReviewableSettlement?.('error') ?? null;
@@ -682,26 +641,14 @@ export class InputController {
             const durationSeconds = state.responseStartTime
               ? Math.floor((performance.now() - state.responseStartTime) / 1000)
               : 0;
-            if (durationSeconds > 0) {
-              const flavorWord =
-                COMPLETION_FLAVOR_WORDS[Math.floor(Math.random() * COMPLETION_FLAVOR_WORDS.length)];
-              finalAssistantMsg.durationSeconds = durationSeconds;
-              finalAssistantMsg.durationFlavorWord = flavorWord;
-              // Add footer to live message in DOM
-              if (state.currentContentEl) {
-                const footerEl = state.currentContentEl.createDiv({ cls: 'claudian-response-footer' });
-                footerEl.createSpan({
-                  text: `* ${flavorWord} for ${formatDurationMmSs(durationSeconds)}`,
-                  cls: 'claudian-baked-duration',
-                });
-              }
-            }
+            finalAssistantMsg.durationSeconds = durationSeconds;
           }
 
           state.currentContentEl = null;
 
           await streamController.finalizeCurrentThinkingBlock(finalAssistantMsg);
           await streamController.finalizeCurrentTextBlock(finalAssistantMsg);
+          renderer.finalizeResponse(finalAssistantMsg, state.messages, !didCancelThisTurn && !hadExecutionError);
           this.deps.getSubagentManager().resetStreamingState();
 
           // Auto-hide completed todo panel on response end

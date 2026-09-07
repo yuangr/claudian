@@ -41,6 +41,10 @@
   border-color: var(--background-modifier-border-hover);
 }
 
+.claudian-context-chip--content:not(.claudian-context-chip--removable) {
+  padding-right: 10px;
+}
+
 .claudian-context-chip--missing {
   border-color: var(--text-error);
 }

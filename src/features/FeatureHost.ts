@@ -39,6 +39,7 @@ export interface FeatureViewHost extends TabManagerViewHost {
   refreshTabControls(): void;
   refreshDualPaneLayout(): void;
   refreshCollabAvailability(): void;
+  refreshMessageTimestamps(): void;
   updateHiddenProviderCommands(): void;
   invalidateProviderResources(providerIds: ProviderId[], generation: number): void;
 }

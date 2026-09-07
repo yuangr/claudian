@@ -1,7 +1,7 @@
 import { createMockEl } from '@test/helpers/MockElement';
 import { Notice } from 'obsidian';
 
-import type { ProviderExecutionEvent } from '@/core/execution';
+import type { ProviderExecutionErrorEvent, ProviderExecutionEvent } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import type { ImageAttachment } from '@/core/types';
@@ -143,11 +143,12 @@ function createFixture(overrides: Record<string, unknown> = {}) {
     renderer: {
       addMessage: jest.fn().mockImplementation(() => {
         const el = createMockEl();
-        el.querySelector = jest.fn().mockReturnValue(createMockEl());
+        el.createDiv({ cls: 'claudian-message-content' });
         return el;
       }),
       appendInterruptIndicator: jest.fn(),
       refreshActionButtons: jest.fn(),
+      finalizeResponse: jest.fn(),
       removeMessage: jest.fn(),
       updateLiveUserMessage: jest.fn(),
     },
@@ -683,6 +684,142 @@ describe('InputController coordinator execution', () => {
     expect(fixture.deps.streamController.appendText).toHaveBeenCalledWith(
       '\n\n**Error:** stream failed',
     );
+  });
+
+  it('puts the completed turn checkpoint on the final assistant projection after message boundaries', async () => {
+    const fixture = createFixture();
+    fixture.coordinator.execute.mockImplementationOnce(async (submission: ChatTurnSubmission) => {
+      for (const sequence of [1, 2]) {
+        await fixture.controller.handleExecutionEvent({
+          type: 'assistant_message_started',
+          scope: { kind: 'requested', executionId: 'execution-1', turnId: 'turn-1',
+            sessionInstanceId: 'session-1', sequence },
+        });
+      }
+      // The execution binding still identifies the original assistant projection.
+      submission.messages!.assistant.assistantMessageId = 'completed-checkpoint';
+      return { accepted: true, planCompleted: false, status: 'completed', nativeCheckpointId: 'completed-checkpoint' };
+    });
+
+    await fixture.controller.sendMessage({ content: 'Inspect the code' });
+
+    const assistants = fixture.state.messages.filter(message => message.role === 'assistant');
+    expect(assistants.length).toBeGreaterThan(1);
+    expect(assistants.at(-1)?.assistantMessageId).toBe('completed-checkpoint');
+    expect(assistants[0].assistantMessageId).toBeUndefined();
+  });
+
+  it('timestamps the final response at execution completion instead of streaming start', async () => {
+    const startedAt = new Date('2026-09-07T10:00:00Z').getTime();
+    const finishedAt = new Date('2026-09-07T10:01:05Z').getTime();
+    let now = startedAt;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const fixture = createFixture();
+      fixture.coordinator.execute.mockImplementationOnce(async () => {
+        now = finishedAt;
+        return { accepted: true, planCompleted: false, status: 'completed' };
+      });
+      await fixture.controller.sendMessage({ content: 'Inspect' });
+      expect(fixture.state.messages[0].timestamp).toBe(startedAt);
+      expect(fixture.state.messages.at(-1)?.timestamp).toBe(startedAt);
+      expect(fixture.state.messages.at(-1)?.completedAt).toBe(finishedAt);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('stores response duration without a completion flavor on ordinary success', async () => {
+    let currentTime = 1000;
+    const nowSpy = jest.spyOn(performance, 'now').mockImplementation(() => currentTime);
+    try {
+      const fixture = createFixture();
+      fixture.coordinator.execute.mockImplementationOnce(async () => {
+        currentTime += 1500;
+        return { accepted: true, planCompleted: false, status: 'completed' };
+      });
+
+      await fixture.controller.sendMessage({ content: 'test request' });
+
+      const assistantMessage = fixture.state.messages[1];
+      expect(assistantMessage.durationSeconds).toBe(1);
+      expect(assistantMessage.durationFlavorWord).toBeUndefined();
+
+      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
+      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('suppresses response duration and DOM footer on normalized execution errors when elapsed time exceeds one second', async () => {
+    let currentTime = 1000;
+    const nowSpy = jest.spyOn(performance, 'now').mockImplementation(() => currentTime);
+    try {
+      const fixture = createFixture();
+      const errorEvent: ProviderExecutionErrorEvent = {
+        category: 'provider',
+        message: 'Model overloaded',
+        recoverable: false,
+        scope: {
+          executionId: 'execution-1',
+          kind: 'requested',
+          sequence: 0,
+          sessionInstanceId: 'session-instance-1',
+          turnId: 'turn-1',
+        },
+        type: 'execution_error',
+      };
+      fixture.coordinator.execute.mockImplementationOnce(async () => {
+        currentTime += 1500;
+        return {
+          accepted: true,
+          error: errorEvent,
+          planCompleted: false,
+          status: 'error',
+        };
+      });
+
+      await fixture.controller.sendMessage({ content: 'test request' });
+
+      expect(fixture.deps.streamController.appendText).toHaveBeenCalledWith(
+        '\n\n**Error:** Model overloaded',
+      );
+      const assistantMessage = fixture.state.messages[1];
+      expect(assistantMessage.durationSeconds).toBeUndefined();
+      expect(assistantMessage.durationFlavorWord).toBeUndefined();
+
+      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
+      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('suppresses response duration and DOM footer on catch-path rejections when elapsed time exceeds one second', async () => {
+    let currentTime = 1000;
+    const nowSpy = jest.spyOn(performance, 'now').mockImplementation(() => currentTime);
+    try {
+      const fixture = createFixture();
+      fixture.coordinator.execute.mockImplementationOnce(async () => {
+        currentTime += 1500;
+        throw new Error('stream failed');
+      });
+
+      await fixture.controller.sendMessage({ content: 'test request' });
+
+      expect(fixture.deps.streamController.appendText).toHaveBeenCalledWith(
+        '\n\n**Error:** stream failed',
+      );
+      const assistantMessage = fixture.state.messages[1];
+      expect(assistantMessage.durationSeconds).toBeUndefined();
+      expect(assistantMessage.durationFlavorWord).toBeUndefined();
+
+      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
+      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('routes normalized requested output to StreamController', async () => {

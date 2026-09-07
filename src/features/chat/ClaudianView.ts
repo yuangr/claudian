@@ -833,6 +833,12 @@ export class ClaudianView extends ItemView {
     return this.isWideSessionLayout;
   }
 
+  refreshMessageTimestamps(): void {
+    for (const tab of this.tabManager?.getAllTabs() ?? []) {
+      tab.renderer.refreshMessageTimestamps();
+    }
+  }
+
   refreshDualPaneLayout(): void {
     if (!this.viewContainerEl) return;
     this.updateSidebarSurfaceVisibility();
