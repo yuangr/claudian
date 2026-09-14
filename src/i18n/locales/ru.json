@@ -57,18 +57,6 @@
       "errorNoActiveTab": "Нет активной вкладки",
       "commandNoMessages": "Нельзя форкнуть: в диалоге нет сообщений",
       "commandNoAssistantUuid": "Нельзя форкнуть: нет ответа ассистента с идентификаторами"
-    },
-    "bangBash": {
-      "placeholder": "> Выполнить команду bash...",
-      "commandPanel": "Панель команд",
-      "copyAriaLabel": "Скопировать вывод последней команды",
-      "clearAriaLabel": "Очистить вывод bash",
-      "commandLabel": "{command}",
-      "statusLabel": "Статус: {status}",
-      "collapseOutput": "Свернуть вывод команды",
-      "expandOutput": "Развернуть вывод команды",
-      "running": "Выполняется...",
-      "copyFailed": "Не удалось скопировать в буфер обмена"
     }
   },
   "collab": {
@@ -475,39 +463,19 @@
     },
     "hotkeys": "Горячие клавиши",
     "inlineEditHotkey": {
-      "name": "Инлайн-редактирование",
-      "descWithKey": "Текущая клавиша: {hotkey}",
-      "descNoKey": "Клавиша не назначена",
-      "btnChange": "Изменить",
-      "btnSet": "Назначить"
+      "name": "Инлайн-редактирование"
     },
     "openChatHotkey": {
-      "name": "Открыть чат",
-      "descWithKey": "Текущая клавиша: {hotkey}",
-      "descNoKey": "Клавиша не назначена",
-      "btnChange": "Изменить",
-      "btnSet": "Назначить"
+      "name": "Открыть чат"
     },
     "newSessionHotkey": {
-      "name": "Заменить текущий диалог",
-      "descWithKey": "Текущая клавиша: {hotkey}",
-      "descNoKey": "Клавиша не назначена",
-      "btnChange": "Изменить",
-      "btnSet": "Назначить"
+      "name": "Заменить текущий диалог"
     },
     "newTabHotkey": {
-      "name": "Новое",
-      "descWithKey": "Текущая клавиша: {hotkey}",
-      "descNoKey": "Клавиша не назначена",
-      "btnChange": "Изменить",
-      "btnSet": "Назначить"
+      "name": "Новое"
     },
     "closeTabHotkey": {
-      "name": "Закрыть вкладку",
-      "descWithKey": "Текущая клавиша: {hotkey}",
-      "descNoKey": "Клавиша не назначена",
-      "btnChange": "Изменить",
-      "btnSet": "Назначить"
+      "name": "Закрыть вкладку"
     },
     "slashCommands": {
       "name": "Команды и навыки",
@@ -517,12 +485,6 @@
       "name": "Скрытые команды и навыки",
       "desc": "Скрыть определённые команды и навыки из выпадающего списка. Полезно для скрытия записей Claude Code, которые не актуальны для Claudian. Вводите имена без начального слэша, по одному на строку.",
       "placeholder": "commit\nbuild\ntest"
-    },
-    "mcpServers": {
-      "name": "MCP серверы",
-      "descBeforeCommand": "Claude Code управляет MCP-серверами через собственный CLI. Настройте через ",
-      "descAfterCommand": ", и они будут доступны в Claudian. ",
-      "learnMore": "Подробнее"
     },
     "plugins": {
       "name": "Плагины Claude Code",
@@ -624,13 +586,6 @@
       "name": "Включить расширение Chrome",
       "desc": "Разрешить Claude взаимодействовать с Chrome через расширение claude-in-chrome. Требуется установка расширения. Требуется перезапуск сессии."
     },
-    "enableBangBash": {
-      "name": "Включить режим bash (!)",
-      "desc": "Введите ! в пустом поле ввода, чтобы перейти в режим bash. Команды выполняются напрямую через Node.js child_process. Требуется повторно открыть представление.",
-      "validation": {
-        "noNode": "Node.js не найден в PATH. Установите Node.js или проверьте настройку PATH."
-      }
-    },
     "maxWarmAgentProcesses": {
       "name": "Максимум одновременно запущенных сессий",
       "desc": "Максимальное число сессий агента, готовых к работе одновременно (5-10). Старые неактивные сессии автоматически приостанавливаются и возобновляются при использовании."
@@ -702,6 +657,17 @@
       "leftSidebar": "Левая боковая панель",
       "mainTab": "Основная вкладка редактора"
     },
+    "cliInstallation": {
+      "disclosure": "Установка {name}",
+      "description": "Необязательный путь к CLI на этом компьютере. Оставьте пустым для автоматического обнаружения.",
+      "checking": "Проверка CLI…",
+      "versionUnavailable": "Версия недоступна",
+      "notFound": "Не найден",
+      "custom": "Пользовательский путь",
+      "auto": "Определено автоматически",
+      "checkFailed": "Не удалось проверить CLI",
+      "saveFailed": "Не удалось сохранить путь. Повторите попытку."
+    },
     "cliPath": {
       "name": "Путь к CLI Claude",
       "desc": "Пользовательский путь к Claude Code CLI. Оставьте пустым для автоматического определения.",
@@ -721,6 +687,14 @@
       "desc": "Сделать включённые модели {provider} доступными для новых бесед. Существующие сеансы сохраняются после отключения.",
       "lastProviderWarning": "Для работы Claudian должен быть включён хотя бы один провайдер.",
       "noModelsWarning": "Нет включённых моделей {provider}. В разделе «Модели» ниже включите хотя бы одну модель."
+    },
+    "claude": {
+      "responseStyle": {
+        "name": "Стиль ответа",
+        "desc": "Обычный использует привычный стиль Claude. Краткий начинает с результата и пропускает вступление. Требуется Claude Code 2.1.237 или новее.",
+        "default": "Обычный",
+        "concise": "Краткий"
+      }
     },
     "codex": {
       "installationMethod": {
@@ -751,6 +725,12 @@
         "desc": "Добавьте дополнительные ID моделей Codex в список выбора, по одному на строку. `OPENAI_MODEL` по-прежнему имеет приоритет, если задан.",
         "placeholder": "gpt-5.4\ngpt-5.3-codex-spark"
       },
+      "responseStyle": {
+        "name": "Стиль ответа",
+        "desc": "Выберите стиль общения Codex для поддерживаемых моделей. Применяется со следующего сообщения.",
+        "pragmatic": "Прагматичный",
+        "friendly": "Дружелюбный"
+      },
       "reasoningSummary": {
         "name": "Сводка рассуждений",
         "desc": "Показывать сводку процесса рассуждений модели в блоке размышлений.",
@@ -774,11 +754,6 @@
         "name": "Субагенты Codex",
         "desc": "Управляйте субагентами Codex уровня vault, сохраненными в .codex/agents/. Каждый TOML-файл задает одного пользовательского агента."
       },
-      "mcp": {
-        "descBeforeCommand": "Codex управляет MCP-серверами через собственный CLI. Настройте через ",
-        "descAfterCommand": ", и они будут доступны в Claudian. ",
-        "learnMore": "Подробнее"
-      },
       "environment": {
         "name": "Окружение Codex",
         "desc": "Только переменные среды выполнения, принадлежащие Codex. Используйте для настроек OPENAI_* и CODEX_*. Если автоопределению Codex нужна помощь, добавьте каталог установки в общий PATH, а не в этот раздел провайдера."
@@ -788,30 +763,6 @@
       "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
       "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
       "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
-    },
-    "codexSkills": {
-      "modal": {
-        "titleEdit": "Редактировать навык Codex",
-        "titleAdd": "Добавить навык Codex",
-        "directory": "Каталог",
-        "directoryDesc": "Где хранить навык",
-        "skillName": "Имя навыка",
-        "skillNameDesc": "Имя, используемое после $ (например, \"analyze\" для $analyze)",
-        "description": "Описание",
-        "descriptionDesc": "Необязательное описание, отображаемое в списке",
-        "instructions": "Инструкции",
-        "instructionsDesc": "Инструкции навыка (содержимое SKILL.md)",
-        "instructionsPlaceholder": "Analyze the code for..."
-      },
-      "instructionsRequired": "Инструкции обязательны",
-      "saveFailed": "Не удалось сохранить навык Codex",
-      "header": "Навыки Codex",
-      "noSkills": "В vault нет навыков Codex. Нажмите +, чтобы создать навык.",
-      "skillBadge": "навык",
-      "deleted": "Навык Codex \"{name}\" удален",
-      "deleteFailed": "Не удалось удалить навык Codex",
-      "created": "Навык Codex \"{name}\" создан",
-      "updated": "Навык Codex \"{name}\" обновлен"
     },
     "codexSubagents": {
       "modal": {

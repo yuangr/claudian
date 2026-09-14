@@ -1,5 +1,7 @@
 import { Notice, setIcon } from 'obsidian';
 
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+
 import {
   type BuiltInCommand,
   detectBuiltInCommand,
@@ -15,12 +17,9 @@ import {
   type ProviderId,
   type TitleGenerationService,
 } from '../../../core/providers/types';
-import { TOOL_EXIT_PLAN_MODE } from '../../../core/tools/toolNames';
 import {
   type ApprovalDecision,
   type ChatMessage,
-  type ExitPlanModeDecision,
-  type ExitPlanModePresentationOptions,
   isCanonicalUserMessage,
   type StreamChunk,
 } from '../../../core/types';
@@ -43,18 +42,13 @@ import type {
   LinkedContentSubmissionToken,
 } from '../linked-content';
 import { type InlineAskQuestionConfig, InlineAskUserQuestion } from '../rendering/InlineAskUserQuestion';
-import { InlineExitPlanMode } from '../rendering/InlineExitPlanMode';
-import { InlinePlanApproval,type PlanApprovalDecision } from '../rendering/InlinePlanApproval';
 import type { MessageRenderer } from '../rendering/MessageRenderer';
-import { setToolIcon, updateToolCallResult } from '../rendering/ToolCallRenderer';
+import { setToolIcon } from '../rendering/ToolCallRenderer';
 import type { SubagentManager } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
 import type { ChatTurnRequest, QueuedMessage, TabReviewOutcome } from '../state/types';
-import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
-import type { AddExternalContextResult } from '../ui/InputToolbar';
 import type { InstructionModeManager } from '../ui/InstructionModeManager';
-import type { StatusPanel } from '../ui/StatusPanel';
 import type { BrowserSelectionController } from './BrowserSelectionController';
 import type { CanvasSelectionController } from './CanvasSelectionController';
 import type { ConversationController } from './ConversationController';
@@ -107,20 +101,14 @@ export interface InputControllerDeps {
   browserSelectionController?: BrowserSelectionController;
   canvasSelectionController: CanvasSelectionController;
   conversationController: ConversationController;
-  getInputEl: () => HTMLTextAreaElement;
+  getInputEl: () => ComposerInputElement;
   getWelcomeEl: () => HTMLElement | null;
   getMessagesEl: () => HTMLElement;
-  getFileContextManager: () => FileContextManager | null;
   getLinkedContentController: () => LinkedContentController;
   getImageContextManager: () => ImageContextManager | null;
-  getExternalContextSelector: () => {
-    getExternalContexts: () => string[];
-    addExternalContext: (path: string) => AddExternalContextResult;
-  } | null;
   getInstructionModeManager: () => InstructionModeManager | null;
   getInstructionRefineService: () => InstructionRefineService | null;
   getTitleGenerationService: () => TitleGenerationService | null;
-  getStatusPanel: () => StatusPanel | null;
   getInputContainerEl: () => HTMLElement;
   generateId: () => string;
   getAuxiliaryModel?: () => string | null;
@@ -133,12 +121,9 @@ export interface InputControllerDeps {
   openConversation?: (conversationId: string) => Promise<void>;
   /** Lets the active layout replace in-place clear with its own New action. */
   handleNewConversationCommand?: () => Promise<boolean>;
-  /** Lets the active layout start approved plan content in a separate conversation. */
-  handleNewSessionPlan?: (planContent: string) => Promise<boolean>;
   onForkAll?: () => Promise<void>;
   /** Toggles the active provider's fast service tier when available. */
   toggleFastMode?: () => Promise<boolean>;
-  restorePrePlanPermissionModeIfNeeded?: () => void | Promise<void>;
   /** Captures a review reporter when a terminal provider turn becomes visible. */
   captureReviewableSettlement?: (outcome: TabReviewOutcome) => () => void;
   canStartTurn?: () => boolean;
@@ -183,9 +168,6 @@ export class InputController {
   private deps: InputControllerDeps;
   private pendingApprovalInline: InlineAskUserQuestion | null = null;
   private pendingAskInline: InlineAskUserQuestion | null = null;
-  private pendingExitPlanModeInline: InlineExitPlanMode | null = null;
-  private pendingPlanApproval: InlinePlanApproval | null = null;
-  private pendingPlanApprovalInvalidated = false;
   private activeResumeDropdown: ResumeSessionDropdown | null = null;
   private inputContainerHideDepth = 0;
   private readonly pendingSteersByConversation = new Map<string, PendingSteerState>();
@@ -330,7 +312,7 @@ export class InputController {
       return;
     }
 
-    // Check for built-in commands first (e.g., /clear, /new, /add-dir)
+    // Check for built-in commands first (e.g., /clear, /new)
     const builtInCmd = detectBuiltInCommand(content, this.getActiveProviderId());
     if (builtInCmd) {
       if (builtInCmd.command.action === 'clear') {
@@ -341,7 +323,7 @@ export class InputController {
       if (shouldUseInput) {
         inputEl.value = '';
       }
-      await this.executeBuiltInCommand(builtInCmd.command, builtInCmd.args);
+      await this.executeBuiltInCommand(builtInCmd.command);
       return;
     }
 
@@ -485,15 +467,12 @@ export class InputController {
     let wasInterrupted = false;
     let wasInvalidated = false;
     let didEnqueueToSdk = false;
-    let planCompleted = false;
     let didRollbackUnsentTurn = false;
     let shouldReportReviewableSettlement = false;
     let currentReviewableSettlementReporter: (() => void) | null = null;
     let didCancelThisTurn = false;
     let hadExecutionError = false;
-    let planApprovalInvalidated = false;
     let scheduledContinuation = false;
-    let continuationStaysInCurrentController = false;
 
     // Lazy initialization: bind and prepare execution on the first provider action.
     if (this.deps.ensureExecutionInitialized) {
@@ -545,7 +524,6 @@ export class InputController {
         }
       }
       didEnqueueToSdk = result.accepted;
-      planCompleted = result.planCompleted;
       shouldReportReviewableSettlement = result.status === 'completed'
         || (result.status === 'error' && result.accepted);
       if (shouldReportReviewableSettlement) {
@@ -625,7 +603,7 @@ export class InputController {
           && state.streamGeneration === streamGeneration
         ) {
           didCancelThisTurn = wasInterrupted || state.cancelRequested;
-          if (didCancelThisTurn && !state.pendingNewSessionPlan) {
+          if (didCancelThisTurn) {
             finalAssistantMsg.isInterrupt = true;
             if (state.currentContentEl) {
               renderer.appendInterruptIndicator(state.currentContentEl);
@@ -650,96 +628,13 @@ export class InputController {
           await streamController.finalizeCurrentTextBlock(finalAssistantMsg);
           renderer.finalizeResponse(finalAssistantMsg, state.messages, !didCancelThisTurn && !hadExecutionError);
           this.deps.getSubagentManager().resetStreamingState();
-
-          // Auto-hide completed todo panel on response end
-          // Panel reappears only when new TodoWrite tool is called
-          if (state.currentTodos && state.currentTodos.every(t => t.status === 'completed')) {
-            state.currentTodos = null;
-          }
           this.syncScrollToBottomAfterRenderUpdates();
 
-          // approve-new-session: the tool_result chunk is dropped because cancelRequested
-          // was set before the stream loop could process it — manually set the result so
-          // the saved conversation renders correctly when revisited
-          if (state.pendingNewSessionPlan && finalAssistantMsg.toolCalls) {
-            for (const tc of finalAssistantMsg.toolCalls) {
-              if (tc.name === TOOL_EXIT_PLAN_MODE && !tc.result) {
-                tc.status = 'completed';
-                tc.result = 'User approved the plan and started a new session.';
-                updateToolCallResult(tc.id, tc, state.toolCallElements);
-              }
-            }
-          }
-
-          // Provider-agnostic post-plan approval: show UI and await decision before save/auto-send
-          let planAutoSendContent: string | null = null;
-          let shouldProcessQueuedMessage = true;
-          if (planCompleted && !didCancelThisTurn) {
-            const planInteractionId = `local-plan-approval:${streamGeneration}`;
-            state.beginActionRequired(planInteractionId);
-            let decisionResult: { decision: PlanApprovalDecision | null; invalidated: boolean };
-            try {
-              decisionResult = await this.showPlanApproval();
-            } finally {
-              state.endActionRequired(planInteractionId);
-            }
-            const { decision, invalidated } = decisionResult;
-
-            // Re-check invalidation after async approval prompt
-            if (state.streamGeneration !== streamGeneration || invalidated) {
-              planApprovalInvalidated = true;
-            } else if (decision?.type === 'implement') {
-              await this.deps.restorePrePlanPermissionModeIfNeeded?.();
-              planAutoSendContent = 'Implement the plan.';
-            } else if (decision?.type === 'revise') {
-              // Keep plan mode active, populate input with feedback text
-              this.deps.getInputEl().value = decision.text;
-              shouldProcessQueuedMessage = false;
-            } else {
-              // cancel or null (dismissed)
-              await this.deps.restorePrePlanPermissionModeIfNeeded?.();
-            }
-          }
-
-          if (!planApprovalInvalidated) {
-            // Only clear resumeAtMessageId if enqueue succeeded; preserve checkpoint on failure for retry
-            const saveExtras = didEnqueueToSdk ? { resumeAtMessageId: undefined } : undefined;
-            await conversationController.save(true, saveExtras);
-
-            const userMsgIndex = state.messages.indexOf(userMsg);
-            renderer.refreshActionButtons(userMsg, state.messages, userMsgIndex >= 0 ? userMsgIndex : undefined);
-
-            // Auto-implement takes precedence over both approve-new-session and queued input
-            if (planAutoSendContent) {
-              scheduledContinuation = true;
-              continuationStaysInCurrentController = true;
-              this.deps.getInputEl().value = planAutoSendContent;
-              this.deferReviewableSettlement(currentReviewableSettlementReporter);
-              this.sendMessage().catch(() => this.reportDeferredReviewableSettlement());
-            } else {
-              // approve-new-session: create fresh conversation and send plan content
-              // Must be inside the invalidation guard — if the tab was closed or
-              // conversation switched, we must not create a new session on stale state.
-              const planContent = state.pendingNewSessionPlan;
-              if (planContent) {
-                state.pendingNewSessionPlan = null;
-                const handledByLayout = await this.deps.handleNewSessionPlan?.(planContent) ?? false;
-                if (handledByLayout) {
-                  scheduledContinuation = true;
-                } else {
-                  await conversationController.createNew();
-                  scheduledContinuation = true;
-                  continuationStaysInCurrentController = true;
-                  this.deps.getInputEl().value = planContent;
-                  this.deferReviewableSettlement(currentReviewableSettlementReporter);
-                  this.sendMessage().catch(() => this.reportDeferredReviewableSettlement());
-                }
-              } else if (shouldProcessQueuedMessage) {
-                scheduledContinuation = this.processQueuedMessage();
-                continuationStaysInCurrentController = scheduledContinuation;
-              }
-            }
-          }
+          const saveExtras = didEnqueueToSdk ? { resumeAtMessageId: undefined } : undefined;
+          await conversationController.save(true, saveExtras);
+          const userMsgIndex = state.messages.indexOf(userMsg);
+          renderer.refreshActionButtons(userMsg, state.messages, userMsgIndex >= 0 ? userMsgIndex : undefined);
+          scheduledContinuation = this.processQueuedMessage();
         }
 
         if (wasInvalidated) {
@@ -749,15 +644,10 @@ export class InputController {
       } finally {
         const currentSettlementIsReviewable = shouldReportReviewableSettlement
           && !didCancelThisTurn
-          && !planApprovalInvalidated
           && state.streamGeneration === streamGeneration;
         if (scheduledContinuation) {
-          if (continuationStaysInCurrentController) {
-            if (currentSettlementIsReviewable && currentReviewableSettlementReporter) {
-              this.deferReviewableSettlement(currentReviewableSettlementReporter);
-            }
-          } else {
-            this.clearDeferredReviewableSettlement();
+          if (currentSettlementIsReviewable && currentReviewableSettlementReporter) {
+            this.deferReviewableSettlement(currentReviewableSettlementReporter);
           }
         } else if (currentSettlementIsReviewable) {
           this.reportCurrentOrDeferredReviewableSettlement(
@@ -1015,9 +905,6 @@ export class InputController {
       canvasSelectionController,
     } = this.deps;
 
-    const fileContextManager = this.deps.getFileContextManager();
-    const externalContextSelector = this.deps.getExternalContextSelector();
-
     const editorContext = options.editorContextOverride !== undefined
       ? options.editorContextOverride
       : selectionController.getContext();
@@ -1028,28 +915,21 @@ export class InputController {
       ? options.canvasContextOverride
       : canvasSelectionController.getContext();
 
-    const externalContextPaths = externalContextSelector?.getExternalContexts();
     const isCompact = /^\/compact(\s|$)/i.test(options.content);
     const candidateUserTurnOrdinal = this.deps.state.messages
       .filter(isCanonicalUserMessage).length + 1;
     const linkedContentPath = !isCompact && candidateUserTurnOrdinal === 1
       ? this.deps.getLinkedContentController().getSnapshot().path ?? undefined
       : undefined;
-    const transformedText = !isCompact && fileContextManager
-      ? fileContextManager.transformContextMentions(options.content)
-      : options.content;
     return {
       displayContent: options.content,
       turnRequest: {
-        text: transformedText,
+        text: options.content,
         images: options.images,
         linkedContentPath,
         editorSelection: editorContext,
         browserSelection: browserContext,
         canvasSelection: canvasContext,
-        externalContextPaths: externalContextPaths && externalContextPaths.length > 0
-          ? externalContextPaths
-          : undefined,
       },
     };
   }
@@ -1099,23 +979,16 @@ export class InputController {
     const serviceTier = typeof settings.serviceTier === 'string'
       ? settings.serviceTier
       : undefined;
-    const mode = permissionMode === 'plan' && this.getActiveCapabilities().supportsPlanMode
-      ? permissionMode
-      : undefined;
     const images = [...(request.images ?? [])];
     const existingUserTurns = this.deps.state.messages.filter(isCanonicalUserMessage).length;
 
     return {
       canonicalText: request.text,
       configuration: {
-        ...(request.externalContextPaths
-          ? { externalWorkspaceRoots: [...request.externalContextPaths] }
-          : {}),
         ...(this.getAuxiliaryModel()
           ? { model: this.getAuxiliaryModel() ?? undefined }
           : {}),
         ...(permissionMode ? { permissionMode } : {}),
-        ...(mode ? { mode } : {}),
         ...(reasoning ? { reasoning } : {}),
         ...(serviceTier ? { serviceTier } : {}),
         systemInstructions: dynamicSystemPromptSections.length > 0
@@ -1137,9 +1010,6 @@ export class InputController {
           : {}),
         ...(request.editorSelection
           ? { editorSelection: request.editorSelection }
-          : {}),
-        ...(request.externalContextPaths
-          ? { externalContextPaths: [...request.externalContextPaths] }
           : {}),
       },
       conversationHistory: user && assistant
@@ -2050,55 +1920,6 @@ export class InputController {
     });
   }
 
-  async handleExitPlanMode(
-    input: Record<string, unknown>,
-    signal?: AbortSignal,
-    presentation?: ExitPlanModePresentationOptions,
-  ): Promise<ExitPlanModeDecision | null> {
-    const { state, streamController } = this.deps;
-    const inputContainerEl = this.deps.getInputContainerEl();
-    const parentEl = inputContainerEl.parentElement;
-    if (!parentEl) {
-      throw new Error('Input container is detached from DOM');
-    }
-
-    streamController.hideThinkingIndicator();
-    this.hideInputContainer(inputContainerEl);
-
-    const enrichedInput = state.planFilePath
-      ? { ...input, planFilePath: state.planFilePath }
-      : input;
-
-    const renderContent = (el: HTMLElement, markdown: string) =>
-      this.deps.renderer.renderContent(el, markdown);
-
-    const planPathPrefix = this.getActiveCapabilities().planPathPrefix;
-
-    return new Promise<ExitPlanModeDecision | null>((resolve, reject) => {
-      const inline = new InlineExitPlanMode(
-        parentEl,
-        enrichedInput,
-        (decision: ExitPlanModeDecision | null) => {
-          this.pendingExitPlanModeInline = null;
-          this.restoreInputContainer(inputContainerEl);
-          resolve(decision);
-        },
-        signal,
-        renderContent,
-        planPathPrefix,
-        presentation,
-      );
-      this.pendingExitPlanModeInline = inline;
-      try {
-        inline.render();
-      } catch (err) {
-        this.pendingExitPlanModeInline = null;
-        this.restoreInputContainer(inputContainerEl);
-        reject(toError(err));
-      }
-    });
-  }
-
   dismissPendingApprovalPrompt(): void {
     if (this.pendingApprovalInline) {
       this.pendingApprovalInline.destroy();
@@ -2106,7 +1927,7 @@ export class InputController {
     }
   }
 
-  dismissProviderInteraction(kind: 'approval' | 'question' | 'plan-decision'): void {
+  dismissProviderInteraction(kind: 'approval' | 'question'): void {
     if (kind === 'approval') {
       this.dismissPendingApprovalPrompt();
       return;
@@ -2116,10 +1937,6 @@ export class InputController {
       this.pendingAskInline = null;
       return;
     }
-    if (this.pendingExitPlanModeInline) {
-      this.pendingExitPlanModeInline.destroy();
-      this.pendingExitPlanModeInline = null;
-    }
   }
 
   dismissPendingApproval(): void {
@@ -2128,57 +1945,7 @@ export class InputController {
       this.pendingAskInline.destroy();
       this.pendingAskInline = null;
     }
-    if (this.pendingExitPlanModeInline) {
-      this.pendingExitPlanModeInline.destroy();
-      this.pendingExitPlanModeInline = null;
-    }
-    this.dismissPendingPlanApproval(true);
     this.resetInputContainerVisibility();
-  }
-
-  private showPlanApproval(): Promise<{ decision: PlanApprovalDecision | null; invalidated: boolean }> {
-    const inputContainerEl = this.deps.getInputContainerEl();
-    const parentEl = inputContainerEl.parentElement;
-    if (!parentEl) {
-      return Promise.resolve({ decision: null, invalidated: false });
-    }
-
-    this.hideInputContainer(inputContainerEl);
-    this.pendingPlanApprovalInvalidated = false;
-
-    return new Promise<{ decision: PlanApprovalDecision | null; invalidated: boolean }>((resolve, reject) => {
-      const inline = new InlinePlanApproval(
-        parentEl,
-        (decision: PlanApprovalDecision | null) => {
-          const invalidated = this.pendingPlanApprovalInvalidated;
-          this.pendingPlanApprovalInvalidated = false;
-          this.pendingPlanApproval = null;
-          this.restoreInputContainer(inputContainerEl);
-          resolve({ decision, invalidated });
-        },
-      );
-      this.pendingPlanApproval = inline;
-      try {
-        inline.render();
-      } catch (err) {
-        this.pendingPlanApproval = null;
-        this.pendingPlanApprovalInvalidated = false;
-        this.restoreInputContainer(inputContainerEl);
-        reject(toError(err));
-      }
-    });
-  }
-
-  private dismissPendingPlanApproval(invalidated: boolean): void {
-    if (!this.pendingPlanApproval) {
-      return;
-    }
-
-    if (invalidated) {
-      this.pendingPlanApprovalInvalidated = true;
-    }
-    this.pendingPlanApproval.destroy();
-    this.pendingPlanApproval = null;
   }
 
   private hideInputContainer(inputContainerEl: HTMLElement): void {
@@ -2205,7 +1972,7 @@ export class InputController {
   // Built-in Commands
   // ============================================
 
-  private async executeBuiltInCommand(command: BuiltInCommand, args: string): Promise<void> {
+  private async executeBuiltInCommand(command: BuiltInCommand): Promise<void> {
     const { conversationController } = this.deps;
     const capabilities = this.getActiveCapabilities();
 
@@ -2225,20 +1992,6 @@ export class InputController {
           }
         } else {
           await conversationController.createNew();
-        }
-        break;
-      }
-      case 'add-dir': {
-        const externalContextSelector = this.deps.getExternalContextSelector();
-        if (!externalContextSelector) {
-          new Notice('External context selector not available.');
-          return;
-        }
-        const result = externalContextSelector.addExternalContext(args);
-        if (result.success) {
-          new Notice(`Added external context: ${result.normalizedPath}`);
-        } else {
-          new Notice(result.error);
         }
         break;
       }
@@ -2345,9 +2098,6 @@ export class InputController {
 function cloneChatTurnRequest(request: ChatTurnRequest): ChatTurnRequest {
   return {
     ...request,
-    externalContextPaths: request.externalContextPaths
-      ? [...request.externalContextPaths]
-      : undefined,
     images: request.images ? [...request.images] : undefined,
   };
 }
@@ -2359,10 +2109,6 @@ function mergeQueuedChatTurns(
   const mergeText = (first: string, second: string) => (
     [first, second].map(value => value.trim()).filter(Boolean).join('\n\n')
   );
-  const externalContextPaths = Array.from(new Set([
-    ...(existing.request.externalContextPaths ?? []),
-    ...(incoming.request.externalContextPaths ?? []),
-  ]));
   const images = [
     ...(existing.request.images ?? []),
     ...(incoming.request.images ?? []),
@@ -2373,8 +2119,6 @@ function mergeQueuedChatTurns(
       ...cloneChatTurnRequest(incoming.request),
       linkedContentPath:
         incoming.request.linkedContentPath ?? existing.request.linkedContentPath,
-      externalContextPaths:
-        externalContextPaths.length > 0 ? externalContextPaths : undefined,
       images: images.length > 0 ? images : undefined,
       text: mergeText(existing.request.text, incoming.request.text),
     },

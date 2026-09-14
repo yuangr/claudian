@@ -1,6 +1,5 @@
 import type { EditorView } from '@codemirror/view';
 
-import type { TodoItem } from '../../../core/tools/todo';
 import type {
   ChatMessage,
   ImageAttachment,
@@ -21,7 +20,6 @@ export interface ChatTurnRequest {
   editorSelection?: EditorSelectionContext | null;
   browserSelection?: BrowserSelectionContext | null;
   canvasSelection?: CanvasSelectionContext | null;
-  externalContextPaths?: string[];
 }
 
 /** Queued message waiting to be sent after current streaming completes. */
@@ -114,9 +112,6 @@ export interface ChatStateData {
   // Flag to ignore usage updates (during session reset)
   ignoreUsageUpdates: boolean;
 
-  // Current todo items for the persistent bottom panel
-  currentTodos: TodoItem[] | null;
-
   // Runtime-only attention state
   attention: TabAttention;
 
@@ -126,15 +121,6 @@ export interface ChatStateData {
   // Response timer state
   responseStartTime: number | null;
   flavorTimerInterval: number | null;
-
-  // Pending plan content for approve-new-session (auto-sends in new session after stream ends)
-  pendingNewSessionPlan: string | null;
-
-  // Plan file path captured from Write tool calls to provider plan directory during plan mode
-  planFilePath: string | null;
-
-  // Saved permission mode before entering plan mode (for Shift+Tab toggle restore)
-  prePlanPermissionMode: string | null;
 }
 
 /** Callbacks for ChatState changes. */
@@ -144,7 +130,6 @@ export interface ChatStateCallbacks {
   onRewindingStateChanged?: (isRewinding: boolean) => void;
   onConversationChanged?: (id: string | null) => void;
   onUsageChanged?: (usage: UsageInfo | null) => void;
-  onTodosChanged?: (todos: TodoItem[] | null) => void;
   onAttentionChanged?: (attention: TabAttention) => void;
   onAutoScrollChanged?: (enabled: boolean) => void;
 }
@@ -156,7 +141,6 @@ export type {
   ImageAttachment,
   SubagentInfo,
   ThinkingBlockState,
-  TodoItem,
   ToolCallInfo,
   UsageInfo,
   WriteEditState,

@@ -41,9 +41,11 @@ import { toClaudeRuntimeModelId } from '../modelSelection';
 import { createCustomSpawnFunction } from '../runtime/customSpawn';
 import {
   DISABLED_BUILTIN_SUBAGENTS,
+  DISABLED_BUILTIN_TASK_TOOLS,
   UNSUPPORTED_SDK_TOOLS,
 } from '../runtime/types';
 import {
+  type ClaudeResponseStyle,
   getClaudeProviderSettings,
   resolveClaudeSettingSources,
 } from '../settings';
@@ -61,7 +63,6 @@ const EFFORT_LEVELS = new Set<EffortLevel>([
 ]);
 const PERMISSION_MODES = new Set<PermissionMode>([
   'normal',
-  'plan',
   'yolo',
 ]);
 const EXPLICIT_PROTOCOL_INSTRUCTIONS = [
@@ -81,6 +82,7 @@ export interface ClaudeEncodedExecutionRequest {
   readonly options: Options;
   readonly model: string;
   readonly effort: EffortLevel;
+  readonly responseStyle: ClaudeResponseStyle;
   readonly sdkPermissionMode: SDKPermissionMode;
   readonly restartKey: string;
   readonly allowedTools: ReadonlySet<string> | null;
@@ -125,10 +127,9 @@ export class ClaudeExecutionRequestEncoder {
         ? request.configuration.reasoning
         : settings.effortLevel,
     );
-    const sdkPermissionMode = this.resolveSdkPermissionMode(
-      settings.permissionMode,
-      claudeSettings.safeMode,
-    );
+    const sdkPermissionMode = settings.permissionMode === 'yolo'
+      ? 'bypassPermissions'
+      : claudeSettings.safeMode;
     const prompt = this.encodePrompt(request, replayConversationHistory);
     const policy = resolveToolPolicy(request);
     const systemPrompt = request.configuration.systemInstructions.kind === 'explicit'
@@ -146,15 +147,16 @@ export class ClaudeExecutionRequestEncoder {
           ? [...request.configuration.systemInstructions.dynamicSections]
           : undefined,
       });
-    const externalPaths = uniqueStrings([
-      ...(request.context?.externalContextPaths ?? []),
-      ...(request.configuration.externalWorkspaceRoots ?? []),
-    ]);
     const options: Options = {
       cwd: sessionConfig.vaultWorkingDirectory,
-      systemPrompt,
+      systemPrompt: {
+        type: 'custom',
+        prompt: systemPrompt,
+        snapshot: false,
+      },
       model,
       effort,
+      settings: { outputStyle: claudeSettings.responseStyle },
       thinking: { type: 'adaptive' },
       abortController,
       pathToClaudeCodeExecutable: cliPath,
@@ -174,11 +176,9 @@ export class ClaudeExecutionRequestEncoder {
       canUseTool,
       disallowedTools: [
         ...UNSUPPORTED_SDK_TOOLS,
+        ...DISABLED_BUILTIN_TASK_TOOLS,
         ...DISABLED_BUILTIN_SUBAGENTS,
       ],
-      ...(externalPaths.length > 0
-        ? { additionalDirectories: externalPaths }
-        : {}),
       ...(policy.tools !== undefined ? { tools: policy.tools } : {}),
       ...(policy.hooks ? { hooks: policy.hooks } : {}),
       ...(resume.sessionId ? { resume: resume.sessionId } : {}),
@@ -217,12 +217,12 @@ export class ClaudeExecutionRequestEncoder {
       model,
       effort,
       sdkPermissionMode,
+      responseStyle: claudeSettings.responseStyle,
       restartKey: JSON.stringify({
         systemPrompt,
         tools: policy.tools,
         disallowedTools: options.disallowedTools,
         hooks: Boolean(policy.hooks),
-        additionalDirectories: externalPaths,
         cliPath,
         settingSources: options.settingSources,
         enableChrome: claudeSettings.enableChrome,
@@ -233,15 +233,6 @@ export class ClaudeExecutionRequestEncoder {
     };
   }
 
-  resolveSdkPermissionMode(
-    permissionMode: PermissionMode,
-    safeMode = getClaudeProviderSettings(this.deps.host.settings).safeMode,
-  ): SDKPermissionMode {
-    if (permissionMode === 'yolo') return 'bypassPermissions';
-    if (permissionMode === 'plan') return 'plan';
-    return safeMode;
-  }
-
   private resolveSettings(request: ProviderExecutionRequest): ClaudianSettings {
     const settings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
       this.deps.host.settings,
@@ -250,8 +241,7 @@ export class ClaudeExecutionRequestEncoder {
     if (request.configuration.model?.trim()) {
       settings.model = request.configuration.model;
     }
-    const requestedMode = request.configuration.mode
-      ?? request.configuration.permissionMode;
+    const requestedMode = request.configuration.permissionMode;
     if (isPermissionMode(requestedMode)) {
       settings.permissionMode = requestedMode;
     }

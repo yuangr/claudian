@@ -41,8 +41,7 @@ The user's query comes first, followed by optional Claudian XML context tags. Tr
 - \`<editor_cursor path="path/to/note.md" line="8">\`: Text around the editor cursor.
 - \`<browser_selection source="browser:https://example.com" title="Example" url="https://example.com">\`: Selected browser-view text.
 - \`<canvas_selection path="boards/project.canvas">\`: Selected Canvas node IDs.
-- \`<context_files><context_file path="/absolute/context" /></context_files>\`: Additional file or directory references.
-- \`@filename.md\`: A Vault file mentioned in the query; read it when relevant.`;
+- \`[[vault-relative-path|display-name]]\`: A Vault file reference. The text before \`|\` is the file path relative to the Vault root; the text after \`|\` is only a display label. Use the path, not the label, to identify the file.`;
 }
 
 function getPathConventions(): string {
@@ -52,7 +51,22 @@ function getPathConventions(): string {
 - Do not rely on the current working directory when constructing an operation path.
 - Resolve Vault-relative context paths against the Vault absolute path before using them.
 - If a supplied context path is already absolute, use it directly.
+- Obsidian CLI and API parameters are an exception: use exact Vault-relative paths for them, and explicitly target the current Vault.
 - This path rule does not expand the directories available under the active sandbox or permission policy.`;
+}
+
+function getFileOperations(): string {
+  return `## File Operations
+
+- Use built-in filesystem tools for ordinary reads, edits, file creation, directory creation, listing, and text search.
+- Use the Obsidian CLI for resolved link and backlink queries, indexed tags and tasks, and live app state that filesystem tools cannot reliably provide.
+- For targeted frontmatter property updates, prefer the Obsidian CLI's \`property:set\` and \`property:remove\` commands so Obsidian handles YAML serialization.
+- Move or rename Vault notes, attachments, and folders through the running Obsidian app so Obsidian can update links according to the user's link-update settings. Do not use shell \`mv\`, filesystem rename APIs, or copy-and-delete followed by manual link replacements.
+- Use the Obsidian CLI for file moves and renames: \`obsidian vault="Vault Name" move path="folder/old.md" to="folder/new.md"\`. Supply the actual current Vault name and exact Vault-relative source and destination paths, including the file extension; do not rely on the active note or a fuzzy \`file=\` match.
+- For folder moves and renames, use \`obsidian vault="Vault Name" eval code="..."\` to resolve the source with \`app.vault.getAbstractFileByPath(sourcePath)\` and await \`app.fileManager.renameFile(folder, destinationPath)\`. Use Vault-relative paths, confirm the source is a folder, and check that the destination does not already exist. Do not use \`app.vault.rename\`, which bypasses FileManager's link updates.
+- Quote shell arguments and safely encode paths embedded in JavaScript. For multiple moves, await each operation and verify the resulting paths and affected links before reporting success.
+- The CLI requires a running Obsidian instance and an available \`obsidian\` executable. If a command's syntax is uncertain, run bare \`obsidian\` to inspect the installed command catalog. If link-aware moves are unavailable, report the blocker instead of silently falling back to filesystem moves.
+- For requested deletions, prefer Obsidian's trash behavior: \`obsidian vault="Vault Name" delete path="folder/note.md"\`. Permanent deletion must be explicitly requested.`;
 }
 
 function getReferenceConventions(): string {
@@ -101,6 +115,7 @@ export function buildSystemPrompt(
     getRuntimeContext(settings.vaultPath, settings.userName),
     getUserMessageContext(),
     getPathConventions(),
+    getFileOperations(),
     getReferenceConventions(),
     getVaultMediaContext(settings.mediaFolder || ''),
     getDynamicSections(options.dynamicSections),

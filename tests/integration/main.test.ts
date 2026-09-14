@@ -1,4 +1,3 @@
-
 import { Notice, TFile, TFolder } from 'obsidian';
 
 import { LocalAgentRuntimeHttpServer } from '@/app/agent-runtime/LocalAgentRuntimeHttpServer';
@@ -2466,9 +2465,7 @@ describe('ClaudianPlugin', () => {
         throw publicationError;
       });
       const refreshModelCatalog = jest.fn().mockResolvedValue({ changed: false });
-      const refreshAgentMentions = jest.fn().mockResolvedValue(undefined);
       ProviderWorkspaceRegistry.setServices('grok', {
-        refreshAgentMentions,
         refreshModelCatalog,
       });
       const invalidateProviderCommandCaches = jest.fn();
@@ -2490,10 +2487,6 @@ describe('ClaudianPlugin', () => {
           .toBe('GROK_PROFILE=committed');
         expect(refreshModelCatalog).toHaveBeenCalledTimes(1);
         expect(refreshModelCatalog).toHaveBeenCalledWith({
-          providerTransitionOwner: true,
-        });
-        expect(refreshAgentMentions).toHaveBeenCalledTimes(1);
-        expect(refreshAgentMentions).toHaveBeenCalledWith({
           providerTransitionOwner: true,
         });
         expect(invalidateProviderCommandCaches).toHaveBeenCalledWith(['grok']);
@@ -3000,7 +2993,6 @@ describe('ClaudianPlugin', () => {
         sessionId: 'session-123',
       });
       await plugin.updateConversation(conversation.id, {
-        externalContextPaths: ['/saved/context'],
         messages: [{
           content: 'hi',
           id: 'msg-1',

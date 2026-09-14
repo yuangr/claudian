@@ -57,18 +57,6 @@
       "errorNoActiveTab": "활성 탭이 없습니다",
       "commandNoMessages": "포크할 수 없습니다: 대화에 메시지가 없습니다",
       "commandNoAssistantUuid": "포크할 수 없습니다: 식별자가 있는 어시스턴트 응답이 없습니다"
-    },
-    "bangBash": {
-      "placeholder": "> bash 명령 실행...",
-      "commandPanel": "명령 패널",
-      "copyAriaLabel": "최신 명령 출력을 복사",
-      "clearAriaLabel": "bash 출력 지우기",
-      "commandLabel": "{command}",
-      "statusLabel": "상태: {status}",
-      "collapseOutput": "명령 출력 접기",
-      "expandOutput": "명령 출력 펼치기",
-      "running": "실행 중...",
-      "copyFailed": "클립보드에 복사하지 못했습니다"
     }
   },
   "collab": {
@@ -475,39 +463,19 @@
     },
     "hotkeys": "단축키",
     "inlineEditHotkey": {
-      "name": "인라인 편집",
-      "descWithKey": "현재 단축키: {hotkey}",
-      "descNoKey": "단축키 미설정",
-      "btnChange": "변경",
-      "btnSet": "단축키 설정"
+      "name": "인라인 편집"
     },
     "openChatHotkey": {
-      "name": "채팅 열기",
-      "descWithKey": "현재 단축키: {hotkey}",
-      "descNoKey": "단축키 미설정",
-      "btnChange": "변경",
-      "btnSet": "단축키 설정"
+      "name": "채팅 열기"
     },
     "newSessionHotkey": {
-      "name": "현재 대화 바꾸기",
-      "descWithKey": "현재 단축키: {hotkey}",
-      "descNoKey": "단축키 미설정",
-      "btnChange": "변경",
-      "btnSet": "단축키 설정"
+      "name": "현재 대화 바꾸기"
     },
     "newTabHotkey": {
-      "name": "새로 만들기",
-      "descWithKey": "현재 단축키: {hotkey}",
-      "descNoKey": "단축키 미설정",
-      "btnChange": "변경",
-      "btnSet": "단축키 설정"
+      "name": "새로 만들기"
     },
     "closeTabHotkey": {
-      "name": "탭 닫기",
-      "descWithKey": "현재 단축키: {hotkey}",
-      "descNoKey": "단축키 미설정",
-      "btnChange": "변경",
-      "btnSet": "단축키 설정"
+      "name": "탭 닫기"
     },
     "slashCommands": {
       "name": "명령어와 스킬",
@@ -517,12 +485,6 @@
       "name": "숨겨진 명령어와 스킬",
       "desc": "드롭다운에서 특정 명령어와 스킬을 숨깁니다. Claudian과 관련 없는 Claude Code 항목을 숨기는 데 유용합니다. 앞의 슬래시 없이 이름을 한 줄에 하나씩 입력하세요.",
       "placeholder": "commit\nbuild\ntest"
-    },
-    "mcpServers": {
-      "name": "MCP 서버",
-      "descBeforeCommand": "Claude Code는 자체 CLI로 MCP 서버를 관리합니다. ",
-      "descAfterCommand": " 명령으로 구성하면 Claudian에서 사용할 수 있습니다. ",
-      "learnMore": "자세히 알아보기"
     },
     "plugins": {
       "name": "Claude Code 플러그인",
@@ -624,13 +586,6 @@
       "name": "Chrome 확장 프로그램 활성화",
       "desc": "claude-in-chrome 확장 프로그램을 통해 Claude가 Chrome과 상호작용할 수 있도록 합니다. 확장 프로그램이 설치되어 있어야 합니다. 세션 재시작이 필요합니다."
     },
-    "enableBangBash": {
-      "name": "bash 모드 (!) 활성화",
-      "desc": "입력창이 비어 있을 때 !를 입력하면 bash 모드로 들어갑니다. Node.js child_process를 통해 명령을 직접 실행합니다. 보기를 다시 열어야 합니다.",
-      "validation": {
-        "noNode": "PATH에서 Node.js를 찾을 수 없습니다. Node.js를 설치하거나 PATH 설정을 확인하세요."
-      }
-    },
     "maxWarmAgentProcesses": {
       "name": "최대 동시 실행 세션 수",
       "desc": "동시에 준비 상태로 유지할 에이전트 세션의 최대 수(5-10). 오래된 유휴 세션은 자동으로 일시 중지되고 사용할 때 재개됩니다."
@@ -702,6 +657,17 @@
       "leftSidebar": "왼쪽 사이드바",
       "mainTab": "메인 편집기 탭"
     },
+    "cliInstallation": {
+      "disclosure": "{name} 설치",
+      "description": "이 컴퓨터의 CLI 경로입니다. 비워 두면 자동으로 감지합니다.",
+      "checking": "CLI 확인 중…",
+      "versionUnavailable": "버전을 확인할 수 없음",
+      "notFound": "찾을 수 없음",
+      "custom": "사용자 지정 경로",
+      "auto": "자동 감지",
+      "checkFailed": "CLI를 확인할 수 없음",
+      "saveFailed": "경로를 저장할 수 없습니다. 다시 시도하세요."
+    },
     "cliPath": {
       "name": "Claude CLI 경로",
       "desc": "Claude Code CLI의 사용자 정의 경로. 비워두면 자동 감지 사용.",
@@ -721,6 +687,14 @@
       "desc": "활성화된 {provider} 모델을 새 대화에서 사용할 수 있게 합니다. 비활성화해도 기존 세션은 유지됩니다.",
       "lastProviderWarning": "Claudian을 사용하려면 하나 이상의 제공자를 활성화해야 합니다.",
       "noModelsWarning": "활성화된 {provider} 모델이 없습니다. 아래 모델 섹션에서 하나 이상의 모델을 활성화하세요."
+    },
+    "claude": {
+      "responseStyle": {
+        "name": "응답 스타일",
+        "desc": "기본은 Claude의 일반 스타일입니다. 간결 모드는 결과부터 제시하고 서두를 생략합니다. Claude Code 2.1.237 이상이 필요합니다.",
+        "default": "기본",
+        "concise": "간결"
+      }
     },
     "codex": {
       "installationMethod": {
@@ -751,6 +725,12 @@
         "desc": "추가 Codex 모델 ID를 한 줄에 하나씩 선택기에 추가합니다. `OPENAI_MODEL`이 설정되어 있으면 계속 우선 적용됩니다.",
         "placeholder": "gpt-5.4\ngpt-5.3-codex-spark"
       },
+      "responseStyle": {
+        "name": "응답 스타일",
+        "desc": "지원되는 모델에서 Codex의 대화 스타일을 선택합니다. 다음 메시지부터 적용됩니다.",
+        "pragmatic": "실용적",
+        "friendly": "친근함"
+      },
       "reasoningSummary": {
         "name": "추론 요약",
         "desc": "생각 블록에 모델의 추론 과정 요약을 표시합니다.",
@@ -774,11 +754,6 @@
         "name": "Codex 하위 에이전트",
         "desc": ".codex/agents/에 저장된 vault 수준 Codex 하위 에이전트를 관리합니다. 각 TOML 파일은 사용자 지정 에이전트 하나를 정의합니다."
       },
-      "mcp": {
-        "descBeforeCommand": "Codex는 자체 CLI로 MCP 서버를 관리합니다. ",
-        "descAfterCommand": " 명령으로 구성하면 Claudian에서 사용할 수 있습니다. ",
-        "learnMore": "자세히 알아보기"
-      },
       "environment": {
         "name": "Codex 환경",
         "desc": "Codex 전용 런타임 변수만 입력하세요. OPENAI_* 및 CODEX_* 설정에 사용합니다. Codex 자동 감지에 도움이 필요하면 이 공급자 섹션 대신 공유 PATH에 설치 디렉터리를 추가하세요."
@@ -788,30 +763,6 @@
       "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
       "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
       "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
-    },
-    "codexSkills": {
-      "modal": {
-        "titleEdit": "Codex 스킬 편집",
-        "titleAdd": "Codex 스킬 추가",
-        "directory": "디렉터리",
-        "directoryDesc": "스킬을 저장할 위치",
-        "skillName": "스킬 이름",
-        "skillNameDesc": "$ 뒤에 사용할 이름입니다(예: $analyze의 경우 \"analyze\")",
-        "description": "설명",
-        "descriptionDesc": "드롭다운에 표시할 선택적 설명",
-        "instructions": "지침",
-        "instructionsDesc": "스킬 지침(SKILL.md 내용)",
-        "instructionsPlaceholder": "Analyze the code for..."
-      },
-      "instructionsRequired": "지침은 필수입니다",
-      "saveFailed": "Codex 스킬 저장 실패",
-      "header": "Codex 스킬",
-      "noSkills": "Vault에 Codex 스킬이 없습니다. +를 클릭해 만드세요.",
-      "skillBadge": "스킬",
-      "deleted": "Codex 스킬 \"{name}\" 삭제됨",
-      "deleteFailed": "Codex 스킬 삭제 실패",
-      "created": "Codex 스킬 \"{name}\" 생성됨",
-      "updated": "Codex 스킬 \"{name}\" 업데이트됨"
     },
     "codexSubagents": {
       "modal": {

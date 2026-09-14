@@ -1,10 +1,18 @@
+/** @jest-environment jsdom */
+
+import { createMockEl } from '@test/helpers/MockElement';
+import { applyTextInput } from '@test/helpers/settingsControls';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
 import * as fs from 'fs';
+import { axe } from 'jest-axe';
+import { setImmediate } from 'timers';
 
 import { DEFAULT_CLAUDE_PROVIDER_SETTINGS } from '@/providers/claude/settings';
 import { claudeSettingsTabRenderer } from '@/providers/claude/ui/ClaudeSettingsTab';
 
+Object.assign(globalThis, { setImmediate });
+
 const mockRenderEnvironmentSettingsSection = jest.fn();
-const mockRenderNativeMcpSettingsSection = jest.fn();
 const mockSaveSettings = jest.fn().mockResolvedValue(undefined);
 const mockSlashCommandSettings = jest.fn();
 const mockPluginSettingsManager = jest.fn();
@@ -106,9 +114,6 @@ jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
-jest.mock('@/shared/settings/NativeMcpSettingsSection', () => ({
-  renderNativeMcpSettingsSection: (...args: unknown[]) => mockRenderNativeMcpSettingsSection(...args),
-}));
 
 jest.mock('@/providers/claude/app/ClaudeWorkspaceServices', () => ({
   getClaudeWorkspaceServices: jest.fn(() => ({
@@ -142,7 +147,11 @@ jest.mock('@/providers/claude/ui/SlashCommandSettings', () => ({
 }));
 
 jest.mock('@/i18n/i18n', () => ({
-  t: (key: string) => key,
+  t: (key: string) => ({
+    'settings.claude.responseStyle.name': 'Response style',
+    'settings.claude.responseStyle.default': 'Default',
+    'settings.claude.responseStyle.concise': 'Concise',
+  } as Record<string, string>)[key] ?? key,
 }));
 
 jest.mock('@/utils/env', () => {
@@ -154,6 +163,7 @@ jest.mock('@/utils/env', () => {
 });
 
 interface MockInputEl {
+  [key: string]: unknown;
   rows: number;
   cols: number;
   value: string;
@@ -179,6 +189,7 @@ interface MockTextAreaComponent extends MockTextComponent {
 }
 
 interface MockDropdownComponent {
+  selectEl: HTMLSelectElement;
   value: string;
   options: Array<{ value: string; label: string }>;
   onChangeCallback: ((value: string) => Promise<void> | void) | null;
@@ -207,6 +218,7 @@ const createdSettings: Array<{
 function createInputEl(): MockInputEl & { _listeners: Map<string, Array<() => void>> } {
   const listeners = new Map<string, Array<() => void>>();
   return {
+    ...createMockEl('input'),
     rows: 0,
     cols: 0,
     value: '',
@@ -260,19 +272,23 @@ function createTextAreaComponent(): MockTextAreaComponent {
 
 function createDropdownComponent(): MockDropdownComponent {
   const component = {} as MockDropdownComponent;
+  component.selectEl = document.createElement('select');
   component.value = '';
   component.options = [];
   component.onChangeCallback = null;
   component.addOption = jest.fn((value: string, label: string) => {
     component.options.push({ value, label });
+    component.selectEl.add(new Option(label, value));
     return component;
   });
   component.setValue = jest.fn((value: string) => {
     component.value = value;
+    component.selectEl.value = value;
     return component;
   });
   component.onChange = jest.fn((callback: (value: string) => Promise<void> | void) => {
     component.onChangeCallback = callback;
+    component.selectEl.addEventListener('change', () => { void callback(component.selectEl.value); });
     return component;
   });
 
@@ -298,6 +314,7 @@ function createToggleComponent(): MockToggleComponent {
 function createElement(): any {
   const classes = new Set<string>();
   const element: any = {
+    ...createMockEl('div'),
     value: '',
     style: {},
     dataset: {},
@@ -427,6 +444,36 @@ describe('ClaudeSettingsTab', () => {
     mockedStatSync.mockReturnValue({ isFile: () => true } as fs.Stats);
   });
 
+  it.each([false, true])('clears legacy CLI configuration when restoring automatic detection (host override: %s)', async (hasHostOverride) => {
+    const config = {
+      cliPath: '/legacy/claude',
+      cliPathsByHost: { 'other-host': '/keep/claude', ...(hasHostOverride ? { 'host-a': '/host/claude' } : {}) },
+    };
+    const plugin = createPlugin();
+    Object.assign(plugin.settings.providerConfigs.claude, config);
+    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    const input = findSetting('settings.cliPath.name').textComponents[0];
+    expect(input.value).toBe(hasHostOverride ? '/host/claude' : '/legacy/claude');
+    await applyTextInput(input, '');
+    expect(plugin.settings.providerConfigs.claude.cliPath).toBe('');
+    expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({ 'other-host': '/keep/claude' });
+  });
+
+  it('persists response styles through an accessible native selector', async () => {
+    const plugin = createPlugin();
+    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    const subtree = document.createElement('main');
+    subtree.appendChild(findSetting('Response style').dropdownComponents[0].selectEl);
+    const select = within(subtree).getByRole('combobox', { name: 'Response style' }) as HTMLSelectElement;
+    expect(select.value).toBe('Default');
+    for (const value of ['Concise', 'Default']) {
+      const option = within(select).getByRole('option', { name: value }) as HTMLOptionElement;
+      fireEvent.change(select, { target: { value: option.value } });
+      await waitFor(() => expect(plugin.settings.providerConfigs.claude.responseStyle).toBe(value));
+    }
+    expect(await axe(subtree)).toHaveNoViolations();
+  });
+
   it('uses the current npm package wrapper path as the CLI placeholder', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
@@ -530,9 +577,8 @@ describe('ClaudeSettingsTab', () => {
     });
 
     claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
-    await findSetting('settings.cliPath.name')
-      .textComponents[0]
-      .onChangeCallback?.('/custom/claude');
+    await applyTextInput(findSetting('settings.cliPath.name')
+      .textComponents[0], '/custom/claude');
 
     expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
       ['claude'],
@@ -567,31 +613,12 @@ describe('ClaudeSettingsTab', () => {
     mockCliResolverReset.mockImplementation(() => undefined);
 
     claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
-    await findSetting('settings.cliPath.name')
-      .textComponents[0]
-      .onChangeCallback?.('"/custom dir/claude"');
+    await applyTextInput(findSetting('settings.cliPath.name')
+      .textComponents[0], '"/custom dir/claude"');
 
     expect(plugin.settings.providerConfigs.claude.cliPathsByHost).toEqual({
       'host-a': '"/custom dir/claude"',
     });
-  });
-
-  it('directs MCP setup to the native Claude CLI', () => {
-    const plugin = createPlugin();
-
-    claudeSettingsTabRenderer.render(createContainer(), createContext(plugin));
-
-    expect(mockRenderNativeMcpSettingsSection).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        descriptionAfterCommand: 'settings.mcpServers.descAfterCommand',
-        descriptionBeforeCommand: 'settings.mcpServers.descBeforeCommand',
-        documentationLabel: 'settings.mcpServers.learnMore',
-        documentationUrl: 'https://code.claude.com/docs/en/mcp',
-        heading: 'settings.mcpServers.name',
-        setupCommand: 'claude mcp add',
-      },
-    );
   });
 
   it('invalidates Claude plugin and agent configuration inside the execution transition', async () => {

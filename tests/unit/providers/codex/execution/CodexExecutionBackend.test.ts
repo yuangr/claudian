@@ -59,6 +59,7 @@ jest.mock('@/providers/codex/runtime/codexAppServerSupport', () => {
 
 import { CodexExecutionBackend } from '@/providers/codex/execution/CodexExecutionBackend';
 import { CodexRpcResponseError } from '@/providers/codex/runtime/CodexRpcTransport';
+import { updateCodexProviderSettings } from '@/providers/codex/settings';
 
 type NotificationHandler = (params: unknown) => void;
 type ServerRequestHandler = (
@@ -225,10 +226,6 @@ function createInteractionPort(): ProviderInteractionPort {
     askUserQuestion: jest.fn().mockImplementation(async request => ({
       interactionId: request.interactionId,
       answers: { choice: 'yes' },
-    })),
-    requestPlanDecision: jest.fn().mockImplementation(async request => ({
-      interactionId: request.interactionId,
-      decision: null,
     })),
     dismissInteraction: jest.fn(),
   };
@@ -484,6 +481,7 @@ describe('CodexExecutionBackend', () => {
         model: TEST_CODEX_MODEL,
         effort: 'high',
         serviceTier: 'priority',
+        personality: 'pragmatic',
       }),
     );
     expect(events.map(event => event.type)).toEqual(expect.arrayContaining([
@@ -1222,7 +1220,8 @@ describe('CodexExecutionBackend', () => {
       throw new Error(`Unexpected method: ${method}`);
     });
 
-    const session = new CodexExecutionBackend(createPlugin()).createSession(
+    const plugin = createPlugin();
+    const session = new CodexExecutionBackend(plugin).createSession(
       createSessionConfig({
         resumeSeed: {
           providerSessionId: 'thread-existing',
@@ -1235,6 +1234,7 @@ describe('CodexExecutionBackend', () => {
     );
 
     await collectEvents(session.execute(createRequest()).events);
+    updateCodexProviderSettings(plugin.settings as unknown as Record<string, unknown>, { responseStyle: 'friendly' });
     await collectEvents(session.execute(createRequest()).events);
 
     expect(
@@ -1243,6 +1243,9 @@ describe('CodexExecutionBackend', () => {
     expect(
       mockTransportRequest.mock.calls.filter(call => call[0] === 'turn/start'),
     ).toHaveLength(2);
+
+    expect(mockTransportRequest.mock.calls.filter(([method]) => method === 'turn/start').map(([, params]) => params.personality))
+      .toEqual(['pragmatic', 'friendly']);
 
     await session.dispose();
   });

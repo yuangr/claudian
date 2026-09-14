@@ -5,7 +5,6 @@ import type {
   ProviderExecutionEvent,
 } from '../../../core/execution';
 import { resolveConversationModel } from '../../../core/providers/conversationModel';
-import { ProviderRegistry } from '../../../core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import {
   DEFAULT_CHAT_PROVIDER_ID,
@@ -13,7 +12,6 @@ import {
   type ProviderSubagentAdapter,
   type ProviderSubagentLifecycleAdapter,
 } from '../../../core/providers/types';
-import { parseTodoInput } from '../../../core/tools/todo';
 import { extractResolvedAnswers, extractResolvedAnswersFromResultText } from '../../../core/tools/toolInput';
 import {
   isEditTool,
@@ -21,8 +19,6 @@ import {
   TOOL_APPLY_PATCH,
   TOOL_ASK_USER_QUESTION,
   TOOL_SUBAGENT,
-  TOOL_TODO_WRITE,
-  TOOL_WRITE,
 } from '../../../core/tools/toolNames';
 import {
   extractToolProviderPayload,
@@ -77,7 +73,6 @@ import {
 import type { SubagentManager } from '../services/SubagentManager';
 import type { AsyncSubagentCompletion } from '../services/SubagentManager';
 import type { ChatState } from '../state/ChatState';
-import type { FileContextManager } from '../ui/FileContext';
 import { StreamingRenderCoordinator } from './StreamingRenderCoordinator';
 
 export interface StreamControllerDeps {
@@ -86,7 +81,6 @@ export interface StreamControllerDeps {
   renderer: MessageRenderer;
   subagentManager: SubagentManager;
   getMessagesEl: () => HTMLElement;
-  getFileContextManager: () => FileContextManager | null;
   updateQueueIndicator: () => void;
   getProviderId?: () => ProviderId;
   getProviderSessionId?: () => string | null;
@@ -357,19 +351,6 @@ export class StreamController {
       }
 
       if (nameChanged || inputChanged) {
-        // Re-parse TodoWrite on input updates (streaming may complete the input)
-        if (existingToolCall.name === TOOL_TODO_WRITE) {
-          const todos = parseTodoInput(existingToolCall.input);
-          if (todos) {
-            this.deps.state.currentTodos = todos;
-          }
-        }
-
-        // Capture plan file path on input updates (file_path may arrive in a later chunk)
-        if (existingToolCall.name === TOOL_WRITE) {
-          this.capturePlanFilePath(existingToolCall.input);
-        }
-
         const rendererRebuilt = nameChanged
           && this.rebuildRenderedToolRenderer(existingToolCall);
 
@@ -409,19 +390,6 @@ export class StreamController {
     // Add to contentBlocks for ordering
     msg.contentBlocks = msg.contentBlocks || [];
     msg.contentBlocks.push({ type: 'tool_use', toolId: chunk.id });
-
-    // TodoWrite: update panel state immediately (side effect), but still buffer render
-    if (chunk.name === TOOL_TODO_WRITE) {
-      const todos = parseTodoInput(chunk.input);
-      if (todos) {
-        this.deps.state.currentTodos = todos;
-      }
-    }
-
-    // Track Write to provider plan directory for plan mode (used by approve-new-session)
-    if (chunk.name === TOOL_WRITE) {
-      this.capturePlanFilePath(chunk.input);
-    }
 
     // Buffer the tool call instead of rendering immediately
     if (state.currentContentEl) {
@@ -526,18 +494,6 @@ export class StreamController {
     return this.shouldDeferMathRendering() && hasStreamingMathDelimiters(content)
       ? { deferMath: true }
       : undefined;
-  }
-
-  private capturePlanFilePath(input: Record<string, unknown>): void {
-    const filePath = input.file_path as string | undefined;
-    if (!filePath) return;
-
-    const planPathPrefix = ProviderRegistry.getCapabilities(
-      this.getActiveProviderId(),
-    ).planPathPrefix;
-    if (planPathPrefix && filePath.replace(/\\/g, '/').includes(planPathPrefix)) {
-      this.deps.state.planFilePath = filePath;
-    }
   }
 
   /**

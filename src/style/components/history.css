@@ -634,14 +634,14 @@ body.theme-dark .claudian-session-metadata-popover {
   white-space: nowrap;
 }
 
-.claudian-session-metadata-value--note {
+.claudian-session-metadata-value--content {
   overflow-x: auto;
   overflow-y: hidden;
   text-overflow: clip;
   scrollbar-width: none;
 }
 
-.claudian-session-metadata-value--note::-webkit-scrollbar {
+.claudian-session-metadata-value--content::-webkit-scrollbar {
   display: none;
 }
 

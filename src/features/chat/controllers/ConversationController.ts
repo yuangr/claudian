@@ -1,5 +1,7 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+
 import type {
   ChatRewindConflict,
   ChatRewindMode,
@@ -34,10 +36,7 @@ import {
 } from '../session-manager/SessionListOrganizer';
 import type { ChatState } from '../state/ChatState';
 import type { TabAttention } from '../state/types';
-import type { FileContextManager } from '../ui/FileContext';
 import type { ImageContextManager } from '../ui/ImageContext';
-import type { ExternalContextSelector } from '../ui/InputToolbar';
-import type { StatusPanel } from '../ui/StatusPanel';
 
 function runConversationAction(action: () => Promise<void>, failureMessage: string): void {
   void action().catch(() => {
@@ -75,15 +74,12 @@ export interface ConversationControllerDeps {
   getWelcomeEl: () => HTMLElement | null;
   setWelcomeEl: (el: HTMLElement | null) => void;
   getMessagesEl: () => HTMLElement;
-  getInputEl: () => HTMLTextAreaElement;
+  getInputEl: () => ComposerInputElement;
   restoreMessageToComposer?: (message: Pick<ChatMessage, 'content' | 'images'>) => void;
-  getFileContextManager: () => FileContextManager | null;
   getLinkedContentController: () => LinkedContentController;
   getImageContextManager: () => ImageContextManager | null;
-  getExternalContextSelector: () => ExternalContextSelector | null;
   clearQueuedMessage: () => void;
   getTitleGenerationService: () => TitleGenerationService | null;
-  getStatusPanel: () => StatusPanel | null;
   getExecutionCoordinator: () => ChatExecutionCoordinator | null;
   ensureExecutionInitialized?: () => Promise<boolean>;
   getProviderId?: () => ProviderId;
@@ -249,10 +245,6 @@ export class ConversationController {
       state.currentConversationId = null;
       state.clearMessages();
       state.usage = null;
-      state.currentTodos = null;
-      state.pendingNewSessionPlan = null;
-      state.planFilePath = null;
-      state.prePlanPermissionMode = null;
       state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
       state.hasPendingConversationSave = false;
 
@@ -261,23 +253,14 @@ export class ConversationController {
       const messagesEl = this.deps.getMessagesEl();
       messagesEl.empty();
 
-      // Recreate welcome element first (before StatusPanel for consistent ordering)
       const welcomeEl = createWelcomeElement(messagesEl, this.getGreeting());
       this.deps.setWelcomeEl(welcomeEl);
 
-      // Remount StatusPanel to restore state for new conversation
-      this.deps.getStatusPanel()?.remount();
-
       this.deps.getInputEl().value = '';
 
-      this.deps.getFileContextManager()?.clearAttachments();
       this.deps.getLinkedContentController().resetAutoDraft();
 
       this.deps.getImageContextManager()?.clearImages();
-      // Pass current settings to ensure we have the most up-to-date persistent paths
-      this.deps.getExternalContextSelector()?.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
       this.deps.clearQueuedMessage();
 
       this.callbacks.onNewConversation?.();
@@ -303,22 +286,12 @@ export class ConversationController {
       state.currentConversationId = null;
       state.clearMessages();
       state.usage = null;
-      state.currentTodos = null;
-      state.pendingNewSessionPlan = null;
-      state.planFilePath = null;
-      state.prePlanPermissionMode = null;
       state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
       state.hasPendingConversationSave = false;
 
       await this.getExecutionCoordinator()?.bindConversation(null);
 
-      this.deps.getFileContextManager()?.clearAttachments();
       this.deps.getLinkedContentController().resetAutoDraft();
-
-      // Initialize external contexts with persistent paths from settings
-      this.deps.getExternalContextSelector()?.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
 
       const welcomeEl = renderer.renderMessages(
         [],
@@ -624,11 +597,8 @@ export class ConversationController {
       throw new Error('Cannot save messages before the Conversation shell is created');
     }
 
-    const externalContextSelector = this.deps.getExternalContextSelector();
-    const externalContextPaths = externalContextSelector?.getExternalContexts() ?? [];
     const updates: ConversationMutablePatch = {
       messages: state.messages,
-      externalContextPaths: externalContextPaths.length > 0 ? externalContextPaths : undefined,
       usage: state.usage ?? undefined,
     };
 
@@ -661,49 +631,13 @@ export class ConversationController {
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.hasPendingConversationSave = false;
 
-    // Clear status panels (auto-hide: panels reappear when agent creates new todos)
-    state.currentTodos = null;
-
-    const hasMessages = state.messages.length > 0;
-
-    // Determine external context paths for this session
-    // Empty session: use persistent paths; session with messages: use saved paths
-    this.deps.getFileContextManager()?.clearAttachments();
     this.deps.getLinkedContentController().lock(conversation.linkedContentPath);
-
-    this.restoreExternalContextPaths(conversation.externalContextPaths, !hasMessages);
 
     const welcomeEl = renderer.renderMessages(
       state.messages,
       () => this.getGreeting()
     );
     this.deps.setWelcomeEl(welcomeEl);
-  }
-
-  /**
-   * Restores external context paths based on session state.
-   * New or empty sessions get current persistent paths from settings.
-   * Sessions with messages restore exactly what was saved.
-   */
-  private restoreExternalContextPaths(
-    savedPaths: string[] | undefined,
-    isEmptySession: boolean
-  ): void {
-    const { plugin } = this.deps;
-    const externalContextSelector = this.deps.getExternalContextSelector();
-    if (!externalContextSelector) {
-      return;
-    }
-
-    if (isEmptySession) {
-      // Empty session: use current persistent paths from settings
-      externalContextSelector.clearExternalContexts(
-        plugin.settings.persistentExternalContextPaths || []
-      );
-    } else {
-      // Session with messages: restore exactly what was saved
-      externalContextSelector.setExternalContexts(savedPaths || []);
-    }
   }
 
   // ============================================
@@ -1788,9 +1722,13 @@ export class ConversationController {
     const closeForViewportChange = (): void => {
       if (this.metadataPopoverEl === hoverEl) this.closeSessionMetadataPopover();
     };
+    const closeForExternalScroll = (event: Event): void => {
+      if (event.composedPath().includes(hoverEl)) return;
+      closeForViewportChange();
+    };
     hoverEl.addEventListener('mouseenter', cancelClose);
     hoverEl.addEventListener('mouseleave', scheduleClose);
-    document.addEventListener('scroll', closeForViewportChange, true);
+    document.addEventListener('scroll', closeForExternalScroll, true);
     document.defaultView?.addEventListener('resize', closeForViewportChange);
 
     const signal = options.signal;
@@ -1803,7 +1741,7 @@ export class ConversationController {
     this.metadataPopoverCleanup = () => {
       hoverEl.removeEventListener('mouseenter', cancelClose);
       hoverEl.removeEventListener('mouseleave', scheduleClose);
-      document.removeEventListener('scroll', closeForViewportChange, true);
+      document.removeEventListener('scroll', closeForExternalScroll, true);
       document.defaultView?.removeEventListener('resize', closeForViewportChange);
       signal?.removeEventListener('abort', closeOnAbort);
       if (descriptionTarget.getAttribute('aria-describedby') === popoverId) {

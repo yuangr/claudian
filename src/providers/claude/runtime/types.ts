@@ -90,7 +90,15 @@ export interface SessionState {
   sessionInvalidated: boolean;
 }
 
-export const UNSUPPORTED_SDK_TOOLS = [] as const;
+export const UNSUPPORTED_SDK_TOOLS = ['EnterPlanMode', 'ExitPlanMode'] as const;
+
+export const DISABLED_BUILTIN_TASK_TOOLS = [
+  'TodoWrite',
+  'TaskCreate',
+  'TaskGet',
+  'TaskList',
+  'TaskUpdate',
+] as const;
 
 /** Built-in subagents that don't apply to Obsidian context. */
 export const DISABLED_BUILTIN_SUBAGENTS = [

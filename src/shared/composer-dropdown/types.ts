@@ -1,4 +1,11 @@
-export type ComposerInputElement = HTMLInputElement | HTMLTextAreaElement;
+/** Text/caret contract shared by native inputs and the Main Chat rich editor. */
+export interface ComposerInputElement extends HTMLElement {
+  value: string;
+  selectionStart: number | null;
+  selectionEnd: number | null;
+  placeholder: string;
+  replaceText?: (from: number, to: number, text: string) => void;
+}
 
 export interface ComposerTriggerMatch {
   readonly atInputStart: boolean;

@@ -27,7 +27,6 @@ export type { ProviderId } from '../types/provider';
 export interface ProviderCapabilities {
   providerId: ProviderId;
   supportsNativeHistory: boolean;
-  supportsPlanMode: boolean;
   supportsRewind: boolean;
   supportsFork: boolean;
   supportsProviderCommands: boolean;
@@ -37,7 +36,6 @@ export interface ProviderCapabilities {
   supportsInstructionMode: boolean;
   supportsTurnSteer?: boolean;
   reasoningControl: 'effort' | 'token-budget' | 'none';
-  planPathPrefix?: string;
 }
 
 export const DEFAULT_CHAT_PROVIDER_ID = 'claude' as const satisfies ProviderId;
@@ -152,19 +150,6 @@ export interface AppAgentStorage {
   delete(agent: AgentDefinition): Promise<void>;
 }
 
-export type AgentMentionSource = AgentDefinition['source'];
-
-export interface AgentMentionProvider {
-  ensureLoaded?(): Promise<void>;
-  isLoaded?(): boolean;
-  searchAgents(query: string): Array<{
-    id: string;
-    name: string;
-    description?: string;
-    source: AgentMentionSource;
-  }>;
-}
-
 /** Provider plugin manager interface consumed by the app layer. */
 export interface AppPluginManager {
   loadPlugins(): Promise<void>;
@@ -179,11 +164,9 @@ export interface AppPluginManager {
 }
 
 /** Provider agent manager interface consumed by the app layer. */
-export interface AppAgentManager extends AgentMentionProvider {
+export interface AppAgentManager {
   loadAgents(): Promise<void>;
   getAvailableAgents(): AgentDefinition[];
-  getAgentById(id: string): AgentDefinition | undefined;
-  searchAgents(query: string): AgentDefinition[];
   setBuiltinAgentNames(names: string[]): void;
 }
 
@@ -241,8 +224,6 @@ export interface ProviderPermissionModeToggleConfig {
   inactiveLabel: string;
   activeValue: string;
   activeLabel: string;
-  planValue?: string;
-  planLabel?: string;
 }
 
 /** Compact service-tier toggle descriptor for providers that expose a fast/standard toolbar control. */
@@ -342,9 +323,6 @@ export interface ProviderChatUIConfig {
   /** Optional hook when the toolbar changes a provider-owned mode selection. */
   applyModeSelection?(value: string, settings: unknown): void;
 
-  /** Whether the provider enables the shared bang-bash input mode. */
-  isBangBashEnabled?(settings: Record<string, unknown>): boolean;
-
   /** SVG icon for the provider (shown next to model names in selectors). */
   getProviderIcon?(): ProviderIconSvg | null;
 }
@@ -372,7 +350,6 @@ export interface ProviderCliResolver {
 export interface ProviderCommandLoaderContext {
   allowIsolatedMetadataCreation: boolean;
   conversation: Conversation | null;
-  externalContextPaths: string[];
   plugin: ProviderHost;
   readyCommandSnapshot?: readonly SlashCommand[];
   /** Cancels provider-owned discovery work when its consumer is invalidated. */
@@ -398,7 +375,6 @@ export type ProviderTabWarmupLifecycleState = 'provisional' | 'cold' | 'warm' | 
 export interface ProviderTabWarmupContext {
   coordinatorState: 'absent' | 'idle' | 'active' | 'stale';
   conversation: Conversation | null;
-  externalContextPaths: string[];
   hasResumableNativeSeed: boolean;
   plugin: ProviderHost;
   tab: {
@@ -416,12 +392,10 @@ export interface ProviderTabWarmupPolicy {
 export interface ProviderWorkspaceServices {
   commandCatalog?: ProviderCommandCatalog | null;
   vaultCommandRepository?: ProviderVaultEntryRepository | null;
-  agentMentionProvider?: AgentMentionProvider | null;
   cliResolver?: ProviderCliResolver | null;
   commandLoader?: ProviderCommandLoader | null;
   tabWarmupPolicy?: ProviderTabWarmupPolicy | null;
   settingsTabRenderer?: ProviderSettingsTabRenderer | null;
-  refreshAgentMentions?(context?: ProviderTransitionOwnerContext): Promise<void>;
   refreshModelCatalog?(
     context?: ProviderTransitionOwnerContext,
   ): Promise<ProviderModelCatalogRefreshResult>;

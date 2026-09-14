@@ -25,9 +25,8 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 
 **Slash Commands & Skills** — Type `/` or `$` for reusable prompt templates or Skills from user- and vault-level scopes.
 
-**`@mention`** - Type `@` to mention anything you want the agent to work with, including vault files, subagents, and files in external directories.
+**`@mention`** — Type `@` to reference vault files, folders, and Collab member changes. Type `#` to reference Collab tickets.
 
-**Plan Mode** — Toggle via `Shift+Tab`. The agent explores and designs before implementing, then presents a plan for approval.
 
 **Instruction Mode (`/instruction`)** — Refined custom instructions added from the chat input.
 
@@ -59,6 +58,12 @@ Open the chat sidebar from the ribbon icon or command palette. Select text and u
 3. Enable the plugin
 
 Or install directly from the [community plugin page](https://community.obsidian.md/plugins/realclaudian).
+
+### Plugin size and Obsidian Sync
+
+Despite considerable effort to reduce the bundle size, keeping it below 5 MB is no longer practical with the latest Claude Agent SDK. The Obsidian community plugin page may therefore display a large-plugin warning, and Obsidian's official Sync service cannot sync the main plugin file because it supports only files smaller than 5 MB.
+
+If you use Obsidian Sync across multiple desktop devices, install and update Claudian separately on each device instead of relying on Sync to copy the plugin files.
 
 ### From source (development)
 

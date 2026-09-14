@@ -39,7 +39,6 @@ export interface ClaudeExecutionStrategy {
     queryToken: number,
   ): Promise<void>;
   cancel(queryToken: number | null, nativeTurnHandedOff: boolean): void;
-  setMode(mode: Parameters<Query['setPermissionMode']>[0]): Promise<boolean>;
   getRewindQuery(): Query | null;
   ensureReadyForRewind(
     request: ClaudeEncodedExecutionRequest,
@@ -151,14 +150,6 @@ implements ClaudeExecutionStrategy {
     }
   }
 
-  async setMode(
-    mode: Parameters<Query['setPermissionMode']>[0],
-  ): Promise<boolean> {
-    if (!this.query) return false;
-    await this.query.setPermissionMode(mode);
-    return true;
-  }
-
   getRewindQuery(): Query | null {
     return this.query;
   }
@@ -257,6 +248,10 @@ implements ClaudeExecutionStrategy {
     }
     if (request.effort !== current.effort) {
       await query.applyFlagSettings({ effortLevel: request.effort });
+      if (this.query !== query || this.disposed) return;
+    }
+    if (request.responseStyle !== current.responseStyle) {
+      await query.applyFlagSettings({ outputStyle: request.responseStyle });
       if (this.query !== query || this.disposed) return;
     }
     if (request.sdkPermissionMode !== current.sdkPermissionMode) {
@@ -508,10 +503,6 @@ implements ClaudeExecutionStrategy {
   ): void {
     this.activeAbortController?.abort();
     void this.activeQuery?.interrupt().catch(() => undefined);
-  }
-
-  setMode(): Promise<boolean> {
-    return Promise.resolve(false);
   }
 
   getRewindQuery(): Query | null {

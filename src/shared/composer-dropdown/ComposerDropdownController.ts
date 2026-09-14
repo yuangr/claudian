@@ -25,7 +25,6 @@ export class ComposerDropdownController {
   private activeMatch: ComposerTriggerMatch | null = null;
   private activeSource: ComposerDropdownSource | null = null;
   private destroyed = false;
-  private enabled = true;
   private generation = 0;
   private inputLoadTimer: number | null = null;
   private items: readonly ComposerDropdownItem[] = [];
@@ -68,7 +67,7 @@ export class ComposerDropdownController {
   }
 
   private rematchAndLoad(inputDriven: boolean): void {
-    if (!this.enabled || this.destroyed) {
+    if (this.destroyed) {
       this.hide();
       return;
     }
@@ -85,19 +84,19 @@ export class ComposerDropdownController {
         }
       }
     }
-    if (!sourceMatch?.match) {
+    if (!sourceMatch) {
       this.hide();
       return;
     }
-
-    if (this.activeSource?.id !== sourceMatch.source.id) this.activeFolder = null;
-    this.activeSource = sourceMatch.source;
-    this.activeMatch = sourceMatch.match;
+    const { match, source } = sourceMatch;
+    if (this.activeSource?.id !== source.id) this.activeFolder = null;
+    this.activeSource = source;
+    this.activeMatch = match;
     this.requestActiveLoad(inputDriven);
   }
 
   handleKeydown(event: KeyboardEvent): boolean {
-    if (!this.enabled || !this.view.isVisible() || event.isComposing) return false;
+    if (!this.view.isVisible() || event.isComposing) return false;
     switch (event.key) {
       case 'ArrowDown':
         event.preventDefault();
@@ -140,11 +139,6 @@ export class ComposerDropdownController {
     return this.view.isVisible();
   }
 
-  setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
-    if (!enabled) this.hide();
-  }
-
   private currentFolderQuery(match: ComposerTriggerMatch): string | null {
     const prefix = this.activeFolder?.item.inputPrefix;
     if (!prefix) return match.query;
@@ -174,7 +168,7 @@ export class ComposerDropdownController {
   private requestActiveLoad(inputDriven: boolean): void {
     const source = this.activeSource;
     const match = this.activeMatch;
-    if (!source || !match || this.destroyed || !this.enabled) return;
+    if (!source || !match || this.destroyed) return;
 
     const folderQuery = this.currentFolderQuery(match);
     if (this.activeFolder && folderQuery === null) {
@@ -204,7 +198,6 @@ export class ComposerDropdownController {
       !source
       || !match
       || this.destroyed
-      || !this.enabled
       || generation !== this.generation
     ) return;
 
@@ -315,10 +308,14 @@ export class ComposerDropdownController {
   }
 
   private replaceRange(match: ComposerTriggerMatch, replacement: string): void {
-    let after = this.inputEl.value.slice(match.end);
-    if (/\s$/.test(replacement) && /^\s/.test(after)) after = after.slice(1);
+    const duplicateSpace = /\s$/.test(replacement) && /^\s/.test(this.inputEl.value.slice(match.end));
+    const end = match.end + (duplicateSpace ? 1 : 0);
+    if (this.inputEl.replaceText) {
+      this.inputEl.replaceText(match.start, end, replacement);
+      return;
+    }
     const before = this.inputEl.value.slice(0, match.start);
-    this.inputEl.value = before + replacement + after;
+    this.inputEl.value = before + replacement + this.inputEl.value.slice(end);
     const cursor = before.length + replacement.length;
     this.inputEl.selectionStart = cursor;
     this.inputEl.selectionEnd = cursor;

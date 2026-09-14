@@ -8,7 +8,6 @@ import type {
   TabAttention,
   TabReviewOutcome,
   ThinkingBlockState,
-  TodoItem,
   WriteEditState,
 } from './types';
 
@@ -36,14 +35,10 @@ function createInitialState(): ChatStateData {
     pendingTools: new Map(),
     usage: null,
     ignoreUsageUpdates: false,
-    currentTodos: null,
     attention: null,
     autoScrollEnabled: true, // Default; controllers will override based on settings
     responseStartTime: null,
     flavorTimerInterval: null,
-    pendingNewSessionPlan: null,
-    planFilePath: null,
-    prePlanPermissionMode: null,
   };
 }
 
@@ -290,21 +285,6 @@ export class ChatState {
   }
 
   // ============================================
-  // Current Todos (for persistent bottom panel)
-  // ============================================
-
-  get currentTodos(): TodoItem[] | null {
-    return this.state.currentTodos ? [...this.state.currentTodos] : null;
-  }
-
-  set currentTodos(value: TodoItem[] | null) {
-    // Normalize empty arrays to null for consistency
-    const normalizedValue = (value && value.length > 0) ? value : null;
-    this.state.currentTodos = normalizedValue;
-    this._callbacks.onTodosChanged?.(normalizedValue);
-  }
-
-  // ============================================
   // Runtime-only Attention State
   // ============================================
 
@@ -413,30 +393,6 @@ export class ChatState {
     this.flavorTimerIntervalWindow = value === null ? null : this.getDefaultTimerWindow();
   }
 
-  get pendingNewSessionPlan(): string | null {
-    return this.state.pendingNewSessionPlan;
-  }
-
-  set pendingNewSessionPlan(value: string | null) {
-    this.state.pendingNewSessionPlan = value;
-  }
-
-  get planFilePath(): string | null {
-    return this.state.planFilePath;
-  }
-
-  set planFilePath(value: string | null) {
-    this.state.planFilePath = value;
-  }
-
-  get prePlanPermissionMode(): string | null {
-    return this.state.prePlanPermissionMode;
-  }
-
-  set prePlanPermissionMode(value: string | null) {
-    this.state.prePlanPermissionMode = value;
-  }
-
   // ============================================
   // Reset Methods
   // ============================================
@@ -495,7 +451,6 @@ export class ChatState {
     this.clearMaps();
     this.state.queuedMessage = null;
     this.usage = null;
-    this.currentTodos = null;
     this.clearAttention();
     this.autoScrollEnabled = true;
   }

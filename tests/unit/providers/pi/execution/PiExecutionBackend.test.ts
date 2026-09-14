@@ -131,7 +131,6 @@ function createInteractionPort(): ProviderInteractionPort {
     askUserQuestion: jest.fn(),
     dismissInteraction: jest.fn(),
     requestApproval: jest.fn(),
-    requestPlanDecision: jest.fn(),
   };
 }
 
@@ -356,7 +355,6 @@ describe('PiExecutionBackend', () => {
     const context = {
       allowIsolatedMetadataCreation: true,
       conversation: null,
-      externalContextPaths: [],
       plugin: host,
     };
 
@@ -407,7 +405,6 @@ describe('PiExecutionBackend', () => {
     const context = {
       allowIsolatedMetadataCreation: true,
       conversation: null,
-      externalContextPaths: [],
       plugin: host,
     };
     const mutationEntered = createDeferred();
@@ -466,7 +463,6 @@ describe('PiExecutionBackend', () => {
     const load = services.commandLoader!.loadCommands({
       allowIsolatedMetadataCreation: true,
       conversation: null,
-      externalContextPaths: [],
       plugin: host,
     });
     await flush();

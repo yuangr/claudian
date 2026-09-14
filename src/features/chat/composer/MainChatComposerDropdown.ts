@@ -11,6 +11,7 @@ import {
   ComposerDropdownController,
   SlashCommandSource,
 } from '@/shared/composer-dropdown';
+import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
 
 import type { FileContextManager } from '../ui/FileContext';
 import { CollabMemberChangesFolder } from './CollabMemberChangesFolder';
@@ -34,7 +35,7 @@ export class MainChatComposerDropdown {
 
   constructor(
     containerEl: HTMLElement,
-    inputEl: HTMLTextAreaElement,
+    inputEl: ComposerInputElement,
     fileContextManager: FileContextManager,
     options: MainChatComposerDropdownOptions,
   ) {
@@ -95,10 +96,6 @@ export class MainChatComposerDropdown {
 
   isVisible(): boolean {
     return this.controller.isVisible();
-  }
-
-  setEnabled(enabled: boolean): void {
-    this.controller.setEnabled(enabled);
   }
 
   setHiddenCommands(commands: ReadonlySet<string>): void {

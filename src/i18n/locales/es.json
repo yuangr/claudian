@@ -57,18 +57,6 @@
       "errorNoActiveTab": "No hay ninguna pestaña activa",
       "commandNoMessages": "No se puede bifurcar: no hay mensajes en la conversación",
       "commandNoAssistantUuid": "No se puede bifurcar: no hay respuesta del asistente con identificadores"
-    },
-    "bangBash": {
-      "placeholder": "> Ejecuta un comando bash...",
-      "commandPanel": "Panel de comandos",
-      "copyAriaLabel": "Copiar la salida del comando más reciente",
-      "clearAriaLabel": "Limpiar la salida de bash",
-      "commandLabel": "{command}",
-      "statusLabel": "Estado: {status}",
-      "collapseOutput": "Contraer la salida del comando",
-      "expandOutput": "Expandir la salida del comando",
-      "running": "Ejecutando...",
-      "copyFailed": "No se pudo copiar al portapapeles"
     }
   },
   "collab": {
@@ -475,39 +463,19 @@
     },
     "hotkeys": "Atajos de teclado",
     "inlineEditHotkey": {
-      "name": "Edición en línea",
-      "descWithKey": "Atajo actual: {hotkey}",
-      "descNoKey": "Sin atajo configurado",
-      "btnChange": "Cambiar",
-      "btnSet": "Configurar"
+      "name": "Edición en línea"
     },
     "openChatHotkey": {
-      "name": "Abrir chat",
-      "descWithKey": "Atajo actual: {hotkey}",
-      "descNoKey": "Sin atajo configurado",
-      "btnChange": "Cambiar",
-      "btnSet": "Configurar"
+      "name": "Abrir chat"
     },
     "newSessionHotkey": {
-      "name": "Reemplazar conversación actual",
-      "descWithKey": "Atajo actual: {hotkey}",
-      "descNoKey": "Sin atajo configurado",
-      "btnChange": "Cambiar",
-      "btnSet": "Configurar"
+      "name": "Reemplazar conversación actual"
     },
     "newTabHotkey": {
-      "name": "Nuevo",
-      "descWithKey": "Atajo actual: {hotkey}",
-      "descNoKey": "Sin atajo configurado",
-      "btnChange": "Cambiar",
-      "btnSet": "Configurar"
+      "name": "Nuevo"
     },
     "closeTabHotkey": {
-      "name": "Cerrar pestaña",
-      "descWithKey": "Atajo actual: {hotkey}",
-      "descNoKey": "Sin atajo configurado",
-      "btnChange": "Cambiar",
-      "btnSet": "Configurar"
+      "name": "Cerrar pestaña"
     },
     "slashCommands": {
       "name": "Comandos y habilidades",
@@ -517,12 +485,6 @@
       "name": "Comandos y habilidades ocultos",
       "desc": "Oculta comandos y habilidades específicos del menú desplegable. Útil para ocultar entradas de Claude Code que no son relevantes para Claudian. Ingresa los nombres sin la barra inicial, uno por línea.",
       "placeholder": "commit\nbuild\ntest"
-    },
-    "mcpServers": {
-      "name": "Servidores MCP",
-      "descBeforeCommand": "Claude Code gestiona servidores MCP mediante su propia CLI. Configúralos con ",
-      "descAfterCommand": " y estarán disponibles en Claudian. ",
-      "learnMore": "Más información"
     },
     "plugins": {
       "name": "Plugins de Claude Code",
@@ -624,13 +586,6 @@
       "name": "Habilitar extensión de Chrome",
       "desc": "Permitir que Claude interactúe con Chrome a través de la extensión claude-in-chrome. Requiere que la extensión esté instalada. Requiere reinicio de sesión."
     },
-    "enableBangBash": {
-      "name": "Habilitar modo bash (!)",
-      "desc": "Escribe ! en una entrada vacía para entrar en modo bash. Ejecuta comandos directamente mediante Node.js child_process. Requiere volver a abrir la vista.",
-      "validation": {
-        "noNode": "Node.js no se encontró en PATH. Instala Node.js o revisa tu configuración de PATH."
-      }
-    },
     "maxWarmAgentProcesses": {
       "name": "Máximo de sesiones en ejecución simultáneas",
       "desc": "Número máximo de sesiones de agente listas a la vez (5-10). Las sesiones inactivas más antiguas se pausan automáticamente y se reanudan al usarlas."
@@ -702,6 +657,17 @@
       "leftSidebar": "Barra lateral izquierda",
       "mainTab": "Pestaña del editor principal"
     },
+    "cliInstallation": {
+      "disclosure": "Instalación de {name}",
+      "description": "Ruta CLI opcional para este equipo. Déjala vacía para detectar automáticamente.",
+      "checking": "Comprobando CLI…",
+      "versionUnavailable": "Versión no disponible",
+      "notFound": "No encontrado",
+      "custom": "Ruta personalizada",
+      "auto": "Detectado automáticamente",
+      "checkFailed": "No se pudo comprobar el CLI",
+      "saveFailed": "No se pudo guardar la ruta. Inténtalo de nuevo."
+    },
     "cliPath": {
       "name": "Ruta CLI Claude",
       "desc": "Ruta personalizada a Claude Code CLI. Dejar vacío para detección automática.",
@@ -721,6 +687,14 @@
       "desc": "Hacer que los modelos de {provider} activados estén disponibles para conversaciones nuevas. Las sesiones existentes se conservan al desactivar el proveedor.",
       "lastProviderWarning": "Debe haber al menos un proveedor habilitado para que Claudian funcione.",
       "noModelsWarning": "No hay modelos de {provider} activados. Ve a Modelos más abajo y activa al menos uno."
+    },
+    "claude": {
+      "responseStyle": {
+        "name": "Estilo de respuesta",
+        "desc": "Predeterminado usa el estilo habitual de Claude. Conciso empieza con los resultados y omite preámbulos. Requiere Claude Code 2.1.237 o posterior.",
+        "default": "Predeterminado",
+        "concise": "Conciso"
+      }
     },
     "codex": {
       "installationMethod": {
@@ -751,6 +725,12 @@
         "desc": "Añade IDs de modelos Codex al selector, uno por línea. `OPENAI_MODEL` sigue teniendo prioridad cuando está definido.",
         "placeholder": "gpt-5.4\ngpt-5.3-codex-spark"
       },
+      "responseStyle": {
+        "name": "Estilo de respuesta",
+        "desc": "Elige cómo se comunica Codex en los modelos compatibles. Se aplica a partir del siguiente mensaje.",
+        "pragmatic": "Pragmático",
+        "friendly": "Amigable"
+      },
       "reasoningSummary": {
         "name": "Resumen de razonamiento",
         "desc": "Muestra un resumen del proceso de razonamiento del modelo en el bloque de pensamiento.",
@@ -774,11 +754,6 @@
         "name": "Subagentes de Codex",
         "desc": "Gestiona subagentes Codex de nivel vault guardados en .codex/agents/. Cada archivo TOML define un agente personalizado."
       },
-      "mcp": {
-        "descBeforeCommand": "Codex gestiona servidores MCP mediante su propia CLI. Configúralos con ",
-        "descAfterCommand": " y estarán disponibles en Claudian. ",
-        "learnMore": "Más información"
-      },
       "environment": {
         "name": "Entorno de Codex",
         "desc": "Solo variables de ejecución propiedad de Codex. Úsalo para ajustes OPENAI_* y CODEX_*. Si la autodetección de Codex necesita ayuda, añade su directorio de instalación al PATH compartido en lugar de esta sección del proveedor."
@@ -788,30 +763,6 @@
       "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
       "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
       "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
-    },
-    "codexSkills": {
-      "modal": {
-        "titleEdit": "Editar habilidad de Codex",
-        "titleAdd": "Añadir habilidad de Codex",
-        "directory": "Directorio",
-        "directoryDesc": "Dónde guardar la habilidad",
-        "skillName": "Nombre de habilidad",
-        "skillNameDesc": "El nombre usado después de $ (por ejemplo, \"analyze\" para $analyze)",
-        "description": "Descripción",
-        "descriptionDesc": "Descripción opcional mostrada en el desplegable",
-        "instructions": "Instrucciones",
-        "instructionsDesc": "Instrucciones de la habilidad (contenido de SKILL.md)",
-        "instructionsPlaceholder": "Analyze the code for..."
-      },
-      "instructionsRequired": "Las instrucciones son obligatorias",
-      "saveFailed": "No se pudo guardar la habilidad de Codex",
-      "header": "Habilidades de Codex",
-      "noSkills": "No hay habilidades Codex en el vault. Haz clic en + para crear una.",
-      "skillBadge": "habilidad",
-      "deleted": "Habilidad de Codex \"{name}\" eliminada",
-      "deleteFailed": "No se pudo eliminar la habilidad de Codex",
-      "created": "Habilidad de Codex \"{name}\" creada",
-      "updated": "Habilidad de Codex \"{name}\" actualizada"
     },
     "codexSubagents": {
       "modal": {

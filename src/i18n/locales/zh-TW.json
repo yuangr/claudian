@@ -57,18 +57,6 @@
       "errorNoActiveTab": "沒有使用中的分頁",
       "commandNoMessages": "無法分叉：對話中沒有訊息",
       "commandNoAssistantUuid": "無法分叉：沒有帶識別碼的助手回覆"
-    },
-    "bangBash": {
-      "placeholder": "> 執行 bash 指令...",
-      "commandPanel": "指令面板",
-      "copyAriaLabel": "複製最新的指令輸出",
-      "clearAriaLabel": "清除 bash 輸出",
-      "commandLabel": "{command}",
-      "statusLabel": "狀態：{status}",
-      "collapseOutput": "摺疊指令輸出",
-      "expandOutput": "展開指令輸出",
-      "running": "執行中...",
-      "copyFailed": "複製到剪貼簿失敗"
     }
   },
   "collab": {
@@ -475,39 +463,19 @@
     },
     "hotkeys": "快捷鍵",
     "inlineEditHotkey": {
-      "name": "內嵌編輯",
-      "descWithKey": "目前快捷鍵：{hotkey}",
-      "descNoKey": "未設定快捷鍵",
-      "btnChange": "變更",
-      "btnSet": "設定快捷鍵"
+      "name": "內嵌編輯"
     },
     "openChatHotkey": {
-      "name": "開啟聊天",
-      "descWithKey": "目前快捷鍵：{hotkey}",
-      "descNoKey": "未設定快捷鍵",
-      "btnChange": "變更",
-      "btnSet": "設定快捷鍵"
+      "name": "開啟聊天"
     },
     "newSessionHotkey": {
-      "name": "取代目前對話",
-      "descWithKey": "目前快捷鍵：{hotkey}",
-      "descNoKey": "未設定快捷鍵",
-      "btnChange": "變更",
-      "btnSet": "設定快捷鍵"
+      "name": "取代目前對話"
     },
     "newTabHotkey": {
-      "name": "新增",
-      "descWithKey": "目前快捷鍵：{hotkey}",
-      "descNoKey": "未設定快捷鍵",
-      "btnChange": "變更",
-      "btnSet": "設定快捷鍵"
+      "name": "新增"
     },
     "closeTabHotkey": {
-      "name": "關閉分頁",
-      "descWithKey": "目前快捷鍵：{hotkey}",
-      "descNoKey": "未設定快捷鍵",
-      "btnChange": "變更",
-      "btnSet": "設定快捷鍵"
+      "name": "關閉分頁"
     },
     "slashCommands": {
       "name": "命令與技能",
@@ -517,12 +485,6 @@
       "name": "隱藏命令與技能",
       "desc": "從下拉選單中隱藏特定的命令與技能。適用於隱藏與 Claudian 無關的 Claude Code 項目。每行輸入一個名稱，無需前導斜線。",
       "placeholder": "commit\nbuild\ntest"
-    },
-    "mcpServers": {
-      "name": "MCP 伺服器",
-      "descBeforeCommand": "Claude Code 透過自己的 CLI 管理 MCP 伺服器。請使用 ",
-      "descAfterCommand": " 進行設定，它們會在 Claudian 中可用。",
-      "learnMore": "了解更多"
     },
     "plugins": {
       "name": "Claude Code 外掛程式",
@@ -624,13 +586,6 @@
       "name": "啟用 Chrome 擴充功能",
       "desc": "允許 Claude 透過 claude-in-chrome 擴充功能與 Chrome 互動。需要安裝該擴充功能。需要重新啟動工作階段。"
     },
-    "enableBangBash": {
-      "name": "啟用 bash 模式 (!)",
-      "desc": "在空白輸入框中輸入 ! 以進入 bash 模式。透過 Node.js child_process 直接執行指令。需要重新開啟檢視。",
-      "validation": {
-        "noNode": "在 PATH 中找不到 Node.js。請安裝 Node.js 或檢查 PATH 設定。"
-      }
-    },
     "maxWarmAgentProcesses": {
       "name": "最大並行執行工作階段數",
       "desc": "同時保持就緒的代理工作階段最大數量（5-10）。較早的閒置工作階段會自動暫停，並在使用時恢復。"
@@ -702,6 +657,17 @@
       "leftSidebar": "左側邊欄",
       "mainTab": "主編輯器分頁"
     },
+    "cliInstallation": {
+      "disclosure": "{name} 安裝",
+      "description": "此電腦的選用 CLI 路徑。留空以自動偵測。",
+      "checking": "正在偵測 CLI…",
+      "versionUnavailable": "版本未知",
+      "notFound": "未找到",
+      "custom": "自訂路徑",
+      "auto": "自動偵測",
+      "checkFailed": "無法偵測 CLI",
+      "saveFailed": "無法儲存路徑，請重試。"
+    },
     "cliPath": {
       "name": "Claude CLI 路徑",
       "desc": "Claude Code CLI 的自訂路徑。留空使用自動檢測。",
@@ -721,6 +687,14 @@
       "desc": "讓已啟用的 {provider} 模型可用於新對話。停用後，現有工作階段仍會保留。",
       "lastProviderWarning": "至少需要啟用一個提供者，Claudian 才能正常運作。",
       "noModelsWarning": "未啟用任何 {provider} 模型。請前往下方的「模型」區段並至少啟用一個模型。"
+    },
+    "claude": {
+      "responseStyle": {
+        "name": "回覆風格",
+        "desc": "預設使用 Claude 的一般風格。簡潔模式先提供結果，省略開場白。需要 Claude Code 2.1.237 或更新版本。",
+        "default": "預設",
+        "concise": "簡潔"
+      }
     },
     "codex": {
       "installationMethod": {
@@ -751,6 +725,12 @@
         "desc": "向選擇器追加額外的 Codex 模型 ID，每行一個。設定 `OPENAI_MODEL` 時仍優先生效。",
         "placeholder": "gpt-5.4\ngpt-5.3-codex-spark"
       },
+      "responseStyle": {
+        "name": "回覆風格",
+        "desc": "選擇支援此功能的模型中 Codex 的溝通風格。從下一則訊息開始生效。",
+        "pragmatic": "務實",
+        "friendly": "友善"
+      },
       "reasoningSummary": {
         "name": "推理摘要",
         "desc": "在思考區塊中顯示模型推理過程的摘要。",
@@ -774,11 +754,6 @@
         "name": "Codex 子代理",
         "desc": "管理儲存在 .codex/agents/ 中的 Vault 層級 Codex 子代理。每個 TOML 檔案定義一個自訂代理。"
       },
-      "mcp": {
-        "descBeforeCommand": "Codex 透過自己的 CLI 管理 MCP 伺服器。請使用 ",
-        "descAfterCommand": " 進行設定，它們會在 Claudian 中可用。",
-        "learnMore": "了解更多"
-      },
       "environment": {
         "name": "Codex 環境",
         "desc": "僅限 Codex 擁有的執行階段變數。用於 OPENAI_* 和 CODEX_* 設定。如果 Codex 自動偵測需要協助，請把安裝目錄新增到共享 PATH，而不是此提供者環境。"
@@ -788,30 +763,6 @@
       "sectionTitle": "Skills", "fixedRoot": "Managed in .agents/skills", "sharedExpectation": "Manage shared skills in .agents/skills/ for compatible providers.", "noSkills": "No shared skills configured. Click + to create one.", "skillBadge": "skill", "diagnosticsTitle": "Skills needing attention", "loadFailed": "Could not load shared skills.", "savedRefreshFailed": "Saved, but provider refresh failed.", "validationFailed": "Invalid skill: {message}", "collisionFailed": "A skill named \"{name}\" already exists.", "saveFailed": "Failed to save shared skill: {message}", "deleteFailed": "Failed to move shared skill to trash: {message}", "staleConflict": "This skill changed elsewhere; refresh before saving.", "created": "Shared skill \"{name}\" created.", "updated": "Shared skill \"{name}\" updated.", "deleted": "Shared skill \"{name}\" moved to trash.",
       "modal": { "titleEdit": "Edit Shared Skill", "titleAdd": "Add Shared Skill", "name": "Skill name", "nameDesc": "Lowercase letters and numbers separated by single hyphens", "namePlaceholder": "code-reviewer", "description": "Description", "descriptionDesc": "Required portable description used by providers to select the skill", "descriptionPlaceholder": "Reviews code for correctness and maintainability", "instructions": "Instructions", "instructionsDesc": "Required SKILL.md instructions", "instructionsPlaceholder": "Review the supplied code and report actionable findings..." },
       "delete": { "title": "Delete Shared Skill", "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.", "confirm": "Move to trash" }
-    },
-    "codexSkills": {
-      "modal": {
-        "titleEdit": "編輯 Codex 技能",
-        "titleAdd": "新增 Codex 技能",
-        "directory": "目錄",
-        "directoryDesc": "技能的儲存位置",
-        "skillName": "技能名稱",
-        "skillNameDesc": "在 $ 後使用的名稱（例如 $analyze 的名稱為「analyze」）",
-        "description": "描述",
-        "descriptionDesc": "下拉選單中顯示的可選描述",
-        "instructions": "指令",
-        "instructionsDesc": "技能指令（SKILL.md 內容）",
-        "instructionsPlaceholder": "Analyze the code for..."
-      },
-      "instructionsRequired": "指令為必填項",
-      "saveFailed": "儲存 Codex 技能失敗",
-      "header": "Codex 技能",
-      "noSkills": "Vault 中沒有 Codex 技能。點擊 + 建立一個。",
-      "skillBadge": "技能",
-      "deleted": "已刪除 Codex 技能「{name}」",
-      "deleteFailed": "刪除 Codex 技能失敗",
-      "created": "已建立 Codex 技能「{name}」",
-      "updated": "已更新 Codex 技能「{name}」"
     },
     "codexSubagents": {
       "modal": {

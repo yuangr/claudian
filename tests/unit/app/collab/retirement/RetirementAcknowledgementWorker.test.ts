@@ -32,6 +32,7 @@ describe('RetirementAcknowledgementWorker', () => {
       acknowledgeCloud: jest.fn(),
     };
     const worker = new RetirementAcknowledgementWorker(store, client, {
+      now: () => new Date(ACKNOWLEDGED_AT),
       projectRecoveryAdmission,
     });
 
@@ -76,6 +77,7 @@ describe('RetirementAcknowledgementWorker', () => {
       acknowledgeCloud: jest.fn(),
     };
     const worker = new RetirementAcknowledgementWorker(store, client, {
+      now: () => new Date(ACKNOWLEDGED_AT),
       projectRecoveryAdmission: admitProjectRecovery,
       scheduleRetry: retry,
     });
@@ -101,6 +103,7 @@ describe('RetirementAcknowledgementWorker', () => {
       acknowledgeCloud: jest.fn(),
     };
     const worker = new RetirementAcknowledgementWorker(store, client, {
+      now: () => new Date(ACKNOWLEDGED_AT),
       projectRecoveryAdmission: admitProjectRecovery,
       scheduleRetry,
     });
@@ -140,6 +143,7 @@ describe('RetirementAcknowledgementWorker', () => {
       ),
     };
     const first = new RetirementAcknowledgementWorker(store, firstClient, {
+      now: () => new Date(ACKNOWLEDGED_AT),
       projectRecoveryAdmission: admitProjectRecovery,
       scheduleRetry: jest.fn(),
     });
@@ -162,6 +166,7 @@ describe('RetirementAcknowledgementWorker', () => {
       }),
     };
     const resumed = new RetirementAcknowledgementWorker(store, secondClient, {
+      now: () => new Date(ACKNOWLEDGED_AT),
       projectRecoveryAdmission: admitProjectRecovery,
     });
 

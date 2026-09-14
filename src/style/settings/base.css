@@ -76,20 +76,17 @@
   display: block;
 }
 
-/* Codex placeholder */
-.claudian-settings-codex-placeholder {
-  padding: 40px 20px;
-  text-align: center;
-  color: var(--text-muted);
-  font-size: var(--font-ui-small);
+/* Settings page - remove separator lines from setting items */
+.setting-group > .setting-items:has(> .claudian-settings) {
+  background: transparent;
 }
 
-/* Settings page - remove separator lines from setting items */
 .setting-item.claudian-settings {
   display: block;
   width: 100%;
   padding: 0;
   border-top: none;
+  background: transparent;
 }
 
 .claudian-settings .setting-item {
@@ -113,10 +110,6 @@
   font-size: var(--font-ui-medium);
   font-weight: var(--font-semibold);
   color: var(--text-normal);
-}
-
-.claudian-mcp-settings-desc {
-  margin-bottom: 12px;
 }
 
 .claudian-collab-git-installation-help {
@@ -167,9 +160,7 @@
 
 /* Custom section descriptions - align with items */
 .claudian-sp-settings-desc,
-.claudian-mcp-settings-desc,
-.claudian-plugin-settings-desc,
-.claudian-approved-desc {
+.claudian-plugin-settings-desc {
   padding: 0 12px;
 }
 

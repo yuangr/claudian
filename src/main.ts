@@ -368,7 +368,6 @@ export default class ClaudianPlugin extends Plugin {
             view,
             editContext,
             notePath,
-            () => this.getView()?.getActiveTab()?.ui.externalContextSelector?.getExternalContexts() ?? []
           );
           const result = await modal.openAndWait();
 
@@ -1229,22 +1228,6 @@ export default class ClaudianPlugin extends Plugin {
       onConversationDeleted: (conversationId) => this.resetDeletedConversationTabs(conversationId),
     });
 
-    // Plan mode is ephemeral — normalize back to normal on load so the app
-    // doesn't start stuck in plan mode after a restart (prePlanPermissionMode is lost)
-    if (this.settings.permissionMode === 'plan') {
-      this.settings.permissionMode = 'normal';
-    }
-    if (
-      this.settings.savedProviderPermissionMode
-      && typeof this.settings.savedProviderPermissionMode === 'object'
-      && !Array.isArray(this.settings.savedProviderPermissionMode)
-    ) {
-      for (const [providerId, mode] of Object.entries(this.settings.savedProviderPermissionMode)) {
-        if (mode === 'plan') {
-          this.settings.savedProviderPermissionMode[providerId] = 'normal';
-        }
-      }
-    }
     const didNormalizeProviderSelection = ProviderSettingsCoordinator.normalizeProviderSelection(
       this.settings,
     );
@@ -1795,7 +1778,6 @@ export default class ClaudianPlugin extends Plugin {
       linkedContentPath: meta.linkedContentPath,
       isPinned: meta.isPinned,
       isArchived: meta.isArchived,
-      externalContextPaths: meta.externalContextPaths,
       usage: meta.usage,
       titleGenerationStatus: meta.titleGenerationStatus,
       resumeAtMessageId: meta.resumeAtMessageId,
@@ -2081,10 +2063,6 @@ export default class ClaudianPlugin extends Plugin {
                     `${ProviderRegistry.getProviderDisplayName(providerId)}: ${result.diagnostics}`,
                   );
                 }
-                await ProviderWorkspaceRegistry.refreshAgentMentions(
-                  providerId,
-                  transitionOwner,
-                );
               }
             }
           },

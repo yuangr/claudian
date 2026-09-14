@@ -31,7 +31,6 @@ import {
   initializeTabExecution,
   invalidateTabProviderCommands,
   refreshTabProviderUI,
-  restorePrePlanMode,
   syncComposerDropdownForProvider,
   syncTabProviderServices,
   toggleTabServiceTier,
@@ -88,7 +87,7 @@ export function buildTabRuntimeControllers(
         return false;
       }
 
-      refreshTabProviderUI(tab, plugin);
+      refreshTabProviderUI(tab);
       applyProviderUIGating(tab, plugin);
       return true;
     } catch (error) {
@@ -156,7 +155,6 @@ export function buildTabRuntimeControllers(
     renderer,
     subagentManager: services.subagentManager,
     getMessagesEl: () => dom.messagesEl,
-    getFileContextManager: () => ui.fileContextManager,
     updateQueueIndicator: () => (
       runtimeRef.requirePublished().controllers.inputController.updateQueueIndicator()
     ),
@@ -237,15 +235,12 @@ export function buildTabRuntimeControllers(
         runtimeRef.requirePublished().controllers.inputController
           .restoreRewoundMessageToComposer(message)
       ),
-      getFileContextManager: () => ui.fileContextManager,
       getLinkedContentController: () => ui.linkedContentController,
       getImageContextManager: () => ui.imageContextManager,
-      getExternalContextSelector: () => ui.externalContextSelector,
       clearQueuedMessage: () => (
         runtimeRef.requirePublished().controllers.inputController.clearQueuedMessage()
       ),
       getTitleGenerationService: () => services.titleGenerationService,
-      getStatusPanel: () => ui.statusPanel,
       getExecutionCoordinator: () => shell.executionCoordinator,
       ensureExecutionInitialized,
       getProviderId: () => getTabProviderId(runtimeRef.requirePublished(), plugin),
@@ -285,7 +280,7 @@ export function buildTabRuntimeControllers(
           ? createConversationExecutionBinding(conversation)
           : null);
 
-        refreshTabProviderUI(tab, plugin);
+        refreshTabProviderUI(tab);
         applyProviderUIGating(tab, plugin);
       },
     },
@@ -303,7 +298,7 @@ export function buildTabRuntimeControllers(
         if (tab.providerId !== previousProviderId) {
           syncTabProviderServices(tab, services, plugin);
         }
-        refreshTabProviderUI(tab, plugin);
+        refreshTabProviderUI(tab);
         applyProviderUIGating(tab, plugin);
         syncComposerDropdownForProvider(tab, plugin, shell.providerCatalogResolver);
       },
@@ -333,14 +328,11 @@ export function buildTabRuntimeControllers(
     getInputContainerEl: () => dom.inputContainerEl,
     getWelcomeEl: () => dom.welcomeEl,
     getMessagesEl: () => dom.messagesEl,
-    getFileContextManager: () => ui.fileContextManager,
     getLinkedContentController: () => ui.linkedContentController,
     getImageContextManager: () => ui.imageContextManager,
-    getExternalContextSelector: () => ui.externalContextSelector,
     getInstructionModeManager: () => ui.instructionModeManager,
     getInstructionRefineService: () => services.instructionRefineService,
     getTitleGenerationService: () => services.titleGenerationService,
-    getStatusPanel: () => ui.statusPanel,
     generateId: createTabMessageId,
     getAuxiliaryModel: () => getTabSelectedModel(runtimeRef.requirePublished(), plugin),
     getExecutionCoordinator: () => shell.executionCoordinator,
@@ -362,16 +354,6 @@ export function buildTabRuntimeControllers(
           return viewHost.handleNewConversationCommand!();
         }
       : undefined,
-    handleNewSessionPlan: viewHost.handleNewSessionPlan
-      ? (planContent) => {
-          const runtime = runtimeRef.requirePublished();
-          if (!isRuntimeLive(runtime)) return Promise.resolve(true);
-          return viewHost.handleNewSessionPlan!(
-            planContent,
-            () => isRuntimeLive(runtime),
-          );
-        }
-      : undefined,
     onForkAll: forkRequestCallback
       ? () => handleForkAll(
           runtimeRef.requirePublished(),
@@ -381,9 +363,6 @@ export function buildTabRuntimeControllers(
         )
       : undefined,
     toggleFastMode: () => toggleTabServiceTier(runtimeRef.requirePublished(), plugin),
-    restorePrePlanPermissionModeIfNeeded: () => (
-      restorePrePlanMode(runtimeRef.requirePublished(), plugin)
-    ),
     captureReviewableSettlement: shell.captureReviewableSettlement ?? undefined,
   });
   const navigationController = new NavigationController({
@@ -393,7 +372,6 @@ export function buildTabRuntimeControllers(
     isStreaming: () => state.isStreaming,
     shouldSkipEscapeHandling: () => {
       if (ui.instructionModeManager.isActive()) return true;
-      if (ui.bangBashModeManager?.isActive()) return true;
       if (inputController.isResumeDropdownVisible()) return true;
       if (ui.composerDropdown.isVisible()) return true;
       return false;

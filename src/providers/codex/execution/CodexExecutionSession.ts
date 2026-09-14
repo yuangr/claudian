@@ -544,10 +544,7 @@ export class CodexExecutionSession
         undefined,
         this.resolveTargetWorkingDirectory(),
       );
-      const isPlanTurn = request.configuration.mode === 'plan'
-        || request.configuration.permissionMode === 'plan'
-        || settings.permissionMode === 'plan';
-      this.notificationRouter.beginTurn({ isPlanTurn });
+      this.notificationRouter.beginTurn();
       this.pendingTurnNotifications = [];
 
       if (isCompactRequest(request)) {
@@ -580,7 +577,7 @@ export class CodexExecutionSession
         settings,
       );
       const collaborationMode = {
-        mode: isPlanTurn ? 'plan' as const : 'default' as const,
+        mode: 'default' as const,
         settings: {
           model,
           reasoning_effort: effort,
@@ -596,7 +593,8 @@ export class CodexExecutionSession
         serviceTier,
         effort,
         summary: getEffectiveCodexReasoningSummary(settings, model),
-        sandboxPolicy: this.buildTurnSandboxPolicy(request, policy),
+        personality: getCodexProviderSettings(settings).responseStyle,
+        sandboxPolicy: policy.sandboxPolicy,
         collaborationMode,
       });
       this.markNativeConversationContextEstablished(run);
@@ -1843,7 +1841,6 @@ export class CodexExecutionSession
 
     const permissionMode =
       normalizeString(request.configuration.permissionMode)
-      ?? normalizeString(request.configuration.mode)
       ?? normalizeString(settings.permissionMode)
       ?? 'normal';
     const safeMode = getCodexProviderSettings(settings).safeMode;
@@ -1854,32 +1851,17 @@ export class CodexExecutionSession
         ? { type: 'dangerFullAccess' }
         : sandboxConfig.sandbox === 'read-only'
           ? strictReadOnlySandbox()
-          : this.buildWorkspaceWriteSandboxPolicy([]),
+          : this.buildWorkspaceWriteSandboxPolicy(),
     };
   }
 
-  private buildTurnSandboxPolicy(
-    request: ProviderExecutionRequest,
-    policy: CodexPolicy,
-  ): SandboxPolicy {
-    if (policy.sandbox !== 'workspace-write') return policy.sandboxPolicy;
-    const externalPaths = [
-      ...(request.context?.externalContextPaths ?? []),
-      ...(request.configuration.externalWorkspaceRoots ?? []),
-    ];
-    return this.buildWorkspaceWriteSandboxPolicy(externalPaths);
-  }
-
-  private buildWorkspaceWriteSandboxPolicy(
-    externalPaths: readonly string[],
-  ): SandboxPolicy {
+  private buildWorkspaceWriteSandboxPolicy(): SandboxPolicy {
     const transcriptRoot = this.resolveTranscriptRootTarget();
     const memoriesDir = deriveCodexMemoriesDirFromSessionsRoot(transcriptRoot)
       ?? this.runtimeContext?.memoriesDirTarget
       ?? null;
     const roots = [
       this.resolveTargetWorkingDirectory(),
-      ...externalPaths.map(hostPath => this.mapRequiredHostPath(hostPath)),
       memoriesDir,
       this.mapHostPathToTarget(os.tmpdir()),
       this.launchSpec?.target.platformFamily === 'unix' ? '/tmp' : null,
@@ -2116,9 +2098,6 @@ function resolveCodexSandboxConfig(
 ): { approvalPolicy: string; sandbox: string } {
   if (permissionMode === 'yolo') {
     return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
-  }
-  if (permissionMode === 'plan') {
-    return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
   }
   return { approvalPolicy: 'on-request', sandbox: safeMode };
 }

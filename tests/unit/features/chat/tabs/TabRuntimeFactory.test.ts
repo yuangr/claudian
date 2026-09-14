@@ -1,4 +1,6 @@
 import { createMockEl } from '@test/helpers/MockElement';
+import { within } from '@testing-library/dom';
+import { JSDOM } from 'jsdom';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
@@ -18,7 +20,7 @@ import { TabManager } from '@/features/chat/tabs/TabManager';
 import {
   initializeTabExecution,
   onProviderAvailabilityChanged,
-  updatePlanModeUI,
+  updateTabPermissionMode,
 } from '@/features/chat/tabs/TabProviderState';
 import {
   createTabRuntime,
@@ -39,7 +41,6 @@ interface MockCoordinator {
   notifyMayCool: jest.Mock;
   prepare: jest.Mock;
   resolveForkSource: jest.Mock;
-  setMode: jest.Mock;
   snapshot: { providerSessionId?: string } | null;
   state: 'absent' | 'idle' | 'active' | 'stale' | 'disposed';
 }
@@ -56,7 +57,6 @@ jest.mock('@/features/chat/execution/ChatExecutionCoordinator', () => ({
       notifyMayCool: jest.fn(),
       prepare: jest.fn().mockResolvedValue(undefined),
       resolveForkSource: jest.fn().mockResolvedValue({ sessionId: 'native-session' }),
-      setMode: jest.fn().mockResolvedValue(true),
       snapshot: null,
       state: 'absent',
     };
@@ -70,7 +70,6 @@ const ensureInitialized = jest.fn().mockResolvedValue(undefined);
 jest.mock('@/core/providers/ProviderWorkspaceRegistry', () => ({
   ProviderWorkspaceRegistry: {
     ensureInitialized: (...args: unknown[]) => ensureInitialized(...args),
-    getAgentMentionProvider: jest.fn().mockReturnValue(null),
     getCommandCatalog: jest.fn().mockReturnValue(null),
     getIfInitialized: jest.fn().mockReturnValue(null),
     getCommandLoader: jest.fn().mockReturnValue(null),
@@ -95,7 +94,6 @@ jest.mock('@/core/providers/ProviderRegistry', () => ({
       providerId: 'claude',
       supportsFork: true,
       supportsImageAttachments: true,
-      supportsPlanMode: true,
     }),
     getChatUIConfig: jest.fn().mockReturnValue({
       applyPermissionMode: (_mode: string, settings: Record<string, unknown>) => {
@@ -157,7 +155,6 @@ function createPlugin(overrides: Record<string, unknown> = {}) {
   const settings: Record<string, unknown> = {
     model: 'claude-default',
     permissionMode: 'normal',
-    persistentExternalContextPaths: [],
   };
   let nextModelSelectionIntent = 0;
   return {
@@ -335,13 +332,10 @@ function installTransitionController(
     setWelcomeEl: (element) => { tab.dom.welcomeEl = element; },
     getMessagesEl: () => tab.dom.messagesEl,
     getInputEl: () => tab.dom.inputEl,
-    getFileContextManager: () => null,
     getLinkedContentController: () => tab.ui.linkedContentController,
     getImageContextManager: () => null,
-    getExternalContextSelector: () => null,
     clearQueuedMessage: jest.fn(),
     getTitleGenerationService: () => null,
-    getStatusPanel: () => null,
     getExecutionCoordinator: () => tab.executionCoordinator,
     awaitBackgroundWork: () => tab.session.awaitBackgroundWork(),
     ensureExecutionForConversation: async (conversation) => {
@@ -425,6 +419,25 @@ describe('Tab provider execution ownership', () => {
 
     expect(onWorkChanged).toHaveBeenCalledTimes(4);
     expect(onWorkChanged).toHaveBeenCalledWith(tab);
+  });
+
+  it('leaves Enter on a composer link available for native link activation', async () => {
+    const tab = await createTestTab({
+      plugin: createPlugin(),
+      containerEl: createMockEl() as any,
+    });
+    const dom = new JSDOM('<a href="Notes/A.md">A</a>');
+    try {
+      const link = within(dom.window.document.body).getByRole('link', { name: 'A' });
+      const preventDefault = jest.fn();
+      tab.dom.inputEl.dispatchEvent({
+        type: 'keydown', key: 'Enter', target: link, preventDefault,
+        ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, isComposing: false,
+      });
+      expect(preventDefault).not.toHaveBeenCalled();
+    } finally {
+      dom.window.close();
+    }
   });
 
   it('lets later navigation override bottom auto-scroll intent', async () => {
@@ -789,13 +802,14 @@ describe('Tab provider execution ownership', () => {
       expect(tab?.ui.modelSelector).not.toBeNull();
       expect(tab?.ui.modeSelector).not.toBeNull();
       expect(tab?.ui.thinkingBudgetSelector).not.toBeNull();
-      expect(tab?.ui.externalContextSelector).not.toBeNull();
       expect(tab?.ui.permissionToggle).not.toBeNull();
       expect(tab?.ui.serviceTierToggle).not.toBeNull();
       expect(tab?.ui.composerDropdown).not.toBeNull();
       expect(tab?.ui.instructionModeManager).not.toBeNull();
       expect(tab?.ui.contextUsageMeter).not.toBeNull();
-      expect(tab?.ui.statusPanel).not.toBeNull();
+      const contentChildren = Array.from(tab!.dom.contentEl.children);
+      const messagesIndex = contentChildren.indexOf(tab!.dom.messagesWrapperEl);
+      expect(contentChildren[messagesIndex + 1]).toBe(tab!.dom.inputComposerEl);
       expect(tab?.hydrationState).toBe('ready');
       expect(tab?.lifecycleState).toBe('cold');
       expect(onTabCreated).toHaveBeenCalledWith(tab);
@@ -2255,7 +2269,6 @@ describe('Tab provider execution ownership', () => {
       const controllers = tab!.controllers;
       const titleGenerationService = tab!.services.titleGenerationService;
       const contextTray = tab!.ui.contextTray;
-      const statusPanel = tab!.ui.statusPanel;
 
       await destroyTab(tab!);
       await destroyTab(tab!);
@@ -2266,7 +2279,6 @@ describe('Tab provider execution ownership', () => {
       expect(tab!.controllers).toBe(controllers);
       expect(tab!.services.titleGenerationService).toBe(titleGenerationService);
       expect(tab!.ui.contextTray).toBe(contextTray);
-      expect(tab!.ui.statusPanel).toBe(statusPanel);
       expect(coordinator.dispose).toHaveBeenCalledTimes(1);
     } finally {
       await manager.destroy();
@@ -2564,29 +2576,27 @@ describe('Tab provider execution ownership', () => {
     expect(forkRequest).not.toHaveBeenCalled();
   });
 
-  it('synchronizes explicit mode changes through the coordinator', async () => {
+  it.each(['normal', 'yolo'] as const)('applies normalized %s permission events to tab settings', async (permissionMode) => {
     const plugin = createPlugin();
-    const tab = await createTestTab({
-      plugin,
-      containerEl: createMockEl() as any,
-      conversation: createConversation(),
-    });
-    const coordinator = coordinatorInstances[0];
+    await createTestTab({ plugin, containerEl: createMockEl() as any });
+    plugin.settings.permissionMode = permissionMode === 'normal' ? 'yolo' : 'normal';
 
-    await updatePlanModeUI(tab, plugin, 'plan', { syncExecution: true });
+    await coordinatorDeps[0].onSessionEvent?.({
+      type: 'permission_mode_changed',
+      permissionMode,
+      scope: { kind: 'session', sessionInstanceId: 'session-instance-1', sequence: 1 },
+      snapshot: { providerId: 'claude', revision: 1, status: 'idle' },
+    }, createEventContext());
 
-    expect(plugin.settings.permissionMode).toBe('plan');
-    expect(coordinator.setMode).toHaveBeenCalledWith('plan');
+    expect(plugin.settings.permissionMode).toBe(permissionMode);
   });
 
-  it('keeps plan mode as draft state when a blank tab has no execution conversation', async () => {
+  it('updates permission settings for an unbound tab', async () => {
     const plugin = createPlugin();
     const tab = await createTestTab({ plugin, containerEl: createMockEl() as any });
-    const coordinator = coordinatorInstances[0];
 
-    await updatePlanModeUI(tab, plugin, 'plan', { syncExecution: true });
+    await updateTabPermissionMode(tab, plugin, 'normal');
 
-    expect(plugin.settings.permissionMode).toBe('plan');
-    expect(coordinator.setMode).not.toHaveBeenCalled();
+    expect(plugin.settings.permissionMode).toBe('normal');
   });
 });

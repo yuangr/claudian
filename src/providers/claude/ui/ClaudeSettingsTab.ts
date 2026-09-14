@@ -1,13 +1,16 @@
 import * as fs from 'fs';
 import { Setting } from 'obsidian';
 
+import { probeCliInstallation } from '@/core/providers/cli/CliInstallationProbe';
+import { getRuntimeEnvironmentVariables } from '@/core/providers/providerEnvironment';
+import { CLAUDE_PROVIDER_ICON } from '@/shared/icons';
+import { renderCliInstallationSetting } from '@/shared/settings/CliInstallationSetting';
+
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type { ProviderSettingsTabRenderer } from '../../../core/providers/types';
 import { t } from '../../../i18n/i18n';
 import { renderEnvironmentSettingsSection } from '../../../shared/settings/EnvironmentSettingsSection';
-import { renderHostnameCliPathSetting } from '../../../shared/settings/HostnameCliPathSetting';
-import { renderNativeMcpSettingsSection } from '../../../shared/settings/NativeMcpSettingsSection';
-import { renderProviderEnablementSetting } from '../../../shared/settings/ProviderEnablementSetting';
+import type { ProviderEnablementSettingOptions } from '../../../shared/settings/ProviderEnablementSetting';
 import { renderLastEnabledProviderWarning } from '../../../shared/settings/ProviderModelEnablementWarning';
 import { getHostnameKey } from '../../../utils/env';
 import { normalizeConfiguredCliPath } from '../../../utils/path';
@@ -52,11 +55,7 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
 
     // --- Setup ---
 
-    new Setting(container).setName(t('settings.setup')).setHeading();
-
-    renderProviderEnablementSetting({
-      container,
-      description: t('settings.providerEnablement.desc', { provider: 'Claude' }),
+    const enablement: Omit<ProviderEnablementSettingOptions, 'container' | 'description'> = {
       getValue: () => getClaudeProviderSettings(settingsBag).enabled,
       name: t('settings.providerEnablement.name', { provider: 'Claude' }),
       onChange: async (value) => {
@@ -86,16 +85,12 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
         }
         context.notifyProviderModelOptionsChanged('claude');
       },
-    });
+    };
 
+    const installationContainer = container.createDiv();
     const lastProviderWarning = renderLastEnabledProviderWarning(container);
 
     const hostnameKey = getHostnameKey();
-    const platformDesc = process.platform === 'win32'
-      ? t('settings.cliPath.descWindows')
-      : t('settings.cliPath.descUnix');
-    const cliPathDescription = `${t('settings.cliPath.desc')} ${platformDesc}`;
-
     const validatePath = (value: string): string | null => {
       const trimmed = value.trim();
       if (!trimmed) return null;
@@ -112,10 +107,25 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       return null;
     };
 
-    renderHostnameCliPathSetting({
-      container,
-      description: cliPathDescription,
-      getValue: () => getClaudeProviderSettings(settingsBag).cliPathsByHost[hostnameKey] || '',
+    renderCliInstallationSetting({
+      cliName: 'Claude Code',
+      icon: CLAUDE_PROVIDER_ICON,
+      inspect: async () => {
+        const settings = context.plugin.settings as unknown as Record<string, unknown>;
+        const config = getClaudeProviderSettings(settings);
+        return probeCliInstallation({
+          path: await context.plugin.getResolvedProviderCliPath('claude'),
+          configuredPath: config.cliPathsByHost[hostnameKey] || config.cliPath,
+          args: ['--version'],
+          env: { ...process.env, ...getRuntimeEnvironmentVariables(settings, 'claude') },
+        });
+      },
+      container: installationContainer,
+      enablement,
+      getValue: () => {
+        const config = getClaudeProviderSettings(settingsBag);
+        return config.cliPathsByHost[hostnameKey] || config.cliPath;
+      },
       name: t('settings.cliPath.name'),
       onChange: async (value) => {
         const cliPathsByHost = {
@@ -130,7 +140,7 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
         await context.plugin.applyProviderRuntimeSettings(
           ['claude'],
           (settings) => {
-            updateClaudeProviderSettings(settings, { cliPathsByHost });
+            updateClaudeProviderSettings(settings, { cliPathsByHost, cliPath: '' });
           },
           () => claudeWorkspace.cliResolver.reset(),
         );
@@ -200,6 +210,24 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
         text.inputEl.addEventListener('blur', () => {
           void commitCustomModels();
         });
+      });
+
+    new Setting(container)
+      .setName(t('settings.claude.responseStyle.name'))
+      .setDesc(t('settings.claude.responseStyle.desc'))
+      .addDropdown((dropdown) => {
+        dropdown.selectEl.setAttribute('aria-label', t('settings.claude.responseStyle.name'));
+        dropdown
+          .addOption('Default', t('settings.claude.responseStyle.default'))
+          .addOption('Concise', t('settings.claude.responseStyle.concise'))
+          .setValue(claudeSettings.responseStyle)
+          .onChange(async (value) => {
+            await context.plugin.mutateSettings((settings) => {
+              updateClaudeProviderSettings(settings, {
+                responseStyle: value === 'Concise' ? 'Concise' : 'Default',
+              });
+            });
+          });
       });
 
     // --- Safety ---
@@ -280,17 +308,6 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       agentStorage: claudeWorkspace.agentStorage,
     });
 
-    // --- MCP Servers ---
-
-    renderNativeMcpSettingsSection(container, {
-      descriptionAfterCommand: t('settings.mcpServers.descAfterCommand'),
-      descriptionBeforeCommand: t('settings.mcpServers.descBeforeCommand'),
-      documentationLabel: t('settings.mcpServers.learnMore'),
-      documentationUrl: 'https://code.claude.com/docs/en/mcp',
-      heading: t('settings.mcpServers.name'),
-      setupCommand: 'claude mcp add',
-    });
-
     // --- Plugins ---
 
     new Setting(container).setName(t('settings.plugins.name')).setHeading();
@@ -342,32 +359,5 @@ export const claudeSettingsTabRenderer: ProviderSettingsTabRenderer = {
           })
       );
 
-    new Setting(container)
-      .setName(t('settings.enableBangBash.name'))
-      .setDesc(t('settings.enableBangBash.desc'))
-      .addToggle((toggle) =>
-        toggle
-          .setValue(claudeSettings.enableBangBash)
-          .onChange(async (value) => {
-            bangBashValidationEl.toggleClass('claudian-hidden', true);
-            if (value) {
-              const { findNodeExecutable, getEnhancedPath } = await import('../../../utils/env');
-              const nodePath = findNodeExecutable(getEnhancedPath());
-              if (!nodePath) {
-                bangBashValidationEl.setText(t('settings.enableBangBash.validation.noNode'));
-                bangBashValidationEl.toggleClass('claudian-hidden', false);
-                toggle.setValue(false);
-                return;
-              }
-            }
-            await context.plugin.mutateSettings((settings) => {
-              updateClaudeProviderSettings(settings, { enableBangBash: value });
-            });
-          })
-      );
-
-    const bangBashValidationEl = container.createDiv({
-      cls: 'claudian-bang-bash-validation claudian-setting-validation claudian-setting-validation-error claudian-hidden',
-    });
   },
 };

@@ -46,21 +46,6 @@ export function isAgentLifecycleTool(name: string): boolean {
   return (AGENT_LIFECYCLE_TOOLS as readonly string[]).includes(name);
 }
 
-/** Tools that should be hidden from rendering when a provider subagent block is shown. */
-export const SUBAGENT_HIDDEN_TOOLS = [
-  TOOL_WAIT,
-  TOOL_WAIT_AGENT,
-  TOOL_CLOSE_AGENT,
-] as const;
-
-export function isSubagentSpawnTool(name: string): boolean {
-  return name === TOOL_SPAWN_AGENT;
-}
-
-export function isSubagentHiddenTool(name: string): boolean {
-  return (SUBAGENT_HIDDEN_TOOLS as readonly string[]).includes(name);
-}
-
 export const EDIT_TOOLS = [TOOL_WRITE, TOOL_EDIT, TOOL_NOTEBOOK_EDIT] as const;
 export type EditToolName = (typeof EDIT_TOOLS)[number];
 

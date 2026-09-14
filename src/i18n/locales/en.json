@@ -57,18 +57,6 @@
       "errorNoActiveTab": "No active tab",
       "commandNoMessages": "Cannot fork: no messages in conversation",
       "commandNoAssistantUuid": "Cannot fork: no assistant response with identifiers"
-    },
-    "bangBash": {
-      "placeholder": "> Run a bash command...",
-      "commandPanel": "Command panel",
-      "copyAriaLabel": "Copy latest command output",
-      "clearAriaLabel": "Clear bash output",
-      "commandLabel": "{command}",
-      "statusLabel": "Status: {status}",
-      "collapseOutput": "Collapse command output",
-      "expandOutput": "Expand command output",
-      "running": "Running...",
-      "copyFailed": "Failed to copy to clipboard"
     }
   },
   "collab": {
@@ -475,39 +463,19 @@
     },
     "hotkeys": "Hotkeys",
     "inlineEditHotkey": {
-      "name": "Inline Edit",
-      "descWithKey": "Current hotkey: {hotkey}",
-      "descNoKey": "No hotkey set",
-      "btnChange": "Change",
-      "btnSet": "Set hotkey"
+      "name": "Inline Edit"
     },
     "openChatHotkey": {
-      "name": "Open Chat",
-      "descWithKey": "Current hotkey: {hotkey}",
-      "descNoKey": "No hotkey set",
-      "btnChange": "Change",
-      "btnSet": "Set hotkey"
+      "name": "Open Chat"
     },
     "newSessionHotkey": {
-      "name": "Replace Current Conversation",
-      "descWithKey": "Current hotkey: {hotkey}",
-      "descNoKey": "No hotkey set",
-      "btnChange": "Change",
-      "btnSet": "Set hotkey"
+      "name": "Replace Current Conversation"
     },
     "newTabHotkey": {
-      "name": "New",
-      "descWithKey": "Current hotkey: {hotkey}",
-      "descNoKey": "No hotkey set",
-      "btnChange": "Change",
-      "btnSet": "Set hotkey"
+      "name": "New"
     },
     "closeTabHotkey": {
-      "name": "Close Tab",
-      "descWithKey": "Current hotkey: {hotkey}",
-      "descNoKey": "No hotkey set",
-      "btnChange": "Change",
-      "btnSet": "Set hotkey"
+      "name": "Close Tab"
     },
     "slashCommands": {
       "name": "Commands and Skills",
@@ -517,12 +485,6 @@
       "name": "Hidden Commands and Skills",
       "desc": "Hide specific commands and skills from the dropdown. Useful for hiding Claude Code entries that are not relevant to Claudian. Enter names without the leading slash, one per line.",
       "placeholder": "commit\nbuild\ntest"
-    },
-    "mcpServers": {
-      "name": "MCP Servers",
-      "descBeforeCommand": "Claude Code manages MCP servers via its own CLI. Configure with ",
-      "descAfterCommand": " and they will be available in Claudian. ",
-      "learnMore": "Learn more"
     },
     "plugins": {
       "name": "Claude Code Plugins",
@@ -624,13 +586,6 @@
       "name": "Enable Chrome extension",
       "desc": "Allow Claude to interact with Chrome via the claude-in-chrome extension. Requires the extension to be installed. Requires session restart."
     },
-    "enableBangBash": {
-      "name": "Enable bash mode (!)",
-      "desc": "Type ! on empty input to enter bash mode. Runs commands directly via Node.js child_process. Requires view reopen.",
-      "validation": {
-        "noNode": "Node.js not found on PATH. Install Node.js or check your PATH configuration."
-      }
-    },
     "maxWarmAgentProcesses": {
       "name": "Maximum concurrent running sessions",
       "desc": "Maximum number of agent sessions kept ready at once (5-10). Older idle sessions pause automatically and resume when used."
@@ -702,6 +657,17 @@
       "leftSidebar": "Left sidebar",
       "mainTab": "Main editor tab"
     },
+    "cliInstallation": {
+      "disclosure": "{name} installation",
+      "description": "Optional CLI path for this computer. Leave empty to detect automatically.",
+      "checking": "Checking CLI…",
+      "versionUnavailable": "Version unavailable",
+      "notFound": "Not found",
+      "custom": "Custom path",
+      "auto": "Auto-detected",
+      "checkFailed": "Could not check CLI",
+      "saveFailed": "Could not save the path. Try again."
+    },
     "cliPath": {
       "name": "Claude CLI path",
       "desc": "Custom path to Claude Code CLI. Leave empty for auto-detection.",
@@ -721,6 +687,14 @@
       "desc": "Make enabled {provider} models available for new conversations. Existing sessions are preserved when disabled.",
       "lastProviderWarning": "At least one provider must remain enabled for Claudian to work.",
       "noModelsWarning": "No {provider} models are enabled. Go to Models below and enable at least one model."
+    },
+    "claude": {
+      "responseStyle": {
+        "name": "Response style",
+        "desc": "Default uses Claude’s normal style. Concise leads with results and skips preamble. Requires Claude Code 2.1.237 or later.",
+        "default": "Default",
+        "concise": "Concise"
+      }
     },
     "codex": {
       "installationMethod": {
@@ -751,6 +725,12 @@
         "desc": "Append additional Codex model IDs to the picker, one per line. `OPENAI_MODEL` still takes precedence when set.",
         "placeholder": "gpt-5.4\ngpt-5.3-codex-spark"
       },
+      "responseStyle": {
+        "name": "Response style",
+        "desc": "Choose how Codex communicates on supported models. Applies from the next message.",
+        "pragmatic": "Pragmatic",
+        "friendly": "Friendly"
+      },
       "reasoningSummary": {
         "name": "Reasoning summary",
         "desc": "Show a summary of the model's reasoning process in the thinking block.",
@@ -773,11 +753,6 @@
       "subagents": {
         "name": "Codex subagents",
         "desc": "Manage vault-level Codex subagents stored in .codex/agents/. Each TOML file defines one custom agent."
-      },
-      "mcp": {
-        "descBeforeCommand": "Codex manages MCP servers via its own CLI. Configure with ",
-        "descAfterCommand": " and they will be available in Claudian. ",
-        "learnMore": "Learn more"
       },
       "environment": {
         "name": "Codex environment",
@@ -819,30 +794,6 @@
         "description": "The entire skill folder, including scripts, references, and assets, will be moved to trash.",
         "confirm": "Move to trash"
       }
-    },
-    "codexSkills": {
-      "modal": {
-        "titleEdit": "Edit Codex Skill",
-        "titleAdd": "Add Codex Skill",
-        "directory": "Directory",
-        "directoryDesc": "Where to store the skill",
-        "skillName": "Skill name",
-        "skillNameDesc": "The name used after $ (e.g., \"analyze\" for $analyze)",
-        "description": "Description",
-        "descriptionDesc": "Optional description shown in dropdown",
-        "instructions": "Instructions",
-        "instructionsDesc": "The skill instructions (SKILL.md content)",
-        "instructionsPlaceholder": "Analyze the code for..."
-      },
-      "instructionsRequired": "Instructions are required",
-      "saveFailed": "Failed to save Codex skill",
-      "header": "Codex Skills",
-      "noSkills": "No Codex skills in vault. Click + to create one.",
-      "skillBadge": "skill",
-      "deleted": "Codex skill \"{name}\" deleted",
-      "deleteFailed": "Failed to delete Codex skill",
-      "created": "Codex skill \"{name}\" created",
-      "updated": "Codex skill \"{name}\" updated"
     },
     "codexSubagents": {
       "modal": {

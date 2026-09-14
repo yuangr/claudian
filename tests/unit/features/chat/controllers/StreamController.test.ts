@@ -20,10 +20,6 @@ import {
 } from '@/features/chat/controllers/StreamController';
 import { ChatState } from '@/features/chat/state/ChatState';
 
-jest.mock('@/core/tools/todo', () => ({
-  parseTodoInput: jest.fn(),
-}));
-
 jest.mock('@/core/tools/toolInput', () => ({
   extractResolvedAnswers: jest.fn().mockReturnValue(undefined),
   extractResolvedAnswersFromResultText: jest.fn().mockReturnValue(undefined),
@@ -119,12 +115,6 @@ type MockStreamControllerDeps = StreamControllerDeps;
 function createMockDeps(): MockStreamControllerDeps {
   const state = new ChatState();
   const messagesEl = createMockEl();
-  const fileContextManager = {
-    markFileBeingEdited: jest.fn(),
-    trackEditedFile: jest.fn(),
-    getAttachedFiles: jest.fn().mockReturnValue(new Set()),
-    hasFilesChanged: jest.fn().mockReturnValue(false),
-  };
 
   return {
     plugin: {
@@ -168,7 +158,6 @@ function createMockDeps(): MockStreamControllerDeps {
       subagentsSpawnedThisStream: 0,
     } as any,
     getMessagesEl: () => messagesEl,
-    getFileContextManager: () => fileContextManager as any,
     updateQueueIndicator: jest.fn(),
     getProviderId: () => 'claude',
     getProviderSessionId: () => 'session-1',
@@ -862,11 +851,9 @@ describe('StreamController - Text Content', () => {
       expect(msg.toolCalls![0].name).toBe(TOOL_SUBAGENT);
     });
 
-    it('should render TodoWrite inline and update panel', async () => {
-      const { parseTodoInput } = jest.requireMock('@/core/tools/todo');
+    it('should render TodoWrite inline', async () => {
       const { renderToolCall } = jest.requireMock('@/features/chat/rendering/ToolCallRenderer');
       const mockTodos = [{ content: 'Task 1', status: 'pending', activeForm: 'Working on task 1' }];
-      parseTodoInput.mockReturnValue(mockTodos);
 
       const msg = createTestMessage();
       deps.state.currentContentEl = createMockEl();
@@ -885,9 +872,6 @@ describe('StreamController - Text Content', () => {
       expect(msg.contentBlocks).toHaveLength(1);
       expect(msg.contentBlocks![0]).toEqual({ type: 'tool_use', toolId: 'todo-1' });
       expect(deps.state.pendingTools.size).toBe(1);
-
-      // Should update currentTodos for panel immediately (side effect)
-      expect(deps.state.currentTodos).toEqual(mockTodos);
 
       // Flush pending tools by sending a different chunk type (text or done)
       await controller.handleStreamChunk({ type: 'done' }, msg);
@@ -1218,49 +1202,6 @@ describe('StreamController - Text Content', () => {
         expect.objectContaining({ run_in_background: false }),
         expect.anything()
       );
-    });
-
-    it('should re-parse TodoWrite on input updates when streaming completes', async () => {
-      const { parseTodoInput } = jest.requireMock('@/core/tools/todo');
-
-      const mockTodos = [
-        { content: 'Task 1', status: 'pending', activeForm: 'Working on task 1' },
-      ];
-
-      // First chunk: partial input, parsing fails
-      parseTodoInput.mockReturnValueOnce(null);
-
-      const msg = createTestMessage();
-      deps.state.currentContentEl = createMockEl();
-
-      await controller.handleStreamChunk(
-        {
-          type: 'tool_use',
-          id: 'todo-1',
-          name: TOOL_TODO_WRITE,
-          input: { todos: '[' }, // Incomplete JSON
-        },
-        msg
-      );
-
-      // No todos yet
-      expect(deps.state.currentTodos).toBeNull();
-
-      // Second chunk: complete input, parsing succeeds
-      parseTodoInput.mockReturnValueOnce(mockTodos);
-
-      await controller.handleStreamChunk(
-        {
-          type: 'tool_use',
-          id: 'todo-1',
-          name: TOOL_TODO_WRITE,
-          input: { todos: mockTodos },
-        },
-        msg
-      );
-
-      // Now todos should be updated
-      expect(deps.state.currentTodos).toEqual(mockTodos);
     });
 
     it('should clear pendingTools on resetStreamingState', async () => {
@@ -2764,12 +2705,10 @@ describe('StreamController - Text Content', () => {
       expect(deps.state.writeEditStates.has('generic-migration')).toBe(false);
     });
 
-    it('rebuilds a rendered generic tool as TodoWrite and updates todo state once', async () => {
-      const { parseTodoInput } = jest.requireMock('@/core/tools/todo');
+    it('rebuilds a rendered generic tool as TodoWrite', async () => {
       const { renderToolCall } = jest.requireMock('@/features/chat/rendering/ToolCallRenderer');
       renderToolCall.mockReset();
       const todos = [{ content: 'Task', status: 'in_progress', activeForm: 'Working' }];
-      parseTodoInput.mockReturnValueOnce(todos);
       const parentEl = createMockEl();
       installOrderedMockParent(parentEl);
       deps.state.currentContentEl = parentEl;
@@ -2799,9 +2738,6 @@ describe('StreamController - Text Content', () => {
       expect(msg.toolCalls).toHaveLength(1);
       expect(msg.toolCalls![0]).toMatchObject({ name: TOOL_TODO_WRITE, input: { todos } });
       expect(msg.contentBlocks?.filter(block => block.type === 'tool_use')).toHaveLength(1);
-      expect(parseTodoInput).toHaveBeenCalledTimes(1);
-      expect(parseTodoInput).toHaveBeenCalledWith({ todos });
-      expect(deps.state.currentTodos).toEqual(todos);
       expect(initialEl.remove).toHaveBeenCalledTimes(1);
       expect(deps.state.toolCallElements.get('todo-migration')).toBe(todoEl);
     });
@@ -4251,7 +4187,7 @@ describe('StreamController - Text Content', () => {
   });
 });
 
-describe('StreamController - Plan Mode', () => {
+describe('StreamController - Tool completion', () => {
   let controller: StreamController;
   let deps: MockStreamControllerDeps;
 
@@ -4268,70 +4204,6 @@ describe('StreamController - Plan Mode', () => {
     deps.state.resetStreamingState();
     restoreTestWindow();
     jest.useRealTimers();
-  });
-
-  describe('capturePlanFilePath', () => {
-    it('should capture plan file path from Write tool_use', async () => {
-      const msg = createTestMessage();
-
-      await controller.handleStreamChunk(
-        { type: 'tool_use', id: 'write-1', name: 'Write', input: { file_path: '/home/user/.claude/plans/plan.md' } },
-        msg
-      );
-
-      expect(deps.state.planFilePath).toBe('/home/user/.claude/plans/plan.md');
-    });
-
-    it('should capture plan file path with Windows backslashes', async () => {
-      const msg = createTestMessage();
-
-      await controller.handleStreamChunk(
-        { type: 'tool_use', id: 'write-1', name: 'Write', input: { file_path: 'C:\\.claude\\plans\\plan.md' } },
-        msg
-      );
-
-      expect(deps.state.planFilePath).toBe('C:\\.claude\\plans\\plan.md');
-    });
-
-    it('should not capture non-plan Write paths', async () => {
-      const msg = createTestMessage();
-
-      await controller.handleStreamChunk(
-        { type: 'tool_use', id: 'write-1', name: 'Write', input: { file_path: '/home/user/notes/todo.md' } },
-        msg
-      );
-
-      expect(deps.state.planFilePath).toBeNull();
-    });
-
-    it('should not capture plan path from non-Write tools', async () => {
-      const msg = createTestMessage();
-
-      await controller.handleStreamChunk(
-        { type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: '/home/user/.claude/plans/plan.md' } },
-        msg
-      );
-
-      expect(deps.state.planFilePath).toBeNull();
-    });
-
-    it('should capture plan file path on subsequent tool_use input update', async () => {
-      const msg = createTestMessage();
-      msg.toolCalls = [{
-        id: 'write-1',
-        name: 'Write',
-        input: { content: 'plan content' },
-        status: 'running',
-      }];
-
-      // Second tool_use chunk with same ID updates the input (file_path arrives later)
-      await controller.handleStreamChunk(
-        { type: 'tool_use', id: 'write-1', name: 'Write', input: { file_path: '/home/user/.claude/plans/plan.md' } },
-        msg
-      );
-
-      expect(deps.state.planFilePath).toBe('/home/user/.claude/plans/plan.md');
-    });
   });
 
   describe('tool completion outcomes', () => {

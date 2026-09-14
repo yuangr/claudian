@@ -34,6 +34,7 @@ const mockBuildClaudeSDKUserMessage = buildClaudeSDKUserMessage as jest.MockedFu
 const sdkMock = sdkModule as unknown as {
   getLastOptions: () => sdkModule.Options | undefined;
   getLastResponse: () => {
+    applyFlagSettings: jest.Mock;
     interrupt: jest.Mock;
     setModel: jest.Mock;
     setPermissionMode: jest.Mock;
@@ -71,10 +72,6 @@ function createInteractionPort(): jest.Mocked<ProviderInteractionPort> {
     askUserQuestion: jest.fn().mockImplementation(async (request) => ({
       interactionId: request.interactionId,
       answers: { choice: 'yes' },
-    })),
-    requestPlanDecision: jest.fn().mockImplementation(async (request) => ({
-      interactionId: request.interactionId,
-      decision: { type: 'approve' },
     })),
     dismissInteraction: jest.fn(),
   };
@@ -176,6 +173,61 @@ describe('ClaudeExecutionBackend', () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('disables native mode-switching and task-list tools in the SDK execution policy', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-1' },
+      { type: 'result', subtype: 'success' },
+    ], { appendResult: false });
+    const { services } = createServices();
+    const session = new ClaudeExecutionBackend(createHost(), services)
+      .createSession(createConfig());
+
+    await collectEvents(session.execute(createRequest()).events);
+
+    expect(sdkMock.getLastOptions()?.disallowedTools).toEqual([
+      'EnterPlanMode',
+      'ExitPlanMode',
+      'TodoWrite',
+      'TaskCreate',
+      'TaskGet',
+      'TaskList',
+      'TaskUpdate',
+      'Task(statusline-setup)',
+    ]);
+  });
+
+  it.each([
+    ['bypassPermissions', 'yolo'],
+    ['default', 'normal'],
+    ['acceptEdits', 'normal'],
+    ['auto', 'normal'],
+    ['dontAsk', 'normal'],
+    ['delegate', 'normal'],
+    ['plan', 'normal'],
+    ['future-mode', 'normal'],
+    ['yolo', 'normal'],
+    ['', 'normal'],
+    [null, 'normal'],
+    [false, 'normal'],
+  ])('normalizes native permission %p to %s in execution events', async (nativeMode, permissionMode) => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-1', permissionMode: nativeMode },
+      { type: 'result', subtype: 'success' },
+    ], { appendResult: false });
+    const { services } = createServices();
+    const session = new ClaudeExecutionBackend(createHost(), services)
+      .createSession(createConfig());
+
+    const events = await collectEvents(session.execute(createRequest()).events);
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'permission_mode_changed',
+      permissionMode,
+      scope: expect.objectContaining({ kind: 'requested', sessionInstanceId: session.sessionInstanceId }),
+      snapshot: expect.objectContaining({ providerId: 'claude', providerSessionId: 'session-1' }),
+    }));
   });
 
   it('creates a persistent session that normalizes SDK output and publishes commands', async () => {
@@ -397,7 +449,6 @@ describe('ClaudeExecutionBackend', () => {
       ],
       context: {
         linkedContent: { path: 'note.md' },
-        externalContextPaths: ['/external'],
       },
       configuration: {
         systemInstructions: { kind: 'provider-default' },
@@ -410,13 +461,12 @@ describe('ClaudeExecutionBackend', () => {
     ]);
     expect(sdkMock.getLastOptions()).toEqual(expect.objectContaining({
       cwd: '/vault',
-      additionalDirectories: ['/external'],
       tools: ['Read', 'Grep'],
     }));
     expect(sdkMock.getLastOptions()?.mcpServers).toBeUndefined();
   });
 
-  it('includes provider-default dynamic sections in the complete system prompt', async () => {
+  it('passes provider-default dynamic sections through a non-snapshotted custom system prompt', async () => {
     const { services } = createServices();
     sdkMock.setMockMessages([
       { type: 'result', subtype: 'success' },
@@ -433,10 +483,17 @@ describe('ClaudeExecutionBackend', () => {
       },
     })).events);
 
-    const systemPrompt = String(sdkMock.getLastOptions()?.systemPrompt);
-    expect(systemPrompt).toContain('## Runtime Context');
-    expect(systemPrompt).toContain('## Collab Mode\nRuntime guidance.');
-    expect(systemPrompt.match(/## Collab Mode/g)).toHaveLength(1);
+    const systemPrompt = sdkMock.getLastOptions()?.systemPrompt;
+    expect(systemPrompt).toEqual({
+      type: 'custom',
+      prompt: expect.stringContaining('## Runtime Context'),
+      snapshot: false,
+    });
+    expect((systemPrompt as { prompt: string }).prompt).toContain(
+      '## Collab Mode\nRuntime guidance.',
+    );
+    expect((systemPrompt as { prompt: string }).prompt.match(/## Collab Mode/g))
+      .toHaveLength(1);
   });
 
   it('encodes structured context with escaped XML paths and bodies', async () => {
@@ -472,7 +529,7 @@ describe('ClaudeExecutionBackend', () => {
     );
   });
 
-  it('normalizes tools, usage, compaction, and plan-mode entry', async () => {
+  it('normalizes tools, usage, compaction', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1' },
       {
@@ -480,7 +537,7 @@ describe('ClaudeExecutionBackend', () => {
         parent_tool_use_id: null,
         message: {
           content: [
-            { type: 'tool_use', id: 'plan-1', name: 'EnterPlanMode', input: {} },
+            { type: 'tool_use', id: 'read-main', name: 'Read', input: { file_path: 'main.md' } },
           ],
           usage: { input_tokens: 10 },
         },
@@ -511,12 +568,8 @@ describe('ClaudeExecutionBackend', () => {
 
     expect(events).toContainEqual(expect.objectContaining({
       type: 'tool_started',
-      toolCallId: 'plan-1',
+      toolCallId: 'read-main',
       toolScope: { kind: 'main' },
-    }));
-    expect(events).toContainEqual(expect.objectContaining({
-      type: 'mode_changed',
-      mode: 'plan',
     }));
     expect(events).toContainEqual(expect.objectContaining({
       type: 'tool_started',
@@ -961,6 +1014,28 @@ describe('ClaudeExecutionBackend', () => {
     expect(interactionPort.requestApproval).not.toHaveBeenCalled();
   });
 
+  it('uses native output styles at launch and updates them on the same session', async () => {
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-1' },
+      { type: 'result', subtype: 'success' },
+    ], { appendResult: false });
+    const host = createHost();
+    host.settings.providerConfigs = { claude: { responseStyle: 'Concise' } };
+    const { services } = createServices();
+    const session = new ClaudeExecutionBackend(host, services).createSession(createConfig());
+
+    await collectEvents(session.execute(createRequest()).events);
+    expect(sdkMock.getLastOptions()?.settings).toEqual({ outputStyle: 'Concise' });
+    const query = sdkMock.getLastResponse();
+    for (const responseStyle of ['Default', 'Concise']) {
+      host.settings.providerConfigs = { claude: { responseStyle } };
+      await collectEvents(session.execute(createRequest()).events);
+      expect(sdkMock.getLastResponse()).toBe(query);
+      expect(query?.applyFlagSettings).toHaveBeenLastCalledWith({ outputStyle: responseStyle });
+    }
+    await session.dispose();
+  });
+
   it('applies model, effort, and permission changes without replacing a compatible persistent query', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1' },
@@ -977,13 +1052,13 @@ describe('ClaudeExecutionBackend', () => {
         systemInstructions: { kind: 'provider-default' },
         model: 'claude-opus-4-6',
         reasoning: 'high',
-        permissionMode: 'plan',
+        permissionMode: 'yolo',
       },
     })).events);
 
     expect(sdkMock.getQueryCallCount()).toBe(1);
     expect(query?.setModel).toHaveBeenCalledWith('claude-opus-4-6');
-    expect(query?.setPermissionMode).toHaveBeenCalledWith('plan');
+    expect(query?.setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
     expect(query?.setMcpServers).not.toHaveBeenCalled();
   });
 

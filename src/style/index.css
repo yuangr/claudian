@@ -15,9 +15,10 @@
 @import "./components/thinking.css";
 @import "./components/citations.css";
 @import "./components/toolcalls.css";
-@import "./components/status-panel.css";
+@import "./components/todo-list.css";
 @import "./components/subagent.css";
 @import "./components/input.css";
+@import "./components/composer-editor.css";
 @import "./components/context-tray.css";
 @import "./components/context-footer.css";
 @import "./components/composer-dropdown.css";
@@ -28,7 +29,6 @@
 @import "./toolbar/thinking-selector.css";
 @import "./toolbar/permission-toggle.css";
 @import "./toolbar/service-tier-toggle.css";
-@import "./toolbar/external-context.css";
 
 /* Features */
 @import "./features/file-link.css";
@@ -39,7 +39,6 @@
 @import "./features/diff.css";
 @import "./features/resume-session.css";
 @import "./features/ask-user-question.css";
-@import "./features/plan-mode.css";
 @import "./features/collab-git.css";
 @import "./features/collab-project.css";
 @import "./features/collab-join.css";
@@ -60,12 +59,14 @@
 
 /* Settings */
 @import "./settings/base.css";
+@import "./settings/cli-installation.css";
 @import "./settings/env-snippets.css";
 @import "./settings/slash-settings.css";
 @import "./settings/plugin-settings.css";
 @import "./settings/agent-settings.css";
 @import "./settings/agent-skills.css";
 @import "./settings/provider-model-picker.css";
+@import "./settings/groups.css";
 
 /* Accessibility */
 @import "./accessibility.css";

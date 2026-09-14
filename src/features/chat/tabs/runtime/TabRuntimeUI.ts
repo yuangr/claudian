@@ -13,19 +13,14 @@ import type {
   ProviderChatUIConfig,
   ProviderId,
 } from '../../../../core/providers/types';
-import { getEnhancedPath } from '../../../../utils/env';
-import { getVaultPath } from '../../../../utils/path';
 import { MainChatComposerDropdown } from '../../composer/MainChatComposerDropdown';
 import { LinkedContentController } from '../../linked-content';
-import { BangBashService } from '../../services/BangBashService';
-import { BangBashModeManager as BangBashModeManagerClass } from '../../ui/BangBashModeManager';
 import { ComposerContextTray } from '../../ui/ComposerContextTray';
 import { FileContextManager } from '../../ui/FileContext';
 import { ImageContextManager } from '../../ui/ImageContext';
 import { createInputToolbar } from '../../ui/InputToolbar';
 import { InstructionModeManager as InstructionModeManagerClass } from '../../ui/InstructionModeManager';
 import { NavigationSidebar } from '../../ui/NavigationSidebar';
-import { StatusPanel } from '../../ui/StatusPanel';
 import { installTextareaSizing } from '../../ui/textareaSizing';
 import { recalculateUsageForModel } from '../../utils/usageInfo';
 import { getTabProviderId } from '../providerResolution';
@@ -43,6 +38,7 @@ import {
   syncComposerDropdownForProvider,
   syncTabProviderServices,
   type TabProviderSettings,
+  updateTabPermissionMode,
   updateTabProviderSettings,
   updateTabServiceTier,
 } from '../TabProviderState';
@@ -58,7 +54,6 @@ import type {
 } from './TabRuntimeConstruction';
 
 function buildContextManagers(
-  externalContextSelector: TabUIComponents['externalContextSelector'],
   options: TabRuntimeConstructionContext,
   shell: TabRuntimeShellBundle,
   contextTray: ComposerContextTray,
@@ -69,13 +64,7 @@ function buildContextManagers(
 > {
   const { dom } = shell;
   const { plugin } = options;
-  const fileContextManager = new FileContextManager(
-    plugin.app,
-    {
-      getExternalContexts: () => externalContextSelector.getExternalContexts(),
-      onAgentMentionSelect: () => onUserModified(),
-    },
-  );
+  const fileContextManager = new FileContextManager(plugin.app);
   options.registerCleanup('tab file context manager', () => fileContextManager.destroy());
   const linkedContentController = new LinkedContentController({
     app: plugin.app,
@@ -143,10 +132,9 @@ function buildInstructionComponents(
   composerDropdown: MainChatComposerDropdown,
 ): Pick<
   TabUIComponents,
-  'instructionModeManager' | 'bangBashModeManager' | 'statusPanel'
+  'instructionModeManager'
 > {
   const { dom } = shell;
-  const { plugin } = options;
   const instructionModeManager = new InstructionModeManagerClass(
     dom.inputEl,
     {
@@ -165,49 +153,7 @@ function buildInstructionComponents(
     () => instructionModeManager.destroy(),
   );
 
-  const statusPanel = new StatusPanel();
-  options.registerCleanup('tab status panel', () => statusPanel.destroy());
-  statusPanel.mount(dom.statusPanelContainerEl);
-
-  let bangBashModeManager: TabUIComponents['bangBashModeManager'] = null;
-  if (isBangBashEnabled(plugin.settings)) {
-    const vaultPath = getVaultPath(plugin.app);
-    if (vaultPath) {
-      const enhancedPath = getEnhancedPath();
-      const bashService = new BangBashService(vaultPath, enhancedPath);
-
-      bangBashModeManager = new BangBashModeManagerClass(
-        dom.inputEl,
-        {
-          onSubmit: async (command) => {
-            const id = `bash-${Date.now()}`;
-            statusPanel.addBashOutput({ id, command, status: 'running', output: '' });
-
-            const result = await bashService.execute(command);
-            const output = [result.stdout, result.stderr, result.error]
-              .filter(Boolean)
-              .join('\n')
-              .trim();
-            const status = result.exitCode === 0 ? 'completed' : 'error';
-            statusPanel.updateBashOutput(id, { status, output, exitCode: result.exitCode });
-          },
-          getInputWrapper: () => dom.inputWrapper,
-        },
-      );
-      const ownedBangBashModeManager = bangBashModeManager;
-      options.registerCleanup(
-        'tab bang-bash mode manager',
-        () => ownedBangBashModeManager.destroy(),
-      );
-    }
-  }
-  return { bangBashModeManager, instructionModeManager, statusPanel };
-}
-
-function isBangBashEnabled(settings: Record<string, unknown>): boolean {
-  return ProviderRegistry.getEnabledProviderIds(settings).some((providerId) => (
-    ProviderRegistry.getChatUIConfig(providerId).isBangBashEnabled?.(settings) ?? false
-  ));
+  return { instructionModeManager };
 }
 
 function buildInputToolbar(
@@ -256,7 +202,7 @@ function buildInputToolbar(
       shell.providerId = providerId;
       syncTabProviderServices(shell, services, plugin);
       syncComposerDropdownForProvider(tab, plugin, shell.providerCatalogResolver);
-      refreshTabProviderUI(tab, plugin);
+      refreshTabProviderUI(tab);
       applyProviderUIGating(tab, plugin);
     },
     initializeProvider: async (providerId) => {
@@ -429,19 +375,7 @@ function buildInputToolbar(
     },
     onPermissionModeChange: async (mode: string) => {
       const tab = runtimeRef.requirePublished();
-      await updateTabProviderSettings(tab, plugin, (settings) => {
-        const uiConfig = getTabChatUIConfig(tab, plugin);
-        if (uiConfig.applyPermissionMode) {
-          uiConfig.applyPermissionMode(mode, settings);
-        } else {
-          settings.permissionMode = mode;
-        }
-      });
-      tab.ui.permissionToggle.updateDisplay();
-      shell.dom.inputWrapper.toggleClass(
-        'claudian-input-plan-mode',
-        mode === 'plan' && getTabCapabilities(tab, plugin).supportsPlanMode,
-      );
+      await updateTabPermissionMode(tab, plugin, mode);
       onUserModified();
     },
   });
@@ -476,7 +410,6 @@ export function buildTabRuntimeUI(
 
   const toolbar = buildInputToolbar(shell, services, options, runtimeRef, onUserModified);
   const contextManagers = buildContextManagers(
-    toolbar.externalContextSelector,
     options,
     shell,
     contextTray,
@@ -510,7 +443,6 @@ export function buildTabRuntimeUI(
     modelSelector: toolbar.modelSelector,
     modeSelector: toolbar.modeSelector,
     thinkingBudgetSelector: toolbar.thinkingBudgetSelector,
-    externalContextSelector: toolbar.externalContextSelector,
     permissionToggle: toolbar.permissionToggle,
     serviceTierToggle: toolbar.serviceTierToggle,
     composerDropdown,
@@ -518,20 +450,6 @@ export function buildTabRuntimeUI(
     contextUsageMeter: toolbar.contextUsageMeter,
     navigationSidebar,
   };
-
-  ui.externalContextSelector.setOnChange(() => {
-    ui.fileContextManager.preScanExternalContexts();
-    options.onCommandContextChanged?.(runtimeRef.requirePublished());
-    onUserModified();
-  });
-  ui.externalContextSelector.setPersistentPaths(
-    plugin.settings.persistentExternalContextPaths || [],
-  );
-  ui.externalContextSelector.setOnPersistenceChange((paths) => {
-    void plugin.mutateSettings((settings) => {
-      settings.persistentExternalContextPaths = paths;
-    });
-  });
 
   const resizeObserver = new ResizeObserver(() => {
     navigationSidebar.updateVisibility();

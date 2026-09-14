@@ -1,6 +1,11 @@
 import * as fs from 'fs';
 import { Setting } from 'obsidian';
 
+import { probeCliInstallation } from '@/core/providers/cli/CliInstallationProbe';
+import { getRuntimeEnvironmentVariables } from '@/core/providers/providerEnvironment';
+import { OPENCODE_PROVIDER_ICON } from '@/shared/icons';
+import { renderCliInstallationSetting } from '@/shared/settings/CliInstallationSetting';
+
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import type {
   ProviderSettingsTabRenderer,
@@ -8,9 +13,7 @@ import type {
 } from '../../../core/providers/types';
 import { t } from '../../../i18n/i18n';
 import { renderEnvironmentSettingsSection } from '../../../shared/settings/EnvironmentSettingsSection';
-import { renderHostnameCliPathSetting } from '../../../shared/settings/HostnameCliPathSetting';
-import { renderNativeMcpSettingsSection } from '../../../shared/settings/NativeMcpSettingsSection';
-import { renderProviderEnablementSetting } from '../../../shared/settings/ProviderEnablementSetting';
+import type { ProviderEnablementSettingOptions } from '../../../shared/settings/ProviderEnablementSetting';
 import {
   renderLastEnabledProviderWarning,
   renderProviderModelEnablementWarning,
@@ -46,11 +49,7 @@ export const opencodeSettingsTabRenderer: ProviderSettingsTabRenderer = {
     const settingsBag = context.plugin.settings as unknown as Record<string, unknown>;
     const hostnameKey = getHostnameKey();
 
-    new Setting(container).setName('Setup').setHeading();
-
-    renderProviderEnablementSetting({
-      container,
-      description: t('settings.providerEnablement.desc', { provider: 'OpenCode' }),
+    const enablement: Omit<ProviderEnablementSettingOptions, 'container' | 'description'> = {
       getValue: () => getOpencodeProviderSettings(settingsBag).enabled,
       name: t('settings.providerEnablement.name', { provider: 'OpenCode' }),
       onChange: async (value) => {
@@ -80,8 +79,9 @@ export const opencodeSettingsTabRenderer: ProviderSettingsTabRenderer = {
         }
         modelWarning.context.notifyProviderModelOptionsChanged('opencode');
       },
-    });
+    };
 
+    const installationContainer = container.createDiv();
     const lastProviderWarning = renderLastEnabledProviderWarning(container);
 
     const modelWarning = renderProviderModelEnablementWarning(container, context, {
@@ -91,10 +91,25 @@ export const opencodeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       providerName: 'OpenCode',
     });
 
-    renderHostnameCliPathSetting({
-      container,
-      description: 'Optional absolute path to the OpenCode CLI for this computer. Leave empty to use `opencode` from PATH.',
-      getValue: () => getOpencodeProviderSettings(settingsBag).cliPathsByHost[hostnameKey] || '',
+    renderCliInstallationSetting({
+      cliName: 'OpenCode CLI',
+      icon: OPENCODE_PROVIDER_ICON,
+      inspect: async () => {
+        const settings = context.plugin.settings as unknown as Record<string, unknown>;
+        const config = getOpencodeProviderSettings(settings);
+        return probeCliInstallation({
+          path: await context.plugin.getResolvedProviderCliPath('opencode'),
+          configuredPath: config.cliPathsByHost[hostnameKey] || config.cliPath,
+          args: ['--version'],
+          env: { ...process.env, ...getRuntimeEnvironmentVariables(settings, 'opencode') },
+        });
+      },
+      container: installationContainer,
+      enablement,
+      getValue: () => {
+        const config = getOpencodeProviderSettings(settingsBag);
+        return config.cliPathsByHost[hostnameKey] || config.cliPath;
+      },
       name: 'CLI path',
       onChange: async (value) => {
         const cliPathsByHost = {
@@ -140,7 +155,7 @@ export const opencodeSettingsTabRenderer: ProviderSettingsTabRenderer = {
       const subagentsDesc = container.createDiv({ cls: 'claudian-sp-settings-desc' });
       subagentsDesc.createEl('p', {
         cls: 'setting-item-description',
-        text: 'Manage vault-level OpenCode subagents from .opencode/agent/ and legacy .opencode/agents/. New entries are saved as subagent-only files and appear in the @mention menu.',
+        text: 'Manage vault-level OpenCode subagents from .opencode/agent/ and legacy .opencode/agents/. New entries are saved as subagent-only files.',
       });
 
       const subagentsContainer = container.createDiv({ cls: 'claudian-slash-commands-container' });
@@ -150,20 +165,11 @@ export const opencodeSettingsTabRenderer: ProviderSettingsTabRenderer = {
         context.plugin.app,
         async () => {
           await context.plugin.runProviderExecutionTransition(['opencode'], async () => {
-            await opencodeWorkspace.refreshAgentMentions?.();
+            // Restart execution so native agent definitions are reloaded.
           });
         },
       );
     }
-
-    renderNativeMcpSettingsSection(container, {
-      descriptionAfterCommand: ' and they will be available in Claudian. ',
-      descriptionBeforeCommand: 'OpenCode manages MCP servers through its own CLI. Configure them with ',
-      documentationLabel: 'Learn more',
-      documentationUrl: 'https://opencode.ai/docs/mcp-servers/',
-      heading: t('settings.mcpServers.name'),
-      setupCommand: 'opencode mcp add',
-    });
 
     renderEnvironmentSettingsSection({
       container,

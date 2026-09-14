@@ -793,7 +793,6 @@ export function renderTodoWriteResult(
   input: Record<string, unknown>
 ): void {
   container.empty();
-  container.addClass('claudian-todo-panel-content');
   container.addClass('claudian-todo-list-container');
 
   const todos = input.todos as TodoItem[] | undefined;
@@ -1136,13 +1135,24 @@ export function renderStoredToolCall(
     setGenericToolHeaderRight(statusEl, toolCall);
   }
 
-  renderToolContent(content, toolCall);
+  let contentRendered = false;
+  const renderContentOnce = () => {
+    if (contentRendered) return;
+    renderToolContent(content, toolCall);
+    contentRendered = true;
+  };
+  const deferContent = toolCall.status !== 'running'
+    && toolCall.name !== TOOL_ASK_USER_QUESTION
+    && toolCall.name !== TOOL_TODO_WRITE;
+  if (!deferContent || options.initiallyExpanded) renderContentOnce();
 
   const state = { isExpanded: false };
   const todoStatusEl = toolCall.name === TOOL_TODO_WRITE ? statusEl : null;
   setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded: options.initiallyExpanded ?? false,
-    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl),
+    onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl, (expanded) => {
+      if (expanded) renderContentOnce();
+    }),
     baseAriaLabel: getToolLabel(toolCall.name, toolCall.input)
   });
 

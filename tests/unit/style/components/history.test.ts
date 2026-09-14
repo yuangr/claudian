@@ -54,3 +54,24 @@ describe('Single-pane history action styles', () => {
     );
   });
 });
+
+describe('Session metadata popover styles', () => {
+  it('scrolls a long Linked content title instead of clipping it to an ellipsis', () => {
+    const css = readFileSync(path.resolve('src/style/components/history.css'), 'utf8');
+
+    expect(css).toMatch(
+      /\.claudian-session-metadata-value--content\s*\{[^}]*overflow-x:\s*auto;[^}]*overflow-y:\s*hidden;[^}]*text-overflow:\s*clip;[^}]*scrollbar-width:\s*none;/,
+    );
+    expect(css).toMatch(
+      /\.claudian-session-metadata-value--content::-webkit-scrollbar\s*\{[^}]*display:\s*none;/,
+    );
+  });
+
+  it('keeps the Linked content override after the shared value rule so it still wins the cascade', () => {
+    const css = readFileSync(path.resolve('src/style/components/history.css'), 'utf8');
+
+    expect(css).toMatch(
+      /\.claudian-session-metadata-value\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[\s\S]*?\.claudian-session-metadata-value--content\s*\{[^}]*overflow-x:\s*auto;/,
+    );
+  });
+});

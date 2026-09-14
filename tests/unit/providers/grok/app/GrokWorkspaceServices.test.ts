@@ -73,7 +73,6 @@ describe('GrokWorkspaceServices', () => {
     expect(services.settingsTabRenderer).toBe(grokSettingsTabRenderer);
     expect(services.tabWarmupPolicy?.resolveMode({} as any)).toBe('commands');
     expect(services.commandLoader).toBeInstanceOf(GrokCommandLoader);
-    expect(services.agentMentionProvider).toBeUndefined();
     expect(services).not.toHaveProperty('beginAuxiliaryServicesEnvironmentChange');
     expect(mockDiscoverCatalog).not.toHaveBeenCalled();
   });
@@ -196,7 +195,6 @@ describe('GrokWorkspaceServices', () => {
     const commandLoad = services.commandLoader!.loadCommands({
       allowIsolatedMetadataCreation: true,
       conversation: null,
-      externalContextPaths: [],
       plugin,
     });
     const ensure = services.modelCatalogCoordinator.ensureFresh('settings');
