@@ -5,6 +5,7 @@ import type {
   ProviderCitationsEvent,
   ProviderContextCompactedEvent,
   ProviderNoticeEvent,
+  ProviderTaskNotificationEvent,
   ProviderTextDeltaEvent,
   ProviderThinkingDeltaEvent,
   ProviderToolCompletedEvent,
@@ -14,7 +15,8 @@ import type {
   ProviderUserMessageStartedEvent,
   ToolExecutionScope,
 } from '../../../core/execution';
-import type { StreamChunk, UsageInfo } from '../../../core/types';
+import type { StreamChunk, TurnStats, UsageInfo } from '../../../core/types';
+import { createTurnStats } from '../../../core/types';
 import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
 import {
   isAsyncSubagentCompletion,
@@ -29,8 +31,8 @@ import type {
 import {
   createTransformStreamState,
   createTransformUsageState,
-  recalculateClaudeUsageContextWindow,
   transformSDKMessage,
+  withReportedContextWindow,
 } from '../stream/transformClaudeMessage';
 
 type WithoutScope<T> = T extends unknown ? Omit<T, 'scope'> : never;
@@ -38,6 +40,7 @@ type WithoutScope<T> = T extends unknown ? Omit<T, 'scope'> : never;
 export type ClaudeNormalizedOutputEvent = WithoutScope<
   | ProviderUserMessageStartedEvent
   | ProviderAssistantMessageStartedEvent
+  | ProviderTaskNotificationEvent
   | ProviderTextDeltaEvent
   | ProviderThinkingDeltaEvent
   | ProviderCitationsEvent
@@ -79,6 +82,7 @@ export type ClaudeNormalizedExecutionEvent =
   }
   | {
     readonly type: 'result';
+    readonly turnStats?: TurnStats;
   };
 
 export type ClaudeExecutionEventChannel = 'requested' | 'background';
@@ -114,8 +118,7 @@ export class ClaudeExecutionEventNormalizer {
     channel: ClaudeExecutionEventChannel,
     options: {
       readonly intendedModel?: string;
-      readonly customContextLimits?: Record<string, number>;
-      readonly authoritativeContextWindow?: number;
+      readonly reportedContextWindow?: number;
     } = {},
   ): ClaudeNormalizedExecutionEvent[] {
     const state = this.states[channel];
@@ -137,16 +140,23 @@ export class ClaudeExecutionEventNormalizer {
           type: 'async_subagent_completion',
           event,
         });
+        if (message.type === 'system' && message.subtype === 'task_notification'
+          && !message.skip_transcript && event.result) {
+          normalized.push({
+            type: 'output',
+            event: { type: 'task_notification', content: event.result },
+          });
+        }
         continue;
       }
       if (isContextWindowEvent(event)) {
         const model = options.intendedModel ?? state.lastUsage?.model ?? 'sonnet';
-        const authoritativeContextWindow = isFinitePositiveNumber(
-          options.authoritativeContextWindow,
+        const reportedContextWindow = isFinitePositiveNumber(
+          options.reportedContextWindow,
         )
-          ? options.authoritativeContextWindow
+          ? options.reportedContextWindow
           : undefined;
-        if (authoritativeContextWindow === undefined) {
+        if (reportedContextWindow === undefined) {
           normalized.push({
             type: 'context_window',
             model,
@@ -156,8 +166,7 @@ export class ClaudeExecutionEventNormalizer {
         const correctedUsage = this.updateContextWindow(
           channel,
           model,
-          options.customContextLimits,
-          authoritativeContextWindow ?? event.contextWindow,
+          reportedContextWindow ?? event.contextWindow,
         );
         if (correctedUsage) {
           normalized.push({
@@ -172,19 +181,20 @@ export class ClaudeExecutionEventNormalizer {
       }
       if (isStreamChunk(event)) {
         for (const chunk of normalizeTaskToolChunk(event, state.taskToolNormalizer)) {
-          this.normalizeStreamChunk(message, chunk, state, normalized);
+          this.#normalizeStreamChunk(message, chunk, state, normalized);
         }
       }
     }
 
-    if (message.type === 'assistant' && message.uuid) {
+    if (message.type === 'assistant' && message.uuid && message.parent_tool_use_id == null) {
       normalized.push({
         type: 'assistant_checkpoint',
         nativeAssistantId: message.uuid,
       });
     }
     if (message.type === 'result') {
-      normalized.push({ type: 'result' });
+      normalized.push({ type: 'result', turnStats: message.subtype === 'success' && !message.is_error
+        ? createTurnStats(message.usage?.output_tokens, message.duration_ms) : undefined });
     }
     return normalized;
   }
@@ -192,17 +202,16 @@ export class ClaudeExecutionEventNormalizer {
   updateContextWindow(
     channel: ClaudeExecutionEventChannel,
     model: string,
-    customContextLimits: Record<string, number> | undefined,
-    runtimeContextWindow: number,
+    reportedContextWindow: number,
   ): UsageInfo | null {
     const state = this.states[channel];
-    if (!state.lastUsage || state.lastUsage.model !== model) {
+    if (!state.lastUsage || state.lastUsage.model !== model
+      || !isFinitePositiveNumber(reportedContextWindow)) {
       return null;
     }
-    const correctedUsage = recalculateClaudeUsageContextWindow(
+    const correctedUsage = withReportedContextWindow(
       state.lastUsage,
-      customContextLimits,
-      runtimeContextWindow,
+      reportedContextWindow,
     );
     if (sameUsageWindow(state.lastUsage, correctedUsage)) {
       return null;
@@ -218,6 +227,11 @@ export class ClaudeExecutionEventNormalizer {
     this.states[channel].blockedToolIds.add(toolUseId);
   }
 
+  /** A steer entering the run opens a new assistant response boundary. */
+  beginUserBoundary(channel: ClaudeExecutionEventChannel): void {
+    this.states[channel].assistantStarted = false;
+  }
+
   reset(channel: ClaudeExecutionEventChannel): void {
     const state = this.states[channel];
     state.streamState.clearAll();
@@ -231,7 +245,7 @@ export class ClaudeExecutionEventNormalizer {
     state.sawStreamThinking = false;
   }
 
-  private normalizeStreamChunk(
+  #normalizeStreamChunk(
     message: SDKMessage,
     chunk: StreamChunk,
     state: NormalizationState,
@@ -384,6 +398,8 @@ function toOutputEvent(
     case 'tool_result':
     case 'subagent_tool_result':
       return normalizeToolCompleted(chunk, state);
+    case 'subagent_tool_output':
+      return { type: 'tool_output', toolCallId: chunk.id, toolScope: { kind: 'subagent', subagentId: chunk.subagentId }, content: chunk.content };
     case 'tool_output': {
       const identity = state.toolScopes.get(chunk.id)
         ?? { toolScope: { kind: 'main' as const } };
@@ -404,6 +420,8 @@ function toOutputEvent(
       return {
         type: 'context_compacted',
       };
+    case 'task_notification':
+      return { type: 'task_notification', content: chunk.content };
     case 'notice':
       return {
         type: 'notice',
@@ -415,7 +433,6 @@ function toOutputEvent(
 
 function sameUsageWindow(current: UsageInfo, next: UsageInfo): boolean {
   return current.contextWindow === next.contextWindow
-    && current.contextWindowIsAuthoritative === next.contextWindowIsAuthoritative
     && current.percentage === next.percentage;
 }
 
@@ -481,6 +498,7 @@ function normalizeToolCompleted(
     isError: chunk.isError,
     isBlocked: state.blockedToolIds.has(chunk.id),
     toolUseResult: chunk.toolUseResult,
+    ...(chunk.providerPayload ? { providerPayload: chunk.providerPayload } : {}),
   };
 }
 

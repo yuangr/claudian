@@ -18,17 +18,23 @@ function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || '';
 }
 
-// Linux excluded: Obsidian registers the CLI through stable symlinks (/usr/local/bin,
-// ~/.local/bin), while process.execPath may point to a transient AppImage mount.
-function getAppProvidedCliPaths(): string[] {
-  if (process.platform === 'darwin') {
-    const appBundleMatch = process.execPath.match(/^(.+?\.app)\//);
-    if (appBundleMatch) {
-      return [path.join(appBundleMatch[1], 'Contents', 'MacOS')];
-    }
-    return [path.dirname(process.execPath)];
+function getMiseShimsDir(home: string): string | null {
+  if (process.env.MISE_SHIMS_DIR) return process.env.MISE_SHIMS_DIR;
+  if (process.env.MISE_DATA_DIR) return path.join(process.env.MISE_DATA_DIR, 'shims');
+  if (process.env.XDG_DATA_HOME) return path.join(process.env.XDG_DATA_HOME, 'mise', 'shims');
+
+  if (isWindows) {
+    const localAppData = process.env.LOCALAPPDATA
+      || (home ? path.join(home, 'AppData', 'Local') : null);
+    return localAppData ? path.join(localAppData, 'mise', 'shims') : null;
   }
 
+  return home ? path.join(home, '.local', 'share', 'mise', 'shims') : null;
+}
+
+// Windows ships Obsidian.com beside the app. Unix uses registered CLI locations;
+// adding the macOS app directory can select the GUI executable as `obsidian`.
+function getAppProvidedCLIPaths(): string[] {
   if (process.platform === 'win32') {
     return [path.dirname(process.execPath)];
   }
@@ -39,9 +45,9 @@ function getAppProvidedCliPaths(): string[] {
 /** GUI apps like Obsidian have minimal PATH, so we add common binary locations. */
 function getExtraBinaryPaths(): string[] {
   const home = getHomeDir();
+  const paths: string[] = [];
 
   if (isWindows) {
-    const paths: string[] = [];
     const localAppData = process.env.LOCALAPPDATA;
     const appData = process.env.APPDATA;
     const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
@@ -127,18 +133,14 @@ function getExtraBinaryPaths(): string[] {
       paths.push(path.join(home, '.bun', 'bin'));
       paths.push(path.join(home, '.opencode', 'bin'));
     }
-
-    paths.push(...getAppProvidedCliPaths());
-
-    return paths;
   } else {
     // Unix paths
-    const paths = [
+    paths.push(
       '/usr/local/bin',
       '/opt/homebrew/bin',  // macOS ARM Homebrew
       '/usr/bin',
       '/bin',
-    ];
+    );
 
     const voltaHome = process.env.VOLTA_HOME;
     if (voltaHome) {
@@ -167,6 +169,7 @@ function getExtraBinaryPaths(): string[] {
       paths.push(path.join(home, '.bun', 'bin'));
       paths.push(path.join(home, '.opencode', 'bin'));
       paths.push(path.join(home, '.docker', 'bin'));
+      paths.push(path.join(home, '.npm-global', 'bin'));
       paths.push(path.join(home, '.volta', 'bin'));
       paths.push(path.join(home, '.asdf', 'shims'));
       paths.push(path.join(home, '.asdf', 'bin'));
@@ -183,11 +186,18 @@ function getExtraBinaryPaths(): string[] {
         }
       }
     }
-
-    paths.push(...getAppProvidedCliPaths());
-
-    return paths;
   }
+
+  const npmPrefix = process.env.npm_config_prefix;
+  if (npmPrefix) {
+    paths.push(isWindows ? npmPrefix : path.join(npmPrefix, 'bin'));
+  }
+
+  const miseShims = getMiseShimsDir(home);
+  if (miseShims) paths.push(miseShims);
+  paths.push(...getAppProvidedCLIPaths());
+
+  return paths;
 }
 
 function* findNodeDirectories(additionalPaths?: string): Generator<string, undefined> {
@@ -259,19 +269,6 @@ export function cliPathRequiresNode(cliPath: string): boolean {
   } catch {
     return false;
   }
-}
-
-export function getMissingNodeError(cliPath: string, enhancedPath?: string): string | null {
-  if (!cliPathRequiresNode(cliPath)) {
-    return null;
-  }
-
-  const nodePath = findNodeExecutable(enhancedPath);
-  if (nodePath) {
-    return null;
-  }
-
-  return 'Claude Code CLI requires Node.js, but Node was not found on PATH. Install Node.js or use the native Claude Code binary, then restart Obsidian.';
 }
 
 export function getEnhancedPath(additionalPaths?: string, cliPath?: string): string {

@@ -1,5 +1,6 @@
 import { Notice, setIcon } from 'obsidian';
 
+import { formatReasoningValueLabel } from '../../../core/providers/reasoning';
 import type {
   ProviderCapabilities,
   ProviderChatUIConfig,
@@ -17,6 +18,7 @@ import {
   type ScheduledAnimationFrame,
 } from '../../../utils/animationFrame';
 import { toggleServiceTier } from '../actions/toggleServiceTier';
+import type { ChatSettings } from '../ChatSettings';
 
 function runToolbarAction(action: () => Promise<void>, failureMessage: string): void {
   void action().catch(() => {
@@ -24,14 +26,7 @@ function runToolbarAction(action: () => Promise<void>, failureMessage: string): 
   });
 }
 
-export interface ToolbarSettings {
-  model: string;
-  thinkingBudget: string;
-  effortLevel: string;
-  serviceTier: string;
-  permissionMode: string;
-  [key: string]: unknown;
-}
+export type ToolbarSettings = ChatSettings & Record<string, unknown>;
 
 export interface ToolbarCallbacks {
   onModelChange: (model: string) => Promise<void>;
@@ -61,7 +56,7 @@ export class ModelSelector {
     });
   }
 
-  private getAvailableModels() {
+  #getAvailableModels() {
     const settings = this.callbacks.getSettings();
     const uiConfig = this.callbacks.getUIConfig();
     return uiConfig.getModelOptions({
@@ -83,7 +78,7 @@ export class ModelSelector {
   updateDisplay() {
     if (!this.buttonEl) return;
     const currentModel = this.callbacks.getSettings().model;
-    const models = this.getAvailableModels();
+    const models = this.#getAvailableModels();
     const modelInfo = models.find(m => m.value === currentModel);
 
     const displayModel = modelInfo || models[0];
@@ -101,7 +96,8 @@ export class ModelSelector {
       });
     }
     const labelEl = this.buttonEl.createSpan({ cls: 'claudian-model-label' });
-    labelEl.setText(displayModel?.label || 'Unknown');
+    labelEl.setText(modelInfo?.label || (currentModel ? 'Model unavailable' : 'Set up models'));
+    this.buttonEl.title = modelInfo ? '' : 'Choose an enabled model in provider settings. If discovery failed, refresh the model list.';
   }
 
   renderOptions() {
@@ -109,7 +105,10 @@ export class ModelSelector {
     this.dropdownEl.empty();
 
     const currentModel = this.callbacks.getSettings().model;
-    const models = this.getAvailableModels();
+    const models = this.#getAvailableModels();
+    if (!models.length) {
+      this.dropdownEl.createDiv({ text: 'No models available. Check provider settings and refresh the model list if discovery failed.', attr: { role: 'status' } });
+    }
     const reversed = [...models].reverse();
 
     let lastGroup: string | undefined;
@@ -163,7 +162,7 @@ export class ModeSelector {
     this.render();
   }
 
-  private getSelectorConfig(): ProviderModeSelectorConfig | null {
+  #getSelectorConfig(): ProviderModeSelectorConfig | null {
     return this.callbacks.getUIConfig().getModeSelector?.(this.callbacks.getSettings()) ?? null;
   }
 
@@ -181,7 +180,7 @@ export class ModeSelector {
   }
 
   /** Resolves the active/inactive option pair for a two-option toggle. */
-  private resolveOptionPair(
+  #resolveOptionPair(
     selectorConfig: ProviderModeSelectorConfig,
   ): { active: ProviderUIOption; inactive: ProviderUIOption } {
     const [first, second] = selectorConfig.options;
@@ -197,14 +196,14 @@ export class ModeSelector {
       return;
     }
 
-    const selectorConfig = this.getSelectorConfig();
+    const selectorConfig = this.#getSelectorConfig();
     if (!selectorConfig || selectorConfig.options.length !== 2) {
       this.container.addClass('claudian-hidden');
       return;
     }
 
     this.container.removeClass('claudian-hidden');
-    const { active, inactive } = this.resolveOptionPair(selectorConfig);
+    const { active, inactive } = this.#resolveOptionPair(selectorConfig);
     const currentOption = selectorConfig.options.find((option) => option.value === selectorConfig.value)
       ?? selectorConfig.options[0];
     const isActive = currentOption.value === active.value;
@@ -229,12 +228,12 @@ export class ModeSelector {
   }
 
   private async toggle() {
-    const selectorConfig = this.getSelectorConfig();
+    const selectorConfig = this.#getSelectorConfig();
     if (!selectorConfig || selectorConfig.options.length !== 2) {
       return;
     }
 
-    const { active, inactive } = this.resolveOptionPair(selectorConfig);
+    const { active, inactive } = this.#resolveOptionPair(selectorConfig);
     const nextValue = selectorConfig.value === active.value ? inactive.value : active.value;
     await this.callbacks.onModeChange(nextValue);
     this.updateDisplay();
@@ -273,19 +272,19 @@ export class ThinkingBudgetSelector {
     this.updateDisplay();
   }
 
-  private renderEffortGears() {
+  #renderEffortGears() {
     if (!this.effortGearsEl) return;
     this.effortGearsEl.empty();
 
-    const currentEffort = this.callbacks.getSettings().effortLevel;
-    const uiConfig = this.callbacks.getUIConfig();
     const settings = this.callbacks.getSettings();
+    const currentEffort = settings.reasoning;
+    const uiConfig = this.callbacks.getUIConfig();
     const model = settings.model;
     const options = uiConfig.getReasoningOptions(model, settings);
     const currentInfo = options.find(e => e.value === currentEffort);
 
     const currentEl = this.effortGearsEl.createDiv({ cls: 'claudian-thinking-current' });
-    currentEl.setText(currentInfo?.label || options[0]?.label || 'High');
+    currentEl.setText(currentInfo?.label ?? (currentEffort ? formatReasoningValueLabel(currentEffort) : 'Default'));
 
     const optionsEl = this.effortGearsEl.createDiv({ cls: 'claudian-thinking-options' });
 
@@ -310,19 +309,19 @@ export class ThinkingBudgetSelector {
     }
   }
 
-  private renderBudgetGears() {
+  #renderBudgetGears() {
     if (!this.budgetGearsEl) return;
     this.budgetGearsEl.empty();
 
-    const currentBudget = this.callbacks.getSettings().thinkingBudget;
-    const uiConfig = this.callbacks.getUIConfig();
     const settings = this.callbacks.getSettings();
+    const currentBudget = settings.reasoning;
+    const uiConfig = this.callbacks.getUIConfig();
     const model = settings.model;
     const options: ProviderReasoningOption[] = uiConfig.getReasoningOptions(model, settings);
     const currentBudgetInfo = options.find(b => b.value === currentBudget);
 
     const currentEl = this.budgetGearsEl.createDiv({ cls: 'claudian-thinking-current' });
-    currentEl.setText(currentBudgetInfo?.label || options[0]?.label || 'Off');
+    currentEl.setText(currentBudgetInfo?.label ?? (currentBudget ? formatReasoningValueLabel(currentBudget) : 'Default'));
 
     const optionsEl = this.budgetGearsEl.createDiv({ cls: 'claudian-thinking-options' });
 
@@ -378,9 +377,9 @@ export class ThinkingBudgetSelector {
     }
 
     if (adaptive) {
-      this.renderEffortGears();
+      this.#renderEffortGears();
     } else {
-      this.renderBudgetGears();
+      this.#renderBudgetGears();
     }
   }
 }
@@ -416,7 +415,7 @@ export class PermissionToggle {
     });
   }
 
-  private getToggleConfig(): ProviderPermissionModeToggleConfig | null {
+  #getToggleConfig(): ProviderPermissionModeToggleConfig | null {
     const uiConfig = this.callbacks.getUIConfig();
     return uiConfig.getPermissionModeToggle?.() ?? null;
   }
@@ -424,7 +423,7 @@ export class PermissionToggle {
   updateDisplay() {
     if (!this.toggleEl || !this.labelEl) return;
 
-    const toggleConfig = this.getToggleConfig();
+    const toggleConfig = this.#getToggleConfig();
     if (!this.visible || !toggleConfig) {
       this.container.addClass('claudian-hidden');
       return;
@@ -442,7 +441,7 @@ export class PermissionToggle {
   }
 
   private async toggle() {
-    const toggleConfig = this.getToggleConfig();
+    const toggleConfig = this.#getToggleConfig();
     if (!toggleConfig) return;
 
     const current = this.callbacks.getSettings().permissionMode;
@@ -482,7 +481,7 @@ export class ServiceTierToggle {
     });
   }
 
-  private getToggleConfig(): ProviderServiceTierToggleConfig | null {
+  #getToggleConfig(): ProviderServiceTierToggleConfig | null {
     const uiConfig = this.callbacks.getUIConfig();
     return uiConfig.getServiceTierToggle?.(this.callbacks.getSettings()) ?? null;
   }
@@ -490,7 +489,7 @@ export class ServiceTierToggle {
   updateDisplay() {
     if (!this.buttonEl || !this.iconEl) return;
 
-    const toggleConfig = this.getToggleConfig();
+    const toggleConfig = this.#getToggleConfig();
     if (!toggleConfig) {
       this.container.addClass('claudian-hidden');
       return;
@@ -614,7 +613,7 @@ export class ContextUsageMeter {
     }
 
     // Set tooltip with detailed usage
-    let tooltip = `${this.formatTokens(usage.contextTokens)} / ${this.formatTokens(usage.contextWindow)}`;
+    let tooltip = `${this.#formatTokens(usage.contextTokens)} / ${this.#formatTokens(usage.contextWindow)}`;
     if (usage.percentage > 80) {
       tooltip += ' (Approaching limit, run `/compact` to continue)';
     }
@@ -622,11 +621,11 @@ export class ContextUsageMeter {
     this.container.setAttribute('aria-valuenow', String(usage.percentage));
     this.container.setAttribute(
       'aria-valuetext',
-      `${this.formatTokens(usage.contextTokens)} / ${this.formatTokens(usage.contextWindow)}`,
+      `${this.#formatTokens(usage.contextTokens)} / ${this.#formatTokens(usage.contextWindow)}`,
     );
   }
 
-  private formatTokens(tokens: number): string {
+  #formatTokens(tokens: number): string {
     if (tokens >= 1000) {
       return `${Math.round(tokens / 1000)}k`;
     }
@@ -645,8 +644,8 @@ export class InputToolbarLayoutController {
 
   constructor(private readonly toolbarEl: HTMLElement) {
     try {
-      this.observeLayoutChanges();
-      this.scheduleLayout();
+      this.#observeLayoutChanges();
+      this.#scheduleLayout();
     } catch (error) {
       this.destroy();
       throw error;
@@ -655,7 +654,7 @@ export class InputToolbarLayoutController {
 
   refreshLayout(): void {
     this.toolbarEl.classList.remove(TOOLBAR_COMPACT_CLASS);
-    this.toolbarEl.classList.toggle(TOOLBAR_COMPACT_CLASS, this.hasWrappedItems());
+    this.toolbarEl.classList.toggle(TOOLBAR_COMPACT_CLASS, this.#hasWrappedItems());
   }
 
   destroy(): void {
@@ -669,7 +668,7 @@ export class InputToolbarLayoutController {
     this.mutationObserver = null;
   }
 
-  private hasWrappedItems(): boolean {
+  #hasWrappedItems(): boolean {
     const rowCenters = Array.from(this.toolbarEl.children)
       .map((item) => item.getBoundingClientRect())
       .filter((rect) => rect.width > 0 && rect.height > 0)
@@ -680,7 +679,7 @@ export class InputToolbarLayoutController {
     return rowCenters.some((center) => Math.abs(center - firstRowCenter) > ROW_CENTER_TOLERANCE);
   }
 
-  private scheduleLayout(): void {
+  #scheduleLayout(): void {
     if (this.pendingLayout !== null) {
       cancelScheduledAnimationFrame(this.pendingLayout);
     }
@@ -690,11 +689,11 @@ export class InputToolbarLayoutController {
     }, this.toolbarEl.ownerDocument.defaultView);
   }
 
-  private observeLayoutChanges(): void {
+  #observeLayoutChanges(): void {
     const ownerWindow = this.toolbarEl.ownerDocument.defaultView;
     const ResizeObserverConstructor = ownerWindow?.ResizeObserver;
     if (typeof ResizeObserverConstructor === 'function') {
-      this.resizeObserver = new ResizeObserverConstructor(() => this.scheduleLayout());
+      this.resizeObserver = new ResizeObserverConstructor(() => this.#scheduleLayout());
       this.resizeObserver.observe(this.toolbarEl);
     }
 
@@ -708,7 +707,7 @@ export class InputToolbarLayoutController {
         || mutation.attributeName !== 'class'
       ));
       if (hasContentChange) {
-        this.scheduleLayout();
+        this.#scheduleLayout();
       }
     });
     this.mutationObserver.observe(this.toolbarEl, {

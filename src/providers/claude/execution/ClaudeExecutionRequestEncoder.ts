@@ -9,9 +9,9 @@ import type {
   ProviderSessionConfig,
 } from '../../../core/execution';
 import { buildSystemPrompt } from '../../../core/prompt/mainAgent';
+import { ProviderModelUnavailableError } from '../../../core/providers/models/ProviderModelUnavailableError';
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
-import type { AppPluginManager } from '../../../core/providers/types';
 import {
   isReadOnlyTool,
   READ_ONLY_TOOLS,
@@ -30,13 +30,17 @@ import {
 import { appendEditorContext } from '../../../utils/editor';
 import {
   getEnhancedPath,
-  getMissingNodeError,
   parseEnvironmentVariables,
 } from '../../../utils/env';
 import {
   buildContextFromHistory,
   buildPromptWithHistoryContext,
 } from '../../../utils/session';
+import {
+  findClaudeModelOption,
+  getClaudeModelCatalog,
+  getClaudeModelOptions,
+} from '../modelOptions';
 import { toClaudeRuntimeModelId } from '../modelSelection';
 import { createCustomSpawnFunction } from '../runtime/customSpawn';
 import {
@@ -51,16 +55,10 @@ import {
 } from '../settings';
 import {
   type EffortLevel,
-  resolveEffortLevel,
+  isEffortLevel,
+  resolveSupportedEffortLevel,
 } from '../types/models';
 
-const EFFORT_LEVELS = new Set<EffortLevel>([
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-]);
 const PERMISSION_MODES = new Set<PermissionMode>([
   'normal',
   'yolo',
@@ -81,16 +79,21 @@ export interface ClaudeEncodedExecutionRequest {
   readonly images: ImageAttachment[];
   readonly options: Options;
   readonly model: string;
-  readonly effort: EffortLevel;
+  /** Explicit effort, or null when Claude Code reported no capabilities for the model. */
+  readonly effort: EffortLevel | null;
   readonly responseStyle: ClaudeResponseStyle;
   readonly sdkPermissionMode: SDKPermissionMode;
   readonly restartKey: string;
   readonly allowedTools: ReadonlySet<string> | null;
 }
 
+export interface ClaudeEncodedSteer {
+  readonly prompt: string;
+  readonly images: ImageAttachment[];
+}
+
 export interface ClaudeExecutionRequestEncoderDeps {
   readonly host: ProviderHost;
-  readonly pluginManager: AppPluginManager;
 }
 
 export class ClaudeExecutionRequestEncoder {
@@ -113,24 +116,32 @@ export class ClaudeExecutionRequestEncoder {
       this.deps.host.getActiveEnvironmentVariables('claude'),
     );
     const enhancedPath = getEnhancedPath(customEnv.PATH, cliPath);
-    const missingNodeError = getMissingNodeError(cliPath, enhancedPath);
-    if (missingNodeError) {
-      throw new Error(missingNodeError);
-    }
 
-    const settings = this.resolveSettings(request);
+    const settings = this.#resolveSettings(request);
     const claudeSettings = getClaudeProviderSettings(settings);
-    const model = toClaudeRuntimeModelId(settings.model);
-    const effort = resolveEffortLevel(
-      model,
-      isEffortLevel(request.configuration.reasoning)
-        ? request.configuration.reasoning
-        : settings.effortLevel,
-    );
+    const selected = findClaudeModelOption(getClaudeModelCatalog(this.deps.host.settings), settings.model);
+    if (!getClaudeProviderSettings(this.deps.host.settings).enabled || !selected
+      || !getClaudeModelOptions(this.deps.host.settings).some(option => option.value === selected.value)) {
+      throw new ProviderModelUnavailableError('Claude');
+    }
+    const model = toClaudeRuntimeModelId(selected.value);
+    const effort = request.configuration.reasoning === null
+      ? null
+      : resolveSupportedEffortLevel(
+        selected.supportedEffortLevels ?? [],
+        isEffortLevel(request.configuration.reasoning)
+          ? request.configuration.reasoning
+          : settings.effortLevel,
+      );
+    const requestedEffort = request.configuration.reasoning;
+    if (requestedEffort != null && (!isEffortLevel(requestedEffort)
+      || !selected.supportedEffortLevels?.includes(requestedEffort))) {
+      throw new Error(`Claude model "${model}" does not support reasoning effort "${request.configuration.reasoning}".`);
+    }
     const sdkPermissionMode = settings.permissionMode === 'yolo'
       ? 'bypassPermissions'
       : claudeSettings.safeMode;
-    const prompt = this.encodePrompt(request, replayConversationHistory);
+    const prompt = this.#encodePrompt(request, replayConversationHistory);
     const policy = resolveToolPolicy(request);
     const systemPrompt = request.configuration.systemInstructions.kind === 'explicit'
       ? [
@@ -155,7 +166,7 @@ export class ClaudeExecutionRequestEncoder {
         snapshot: false,
       },
       model,
-      effort,
+      ...(effort ? { effort } : {}),
       settings: { outputStyle: claudeSettings.responseStyle },
       thinking: { type: 'adaptive' },
       abortController,
@@ -171,6 +182,13 @@ export class ClaudeExecutionRequestEncoder {
         claudeSettings.loadUserSettings,
       ),
       spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath),
+      // Auto mode stays available so safe-mode switches remain live setters.
+      extraArgs: {
+        'enable-auto-mode': null,
+        // Replays acknowledge when a streamed send, including a steer, enters a native turn.
+        'replay-user-messages': null,
+        ...(claudeSettings.enableChrome ? { chrome: null } : {}),
+      },
       includePartialMessages: true,
       enableFileCheckpointing: true,
       canUseTool,
@@ -186,33 +204,18 @@ export class ClaudeExecutionRequestEncoder {
       ...(resume.fork ? { forkSession: true } : {}),
     };
 
-    if (claudeSettings.safeMode === 'auto') {
-      options.extraArgs = {
-        ...options.extraArgs,
-        'enable-auto-mode': null,
-      };
-    }
-    if (claudeSettings.enableChrome) {
-      options.extraArgs = {
-        ...options.extraArgs,
-        chrome: null,
-      };
-    }
     if (sessionConfig.nativePersistence === 'disabled-if-supported') {
       options.persistSession = false;
-      if (request.toolPolicy.kind === 'passive') {
-        delete options.thinking;
-        delete options.effort;
-      }
     } else if (sessionConfig.nativePersistence === 'enabled') {
       options.persistSession = true;
+    }
+    if (request.configuration.reasoning === null) {
+      delete options.thinking;
     }
 
     return {
       prompt,
-      images: request.input
-        .filter((block) => block.type === 'image')
-        .map((block) => ({ ...block.image })),
+      images: encodeImages(request),
       options,
       model,
       effort,
@@ -221,23 +224,29 @@ export class ClaudeExecutionRequestEncoder {
       restartKey: JSON.stringify({
         systemPrompt,
         tools: policy.tools,
-        disallowedTools: options.disallowedTools,
         hooks: Boolean(policy.hooks),
         cliPath,
         settingSources: options.settingSources,
         enableChrome: claudeSettings.enableChrome,
-        enableAutoMode: claudeSettings.safeMode === 'auto',
         persistSession: options.persistSession,
       }),
       allowedTools: policy.allowedTools,
     };
   }
 
-  private resolveSettings(request: ProviderExecutionRequest): ClaudianSettings {
-    const settings = ProviderSettingsCoordinator.getProviderSettingsSnapshot(
+  /** A steer joins the live turn, so it carries only its own input and context. */
+  encodeSteer(request: ProviderExecutionRequest): ClaudeEncodedSteer {
+    return {
+      prompt: this.#encodePrompt(request, false),
+      images: encodeImages(request),
+    };
+  }
+
+  #resolveSettings(request: ProviderExecutionRequest): ClaudianSettings {
+    const settings = { ...ProviderSettingsCoordinator.getProviderSettingsSnapshot(
       this.deps.host.settings,
       'claude',
-    );
+    ) };
     if (request.configuration.model?.trim()) {
       settings.model = request.configuration.model;
     }
@@ -251,7 +260,7 @@ export class ClaudeExecutionRequestEncoder {
     return settings;
   }
 
-  private encodePrompt(
+  #encodePrompt(
     request: ProviderExecutionRequest,
     replayConversationHistory: boolean,
   ): string {
@@ -292,6 +301,12 @@ export class ClaudeExecutionRequestEncoder {
       [...history],
     );
   }
+}
+
+function encodeImages(request: ProviderExecutionRequest): ImageAttachment[] {
+  return request.input
+    .filter((block) => block.type === 'image')
+    .map((block) => ({ ...block.image }));
 }
 
 function resolveToolPolicy(request: ProviderExecutionRequest): {
@@ -357,11 +372,6 @@ function createReadOnlyHook(): HookCallbackMatcher {
 function isPermissionMode(value: unknown): value is PermissionMode {
   return typeof value === 'string'
     && PERMISSION_MODES.has(value as PermissionMode);
-}
-
-function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === 'string'
-    && EFFORT_LEVELS.has(value as EffortLevel);
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

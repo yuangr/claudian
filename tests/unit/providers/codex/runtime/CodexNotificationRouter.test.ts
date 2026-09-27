@@ -4,34 +4,22 @@ import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotifica
 describe('CodexNotificationRouter', () => {
   let router: CodexNotificationRouter;
   let chunks: StreamChunk[];
-  let turnMetadata: Array<Record<string, unknown>>;
 
   beforeEach(() => {
     chunks = [];
-    turnMetadata = [];
     router = new CodexNotificationRouter(
       (chunk) => chunks.push(chunk),
-      (update) => turnMetadata.push(update),
       '/workspace',
     );
   });
 
   describe('text streaming', () => {
-    it('maps item/agentMessage/delta to a text chunk', () => {
-      router.handleNotification('item/agentMessage/delta', {
-        threadId: 't1',
-        turnId: 'turn1',
-        itemId: 'msg1',
-        delta: 'Hello',
-      });
-
-      expect(chunks).toEqual([{ type: 'text', content: 'Hello' }]);
-    });
-
     it('accumulates multiple deltas', () => {
       router.handleNotification('item/agentMessage/delta', {
         threadId: 't1', turnId: 'turn1', itemId: 'msg1', delta: 'Hello',
       });
+      expect(chunks).toEqual([{ type: 'text', content: 'Hello' }]);
+
       router.handleNotification('item/agentMessage/delta', {
         threadId: 't1', turnId: 'turn1', itemId: 'msg1', delta: ' world',
       });
@@ -1248,10 +1236,16 @@ describe('CodexNotificationRouter', () => {
         },
       });
 
+      router.handleNotification('turn/completed', {
+        threadId: 't1',
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
       expect(chunks.filter(chunk => (
         chunk.type === 'tool_use' || chunk.type === 'tool_result'
       )).every(chunk => chunk.id === 'exec_patch')).toBe(true);
       expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
+      expect(chunks[chunks.length - 1]).toEqual({ type: 'done' });
     });
 
     it('does not recreate a claimed exec envelope from a repeated raw call', () => {
@@ -1592,11 +1586,19 @@ describe('CodexNotificationRouter', () => {
         },
       });
 
-      const lifecycleIds = chunks
+      router.handleNotification('turn/completed', {
+        threadId: 't1',
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
+      expect(chunks.map(chunk => chunk.type)).toEqual([
+        'tool_use', 'tool_use', 'tool_result', 'done',
+      ]);
+      expect(chunks
         .filter(chunk => chunk.type === 'tool_use' || chunk.type === 'tool_result')
-        .map(chunk => chunk.id);
-      expect(lifecycleIds.every(id => id === 'canonical_patch')).toBe(true);
-      expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
+        .map(chunk => chunk.id)).toEqual([
+        'canonical_patch', 'canonical_patch', 'canonical_patch',
+      ]);
     });
 
     it('correlates matching move patches across raw and canonical kind shapes', () => {
@@ -1657,9 +1659,19 @@ describe('CodexNotificationRouter', () => {
         },
       });
 
-      expect(chunks.filter(chunk => (
-        chunk.type === 'tool_use' || chunk.type === 'tool_result'
-      )).every(chunk => chunk.id === 'canonical_move')).toBe(true);
+      router.handleNotification('turn/completed', {
+        threadId: 't1',
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
+      expect(chunks.map(chunk => chunk.type)).toEqual([
+        'tool_use', 'tool_use', 'tool_result', 'done',
+      ]);
+      expect(chunks
+        .filter(chunk => chunk.type === 'tool_use' || chunk.type === 'tool_result')
+        .map(chunk => chunk.id)).toEqual([
+        'canonical_move', 'canonical_move', 'canonical_move',
+      ]);
     });
 
     it('falls back to a raw non-command exec when no canonical item arrives', () => {
@@ -2506,11 +2518,17 @@ describe('CodexNotificationRouter', () => {
         },
       });
 
+      router.handleNotification('turn/completed', {
+        threadId: 't1',
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
       expect(chunks.filter(chunk => chunk.type === 'tool_use')).toHaveLength(1);
       expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
       expect(chunks.filter(chunk => (
         chunk.type === 'tool_use' || chunk.type === 'tool_result'
       )).every(chunk => chunk.id === canonicalId)).toBe(true);
+      expect(chunks[chunks.length - 1]).toEqual({ type: 'done' });
     });
 
     it('does not correlate MCP calls when canonical arguments are a strict superset', () => {
@@ -3680,6 +3698,85 @@ describe('CodexNotificationRouter', () => {
   });
 
   describe('webSearch tool', () => {
+    // Shapes captured from the 2026-09-20 native research session.
+    it.each([
+      {
+        label: 'multi-query summary',
+        input: { search_query: [{ q: 'AI drug discovery' }, { q: 'clinical trials' }] },
+        item: {
+          query: 'AI drug discovery ...',
+          action: { type: 'search', query: null, queries: ['AI drug discovery', 'clinical trials'] },
+        },
+      },
+      {
+        label: 'open with an opaque native action',
+        input: { open: [{ ref_id: 'turn2view3' }] },
+        item: { query: '', action: { type: 'other' } },
+      },
+      {
+        label: 'click with an opaque native action',
+        input: { click: [{ ref_id: 'turn9view0', id: 13 }], response_length: 'short' },
+        item: { query: '', action: { type: 'other' } },
+      },
+      {
+        label: 'find without a native URL',
+        input: { find: [{ ref_id: 'turn10view0', pattern: 'FINANCIAL HIGHLIGHTS' }] },
+        item: {
+          query: "'FINANCIAL HIGHLIGHTS'",
+          action: { type: 'findInPage', url: null, pattern: 'FINANCIAL HIGHLIGHTS' },
+        },
+      },
+    ])('keeps $label before the final answer without a duplicate', ({ input, item }) => {
+      router.beginTurn();
+      router.handleNotification('rawResponseItem/completed', {
+        item: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'call_web',
+          input: `text(await tools.web__run(${JSON.stringify(input)}));`,
+        },
+      });
+      router.handleNotification('item/completed', {
+        item: { ...item, type: 'webSearch', id: 'exec_web', status: 'completed' },
+      });
+      router.handleNotification('rawResponseItem/completed', {
+        item: { type: 'custom_tool_call_output', call_id: 'call_web', output: 'Sources found.' },
+      });
+      router.handleNotification('item/agentMessage/delta', {
+        itemId: 'final', delta: 'Research complete.',
+      });
+      router.handleNotification('turn/completed', {
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
+      expect(chunks).toEqual([
+        expect.objectContaining({ type: 'tool_use', id: 'exec_web', name: 'WebSearch' }),
+        { type: 'tool_result', id: 'exec_web', content: 'Search complete', isError: false },
+        { type: 'text', content: 'Research complete.' },
+        { type: 'done' },
+      ]);
+    });
+
+    it('preserves concurrent raw opens when an opaque native action cannot identify one', () => {
+      router.beginTurn();
+      for (const [callId, refId] of [['call_first', 'turn1view0'], ['call_second', 'turn2view0']]) {
+        router.handleNotification('rawResponseItem/completed', {
+          item: {
+            type: 'custom_tool_call', name: 'exec', call_id: callId,
+            input: `text(await tools.web__run({open:[{ref_id:"${refId}"}]}));`,
+          },
+        });
+      }
+      router.handleNotification('item/completed', {
+        item: { type: 'webSearch', id: 'exec_web', action: { type: 'other' }, status: 'completed' },
+      });
+      router.handleNotification('turn/completed', {
+        turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
+      expect(chunks.filter(chunk => chunk.type === 'tool_use').map(chunk => chunk.id)).toEqual([
+        'exec_web', 'call_first', 'call_second',
+      ]);
+    });
+
     it('maps webSearch item/started to tool_use chunk', () => {
       router.handleNotification('item/started', {
         item: {
@@ -4167,7 +4264,6 @@ describe('CodexNotificationRouter', () => {
           cacheReadInputTokens: 5000,
           cacheCreationInputTokens: 0,
           contextWindow: 200000,
-          contextWindowIsAuthoritative: true,
           contextTokens: 9000,
           percentage: 5,
         },
@@ -4176,13 +4272,12 @@ describe('CodexNotificationRouter', () => {
   });
 
   describe('turn completion', () => {
-    it('records assistant turn metadata then emits done on completion', () => {
+    it('emits done on turn/completed with status completed', () => {
       router.handleNotification('turn/completed', {
         threadId: 't1',
         turn: { id: 'turn1', items: [], status: 'completed', error: null },
       });
 
-      expect(turnMetadata).toContainEqual({ assistantMessageId: 'turn1' });
       expect(chunks).toEqual([{ type: 'done' }]);
     });
 
@@ -4503,25 +4598,15 @@ describe('CodexNotificationRouter', () => {
       expect(chunks.map(chunk => chunk.type)).toEqual(['tool_use', 'tool_output']);
     });
 
-    it('emits tool_output chunk for incremental command output', () => {
-      startCommand();
-      router.handleNotification('item/commandExecution/outputDelta', {
-        threadId: 't1',
-        turnId: 'turn1',
-        itemId: 'call_1',
-        delta: 'line 1\n',
-      });
-
-      expect(chunks.filter(chunk => chunk.type === 'tool_output')).toEqual([
-        { type: 'tool_output', id: 'call_1', content: 'line 1\n' },
-      ]);
-    });
-
     it('accumulates multiple output deltas', () => {
       startCommand();
       router.handleNotification('item/commandExecution/outputDelta', {
         threadId: 't1', turnId: 'turn1', itemId: 'call_1', delta: 'line 1\n',
       });
+      expect(chunks.filter(chunk => chunk.type === 'tool_output')).toEqual([
+        { type: 'tool_output', id: 'call_1', content: 'line 1\n' },
+      ]);
+
       router.handleNotification('item/commandExecution/outputDelta', {
         threadId: 't1', turnId: 'turn1', itemId: 'call_1', delta: 'line 2\n',
       });
@@ -4675,42 +4760,6 @@ describe('CodexNotificationRouter', () => {
       expect(chunks).toEqual([
         { type: 'assistant_message_start', itemId: 'a1' },
       ]);
-    });
-  });
-
-  describe('assistant metadata emission', () => {
-    it('records assistant metadata before done on completed turn', () => {
-      router.handleNotification('turn/completed', {
-        threadId: 't1',
-        turn: { id: 'turn-uuid-123', items: [], status: 'completed', error: null },
-      });
-
-      const types = chunks.map(c => c.type);
-      expect(types).toContain('done');
-      expect(turnMetadata).toContainEqual({ assistantMessageId: 'turn-uuid-123' });
-    });
-
-    it('does NOT record assistant metadata on failed turn', () => {
-      router.handleNotification('turn/completed', {
-        threadId: 't1',
-        turn: {
-          id: 'turn-failed-1',
-          items: [],
-          status: 'failed',
-          error: { message: 'Error', codexErrorInfo: 'other', additionalDetails: null },
-        },
-      });
-
-      expect(turnMetadata).toEqual([]);
-    });
-
-    it('does NOT record assistant metadata on interrupted turn', () => {
-      router.handleNotification('turn/completed', {
-        threadId: 't1',
-        turn: { id: 'turn-interrupted-1', items: [], status: 'interrupted', error: null },
-      });
-
-      expect(turnMetadata).toEqual([]);
     });
   });
 });

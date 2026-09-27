@@ -13,11 +13,10 @@ export type BuiltInCommandAction =
   | 'resume'
   | 'fork'
   | 'fast'
-  | 'instruction';
+  | 'side';
 type BuiltInCommandCapability =
   | 'supportsNativeHistory'
-  | 'supportsFork'
-  | 'supportsInstructionMode';
+  | 'supportsFork';
 type BuiltInCommandCapabilityContext =
   Partial<Pick<ProviderCapabilities, BuiltInCommandCapability>>
   & Partial<Pick<ProviderCapabilities, 'providerId'>>;
@@ -34,8 +33,6 @@ export interface BuiltInCommand {
   requiredCapability?: BuiltInCommandCapability;
   /** When set, only these providers expose and execute the command. */
   supportedProviderIds?: ProviderId[];
-  /** When true, any submitted arguments leave the text for normal provider handling. */
-  exact?: boolean;
 }
 
 export interface BuiltInCommandResult {
@@ -70,11 +67,12 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     supportedProviderIds: ['codex'],
   },
   {
-    name: 'instruction',
-    description: 'Save a reusable custom instruction',
-    action: 'instruction',
-    exact: true,
-    requiredCapability: 'supportsInstructionMode',
+    name: 'side',
+    aliases: ['btw'],
+    description: 'Ask a temporary side question from the latest reply',
+    action: 'side',
+    argumentHint: 'prompt',
+    requiredCapability: 'supportsFork',
   },
 ];
 
@@ -158,9 +156,52 @@ export function detectBuiltInCommand(
   if (!isBuiltInCommandSupported(command, context)) return null;
 
   const args = (match[2] || '').trim();
-  if (command.exact && args.length > 0) return null;
 
   return { command, args };
+}
+
+export interface SideChatCommandMatch {
+  /** Alias exactly as typed, lowercased. */
+  readonly alias: string;
+  /** Trimmed argument; empty when the alias was submitted on its own. */
+  readonly argument: string;
+}
+
+/**
+ * Recognizes a complete leading side-chat command token, including multiline
+ * arguments that the single-line built-in matcher deliberately rejects.
+ */
+export function detectSideChatCommand(
+  input: string,
+  context?: BuiltInCommandSupportContext,
+): SideChatCommandMatch | null {
+  const match = /^\/([a-zA-Z0-9_-]+)(?:[ \t]+([\s\S]*))?$/.exec(input.trim());
+  if (!match) return null;
+  const command = commandMap.get(match[1].toLowerCase());
+  if (!command || command.action !== 'side') return null;
+  if (context && !isBuiltInCommandProviderSupported(command, context)) return null;
+  return { alias: match[1].toLowerCase(), argument: (match[2] ?? '').trim() };
+}
+
+/**
+ * Leading built-in command token that Claudian owns for the main chat only,
+ * regardless of provider capability. Side-chat aliases are excluded because
+ * they are the side feature's own controls.
+ */
+export function detectMainOnlyBuiltInCommand(input: string): BuiltInCommand | null {
+  const match = /^\/([a-zA-Z0-9_-]+)(?:[\s]([\s\S]*))?$/.exec(input.trim());
+  if (!match) return null;
+  const command = commandMap.get(match[1].toLowerCase());
+  if (!command || command.action === 'side') return null;
+  return command;
+}
+
+/** Whether the current provider exposes the side-chat command at all. */
+export function isSideChatCommandSupported(
+  context?: BuiltInCommandSupportContext,
+): boolean {
+  const command = commandMap.get('side');
+  return Boolean(command && isBuiltInCommandSupported(command, context));
 }
 
 /**
@@ -170,6 +211,7 @@ export function detectBuiltInCommand(
 export function getBuiltInCommandsForDropdown(context?: BuiltInCommandSupportContext): Array<{
   id: string;
   name: string;
+  aliases?: readonly string[];
   description: string;
   content: string;
   argumentHint?: string;
@@ -179,6 +221,7 @@ export function getBuiltInCommandsForDropdown(context?: BuiltInCommandSupportCon
     .map((cmd) => ({
       id: `builtin:${cmd.name}`,
       name: cmd.name,
+      aliases: cmd.aliases,
       description: cmd.description,
       content: '', // Built-in commands don't have prompt content
       argumentHint: cmd.argumentHint,

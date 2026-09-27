@@ -14,14 +14,14 @@ HTMLElement.prototype.appendText = function (text) { this.append(document.create
 HTMLElement.prototype.empty = function () { this.replaceChildren(); };
 HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
 
-function setup() {
+function setup(providerId = 'claude') {
   const messagesEl = document.body.createDiv();
   const fork = jest.fn().mockResolvedValue(undefined);
   const settings = { mediaFolder: '', showMessageTimestamps: true };
   const renderer = new MessageRenderer(
     { app: {}, settings } as any,
     { registerDomEvent: jest.fn(), register: jest.fn(), addChild: jest.fn() } as any,
-    messagesEl, undefined, fork, () => ProviderRegistry.getCapabilities('claude'),
+    messagesEl, undefined, fork, () => ProviderRegistry.getCapabilities(providerId),
   );
   return { renderer, messagesEl, fork, settings };
 }
@@ -119,14 +119,16 @@ it('leaves interrupted and unsuccessful output expanded', () => {
   }
 });
 
-it('copies interrupted replay text without legacy marker markup', async () => {
+it('copies retired interruption markup as ordinary message text', async () => {
   const { renderer, messagesEl } = setup();
   const marker = '<span class="claudian-interrupted">Interrupted</span> <span class="claudian-interrupted-hint">· What should Claudian do instead?</span>';
   renderer.renderStoredMessage({ id: 'legacy', role: 'assistant', timestamp: 5,
     content: `Partial answer\n\n${marker}` });
   fireEvent.click(within(messagesEl).getByRole('button', { name: 'Copy message' }));
   await Promise.resolve();
-  expect(navigator.clipboard.writeText).toHaveBeenCalledWith('Partial answer');
+  expect(navigator.clipboard.writeText).toHaveBeenCalledWith(`Partial answer\n\n${marker}`);
+  expect(messagesEl.querySelectorAll('.claudian-interrupted')).toHaveLength(0);
+  expect(await axe(messagesEl)).toHaveNoViolations();
   renderer.dispose();
 });
 
@@ -197,5 +199,203 @@ it('offers fork on the final live response of a multi-message turn', async () =>
   fireEvent.click(within(response).getByRole('button', { name: 'Fork conversation' }));
   await Promise.resolve();
   expect(fork).toHaveBeenCalledWith('a2');
+  renderer.dispose();
+});
+
+it('offers full-session fork only on the latest reply and removes it when another turn starts', async () => {
+  const { renderer, messagesEl, fork } = setup('opencode');
+  const latest: ChatMessage = { id: 'a3', role: 'assistant', content: 'Latest answer', timestamp: 7,
+    assistantMessageId: 'native-a3' };
+  renderer.renderMessages([...messages, { id: 'u2', role: 'user', content: 'Next', timestamp: 6 }, latest], () => 'Hello');
+  const buttons = within(messagesEl).getAllByRole('button', { name: 'Fork conversation' });
+  expect(buttons).toHaveLength(1);
+  expect(buttons[0].closest('[data-message-id]')?.getAttribute('data-message-id')).toBe('a3');
+  expect(buttons[0].getAttribute('type')).toBe('button');
+  fireEvent.click(buttons[0]);
+  await Promise.resolve();
+  expect(fork).toHaveBeenCalledWith('a3');
+  expect((await axe(messagesEl)).violations).toEqual([]);
+  renderer.addMessage({ id: 'u3', role: 'user', content: 'Continue', timestamp: 8 });
+  expect(within(messagesEl).queryByRole('button', { name: 'Fork conversation' })).toBeNull();
+  renderer.dispose();
+});
+
+it('shows one task notification disclosure between the initial and automatic replies', async () => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderMessages([
+    { id: 'initial', role: 'assistant', content: 'Waiting for completion.', timestamp: 1,
+      durationSeconds: 5, contentBlocks: [{ type: 'text', content: 'Waiting for completion.' }] },
+    { id: 'automatic', role: 'assistant', isAutomaticResponse: true, content: 'The sleep finished successfully.', timestamp: 25,
+      contentBlocks: [
+        { type: 'task_notification', content: 'Background command completed (exit code 0).' },
+        { type: 'thinking', content: 'Check the completed task.' },
+        { type: 'text', content: 'The sleep finished successfully.' },
+      ] },
+  ], () => 'Hello');
+  await Promise.resolve();
+
+  const header = within(messagesEl).getByRole('button', { name: 'Task notification' });
+  expect(header.getAttribute('type')).toBe('button');
+  expect(header.getAttribute('aria-expanded')).toBe('false');
+  const result = within(messagesEl).getByText('Background command completed (exit code 0).');
+  expect(result.closest('[hidden]')).not.toBeNull();
+  expect(within(messagesEl).getByText('Waiting for completion.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('The sleep finished successfully.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getAllByRole('button', { name: /^Worked/ })).toHaveLength(1);
+  expect(within(messagesEl).getByRole('button', { name: 'Worked for 00:05' })).toBeDefined();
+  fireEvent.click(header);
+  expect(result.closest('[hidden]')).toBeNull();
+  expect(header.getAttribute('aria-expanded')).toBe('true');
+  fireEvent.click(header);
+  expect(result.closest('[hidden]')).not.toBeNull();
+  header.focus();
+  expect(document.activeElement).toBe(header);
+  expect((await axe(messagesEl)).violations).toEqual([]);
+  renderer.dispose();
+});
+
+it('preserves requested work before a notification arriving in the same response', async () => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderStoredMessage({
+    id: 'requested-with-notification', role: 'assistant', timestamp: 1,
+    content: 'Initial reply.\n\nFollow-up reply.', durationSeconds: 5,
+    contentBlocks: [
+      { type: 'thinking', content: 'Initial reasoning.' },
+      { type: 'text', content: 'Initial reply.' },
+      { type: 'task_notification', content: 'The background result.' },
+      { type: 'text', content: 'Follow-up reply.' },
+    ],
+  });
+  await Promise.resolve();
+  const work = within(messagesEl).getByRole('button', { name: 'Worked for 00:05' });
+  expect(within(messagesEl).getByRole('button', { name: 'Task notification' }).closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('Initial reply.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('Follow-up reply.').closest('[hidden]')).toBeNull();
+  fireEvent.click(work);
+  expect(within(messagesEl).getByText('Initial reasoning.').closest('[hidden]')).toBeNull();
+  renderer.dispose();
+});
+
+it('keeps a requested response disclosure separate when a notification precedes its first output', async () => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderStoredMessage({
+    id: 'requested-after-notification', role: 'assistant', timestamp: 1,
+    content: 'The requested answer.', durationSeconds: 5,
+    contentBlocks: [
+      { type: 'task_notification', content: 'Old task result.' },
+      { type: 'thinking', content: 'Reasoning about the new request.' },
+      { type: 'text', content: 'The requested answer.' },
+    ],
+  });
+  await Promise.resolve();
+  const notification = within(messagesEl).getByRole('button', { name: 'Task notification' });
+  const work = within(messagesEl).getByRole('button', { name: 'Worked for 00:05' });
+  fireEvent.click(notification);
+  expect(within(messagesEl).getByText('Old task result.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('Reasoning about the new request.').closest('[hidden]')).not.toBeNull();
+  fireEvent.click(work);
+  expect(within(messagesEl).getByText('Reasoning about the new request.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('The requested answer.').closest('[hidden]')).toBeNull();
+  renderer.dispose();
+});
+
+it('finalizes each automatic response when multiple task notifications arrive consecutively', async () => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderMessages([
+    { id: 'first-automatic', role: 'assistant', isAutomaticResponse: true, timestamp: 1, content: 'First follow-up.',
+      contentBlocks: [
+        { type: 'task_notification', content: 'First result.' },
+        { type: 'thinking', content: 'Processing the first result.' },
+        { type: 'text', content: 'First follow-up.' },
+      ] },
+    { id: 'second-automatic', role: 'assistant', isAutomaticResponse: true, timestamp: 2, content: 'Second follow-up.',
+      contentBlocks: [
+        { type: 'task_notification', content: 'Second result.' },
+        { type: 'text', content: 'Second follow-up.' },
+      ] },
+  ], () => 'Hello');
+  await Promise.resolve();
+  expect(within(messagesEl).getAllByRole('button', { name: 'Task notification' })).toHaveLength(2);
+  expect(within(messagesEl).getByText('Processing the first result.').closest('[hidden]')).not.toBeNull();
+  expect(within(messagesEl).getByText('First follow-up.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('Second follow-up.').closest('[hidden]')).toBeNull();
+  renderer.dispose();
+});
+
+it('keeps requested work on both sides of a mid-response notification in its own disclosure', async () => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderStoredMessage({
+    id: 'requested-mid-response', role: 'assistant', timestamp: 1,
+    content: 'The requested answer.', durationSeconds: 5,
+    contentBlocks: [
+      { type: 'thinking', content: 'Work before notification.' },
+      { type: 'task_notification', content: 'Old task result.' },
+      { type: 'thinking', content: 'Work after notification.' },
+      { type: 'text', content: 'The requested answer.' },
+    ],
+  });
+  await Promise.resolve();
+  fireEvent.click(within(messagesEl).getByRole('button', { name: 'Task notification' }));
+  expect(within(messagesEl).getByText('Work after notification.').closest('[hidden]')).not.toBeNull();
+  fireEvent.click(within(messagesEl).getByRole('button', { name: 'Worked for 00:05' }));
+  expect(within(messagesEl).getByText('Work before notification.').closest('[hidden]')).toBeNull();
+  expect(within(messagesEl).getByText('Work after notification.').closest('[hidden]')).toBeNull();
+  renderer.dispose();
+});
+
+it.each(['claude', 'pi', 'opencode', 'codex'])('shows native throughput for %s on replay', async (provider) => {
+  const { renderer, messagesEl } = setup(provider);
+  const response = { ...messages[2], turnStats: { outputTokens: 125, durationMs: 2500 } };
+  renderer.renderMessages([messages[0], response], () => 'Hello');
+  const stat = within(messagesEl).getByText('50.0 tok/s');
+  expect(stat.parentElement).toBe(within(messagesEl).getAllByRole('button', { name: 'Copy message' }).at(-1)!.parentElement);
+  // Obsidian renders aria-label tooltips; a title would add a duplicate browser tooltip.
+  expect(stat.getAttribute('aria-label')).toBe('125 tokens · 2.5s');
+  expect(stat.hasAttribute('title')).toBe(false);
+  expect((await axe(messagesEl)).violations).toEqual([]);
+  renderer.dispose();
+});
+
+it.each([
+  ['grok', { outputTokens: 125, durationMs: 2500 }],
+  ['claude', undefined],
+])('omits unavailable or unsupported throughput (%s, %j)', (provider, turnStats) => {
+  const { renderer, messagesEl } = setup(provider as string);
+  renderer.renderMessages([messages[0], { ...messages[2], turnStats } as ChatMessage], () => 'Hello');
+  expect(within(messagesEl).queryByText(/tok\/s/)).toBeNull();
+  renderer.dispose();
+});
+
+it.each([
+  [2888, 118846, '24.3 tok/s', '2,888 tokens · 1m 58.8s'],
+  [300, 119960, '2.5 tok/s', '300 tokens · 2m 0s'],
+  [90, 3000, '30.0 tok/s', '90 tokens · 3s'],
+])('summarizes %i tokens over %ims in the tooltip', (outputTokens, durationMs, rate, tooltip) => {
+  const { renderer, messagesEl } = setup();
+  renderer.renderMessages([messages[0], { ...messages[2], turnStats: { outputTokens, durationMs } }], () => 'Hello');
+  expect(within(messagesEl).getByText(rate).getAttribute('aria-label')).toBe(tooltip);
+  renderer.dispose();
+});
+
+it('keeps time after throughput when timestamps are refreshed or toggled', () => {
+  const { renderer, messagesEl, settings } = setup();
+  renderer.renderMessages([messages[0], { ...messages[2], turnStats: { outputTokens: 158, durationMs: 10000 } }], () => 'Hello');
+  const stat = within(messagesEl).getByText('15.8 tok/s');
+  const toolbar = stat.parentElement!;
+  const copy = within(toolbar).getByRole('button', { name: 'Copy message' });
+  const fork = within(toolbar).getByRole('button', { name: 'Fork conversation' });
+  const expectOrder = () => {
+    expect(Array.from(toolbar.children)).toEqual([copy, fork, stat, toolbar.querySelector('.claudian-message-timestamp')]);
+  };
+  expectOrder();
+  renderer.refreshMessageTimestamps();
+  expectOrder();
+  settings.showMessageTimestamps = false;
+  renderer.refreshMessageTimestamps();
+  expect(Array.from(toolbar.children)).toEqual([copy, fork, stat]);
+  settings.showMessageTimestamps = true;
+  renderer.refreshMessageTimestamps();
+  renderer.refreshMessageTimestamps();
+  expectOrder();
   renderer.dispose();
 });

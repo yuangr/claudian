@@ -1,23 +1,15 @@
+import { createFixture, deferred, requestedUserMessageStarted, waitForCall } from '@test/helpers/ChatInputHarness';
 import { createMockEl } from '@test/helpers/MockElement';
 import { Notice } from 'obsidian';
 
 import type { ProviderExecutionErrorEvent, ProviderExecutionEvent } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import type { ImageAttachment } from '@/core/types';
-import {
-  InputController,
-  type InputControllerDeps,
-} from '@/features/chat/controllers/InputController';
-import {
-  ChatExecutionPreHandoffError,
-  type ChatTurnSubmission,
-} from '@/features/chat/execution/ChatExecutionCoordinator';
-import { ChatState } from '@/features/chat/state/ChatState';
-import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
+import { ChatExecutionPreHandoffError, type ChatTurnSubmission } from '@/features/chat/execution/ChatExecutionCoordinator';
 
 jest.mock('@/core/providers/ProviderRegistry', () => ({
   ProviderRegistry: {
+    resolveTitleGenerationSelection: jest.fn().mockReturnValue(null),
     getCapabilities: jest.fn().mockReturnValue({
       providerId: 'claude',
       supportsFork: true,
@@ -26,197 +18,6 @@ jest.mock('@/core/providers/ProviderRegistry', () => ({
     }),
   },
 }));
-
-jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
-  ProviderSettingsCoordinator: {
-    getProviderSettingsSnapshot: jest.fn().mockReturnValue({
-      effortLevel: 'high',
-      model: 'claude-model',
-      permissionMode: 'normal',
-      serviceTier: 'standard',
-    }),
-  },
-}));
-
-function createInput(): ComposerInputElement {
-  return {
-    dispatchEvent: jest.fn().mockReturnValue(true),
-    focus: jest.fn(),
-    value: '',
-  } as unknown as ComposerInputElement;
-}
-
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (error: unknown) => void;
-} {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, reject, resolve };
-}
-
-async function waitForCall(mock: jest.Mock): Promise<void> {
-  for (let attempt = 0; attempt < 20 && mock.mock.calls.length === 0; attempt++) {
-    await Promise.resolve();
-  }
-  expect(mock).toHaveBeenCalled();
-}
-
-function requestedUserMessageStarted(
-  content: string,
-  sequence: number,
-  nativeUserMessageId?: string,
-): ProviderExecutionEvent {
-  return {
-    content,
-    ...(nativeUserMessageId ? { nativeUserMessageId } : {}),
-    scope: {
-      executionId: 'execution-1',
-      kind: 'requested',
-      sequence,
-      sessionInstanceId: 'session-1',
-      turnId: 'turn-1',
-    },
-    type: 'user_message_started',
-  };
-}
-
-function createFixture(overrides: Record<string, unknown> = {}) {
-  const {
-    onReviewableSettlement,
-    ...dependencyOverrides
-  } = overrides;
-  const state = new ChatState();
-  state.currentConversationId = 'conversation-1';
-  const input = createInput();
-  const queueIndicator = createMockEl();
-  state.queueIndicatorEl = queueIndicator as any;
-  let id = 0;
-  const coordinator = {
-    acceptSteerFromProviderEvent: jest.fn().mockResolvedValue(true),
-    cancel: jest.fn().mockResolvedValue(undefined),
-    execute: jest.fn().mockResolvedValue({
-      accepted: true,
-      status: 'completed',
-    }),
-    releaseSteerCorrelation: jest.fn(),
-    state: 'idle',
-    steer: jest.fn().mockResolvedValue(true),
-  };
-  const plugin = {
-    createConversation: jest.fn(),
-    getConversationById: jest.fn().mockResolvedValue(null),
-    getConversationList: jest.fn().mockReturnValue([]),
-    getConversationSync: jest.fn().mockReturnValue({
-      id: 'conversation-1',
-      providerId: 'claude',
-    }),
-    renameConversation: jest.fn().mockResolvedValue(undefined),
-    rewriteLinkedContentPaths: jest.fn().mockResolvedValue(undefined),
-    settings: {
-      enableAutoTitleGeneration: false,
-      permissionMode: 'normal',
-    },
-    updateConversation: jest.fn().mockResolvedValue(undefined),
-  };
-  const linkedContentToken = Object.freeze({}) as { readonly path?: string };
-  const linkedContentController = {
-    beginSubmission: jest.fn().mockReturnValue(linkedContentToken),
-    commitSubmission: jest.fn().mockReturnValue({ queuedEvents: [] }),
-    getSnapshot: jest.fn().mockReturnValue({
-      content: null,
-      mode: 'locked',
-      path: null,
-    }),
-    resetAutoDraft: jest.fn(),
-    rollbackSubmission: jest.fn(),
-  };
-  const deps = {
-    plugin,
-    state,
-    renderer: {
-      addMessage: jest.fn().mockImplementation(() => {
-        const el = createMockEl();
-        el.createDiv({ cls: 'claudian-message-content' });
-        return el;
-      }),
-      appendInterruptIndicator: jest.fn(),
-      refreshActionButtons: jest.fn(),
-      finalizeResponse: jest.fn(),
-      removeMessage: jest.fn(),
-      updateLiveUserMessage: jest.fn(),
-    },
-    streamController: {
-      appendText: jest.fn(),
-      finalizeCurrentTextBlock: jest.fn(),
-      finalizeCurrentThinkingBlock: jest.fn(),
-      handleStreamChunk: jest.fn(),
-      hideThinkingIndicator: jest.fn(),
-      showThinkingIndicator: jest.fn(),
-    },
-    selectionController: {
-      getContext: jest.fn().mockReturnValue(null),
-    },
-    browserSelectionController: {
-      getContext: jest.fn().mockReturnValue(null),
-    },
-    canvasSelectionController: {
-      getContext: jest.fn().mockReturnValue(null),
-    },
-    conversationController: {
-      clearTerminalSubagentsFromMessages: jest.fn(),
-      createNew: jest.fn().mockResolvedValue(undefined),
-      generateFallbackTitle: jest.fn().mockReturnValue('Fallback title'),
-      save: jest.fn().mockResolvedValue(undefined),
-      updateHistoryDropdown: jest.fn(),
-    },
-    getInputEl: () => input,
-    getInputContainerEl: () => createMockEl() as any,
-    getWelcomeEl: () => null,
-    getMessagesEl: () => createMockEl() as any,
-    getLinkedContentController: () => linkedContentController as any,
-    getImageContextManager: () => ({
-      clearImages: jest.fn(),
-      getAttachedImages: jest.fn().mockReturnValue([]),
-      hasImages: jest.fn().mockReturnValue(false),
-      setImages: jest.fn(),
-    }) as any,
-    getInstructionModeManager: () => null,
-    getInstructionRefineService: () => null,
-    getTitleGenerationService: () => null,
-    generateId: () => `id-${++id}`,
-    getAuxiliaryModel: () => 'claude-model',
-    getExecutionCoordinator: () => coordinator,
-    getSubagentManager: () => ({
-      resetSpawnedCount: jest.fn(),
-      resetStreamingState: jest.fn(),
-    }) as any,
-    getTabProviderId: () => 'claude',
-    ensureExecutionInitialized: jest.fn().mockResolvedValue(true),
-    ...dependencyOverrides,
-    ...(typeof onReviewableSettlement === 'function'
-      ? {
-          captureReviewableSettlement: jest.fn(
-            () => onReviewableSettlement as () => void,
-          ),
-        }
-      : {}),
-  } as unknown as InputControllerDeps;
-  return {
-    controller: new InputController(deps),
-    coordinator,
-    deps,
-    input,
-    linkedContentController,
-    plugin,
-    state,
-  };
-}
 
 describe('composer wikilinks', () => {
   it('sends exact aliased wikilinks and retains them in displayed messages', async () => {
@@ -266,6 +67,7 @@ describe('InputController approval details', () => {
     });
 
     const pending = fixture.controller.handleApprovalRequest(
+      'approval-id',
       'Bash',
       {},
       'A long command description',
@@ -294,7 +96,7 @@ describe('InputController approval details', () => {
     expect(stopPropagation).toHaveBeenCalledTimes(2);
     expect(preventDefault).not.toHaveBeenCalled();
 
-    fixture.controller.dismissPendingApprovalPrompt();
+    fixture.controller.dismissProviderInteraction('approval-id');
     return pending;
   });
 });
@@ -308,12 +110,31 @@ describe('InputController coordinator execution', () => {
       supportsNativeHistory: true,
       supportsTurnSteer: true,
     } as any);
-    jest.mocked(ProviderSettingsCoordinator.getProviderSettingsSnapshot).mockReturnValue({
-      effortLevel: 'high',
-      model: 'claude-model',
-      permissionMode: 'normal',
-      serviceTier: 'standard',
+
+  });
+
+  it.each(['claude', 'codex', 'grok', 'opencode', 'pi'])('uses the toolbar model and reasoning snapshot as the only submission input for %s', async providerId => {
+    const toolbar = { model: 'toolbar-model', reasoning: 'low', permissionMode: 'normal', serviceTier: 'default' };
+    const fixture = createFixture({
+      getSettings: () => toolbar,
+      getTabProviderId: () => providerId,
     });
+    await fixture.controller.sendMessage({ content: 'use toolbar settings' });
+    expect(fixture.coordinator.execute).toHaveBeenCalledWith(expect.objectContaining({
+      configuration: expect.objectContaining(toolbar),
+    }), expect.any(AbortSignal));
+  });
+
+  it('preserves input and blocks execution for an unresolved tab provider', async () => {
+    const fixture = createFixture({ getTabProviderId: () => null });
+    fixture.state.currentConversationId = null;
+    fixture.input.value = 'keep this draft';
+    await fixture.controller.sendMessage();
+    expect(fixture.input.value).toBe('keep this draft');
+    expect(fixture.coordinator.execute).not.toHaveBeenCalled();
+    expect(fixture.deps.ensureExecutionInitialized).not.toHaveBeenCalled();
+    expect(fixture.state.messages).toEqual([]);
+    expect(Notice).toHaveBeenCalledWith('Select an available model before sending.');
   });
 
   it('does not start a turn when its tab session has closed intent admission', async () => {
@@ -415,11 +236,9 @@ describe('InputController coordinator execution', () => {
       canonicalText: 'first',
       context: { linkedContent: { path: 'Projects' } },
       rawDisplayText: 'first',
-      userTurnOrdinal: 1,
       toolPolicy: { kind: 'provider-default' },
     });
     expect(first.conversationHistory).toEqual([]);
-    expect(second.userTurnOrdinal).toBe(2);
     expect(second.context).not.toHaveProperty('linkedContent');
     expect(second.conversationHistory).toHaveLength(2);
     expect(fixture.deps.conversationController.save).toHaveBeenCalledTimes(2);
@@ -427,7 +246,7 @@ describe('InputController coordinator execution', () => {
 
   it('adds app guidance to provider-default system instructions without changing input', async () => {
     const fixture = createFixture();
-    const getDynamicSections = jest.fn().mockResolvedValue(['## Collab Mode\nRuntime guidance.']);
+    const getDynamicSections = jest.fn().mockResolvedValue(['## Additional context\nRuntime guidance.']);
     Object.assign(fixture.plugin, {
       getMainAgentDynamicSystemPromptSections: getDynamicSections,
     });
@@ -440,13 +259,30 @@ describe('InputController coordinator execution', () => {
       canonicalText: 'list my projects',
       configuration: {
         systemInstructions: {
-          dynamicSections: ['## Collab Mode\nRuntime guidance.'],
+          dynamicSections: ['## Additional context\nRuntime guidance.'],
           kind: 'provider-default',
         },
       },
       rawDisplayText: 'list my projects',
     });
     expect(fixture.state.messages[0]?.content).toBe('list my projects');
+  });
+
+  it('does not launch execution when close overlaps dynamic configuration', async () => {
+    let closing = false;
+    const fixture = createFixture({ isClosing: () => closing });
+    Object.assign(fixture.plugin, {
+      getMainAgentDynamicSystemPromptSections: async () => {
+        closing = true;
+        fixture.state.bumpStreamGeneration();
+        return [];
+      },
+    });
+    await fixture.controller.sendMessage({ content: 'Keep the admitted input' });
+    expect(fixture.coordinator.execute).not.toHaveBeenCalled();
+    expect(fixture.state.messages).toEqual([
+      expect.objectContaining({ role: 'user', content: 'Keep the admitted input' }),
+    ]);
   });
 
   it('continues without dynamic sections when app guidance is unavailable', async () => {
@@ -542,7 +378,6 @@ describe('InputController coordinator execution', () => {
         editorSelection: editorContext,
       },
       rawDisplayText: 'B',
-      userTurnOrdinal: 2,
     });
     expect(submission.conversationHistory?.map(message => message.id)).toEqual([
       'user-a',
@@ -579,7 +414,7 @@ describe('InputController coordinator execution', () => {
       context: expect.objectContaining({
         linkedContent: { path: 'note.md' },
       }),
-    }));
+    }), expect.any(AbortSignal));
   });
 
   it('restores composer input and rolls back the local turn on definite pre-handoff failure', async () => {
@@ -620,8 +455,31 @@ describe('InputController coordinator execution', () => {
     expect(fixture.deps.streamController.appendText).not.toHaveBeenCalled();
   });
 
+  it('keeps unsent input in the closing transcript when preparation fails before handoff', async () => {
+    let closing = false;
+    const fixture = createFixture({ isClosing: () => closing });
+    fixture.coordinator.execute.mockImplementation(async () => {
+      closing = true;
+      fixture.state.bumpStreamGeneration();
+      throw new ChatExecutionPreHandoffError('closed during preparation');
+    });
+    await fixture.controller.sendMessage({ content: 'Keep the admitted input' });
+    expect(fixture.state.messages).toEqual([
+      expect.objectContaining({ role: 'user', content: 'Keep the admitted input' }),
+    ]);
+    expect(fixture.input.value).toBe('');
+  });
+
   it('restores the unsent turn after an asynchronous unaccepted configuration rejection', async () => {
-    const fixture = createFixture();
+    const image: ImageAttachment = { id: 'retry-image', name: 'retry.png', mediaType: 'image/png', data: 'aGVsbG8=', size: 5, source: 'paste' };
+    let attachedImages = [image];
+    const imageContextManager = {
+      clearImages: () => { attachedImages = []; },
+      getAttachedImages: () => attachedImages,
+      hasImages: () => attachedImages.length > 0,
+      setImages: (images: ImageAttachment[]) => { attachedImages = images; },
+    };
+    const fixture = createFixture({ getImageContextManager: () => imageContextManager });
     const rejection: ProviderExecutionEvent = {
       type: 'execution_error',
       category: 'configuration',
@@ -643,6 +501,7 @@ describe('InputController coordinator execution', () => {
     await fixture.controller.sendMessage();
 
     expect(fixture.input.value).toBe('retry after configuration');
+    expect(attachedImages).toEqual([image]);
     expect(fixture.state.messages).toEqual([]);
     expect(fixture.deps.renderer.removeMessage).toHaveBeenCalledTimes(2);
     expect(fixture.deps.conversationController.save).not.toHaveBeenCalled();
@@ -664,7 +523,7 @@ describe('InputController coordinator execution', () => {
     );
   });
 
-  it('puts the completed turn checkpoint on the final assistant projection after message boundaries', async () => {
+  it('puts the completed turn checkpoint and statistics on the final assistant projection after message boundaries', async () => {
     const fixture = createFixture();
     fixture.coordinator.execute.mockImplementationOnce(async (submission: ChatTurnSubmission) => {
       for (const sequence of [1, 2]) {
@@ -674,6 +533,13 @@ describe('InputController coordinator execution', () => {
             sessionInstanceId: 'session-1', sequence },
         });
       }
+      await fixture.controller.handleExecutionEvent({
+        type: 'turn_completed',
+        scope: { kind: 'requested', executionId: 'execution-1', turnId: 'turn-1',
+          sessionInstanceId: 'session-1', sequence: 3 },
+        reason: 'completed',
+        turnStats: { outputTokens: 125, durationMs: 2500 },
+      });
       // The execution binding still identifies the original assistant projection.
       submission.messages!.assistant.assistantMessageId = 'completed-checkpoint';
       return { accepted: true, status: 'completed', nativeCheckpointId: 'completed-checkpoint' };
@@ -685,6 +551,7 @@ describe('InputController coordinator execution', () => {
     expect(assistants.length).toBeGreaterThan(1);
     expect(assistants.at(-1)?.assistantMessageId).toBe('completed-checkpoint');
     expect(assistants[0].assistantMessageId).toBeUndefined();
+    expect(assistants.at(-1)?.turnStats).toEqual({ outputTokens: 125, durationMs: 2500 });
   });
 
   it('timestamps the final response at execution completion instead of streaming start', async () => {
@@ -722,15 +589,12 @@ describe('InputController coordinator execution', () => {
       const assistantMessage = fixture.state.messages[1];
       expect(assistantMessage.durationSeconds).toBe(1);
       expect(assistantMessage.durationFlavorWord).toBeUndefined();
-
-      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
-      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
     } finally {
       nowSpy.mockRestore();
     }
   });
 
-  it('suppresses response duration and DOM footer on normalized execution errors when elapsed time exceeds one second', async () => {
+  it('suppresses response duration on normalized execution errors when elapsed time exceeds one second', async () => {
     let currentTime = 1000;
     const nowSpy = jest.spyOn(performance, 'now').mockImplementation(() => currentTime);
     try {
@@ -765,15 +629,12 @@ describe('InputController coordinator execution', () => {
       const assistantMessage = fixture.state.messages[1];
       expect(assistantMessage.durationSeconds).toBeUndefined();
       expect(assistantMessage.durationFlavorWord).toBeUndefined();
-
-      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
-      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
     } finally {
       nowSpy.mockRestore();
     }
   });
 
-  it('suppresses response duration and DOM footer on catch-path rejections when elapsed time exceeds one second', async () => {
+  it('suppresses response duration on catch-path rejections when elapsed time exceeds one second', async () => {
     let currentTime = 1000;
     const nowSpy = jest.spyOn(performance, 'now').mockImplementation(() => currentTime);
     try {
@@ -791,9 +652,6 @@ describe('InputController coordinator execution', () => {
       const assistantMessage = fixture.state.messages[1];
       expect(assistantMessage.durationSeconds).toBeUndefined();
       expect(assistantMessage.durationFlavorWord).toBeUndefined();
-
-      const assistantMsgEl = jest.mocked(fixture.deps.renderer.addMessage).mock.results.at(-1)?.value;
-      expect(assistantMsgEl?.querySelector('.claudian-response-footer')).toBeNull();
     } finally {
       nowSpy.mockRestore();
     }
@@ -1015,6 +873,8 @@ describe('InputController coordinator execution', () => {
     nativeResult.resolve(true);
     await steer;
 
+    expect(fixture.linkedContentController.beginSubmission).not.toHaveBeenCalled();
+    expect(fixture.linkedContentController.commitSubmission).not.toHaveBeenCalled();
     expect(fixture.input.value).toBe('');
     expect(fixture.state.queuedMessage).toBeNull();
     expect((fixture.controller as any).pendingSteersByConversation.get('conversation-1'))
@@ -1119,25 +979,6 @@ describe('InputController coordinator execution', () => {
     fixture.input.value = '';
     fixture.controller.onConversationActivated();
     expect(fixture.input.value).toBe('conversation A typed retry');
-  });
-
-  it('does not mutate Linked content after a stale accepted steer settles', async () => {
-    const fixture = createFixture();
-    const nativeResult = deferred<boolean>();
-    fixture.coordinator.steer.mockReturnValueOnce(nativeResult.promise);
-    fixture.state.isStreaming = true;
-    fixture.input.value = 'accepted A';
-
-    await fixture.controller.sendMessage();
-    const steer = (fixture.controller as any).steerQueuedMessage();
-    await waitForCall(fixture.coordinator.steer);
-    fixture.state.currentConversationId = 'conversation-2';
-    nativeResult.resolve(true);
-    await steer;
-
-    expect(fixture.linkedContentController.beginSubmission).not.toHaveBeenCalled();
-    expect(fixture.linkedContentController.commitSubmission).not.toHaveBeenCalled();
-    expect(fixture.input.value).toBe('');
   });
 
   it.each([
@@ -1304,7 +1145,7 @@ describe('InputController coordinator execution', () => {
       await mainTurn;
 
       expect(fixture.coordinator.acceptSteerFromProviderEvent).toHaveBeenCalledWith(
-        submission.inputRecordId,
+        submission.submissionId,
         'native-steer-user',
       );
       expect(fixture.state.messages.filter(message => (
@@ -1318,7 +1159,7 @@ describe('InputController coordinator execution', () => {
       expect((fixture.controller as any).pendingSteersByConversation.has('conversation-1'))
         .toBe(false);
       expect(fixture.coordinator.releaseSteerCorrelation).toHaveBeenCalledWith(
-        submission.inputRecordId,
+        submission.submissionId,
       );
     },
   );
@@ -1348,7 +1189,7 @@ describe('InputController coordinator execution', () => {
     ));
 
     expect(fixture.coordinator.acceptSteerFromProviderEvent).toHaveBeenCalledWith(
-      submission.inputRecordId,
+      submission.submissionId,
       'native-after-ack',
     );
     expect(fixture.state.messages.find(message => (
@@ -1387,7 +1228,7 @@ describe('InputController coordinator execution', () => {
     expect((fixture.controller as any).pendingSteersByConversation.has('conversation-1'))
       .toBe(false);
     expect(fixture.coordinator.releaseSteerCorrelation).toHaveBeenCalledWith(
-      submission.inputRecordId,
+      submission.submissionId,
     );
   });
 
@@ -1723,21 +1564,6 @@ describe('InputController coordinator execution', () => {
     expect(onReviewableSettlement).not.toHaveBeenCalled();
   });
 
-  it('defers review attention while a queued turn continuation is scheduled', async () => {
-    const onReviewableSettlement = jest.fn();
-    const fixture = createFixture({ onReviewableSettlement });
-    fixture.state.queuedMessage = {
-      canvasContext: null,
-      content: 'continue',
-      editorContext: null,
-    };
-    jest.spyOn(fixture.controller as any, 'processQueuedMessage').mockReturnValue(true);
-
-    await fixture.controller.sendMessage({ content: 'first turn' });
-
-    expect(onReviewableSettlement).not.toHaveBeenCalled();
-  });
-
   it('reports deferred review when the continuation fails before handoff', async () => {
     const onReviewableSettlement = jest.fn();
     const fixture = createFixture({ onReviewableSettlement });
@@ -1749,6 +1575,7 @@ describe('InputController coordinator execution', () => {
     jest.spyOn(fixture.controller as any, 'processQueuedMessage').mockReturnValue(true);
 
     await fixture.controller.sendMessage({ content: 'first turn' });
+    expect(onReviewableSettlement).not.toHaveBeenCalled();
     fixture.state.queuedMessage = null;
     fixture.coordinator.execute.mockRejectedValueOnce(
       new ChatExecutionPreHandoffError('continuation not handed off'),
@@ -1853,12 +1680,28 @@ describe('InputController coordinator execution', () => {
     expect(fixture.state.attention).toBeNull();
   });
 
+  it('skips title generation when no enabled title selection resolves', async () => {
+    jest.mocked(ProviderRegistry.resolveTitleGenerationSelection).mockReturnValueOnce(null);
+    const generateTitle = jest.fn().mockResolvedValue(undefined);
+    const fixture = createFixture({ getTitleGenerationService: () => ({ generateTitle }) as any });
+    fixture.plugin.settings.enableAutoTitleGeneration = true;
+    fixture.plugin.settings.titleGenerationModel = 'removed-title-model';
+    await fixture.controller.sendMessage({ content: 'keep this fallback' });
+    expect(generateTitle).not.toHaveBeenCalled();
+    expect(fixture.plugin.updateConversation).not.toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ titleGenerationStatus: 'pending' }),
+    );
+    expect(fixture.plugin.renameConversation).toHaveBeenCalled();
+  });
+
   it('starts title generation independently of the execution session', async () => {
+    jest.mocked(ProviderRegistry.resolveTitleGenerationSelection).mockReturnValueOnce({ providerId: 'claude', model: 'sonnet' });
     const generateTitle = jest.fn().mockResolvedValue(undefined);
     const fixture = createFixture({
       getTitleGenerationService: () => ({ generateTitle }) as any,
     });
     fixture.plugin.settings.enableAutoTitleGeneration = true;
+    fixture.plugin.settings.titleGenerationModel = 'sonnet';
 
     await fixture.controller.sendMessage({ content: 'title this' });
 
@@ -1906,8 +1749,7 @@ describe('InputController coordinator execution', () => {
       context: expect.objectContaining({
         linkedContent: { path: 'Projects/Plan.md' },
       }),
-      userTurnOrdinal: 1,
-    }));
+    }), expect.any(AbortSignal));
   });
 
   it('restores the reconciled Linked content draft when Conversation creation fails', async () => {
@@ -1976,11 +1818,9 @@ describe('InputController coordinator execution', () => {
     expect(submissions).toHaveLength(2);
     expect(submissions[0]).toMatchObject({
       context: { linkedContent: { path: 'Projects/Plan.md' } },
-      userTurnOrdinal: 1,
     });
     expect(submissions[1]).toMatchObject({
       context: { linkedContent: { path: 'Projects/Plan.md' } },
-      userTurnOrdinal: 1,
     });
     expect(fixture.plugin.createConversation).toHaveBeenCalledTimes(1);
   });
@@ -2013,8 +1853,7 @@ describe('InputController coordinator execution', () => {
     expect(fixture.coordinator.execute).toHaveBeenCalledWith(expect.objectContaining({
       context: { linkedContent: { path: 'Projects/Plan.md' } },
       rawDisplayText: 'Promoted queued turn',
-      userTurnOrdinal: 1,
-    }));
+    }), expect.any(AbortSignal));
   });
 
   it('keeps the frozen first-send path when a queued rename settles during creation', async () => {
@@ -2053,8 +1892,7 @@ describe('InputController coordinator execution', () => {
     }));
     expect(fixture.coordinator.execute).toHaveBeenCalledWith(expect.objectContaining({
       context: { linkedContent: { path: 'Projects/Old' } },
-      userTurnOrdinal: 1,
-    }));
+    }), expect.any(AbortSignal));
     expect(linkedContentController.getSnapshot()).toMatchObject({
       mode: 'locked',
       path: 'Projects/New',
@@ -2073,4 +1911,40 @@ describe('InputController coordinator execution', () => {
     const submission = fixture.coordinator.execute.mock.calls[0][0] as ChatTurnSubmission;
     expect(submission.context).not.toHaveProperty('linkedContent');
   });
+});
+
+it('keeps a completed answer when cancellation loses to native completion', async () => {
+  const fixture = createFixture();
+  fixture.coordinator.execute.mockImplementationOnce(async () => {
+    fixture.controller.cancelStreaming();
+    await fixture.controller.handleExecutionEvent({
+      type: 'turn_completed', reason: 'completed',
+      scope: { kind: 'requested', executionId: 'e', turnId: 't', sessionInstanceId: 's', sequence: 1 },
+    });
+    return { accepted: true, status: 'completed' };
+  });
+  await fixture.controller.sendMessage({ content: 'Work' });
+  expect(fixture.state.messages.at(-1)?.isInterrupt).not.toBe(true);
+});
+
+it('queuing another input must retain the running turn drain handle', async () => {
+  const fixture = createFixture();
+  const gate = deferred<{ accepted: boolean; status: string }>();
+  fixture.coordinator.execute.mockImplementationOnce(() => gate.promise as any);
+  const first = fixture.controller.sendMessage({ content: 'first turn' });
+  await waitForCall(fixture.coordinator.execute);
+  try {
+    await fixture.controller.sendMessage({ content: 'queued follow-up' });
+    expect(fixture.state.queuedMessage?.content).toBe('queued follow-up');
+    expect(fixture.state.isStreaming).toBe(true);
+    let cancellationDrainFinished = false;
+    const drain = fixture.controller.cancelStreamingAndWait().then(() => { cancellationDrainFinished = true; });
+    for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+    expect(cancellationDrainFinished).toBe(false);
+    void drain;
+  } finally {
+    fixture.state.queuedMessage = null;
+    gate.resolve({ accepted: true, status: 'completed' });
+    await first;
+  }
 });

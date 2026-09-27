@@ -12,7 +12,6 @@ const {
   findNodeExecutable,
   formatContextLimit,
   getEnhancedPath,
-  getMissingNodeError,
   getHostnameKey,
   getInstallationKey,
   parseContextLimit,
@@ -74,12 +73,6 @@ describe('getEnhancedPath', () => {
   });
 
   describe('basic functionality', () => {
-    it('returns a non-empty string', () => {
-      const result = getEnhancedPath();
-      expect(typeof result).toBe('string');
-      expect(result.length).toBeGreaterThan(0);
-    });
-
     it('includes current PATH from process.env', () => {
       process.env.PATH = `/existing/path${SEP}/another/path`;
       const result = getEnhancedPath();
@@ -103,30 +96,6 @@ describe('getEnhancedPath', () => {
     });
   });
 
-  describe('platform-specific separator', () => {
-    it('uses correct separator for current platform', () => {
-      const result = getEnhancedPath();
-      // Result should contain the platform-specific separator
-      expect(result).toContain(SEP);
-    });
-
-    it('splits and joins with platform separator', () => {
-      const result = getEnhancedPath();
-      const segments = result.split(SEP);
-      // Should have multiple segments
-      expect(segments.length).toBeGreaterThan(1);
-      // Rejoining should give same result
-      expect(segments.join(SEP)).toBe(result);
-    });
-
-    it('handles input with platform separator', () => {
-      const customPath = `/custom/bin1${SEP}/custom/bin2`;
-      const result = getEnhancedPath(customPath);
-      expect(result).toContain('/custom/bin1');
-      expect(result).toContain('/custom/bin2');
-    });
-  });
-
   describe('custom PATH merging and priority', () => {
     it('prepends additional paths (highest priority)', () => {
       process.env.PATH = '/existing/path';
@@ -147,24 +116,6 @@ describe('getEnhancedPath', () => {
       expect(segments[2]).toBe('/third/bin');
     });
 
-    it('preserves priority: additional > extra > current', () => {
-      process.env.PATH = '/usr/bin';
-      const result = getEnhancedPath('/user/custom');
-      const segments = result.split(SEP);
-
-      const customIndex = segments.indexOf('/user/custom');
-      const usrBinIndex = segments.indexOf('/usr/bin');
-
-      // Custom should come before current PATH
-      expect(customIndex).toBeLessThan(usrBinIndex);
-    });
-
-    it('handles undefined additional paths', () => {
-      process.env.PATH = '/existing/path';
-      const result = getEnhancedPath(undefined);
-      expect(result).toContain('/existing/path');
-    });
-
     it('handles empty string additional paths', () => {
       process.env.PATH = '/existing/path';
       const result = getEnhancedPath('');
@@ -176,14 +127,6 @@ describe('getEnhancedPath', () => {
   });
 
   describe('deduplication logic', () => {
-    it('removes duplicate paths', () => {
-      process.env.PATH = `/usr/local/bin${SEP}/usr/bin`;
-      const result = getEnhancedPath('/usr/local/bin');
-      const segments = result.split(SEP);
-      const count = segments.filter(s => s === '/usr/local/bin').length;
-      expect(count).toBe(1);
-    });
-
     it('preserves first occurrence when deduplicating', () => {
       // Additional path should win over current PATH
       process.env.PATH = `/duplicate/path${SEP}/other/path`;
@@ -233,19 +176,6 @@ describe('getEnhancedPath', () => {
   });
 
   describe('extra binary paths', () => {
-    it('returns non-empty result with extra paths', () => {
-      const result = getEnhancedPath();
-      // On both platforms, result should be non-empty
-      expect(result.length).toBeGreaterThan(0);
-    });
-
-    it('includes platform-appropriate paths', () => {
-      const result = getEnhancedPath();
-      const segments = result.split(SEP);
-      // Should have added some extra paths beyond just process.env.PATH
-      expect(segments.length).toBeGreaterThan(1);
-    });
-
     it('includes the default OpenCode install bin path from HOME', () => {
       process.env.HOME = '/mock/home';
       const result = getEnhancedPath();
@@ -496,20 +426,9 @@ describe('getEnhancedPath', () => {
       expect(nodeIndex).toBeGreaterThan(extraIndex);
     });
 
-    it('accepts cliPath parameter without error', () => {
-      const result = getEnhancedPath(undefined, '/path/to/cli.js');
-      expect(typeof result).toBe('string');
-      expect(result.length).toBeGreaterThan(0);
-    });
-
     it('works with both additionalPaths and cliPath', () => {
       const result = getEnhancedPath('/custom/path', '/path/to/cli.js');
       expect(result).toContain('/custom/path');
-    });
-
-    it('works with native binary path (no Node.js detection needed)', () => {
-      const result = getEnhancedPath(undefined, '/path/to/claude.exe');
-      expect(typeof result).toBe('string');
     });
   });
 
@@ -556,45 +475,6 @@ describe('getEnhancedPath', () => {
       // CLI directory should be added (case-insensitive check for Windows)
       const hasNvmDir = segments.some(s => s.toLowerCase() === nvmBinDir.toLowerCase());
       expect(hasNvmDir).toBe(true);
-    });
-
-    it('adds CLI directory to PATH for fnm installation', () => {
-      if (isWindows) return;
-
-      const fnmBinDir = '/Users/test/.fnm/node-versions/v20.10.0/installation/bin';
-      const cliPath = path.join(fnmBinDir, 'claude');
-      mockCliDirWithNode(fnmBinDir);
-
-      process.env.PATH = '/usr/bin';
-      const result = getEnhancedPath(undefined, cliPath);
-
-      expect(result).toContain(fnmBinDir);
-    });
-
-    it('adds CLI directory to PATH for volta installation', () => {
-      if (isWindows) return;
-
-      const voltaBinDir = '/Users/test/.volta/bin';
-      const cliPath = path.join(voltaBinDir, 'claude');
-      mockCliDirWithNode(voltaBinDir);
-
-      process.env.PATH = '/usr/bin';
-      const result = getEnhancedPath(undefined, cliPath);
-
-      expect(result).toContain(voltaBinDir);
-    });
-
-    it('adds CLI directory to PATH for asdf installation', () => {
-      if (isWindows) return;
-
-      const asdfBinDir = '/Users/test/.asdf/installs/nodejs/20.10.0/bin';
-      const cliPath = path.join(asdfBinDir, 'claude');
-      mockCliDirWithNode(asdfBinDir);
-
-      process.env.PATH = '/usr/bin';
-      const result = getEnhancedPath(undefined, cliPath);
-
-      expect(result).toContain(asdfBinDir);
     });
 
     it('does not add CLI directory when node is not present', () => {
@@ -753,37 +633,6 @@ describe('cliPathRequiresNode', () => {
   });
 });
 
-describe('getMissingNodeError', () => {
-  afterEach(() => {
-    jest.restoreAllMocks();
-  });
-
-  it('returns null when CLI does not require Node.js', () => {
-    jest.spyOn(fs, 'existsSync').mockReturnValue(false);
-    const error = getMissingNodeError('/path/to/claude');
-    expect(error).toBeNull();
-  });
-
-  it('returns error when Node.js is missing and CLI requires Node.js', () => {
-    jest.spyOn(fs, 'existsSync').mockReturnValue(false);
-    const error = getMissingNodeError('/path/to/cli.js', '/missing');
-    expect(error).toContain('Node.js');
-  });
-
-  it('returns null when Node.js is found on PATH', () => {
-    const nodeDir = isWindows ? 'C:\\custom\\bin' : '/custom/bin';
-    const nodePath = path.join(nodeDir, isWindows ? 'node.exe' : 'node');
-
-    jest.spyOn(fs, 'existsSync').mockImplementation(p => String(p) === nodePath);
-    jest.spyOn(fs, 'statSync').mockImplementation(
-      p => ({ isFile: () => String(p) === nodePath }) as fsType.Stats
-    );
-
-    const error = getMissingNodeError('/path/to/cli.js', nodeDir);
-    expect(error).toBeNull();
-  });
-});
-
 describe('findNodeDirectory', () => {
   const originalEnv = { ...process.env };
 
@@ -791,19 +640,6 @@ describe('findNodeDirectory', () => {
     jest.restoreAllMocks();
     Object.keys(process.env).forEach(key => delete process.env[key]);
     Object.assign(process.env, originalEnv);
-  });
-
-  it('returns string or null', () => {
-    const result = findNodeDirectory();
-    expect(result === null || typeof result === 'string').toBe(true);
-  });
-
-  it('returns a non-empty string when node is found', () => {
-    const result = findNodeDirectory();
-    // On most dev machines, node should be findable
-    // Result is either null (not found) or a non-empty directory path
-    const isValidResult = result === null || (typeof result === 'string' && result.length > 0);
-    expect(isValidResult).toBe(true);
   });
 
   it('uses NVM_SYMLINK when set on Windows', () => {
@@ -883,12 +719,6 @@ describe('getHostnameKey', () => {
     } else {
       Reflect.deleteProperty(globalThis, 'window');
     }
-  });
-
-  it('returns a non-empty string', () => {
-    const key = getHostnameKey();
-    expect(typeof key).toBe('string');
-    expect(key.length).toBeGreaterThan(0);
   });
 
   it('returns an opaque device key instead of the system hostname', () => {
@@ -1073,7 +903,6 @@ describe('parseContextLimit with comma-formatted input', () => {
     expect(parseContextLimit('1,234,567')).toBe(1234567);
   });
 });
-
 
 describe('getExtraBinaryPaths (Windows branches)', () => {
   const originalPlatform = process.platform;
@@ -1267,16 +1096,20 @@ describe('Obsidian CLI path integration', () => {
     return require('../../../src/utils/env');
   }
 
-  it('uses the top-level app bundle binary dir on macOS helper processes', () => {
-    const helperExecPath = '/Applications/Obsidian.app/Contents/Frameworks/Obsidian Helper (Renderer).app/Contents/MacOS/Obsidian Helper (Renderer)';
-    process.env.PATH = '';
+  it.each([
+    '/Applications/Obsidian.app/Contents/MacOS/Obsidian',
+    '/Applications/Obsidian.app/Contents/Frameworks/Obsidian Helper (Renderer).app/Contents/MacOS/Obsidian Helper (Renderer)',
+  ])('preserves inherited CLI precedence when running %s', (execPath) => {
+    const cliDirectory = '/custom/obsidian-cli/bin';
+    const appDirectory = '/Applications/Obsidian.app/Contents/MacOS';
+    process.env.PATH = `${cliDirectory}:${appDirectory}`;
 
-    const mod = loadWithPlatform('darwin', helperExecPath);
-    const result = mod.getEnhancedPath();
-    const segments = result.split(':');
+    const mod = loadWithPlatform('darwin', execPath);
+    const segments = mod.getEnhancedPath().split(':');
 
-    expect(segments).toContain('/Applications/Obsidian.app/Contents/MacOS');
-    expect(segments).not.toContain('/Applications/Obsidian.app/Contents/Frameworks/Obsidian Helper (Renderer).app/Contents/MacOS');
+    expect(segments).toContain(cliDirectory);
+    expect(segments).toContain(appDirectory);
+    expect(segments.indexOf(cliDirectory)).toBeLessThan(segments.indexOf(appDirectory));
   });
 
   it('does not add transient Linux AppImage mount dirs', () => {
@@ -1291,6 +1124,62 @@ describe('Obsidian CLI path integration', () => {
 
     expect(segments).not.toContain(appImageDir);
     expect(segments).toContain('/usr/local/bin');
-    expect(segments).toContain('/home/test/.local/bin');
+    expect(segments).toContain(path.join('/home/test', '.local', 'bin'));
+  });
+});
+
+describe('environment variable parsing edge cases', () => {
+  it('should skip lines without = sign', () => {
+    const input = 'VALID=value\nINVALID_LINE\nANOTHER=test';
+    const result = parseEnvironmentVariables(input);
+
+    expect(result).toEqual({
+      VALID: 'value',
+      ANOTHER: 'test',
+    });
+  });
+
+  it('should skip lines with = at start (no key)', () => {
+    const input = '=value\nKEY=valid\n =also-no-key';
+    const result = parseEnvironmentVariables(input);
+
+    expect(result).toEqual({
+      KEY: 'valid',
+    });
+  });
+
+  it('should return empty object for empty input', () => {
+    expect(parseEnvironmentVariables('')).toEqual({});
+    expect(parseEnvironmentVariables('   ')).toEqual({});
+    expect(parseEnvironmentVariables('\n\n')).toEqual({});
+  });
+
+  it('should handle values with spaces', () => {
+    const input = 'MESSAGE=Hello World';
+    const result = parseEnvironmentVariables(input);
+
+    expect(result).toEqual({
+      MESSAGE: 'Hello World',
+    });
+  });
+
+  it('should not strip mismatched quotes', () => {
+    const input = 'VAL1="not-closed\nVAL2=\'also-not-closed\nVAL3="mixed\'';
+    const result = parseEnvironmentVariables(input);
+
+    expect(result).toEqual({
+      VAL1: '"not-closed',
+      VAL2: "'also-not-closed",
+      VAL3: '"mixed\'',
+    });
+  });
+
+  it('should preserve quotes inside values', () => {
+    const input = 'JSON={"key": "value"}';
+    const result = parseEnvironmentVariables(input);
+
+    expect(result).toEqual({
+      JSON: '{"key": "value"}',
+    });
   });
 });

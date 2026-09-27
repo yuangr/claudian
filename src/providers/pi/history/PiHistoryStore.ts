@@ -5,7 +5,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { isWriteEditTool } from '../../../core/tools/toolNames';
-import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo } from '../../../core/types';
+import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo, TurnStats } from '../../../core/types';
+import { createTurnStats, isTokenCount } from '../../../core/types';
 import { extractUserQuery } from '../../../utils/context';
 import { extractDiffData } from '../../../utils/diff';
 import { buildImageAttachmentFromBase64 } from '../../../utils/imageAttachment';
@@ -205,7 +206,7 @@ export function resolvePiActivePath(entries: PiSessionEntry[], leafId?: string):
     : includePiLinearPathEntries(entries, activePath);
 }
 
-export function resolvePiEntryPath(entries: PiSessionEntry[], leafId: string): PiSessionEntry[] {
+function resolvePiEntryPath(entries: PiSessionEntry[], leafId: string): PiSessionEntry[] {
   const entriesWithIds = entries.filter((entry): entry is PiSessionEntry & { id: string } => !!entry.id);
   const byId = new Map(entriesWithIds.map(entry => [entry.id, entry] as const));
   if (!byId.has(leafId)) {
@@ -421,21 +422,13 @@ export function findPiSessionFileInRoot(
   return findSessionFileInRoot(root, trimmed);
 }
 
-export function derivePiSessionsRootFromSessionPath(sessionPath: string): string | null {
-  const normalized = sessionPath.trim();
-  if (!normalized) {
-    return null;
-  }
-
-  return path.dirname(normalized);
-}
-
 function mapPiSessionEntries(
   entries: PiSessionEntry[],
   syntheticIdNamespace?: string,
 ): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let turnStartedAt: number | undefined;
+  const stats = new PiTurnStats();
 
   for (const entry of entries) {
     const mapped = mapPiSessionEntry(entry, messages, syntheticIdNamespace);
@@ -448,6 +441,7 @@ function mapPiSessionEntries(
       }
 
       const nativeMessage = entry.message ?? entry.raw;
+      const turnStats = stats.add(entry);
       if (mapped.role === 'user') {
         turnStartedAt = parseTimestamp(nativeMessage.timestamp) ?? parseTimestamp(entry.raw.timestamp);
       } else if (isBoundaryMessage(mapped)) {
@@ -458,6 +452,7 @@ function mapPiSessionEntries(
         const completedAt = parseTimestamp(entry.raw.timestamp);
         if ((stopReason === 'stop' || stopReason === 'length')
           && turnStartedAt !== undefined && completedAt !== undefined && completedAt >= turnStartedAt) {
+          messages[messages.length - 1].turnStats = turnStats;
           messages[messages.length - 1].completedAt = completedAt;
           messages[messages.length - 1].durationSeconds = Math.floor((completedAt - turnStartedAt) / 1_000);
         }
@@ -467,6 +462,45 @@ function mapPiSessionEntries(
   }
 
   return messages;
+}
+
+/** Account on the resolved native branch; tool results never contribute usage. */
+class PiTurnStats {
+  private startedAt: number | undefined;
+  private outputTokens: number | undefined = 0;
+
+  add(entry: PiSessionEntry): TurnStats | undefined {
+    const message = entry.message ?? entry.raw;
+    const role = getString(message.role) ?? inferRole(entry.type);
+    if (role === 'user') {
+      if (isHiddenPiRecoveryInput(message)) return undefined;
+      this.startedAt = parseTimestamp(message.timestamp) ?? parseTimestamp(entry.raw.timestamp);
+      this.outputTokens = 0;
+    } else if (entry.type === 'compaction') {
+      this.startedAt = undefined;
+    } else if (role === 'assistant') {
+      const output = getRecord(message.usage)?.output;
+      this.outputTokens = this.outputTokens !== undefined && isTokenCount(output)
+        ? this.outputTokens + output : undefined;
+      const stopReason = getString(message.stopReason);
+      const completedAt = parseTimestamp(entry.raw.timestamp);
+      const stats = (stopReason === 'stop' || stopReason === 'length')
+        && this.startedAt !== undefined && completedAt !== undefined
+        ? createTurnStats(this.outputTokens, completedAt - this.startedAt) : undefined;
+      if (stopReason && stopReason !== 'toolUse') this.startedAt = undefined;
+      return stats;
+    }
+    return undefined;
+  }
+}
+
+export function getPiTurnStats(entries: PiSessionEntry[], assistantId: string | undefined): TurnStats | undefined {
+  const stats = new PiTurnStats();
+  for (const entry of entries) {
+    const result = stats.add(entry);
+    if (assistantId && entry.id === assistantId) return result;
+  }
+  return undefined;
 }
 
 function isAssistantMessageEntry(entry: PiSessionEntry): boolean {
@@ -534,7 +568,7 @@ function mapPiSessionEntry(
       message.content ?? message.parts ?? message.blocks,
       messageId,
     );
-    if (recoveryPrompt?.currentInput === null && images.length === 0) {
+    if (isHiddenPiRecoveryInput(message, images.length > 0)) {
       return null;
     }
     return {
@@ -612,6 +646,12 @@ function mapPiSessionEntry(
   }
 
   return null;
+}
+
+function isHiddenPiRecoveryInput(message: Record<string, unknown>, hasImages?: boolean): boolean {
+  const content = extractTextContent(message.content ?? message.text ?? message.message);
+  if (decodePiRecoveryPrompt(content)?.currentInput !== null) return false;
+  return !(hasImages ?? (extractUserImages(message.content ?? message.parts ?? message.blocks, 'recovery').length > 0));
 }
 
 function createSyntheticPiMessageId(

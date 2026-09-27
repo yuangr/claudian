@@ -314,3 +314,41 @@ describe('ClaudeExecutionEventNormalizer api error messages', () => {
     }));
   });
 });
+
+describe('Claude task notification presentation', () => {
+  it.each(['b0ziu71bi', 'af5dfc0e508259ca4'])('exposes completion content for task %s', (taskId) => {
+    const events = new ClaudeExecutionEventNormalizer().normalize(msg({
+      type: 'system', subtype: 'task_notification', task_id: taskId,
+      status: 'completed', summary: 'Background work finished.',
+    } as any), 'background');
+    expect(events).toContainEqual({
+      type: 'output', event: { type: 'task_notification', content: 'Background work finished.' },
+    });
+  });
+
+  it('does not display native notifications excluded from the transcript', () => {
+    const events = new ClaudeExecutionEventNormalizer().normalize(msg({
+      type: 'system', subtype: 'task_notification', task_id: 'watcher',
+      status: 'completed', summary: 'Watcher update.', skip_transcript: true,
+    } as any), 'background');
+    expect(events.filter(event => event.type === 'output')).toEqual([]);
+  });
+});
+
+
+it('uses main-only SDK result usage and wall duration, excluding cumulative model usage', () => {
+  const normalizer = new ClaudeExecutionEventNormalizer();
+  const events = normalizer.normalize(msg({ type: 'result', subtype: 'success',
+    duration_ms: 2500, duration_api_ms: 1000, usage: { output_tokens: 125 },
+    modelUsage: { child: { outputTokens: 900 } },
+  }), 'requested');
+  expect(events).toContainEqual({ type: 'result', turnStats: { outputTokens: 125, durationMs: 2500 } });
+});
+
+
+it('omits throughput for success-subtype API errors', () => {
+  const events = new ClaudeExecutionEventNormalizer().normalize(msg({ type: 'result', subtype: 'success',
+    is_error: true, api_error_status: 500, duration_ms: 2500, usage: { output_tokens: 125 },
+  }), 'requested');
+  expect(events.find(event => event.type === 'result')).not.toHaveProperty('turnStats', expect.anything());
+});

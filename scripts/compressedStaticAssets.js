@@ -6,7 +6,6 @@ const {
 } = require('node:zlib');
 
 const localeFilter = /[\\/]src[\\/]i18n[\\/]locales[\\/][^\\/]+\.json$/;
-const sqlWasmFilter = /[\\/]node_modules[\\/]sql\.js[\\/]dist[\\/]sql-wasm\.wasm$/;
 const localeCatalogSpecifier = 'claudian:compressed-locale-catalog';
 const localeCatalogNamespace = 'compressed-locale-catalog';
 
@@ -14,7 +13,7 @@ function compress(contents, mode) {
   return brotliCompressSync(contents, {
     params: {
       [zlibConstants.BROTLI_PARAM_MODE]: mode,
-      [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
+      [zlibConstants.BROTLI_PARAM_QUALITY]: 9,
     },
   }).toString('base64');
 }
@@ -31,13 +30,13 @@ function createCompressedStaticAssetsPlugin({ root = process.cwd() } = {}) {
     setup(build) {
       build.onResolve({ filter: /^claudian:compressed-locale-catalog$/ }, () => ({
         namespace: localeCatalogNamespace,
-        path: 'non-english',
+        path: 'all',
       }));
 
       build.onLoad({ filter: /.*/, namespace: localeCatalogNamespace }, () => {
         const catalog = Object.fromEntries(
           readdirSync(localeDirectory)
-            .filter(fileName => fileName.endsWith('.json') && fileName !== 'en.json')
+            .filter(fileName => fileName.endsWith('.json'))
             .sort()
             .map(fileName => [
               path.basename(fileName, '.json'),
@@ -64,40 +63,17 @@ function createCompressedStaticAssetsPlugin({ root = process.cwd() } = {}) {
         };
       });
 
-      build.onLoad({ filter: sqlWasmFilter }, (args) => {
-        const base64 = compress(
-          readFileSync(args.path),
-          zlibConstants.BROTLI_MODE_GENERIC,
-        );
-        return {
-          contents: [
-            'import { brotliDecompressSync } from "node:zlib";',
-            `const wasmBinary = ${decodeExpression(base64)};`,
-            'export default wasmBinary;',
-          ].join('\n'),
-          loader: 'js',
-        };
-      });
-
       build.onLoad({ filter: localeFilter }, (args) => {
-        const raw = readFileSync(args.path);
-        const dictionary = JSON.parse(raw.toString('utf8'));
+        const dictionary = JSON.parse(readFileSync(args.path, 'utf8'));
         const exportNames = Object.keys(dictionary);
         if (!exportNames.every(name => /^[$A-Z_a-z][$\w]*$/.test(name))) {
           throw new Error(`Locale ${args.path} has a top-level key that cannot be exported`);
         }
         const locale = path.basename(args.path, '.json');
-        const dictionaryExpression = locale === 'en'
-          ? `JSON.parse(${decodeExpression(
-            compress(raw, zlibConstants.BROTLI_MODE_TEXT),
-          )}.toString("utf8"))`
-          : `loadCompressedLocale(${JSON.stringify(locale)})`;
         return {
           contents: [
-            locale === 'en'
-              ? 'import { brotliDecompressSync } from "node:zlib";'
-              : `import { loadCompressedLocale } from ${JSON.stringify(localeCatalogSpecifier)};`,
-            `const dictionary = ${dictionaryExpression};`,
+            `import { loadCompressedLocale } from ${JSON.stringify(localeCatalogSpecifier)};`,
+            `const dictionary = loadCompressedLocale(${JSON.stringify(locale)});`,
             ...exportNames.map(name => `const ${name} = dictionary.${name};`),
             `export { ${exportNames.join(', ')} };`,
             'export default dictionary;',

@@ -16,7 +16,7 @@ import { buildPersistentPermissionUpdates } from '../security/ClaudePermissionUp
 export interface ClaudeExecutionInteractionDeps {
   readonly interactionPort: ProviderInteractionPort;
   readonly sessionInstanceId: string;
-  readonly getTurnId: () => string | null;
+  readonly getTurnId: (toolId: string) => string | null;
   readonly isToolAllowed: (toolName: string) => boolean;
   readonly onToolBlocked: (toolUseId: string) => void;
 }
@@ -38,7 +38,7 @@ export class ClaudeInteractionHandler {
       };
     }
 
-    const turnId = this.deps.getTurnId();
+    const turnId = this.deps.getTurnId(options.toolUseID);
     if (!turnId) {
       return {
         behavior: 'deny',
@@ -47,7 +47,7 @@ export class ClaudeInteractionHandler {
       };
     }
 
-    const interactionId = this.getInteractionId(options.toolUseID);
+    const interactionId = this.#getInteractionId(options.toolUseID);
     if (this.pendingInteractionIds.has(interactionId)) {
       return {
         behavior: 'deny',
@@ -170,15 +170,9 @@ export class ClaudeInteractionHandler {
     this.pendingInteractionIds.clear();
   }
 
-  private getInteractionId(nativeToolUseId: string): string {
+  #getInteractionId(nativeToolUseId: string): string {
     return `claude:${this.deps.sessionInstanceId}:${nativeToolUseId}`;
   }
-}
-
-export function createClaudeExecutionCanUseTool(
-  deps: ClaudeExecutionInteractionDeps,
-): CanUseTool {
-  return new ClaudeInteractionHandler(deps).canUseTool;
 }
 
 class StaleClaudeInteractionResponseError extends Error {}

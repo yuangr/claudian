@@ -1,3 +1,4 @@
+export { ExecutionEventQueue } from './ExecutionEventQueue';
 export {
   type ProviderExecutionBackend,
   type ProviderNativePersistence,
@@ -14,6 +15,7 @@ export {
   type ProviderBackgroundTurnStartedEvent,
   type ProviderCancelledEvent,
   type ProviderCitationsEvent,
+  type ProviderCommandsChangedEvent,
   type ProviderContextCompactedEvent,
   type ProviderExecutionErrorCategory,
   type ProviderExecutionErrorEvent,
@@ -27,6 +29,7 @@ export {
   type ProviderSessionEvent,
   type ProviderSessionEventScope,
   type ProviderSessionStateChangedEvent,
+  type ProviderTaskNotificationEvent,
   type ProviderTextDeltaEvent,
   type ProviderThinkingDeltaEvent,
   type ProviderToolCompletedEvent,

@@ -57,10 +57,10 @@ jest.mock('@/utils/env', () => ({
 }));
 
 describe('GrokChatUIConfig', () => {
-  it('owns only enabled provider-qualified Grok models and resolves the enabled default', () => {
+  it('owns unavailable provider-qualified Grok models and resolves the enabled default', () => {
     expect(grokChatUIConfig.ownsModel('grok', {})).toBe(false);
     expect(grokChatUIConfig.ownsModel('grok/grok-4', makeSettings())).toBe(true);
-    expect(grokChatUIConfig.ownsModel('grok/kimi-coding', makeSettings())).toBe(false);
+    expect(grokChatUIConfig.ownsModel('grok/kimi-coding', makeSettings())).toBe(true);
     expect(grokChatUIConfig.ownsModel('grok/', {})).toBe(false);
     expect(grokChatUIConfig.ownsModel('grok-4', {})).toBe(false);
     expect(grokChatUIConfig.getDefaultModel?.({})).toBeNull();
@@ -179,7 +179,7 @@ describe('GrokChatUIConfig', () => {
     expect(settings.effortLevel).toBe('xhigh');
   });
 
-  it('uses the provider-advertised reasoning default without a saved preference', () => {
+  it('defaults to High over the provider-advertised default without a saved preference', () => {
     const catalogWithAdvertisedDefault = {
       ...catalog,
       models: catalog.models.map(model => model.rawId === 'grok-4'
@@ -202,7 +202,7 @@ describe('GrokChatUIConfig', () => {
       },
     });
 
-    expect(grokChatUIConfig.getDefaultReasoningValue('grok/grok-4', settings)).toBe('medium');
+    expect(grokChatUIConfig.getDefaultReasoningValue('grok/grok-4', settings)).toBe('high');
   });
 
   it('adopts and persists a future provider-advertised effort value', () => {
@@ -234,7 +234,7 @@ describe('GrokChatUIConfig', () => {
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ label: 'Maximum', value: 'max' }),
       ]));
-    expect(grokChatUIConfig.getDefaultReasoningValue('grok/grok-future', settings)).toBe('max');
+    expect(grokChatUIConfig.getDefaultReasoningValue('grok/grok-future', settings)).toBe('high');
     grokChatUIConfig.applyReasoningSelection?.('grok/grok-future', 'max', settings);
     expect(getGrokProviderSettings(settings).preferredReasoningByModel)
       .toEqual({ 'grok-future': 'max' });
@@ -322,22 +322,6 @@ describe('GrokChatUIConfig', () => {
     expect(getGrokProviderSettings(settings).preferredReasoningByModel).toEqual({
       'grok-4': 'xhigh',
     });
-  });
-
-  it('resolves model context before custom limits and the provider fallback', () => {
-    const settings = makeSettings();
-
-    expect(grokChatUIConfig.getContextWindowSize(
-      'grok/grok-4',
-      { 'grok/grok-4': 100_000 },
-      settings,
-    )).toBe(256_000);
-    expect(grokChatUIConfig.getContextWindowSize(
-      'grok/unknown',
-      { 'grok/unknown': 123_000 },
-      settings,
-    )).toBe(123_000);
-    expect(grokChatUIConfig.getContextWindowSize('grok/unknown', undefined, settings)).toBe(200_000);
   });
 
   it('normalizes explicit ids without replacing hidden current selections', () => {

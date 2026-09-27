@@ -25,7 +25,7 @@ import {
 } from '../../../core/tools/toolNames';
 import type { AskUserQuestionItem, AskUserQuestionOption, ToolCallInfo } from '../../../core/types';
 import type { DiffStats } from '../../../core/types/diff';
-import { appendMcpIcon } from '../../../shared/icons';
+import { appendMCPIcon } from '../../../shared/icons';
 import { parseApplyPatchDiffs, parseFileUpdateChangeDiffs } from '../../../utils/diff';
 import { setupCollapsible } from './collapsible';
 import { renderDiffContent, renderDiffStats } from './DiffRenderer';
@@ -34,7 +34,7 @@ import { renderTodoItems } from './todoUtils';
 export function setToolIcon(el: HTMLElement, name: string): void {
   const icon = getToolIcon(name);
   if (icon === MCP_ICON_MARKER) {
-    appendMcpIcon(el);
+    appendMCPIcon(el);
   } else {
     setIcon(el, icon);
   }
@@ -788,7 +788,7 @@ function setGenericToolHeaderRight(statusEl: HTMLElement, toolCall: ToolCallInfo
   setToolStatus(statusEl, toolCall.status);
 }
 
-export function renderTodoWriteResult(
+function renderTodoWriteResult(
   container: HTMLElement,
   input: Record<string, unknown>
 ): void {
@@ -1037,6 +1037,8 @@ function renderToolContent(
   }
 }
 
+const liveContentUpdates = new WeakMap<HTMLElement, (toolCall: ToolCallInfo) => void>();
+
 export function renderToolCall(
   parentEl: HTMLElement,
   toolCall: ToolCallInfo,
@@ -1051,16 +1053,34 @@ export function renderToolCall(
 
   setGenericToolHeaderRight(statusEl, toolCall);
 
-  renderToolContent(content, toolCall, 'Running...');
-
   const initiallyExpanded = options.initiallyExpanded ?? false;
   const state = { isExpanded: initiallyExpanded };
+  let currentTool = toolCall;
+  let initial = true;
+  let dirty = true;
+  const renderCurrentContent = () => {
+    if (!dirty) return;
+    content.empty();
+    if (initial) renderToolContent(content, currentTool, 'Running...');
+    else renderExpandedContent(content, currentTool.name, currentTool.result, currentTool.input);
+    dirty = false;
+  };
+  const eager = toolCall.name === TOOL_TODO_WRITE || toolCall.name === TOOL_ASK_USER_QUESTION;
+  if (eager || initiallyExpanded) renderCurrentContent();
+  if (!eager) liveContentUpdates.set(toolEl, next => {
+    currentTool = next;
+    currentTool.isExpanded = state.isExpanded;
+    initial = false;
+    dirty = true;
+    if (state.isExpanded) renderCurrentContent();
+  });
   toolCall.isExpanded = initiallyExpanded;
   const todoStatusEl = toolCall.name === TOOL_TODO_WRITE ? statusEl : null;
   setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded,
     onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl, (expanded) => {
-      toolCall.isExpanded = expanded;
+      currentTool.isExpanded = expanded;
+      if (expanded && !eager) renderCurrentContent();
     }),
     baseAriaLabel: getToolLabel(toolCall.name, toolCall.input)
   });
@@ -1110,6 +1130,12 @@ export function updateToolCallResult(
         renderAskUserQuestionFallback(content, toolCall);
       }
     }
+    return;
+  }
+
+  const updateLiveContent = liveContentUpdates.get(toolEl);
+  if (updateLiveContent) {
+    updateLiveContent(toolCall);
     return;
   }
 

@@ -1,6 +1,7 @@
-import type { Plugin } from 'obsidian';
+import { Notice, type Plugin } from 'obsidian';
 
 import { ConversationPersistenceStore } from '../../core/bootstrap/ConversationPersistenceStore';
+import { migrateSessionSidecars } from '../../core/bootstrap/migrateSessionSidecars';
 import { SessionStorage } from '../../core/bootstrap/SessionStorage';
 import type { SharedAppStorage } from '../../core/bootstrap/storage';
 import { normalizeTabManagerState } from '../../core/bootstrap/tabManagerState';
@@ -20,6 +21,7 @@ export class SharedStorageService implements SharedAppStorage {
 
   private adapter: VaultFileAdapter;
   private plugin: Plugin;
+  private obsoleteSessionInputs: string[] = [];
 
   constructor(plugin: Plugin) {
     this.plugin = plugin;
@@ -31,8 +33,29 @@ export class SharedStorageService implements SharedAppStorage {
   }
 
   async initialize(): Promise<{ claudian: Record<string, unknown> }> {
-    const claudian = await this.claudianSettings.load();
-    return { claudian };
+    // Settings and session recovery touch separate files. Join both even if settings fail.
+    const [settings] = await Promise.allSettled([
+      this.claudianSettings.load(),
+      migrateSessionSidecars(this.adapter).then(paths => {
+        this.obsoleteSessionInputs = paths;
+      }).catch(() => {
+        new Notice('Failed to clean up obsolete session files; will retry next launch');
+      }),
+    ]);
+    if (settings.status === 'rejected') throw settings.reason;
+    return { claudian: settings.value };
+  }
+
+  async cleanupObsoleteSessionInputs(signal: AbortSignal): Promise<void> {
+    try {
+      for (const file of this.obsoleteSessionInputs) {
+        if (signal.aborted) return;
+        await this.adapter.delete(file);
+      }
+      this.obsoleteSessionInputs = [];
+    } catch {
+      new Notice('Failed to clean up obsolete session files; will retry next launch');
+    }
   }
 
   async saveClaudianSettings(settings: Record<string, unknown>): Promise<void> {

@@ -3,6 +3,7 @@ import type {
   PermissionMode,
   SDKToolUseResult,
   ToolProviderPayload,
+  TurnStats,
   UsageInfo,
 } from '../types';
 import type { ProviderSessionSnapshot } from './ProviderSessionSnapshot';
@@ -210,6 +211,7 @@ export type ProviderTurnCompletedEvent = ProviderEventBase<
   ProviderOpaqueEventPayload & {
     readonly nativeAssistantId?: string;
     readonly nativeCheckpointId?: string;
+    readonly turnStats?: TurnStats;
     readonly reason: ProviderTurnCompletionReason;
   };
 
@@ -253,6 +255,7 @@ export type ProviderRequestedExecutionEvent =
   | (ProviderToolCompletedEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderUsageUpdatedEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderContextCompactedEvent & { readonly scope: ProviderRequestedEventScope })
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderNoticeEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderSessionStateChangedEvent & { readonly scope: ProviderRequestedEventScope })
   | (ProviderPermissionModeChangedEvent & { readonly scope: ProviderRequestedEventScope })
@@ -295,6 +298,17 @@ export type ProviderAsyncSubagentCompletedEvent = ProviderEventBase<
     readonly snapshotRevision?: number;
   };
 
+export type ProviderTaskNotificationEvent = ProviderEventBase<
+  'task_notification',
+  ProviderExecutionEventScope
+> & {
+  readonly content: string;
+  /** Latest requested event emitted before this independent notification. */
+  readonly afterRequestedEvent?: ProviderRequestedEventScope;
+  /** Latest automatic event emitted before this independent notification. */
+  readonly afterBackgroundEvent?: ProviderBackgroundEventScope;
+};
+
 export type ProviderSessionErrorEvent = ProviderEventBase<
   'session_error',
   ProviderSessionEventScope
@@ -316,11 +330,18 @@ export type ProviderBackgroundOutputEvent =
   | (ProviderToolCompletedEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderUsageUpdatedEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderContextCompactedEvent & { readonly scope: ProviderBackgroundEventScope })
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderNoticeEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderSessionStateChangedEvent & { readonly scope: ProviderBackgroundEventScope })
   | (ProviderPermissionModeChangedEvent & { readonly scope: ProviderBackgroundEventScope });
 
+export type ProviderCommandsChangedEvent = ProviderEventBase<
+  'commands_changed', ProviderSessionEventScope
+>;
+
 export type ProviderSessionEvent =
+  | ProviderCommandsChangedEvent
+  | (ProviderTaskNotificationEvent & { readonly scope: ProviderSessionEventScope })
   | ProviderBackgroundTurnStartedEvent
   | ProviderBackgroundOutputEvent
   | ProviderBackgroundTurnCompletedEvent

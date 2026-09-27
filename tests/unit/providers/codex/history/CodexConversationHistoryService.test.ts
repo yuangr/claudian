@@ -6,21 +6,10 @@ const fs = jest.requireActual<typeof fsType>('fs');
 const os = jest.requireActual<typeof osType>('os');
 const path = jest.requireActual<typeof pathType>('path');
 
-import type { ProviderConversationHistoryService } from '@/core/providers/types';
+import { testDate } from '@test/helpers/testClock';
+
 import type { Conversation } from '@/core/types';
 import { CodexConversationHistoryService } from '@/providers/codex/history/CodexConversationHistoryService';
-
-async function resolveMissingConversationSession(
-  service: CodexConversationHistoryService,
-  conversation: Conversation,
-  missingProviderSessionId?: string,
-): Promise<'delete' | 'reset' | 'preserve' | 'unimplemented'> {
-  const resolver = (service as ProviderConversationHistoryService)
-    .resolveMissingConversationSession;
-  return resolver
-    ? resolver.call(service, conversation, null, missingProviderSessionId)
-    : 'unimplemented';
-}
 
 describe('CodexConversationHistoryService', () => {
   let homeDirSpy: jest.SpyInstance<string, []>;
@@ -83,7 +72,12 @@ describe('CodexConversationHistoryService', () => {
     };
 
     const service = new CodexConversationHistoryService();
-    await service.hydrateConversationHistory(conversation, null);
+    conversation.messages = [{ id: 'local', role: 'assistant', content: 'Local placeholder', timestamp: testDate().getTime() }];
+    const before = structuredClone(conversation);
+    const first = await service.hydrateConversationHistory(conversation, null);
+    expect(conversation).toEqual(before);
+    expect(await service.hydrateConversationHistory(conversation, null)).toEqual(first);
+    Object.assign(conversation, first);
 
     expect(conversation.messages).toHaveLength(2);
     expect(conversation.messages[0]).toMatchObject({
@@ -119,7 +113,7 @@ describe('CodexConversationHistoryService', () => {
     };
 
     await expect(new CodexConversationHistoryService()
-      .recoverConversationModelSelection?.(conversation, null))
+      .recoverConversationModelSelection(conversation, null))
       .resolves.toBe('openai-codex/gpt-5.5');
   });
 
@@ -316,10 +310,10 @@ describe('CodexConversationHistoryService', () => {
       messages: [],
     };
 
-    await new CodexConversationHistoryService().hydrateConversationHistory(
+    Object.assign(conversation, await new CodexConversationHistoryService().hydrateConversationHistory(
       conversation,
       null,
-    );
+    ));
 
     expect(conversation.messages).toHaveLength(2);
     expect(conversation.providerState).toEqual(expect.objectContaining({
@@ -328,7 +322,7 @@ describe('CodexConversationHistoryService', () => {
     }));
   });
 
-  it('rehydrates when the same conversation id is restored with empty messages', async () => {
+  it('rehydrates the same conversation object after its messages are cleared', async () => {
     const threadId = 'thread-456';
     const sessionsDir = path.join(tempHome, '.codex', 'sessions', '2026', '03', '27');
     fs.mkdirSync(sessionsDir, { recursive: true });
@@ -375,11 +369,11 @@ describe('CodexConversationHistoryService', () => {
     };
 
     const service = new CodexConversationHistoryService();
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
     expect(conversation.messages).toHaveLength(2);
 
     conversation.messages = [];
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
     expect(conversation.messages).toHaveLength(2);
     expect(conversation.messages[1]).toMatchObject({
@@ -429,7 +423,7 @@ describe('CodexConversationHistoryService', () => {
     };
 
     const service = new CodexConversationHistoryService();
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
     expect(conversation.messages).toHaveLength(1);
     expect(conversation.messages[0]).toMatchObject({
@@ -480,7 +474,7 @@ describe('CodexConversationHistoryService', () => {
     };
 
     const service = new CodexConversationHistoryService();
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
     expect(conversation.messages).toHaveLength(1);
     expect((conversation.providerState as Record<string, unknown>).transcriptRootPath).toBe(
@@ -525,11 +519,11 @@ describe('CodexConversationHistoryService', () => {
       messages: [],
     };
 
-    await new CodexConversationHistoryService().hydrateConversationHistory(
+    Object.assign(conversation, await new CodexConversationHistoryService().hydrateConversationHistory(
       conversation,
       null,
       { environment: { HOME: tempHome } },
-    );
+    ));
 
     expect(conversation.messages.map(message => message.content)).toEqual(['Trusted transcript.']);
     expect((conversation.providerState as Record<string, unknown>).sessionFilePath).toBe(trustedPath);
@@ -559,72 +553,81 @@ describe('CodexConversationHistoryService', () => {
       messages: [],
     };
 
-    await new CodexConversationHistoryService().hydrateConversationHistory(
+    Object.assign(conversation, await new CodexConversationHistoryService().hydrateConversationHistory(
       conversation,
       null,
       { environment: { CODEX_HOME: configuredHome, HOME: tempHome } },
-    );
+    ));
 
     expect(conversation.messages.map(message => message.content)).toEqual(['Configured transcript.']);
   });
 
   describe('buildForkProviderState', () => {
-    it('stores forkSource with sessionId and resumeAt in providerState', () => {
-      const service = new CodexConversationHistoryService();
-      const result = service.buildForkProviderState('source-thread-id', 'turn-uuid-2');
+    let transcriptPath: string;
+    let transcript: string;
 
-      expect(result).toEqual({
-        forkSource: { sessionId: 'source-thread-id', resumeAt: 'turn-uuid-2' },
-      });
+    beforeEach(() => {
+      const sessionsDir = path.join(tempHome, '.codex', 'sessions');
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      transcriptPath = path.join(sessionsDir, 'rollout-source-thread-id.jsonl');
+      transcript = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-uuid-2' } },
+        { type: 'response_item', payload: {
+          type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello' }],
+        } },
+        { type: 'response_item', payload: {
+          type: 'message', role: 'assistant', id: 'msg_item',
+          content: [{ type: 'output_text', text: 'Hi' }],
+        } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-uuid-2' } },
+      ].map(record => JSON.stringify(record)).join('\n');
+      fs.writeFileSync(transcriptPath, transcript);
     });
 
-    it('preserves source transcript hints when provided', () => {
+    it('validates the native checkpoint and preserves source context for hydration', async () => {
       const service = new CodexConversationHistoryService();
-      const result = service.buildForkProviderState(
-        'source-thread-id',
-        'turn-uuid-2',
-        {
-          sessionFilePath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\03\\27\\rollout-thread.jsonl',
-          transcriptRootPath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions',
-        },
-      );
-
-      expect(result).toEqual({
-        forkSource: { sessionId: 'source-thread-id', resumeAt: 'turn-uuid-2' },
-        forkSourceSessionFilePath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\03\\27\\rollout-thread.jsonl',
-        forkSourceTranscriptRootPath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions',
+      const state = await service.buildForkProviderState('source-thread-id', 'turn-uuid-2', {
+        sessionFilePath: transcriptPath, workspaceDependencyToolVersion: 1,
       });
+      expect(state).toMatchObject({ workspaceDependencyToolVersion: 1 });
+      const fork: Conversation = {
+        id: 'fork', providerId: 'codex', title: 'Fork', createdAt: 1, lastActivityAt: 1,
+        sessionId: null, messages: [], providerState: state,
+      };
+      Object.assign(fork, await service.hydrateConversationHistory(fork, null));
+      expect(fork.messages.map(message => message.content)).toEqual(['Hello', 'Hi']);
+      expect(fs.readFileSync(transcriptPath, 'utf8')).toBe(transcript);
     });
 
-    it('preserves workspace dependency tool provenance from the source thread', () => {
+    it.each(['msg_item', 'missing-turn'])('rejects unavailable checkpoint %s during fork creation', async checkpoint => {
       const service = new CodexConversationHistoryService();
-      const result = service.buildForkProviderState(
-        'source-thread-id',
-        'turn-uuid-2',
-        { workspaceDependencyToolVersion: 1 },
-      );
-
-      expect(result).toEqual({
-        forkSource: { sessionId: 'source-thread-id', resumeAt: 'turn-uuid-2' },
-        workspaceDependencyToolVersion: 1,
-      });
+      await expect(service.buildForkProviderState(
+        'source-thread-id', checkpoint, { sessionFilePath: transcriptPath },
+      )).rejects.toThrow('Fork checkpoint not found');
     });
 
-    it('derives the source transcript root from sessionFilePath when only the session path is stored', () => {
+    it('rejects an unavailable source during fork creation', async () => {
+      fs.unlinkSync(transcriptPath);
       const service = new CodexConversationHistoryService();
-      const result = service.buildForkProviderState(
-        'source-thread-id',
-        'turn-uuid-2',
-        {
-          sessionFilePath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\03\\27\\rollout-thread.jsonl',
-        },
-      );
+      await expect(service.buildForkProviderState(
+        'source-thread-id', 'turn-uuid-2', { sessionFilePath: transcriptPath },
+      )).rejects.toThrow('Fork checkpoint not found');
+    });
 
-      expect(result).toEqual({
-        forkSource: { sessionId: 'source-thread-id', resumeAt: 'turn-uuid-2' },
-        forkSourceSessionFilePath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions\\2026\\03\\27\\rollout-thread.jsonl',
-        forkSourceTranscriptRootPath: '\\\\wsl$\\Ubuntu\\home\\user\\.codex\\sessions',
-      });
+    it('finds an archived source when its saved path has moved', async () => {
+      const archive = path.join(tempHome, '.codex', 'archived_sessions');
+      fs.mkdirSync(archive, { recursive: true });
+      fs.renameSync(transcriptPath, path.join(archive, path.basename(transcriptPath)));
+      const service = new CodexConversationHistoryService();
+      const state = await service.buildForkProviderState(
+        'source-thread-id', 'turn-uuid-2', { sessionFilePath: transcriptPath },
+      );
+      const fork: Conversation = {
+        id: 'fork', providerId: 'codex', title: 'Fork', createdAt: 1, lastActivityAt: 1,
+        sessionId: null, messages: [], providerState: state,
+      };
+      Object.assign(fork, await service.hydrateConversationHistory(fork, null));
+      expect(fork.messages.map(message => message.content)).toEqual(['Hello', 'Hi']);
     });
   });
 
@@ -749,11 +752,13 @@ describe('CodexConversationHistoryService', () => {
         messages: [],
       };
 
-      await expect(resolveMissingConversationSession(
-        new CodexConversationHistoryService(),
+      const update1 = await new CodexConversationHistoryService().resolveMissingConversationSession(
         conversation,
+        null,
         'thread-missing',
-      )).resolves.toBe('reset');
+      );
+      expect(update1.outcome).toBe('reset');
+      Object.assign(conversation, update1.changes);
 
       expect(conversation.sessionId).toBeNull();
       expect(conversation.resumeAtMessageId).toBe('fork-checkpoint');
@@ -792,11 +797,13 @@ describe('CodexConversationHistoryService', () => {
         messages: [],
       };
 
-      await expect(resolveMissingConversationSession(
-        new CodexConversationHistoryService(),
+      const update2 = await new CodexConversationHistoryService().resolveMissingConversationSession(
         conversation,
+        null,
         missingSessionId,
-      )).resolves.toBe('preserve');
+      );
+      expect(update2.outcome).toBe('preserve');
+      Object.assign(conversation, update2.changes);
 
       expect(conversation.sessionId).toBe('thread-current');
       expect(conversation.providerState).toBe(providerState);
@@ -845,7 +852,7 @@ describe('CodexConversationHistoryService', () => {
       };
 
       const service = new CodexConversationHistoryService();
-      await service.hydrateConversationHistory(conversation, null);
+      Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
       // Should only have messages from turn 1 and turn 2 (truncated at resumeAt)
       expect(conversation.messages).toHaveLength(4);
@@ -887,7 +894,7 @@ describe('CodexConversationHistoryService', () => {
       };
 
       const service = new CodexConversationHistoryService();
-      await service.hydrateConversationHistory(conversation, null);
+      Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
       expect(conversation.messages).toEqual([]);
     });
@@ -907,7 +914,7 @@ describe('CodexConversationHistoryService', () => {
       };
 
       const service = new CodexConversationHistoryService();
-      await service.hydrateConversationHistory(conversation, null);
+      Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
       expect(conversation.messages).toHaveLength(1);
       expect(conversation.messages[0].content).toBe('Cloned message');
@@ -979,7 +986,7 @@ describe('CodexConversationHistoryService', () => {
       };
 
       const service = new CodexConversationHistoryService();
-      await service.hydrateConversationHistory(conversation, null);
+      Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
       // Expected: source prefix (turns 1+2) + fork-only turn
       // = SrcQ1, SrcA1, SrcQ2, SrcA2, ForkQ1, ForkA1
@@ -1044,7 +1051,7 @@ describe('CodexConversationHistoryService', () => {
       };
 
       const service = new CodexConversationHistoryService();
-      await service.hydrateConversationHistory(conversation, null);
+      Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
       expect(conversation.messages).toEqual([]);
     });
@@ -1074,7 +1081,7 @@ describe('CodexConversationHistoryService', () => {
     };
 
     const service = new CodexConversationHistoryService();
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
     expect(conversation.messages).toEqual([]);
 
     fs.writeFileSync(
@@ -1102,7 +1109,7 @@ describe('CodexConversationHistoryService', () => {
       'utf-8',
     );
 
-    await service.hydrateConversationHistory(conversation, null);
+    Object.assign(conversation, await service.hydrateConversationHistory(conversation, null));
 
     expect(conversation.messages).toHaveLength(2);
     expect(conversation.messages[0]).toMatchObject({
@@ -1110,4 +1117,18 @@ describe('CodexConversationHistoryService', () => {
       content: 'Second prompt',
     });
   });
+});
+
+
+test('missing-session recovery returns an update without mutating its input', async () => {
+  const conversation = {
+    id: 'immutable-history', providerId: 'codex' as const, title: 'History',
+    createdAt: testDate().getTime(), lastActivityAt: testDate({ seconds: 1 }).getTime(), sessionId: 'missing-thread',
+    providerState: { threadId: 'missing-thread' }, messages: [],
+  };
+  const before = structuredClone(conversation);
+  const result = await new CodexConversationHistoryService()
+    .resolveMissingConversationSession(conversation, null, 'missing-thread');
+  expect(conversation).toEqual(before);
+  expect(result).toMatchObject({ outcome: 'reset', changes: { sessionId: null } });
 });

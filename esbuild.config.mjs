@@ -13,8 +13,6 @@ import {
 import { assertRuntimeDependencyParity } from './scripts/runtimeDependencyParity.mjs';
 import rendererSafeUnrefHelpers from './scripts/rendererSafeUnref.js';
 import desktopRuntimeAliasHelpers from './scripts/desktopRuntimeAliases.js';
-import terserProductionBundleHelpers from './scripts/terserProductionBundle.js';
-import pierreShikiBundleHelpers from './scripts/pierreShikiBundle.js';
 import compressedStaticAssetsHelpers from './scripts/compressedStaticAssets.js';
 
 const {
@@ -22,8 +20,6 @@ const {
   patchRendererUnsafeUnrefSites,
 } = rendererSafeUnrefHelpers;
 const { createDesktopRuntimeAliases } = desktopRuntimeAliasHelpers;
-const { createTerserProductionBundlePlugin } = terserProductionBundleHelpers;
-const { createPierreShikiBundlePlugin } = pierreShikiBundleHelpers;
 const { createCompressedStaticAssetsPlugin } = compressedStaticAssetsHelpers;
 
 // Load .env.local if it exists
@@ -188,7 +184,8 @@ const external = [
   '@lezer/highlight',
   '@lezer/lr',
   ...builtinModules,
-  ...builtinModules.map(m => `node:${m}`),
+  // Older build hosts omit prefix-only modules such as node:sqlite from builtinModules.
+  'node:*',
 ];
 
 const mainContext = await esbuild.context({
@@ -200,8 +197,6 @@ const mainContext = await esbuild.context({
   plugins: [
     patchSdkImportMeta,
     createCompressedStaticAssetsPlugin(),
-    createPierreShikiBundlePlugin(),
-    ...(prod ? [createTerserProductionBundlePlugin(['main.js'])] : []),
     createPatchRendererUnsafeUnref(['main.js']),
     copyToObsidian,
   ],
