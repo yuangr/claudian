@@ -1,10 +1,16 @@
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
-import { ClaudianSettingTab } from '@/features/settings/ClaudianSettings';
 import ClaudianPlugin from '@/main';
+import { BUILT_IN_PROVIDER_MODULES } from '@/providers';
 
 describe('agent skill host invalidation', () => {
+  beforeEach(() => {
+    for (const provider of BUILT_IN_PROVIDER_MODULES) {
+      ProviderWorkspaceRegistry.register(provider.id, provider.workspace);
+    }
+  });
+
   afterEach(() => {
-    ProviderWorkspaceRegistry.setServices('codex', undefined);
+    ProviderWorkspaceRegistry.clear();
   });
 
   it('publishes the new generation synchronously before Codex refresh settles', async () => {
@@ -13,7 +19,7 @@ describe('agent skill host invalidation', () => {
       finishRefresh = resolve;
     }));
     ProviderWorkspaceRegistry.setServices('codex', {
-      commandCatalog: { refresh } as any,
+      onAgentSkillsChanged: refresh,
     });
     const invalidateProviderResources = jest.fn();
     const plugin = {
@@ -25,26 +31,34 @@ describe('agent skill host invalidation', () => {
 
     expect(plugin.agentSkillResourceGeneration).toBe(1);
     expect(invalidateProviderResources).toHaveBeenCalledWith(
-      ['codex', 'grok', 'pi', 'opencode'],
+      expect.arrayContaining(['codex', 'grok', 'pi', 'opencode']),
       1,
     );
+    expect(invalidateProviderResources.mock.calls[0][0]).not.toContain('claude');
     expect(refresh).toHaveBeenCalledTimes(1);
 
     finishRefresh();
     await expect(pending).resolves.toBeUndefined();
   });
 
-  it('constructs one settings-owned shared repository coordinator', () => {
-    const adapter = {};
-    const getAdapter = jest.fn().mockReturnValue(adapter);
+  it('invalidates registered skill consumers without initializing their workspaces', async () => {
+    const initialize = jest.fn();
+    const onAgentSkillsChanged = jest.fn();
+    ProviderWorkspaceRegistry.register('test-skills', { consumesAgentSkills: true, initialize });
+    ProviderWorkspaceRegistry.register('test-lazy', { consumesAgentSkills: true, initialize });
+    ProviderWorkspaceRegistry.register('test-unrelated', { initialize });
+    ProviderWorkspaceRegistry.setServices('test-skills', { onAgentSkillsChanged });
+    const invalidateProviderResources = jest.fn();
     const plugin = {
-      storage: { getAdapter },
-      notifyAgentSkillsChanged: jest.fn(),
+      agentSkillResourceGeneration: 0,
+      getAllViews: () => [{ invalidateProviderResources }],
     };
-
-    const tab = new ClaudianSettingTab({} as any, plugin as any);
-
-    expect(getAdapter).toHaveBeenCalledTimes(1);
-    expect((tab as any).agentSkillCoordinator).toBeDefined();
+    await ClaudianPlugin.prototype.notifyAgentSkillsChanged.call(plugin as any);
+    const [ids] = invalidateProviderResources.mock.calls[0];
+    expect(ids).toContain('test-skills');
+    expect(ids).toContain('test-lazy');
+    expect(ids).not.toContain('test-unrelated');
+    expect(initialize).not.toHaveBeenCalled();
+    expect(onAgentSkillsChanged).toHaveBeenCalledTimes(1);
   });
 });

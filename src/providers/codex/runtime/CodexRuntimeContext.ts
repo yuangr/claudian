@@ -10,7 +10,6 @@ export interface CodexRuntimeContext {
   codexHomeHost: string | null;
   sessionsDirTarget: string | null;
   sessionsDirHost: string | null;
-  memoriesDirTarget: string | null;
 }
 
 function normalizeTargetPath(launchSpec: CodexLaunchSpec, value: string): string {
@@ -72,13 +71,13 @@ function validateInitializeTarget(
 ): void {
   if (initializeResult.platformOs !== launchSpec.target.platformOs) {
     throw new Error(
-      `Codex target mismatch: expected ${launchSpec.target.platformOs}, received ${initializeResult.platformOs}`,
+      `Codex CLI target mismatch: expected ${launchSpec.target.platformOs}, received ${initializeResult.platformOs}`,
     );
   }
 
   if (initializeResult.platformFamily !== launchSpec.target.platformFamily) {
     throw new Error(
-      `Codex target mismatch: expected ${launchSpec.target.platformFamily}, received ${initializeResult.platformFamily}`,
+      `Codex CLI target mismatch: expected ${launchSpec.target.platformFamily}, received ${initializeResult.platformFamily}`,
     );
   }
 }
@@ -93,9 +92,6 @@ export function createCodexRuntimeContext(
   const sessionsDirTarget = codexHomeTarget
     ? joinTargetPath(launchSpec, codexHomeTarget, 'sessions')
     : null;
-  const memoriesDirTarget = codexHomeTarget
-    ? joinTargetPath(launchSpec, codexHomeTarget, 'memories')
-    : null;
 
   return {
     launchSpec,
@@ -104,6 +100,5 @@ export function createCodexRuntimeContext(
     codexHomeHost: codexHomeTarget ? launchSpec.pathMapper.toHostPath(codexHomeTarget) : null,
     sessionsDirTarget,
     sessionsDirHost: sessionsDirTarget ? launchSpec.pathMapper.toHostPath(sessionsDirTarget) : null,
-    memoriesDirTarget,
   };
 }

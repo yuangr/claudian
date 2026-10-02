@@ -6,7 +6,7 @@ export interface ApplyPatchFileDiff extends ToolDiffData {
   movedTo?: string;
 }
 
-export function structuredPatchToDiffLines(hunks: StructuredPatchHunk[]): DiffLine[] {
+function structuredPatchToDiffLines(hunks: StructuredPatchHunk[]): DiffLine[] {
   const result: DiffLine[] = [];
 
   for (const hunk of hunks) {
@@ -30,7 +30,7 @@ export function structuredPatchToDiffLines(hunks: StructuredPatchHunk[]): DiffLi
   return result;
 }
 
-export function countLineChanges(diffLines: DiffLine[]): DiffStats {
+function countLineChanges(diffLines: DiffLine[]): DiffStats {
   let added = 0;
   let removed = 0;
 
@@ -105,7 +105,8 @@ export function parseApplyPatchDiffs(patchText: string): ApplyPatchFileDiff[] {
       continue;
     }
 
-    if (line === '*** End of File' || line.startsWith('@@') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+    // The patch envelope marks files with `***` lines, so `--- `/`+++ ` lines are content.
+    if (line === '*** End of File' || line.startsWith('@@')) {
       continue;
     }
 
@@ -166,7 +167,7 @@ export function extractDiffData(toolUseResult: unknown, toolCall: ToolCallInfo):
   return diffFromToolInput(toolCall, filePath);
 }
 
-export function diffFromToolInput(toolCall: ToolCallInfo, filePath: string): ToolDiffData | undefined {
+function diffFromToolInput(toolCall: ToolCallInfo, filePath: string): ToolDiffData | undefined {
   if (toolCall.name === 'Edit') {
     const oldStr = toolCall.input.old_string;
     const newStr = toolCall.input.new_string;
@@ -368,20 +369,51 @@ function parseUnifiedDiffLines(diffText: string): DiffLine[] {
   const diffLines: DiffLine[] = [];
   let oldLineNum = 1;
   let newLineNum = 1;
+  // Hunk headers declare line counts; content lines may themselves start with `--- ` or `+++ `.
+  let oldRemaining = 0;
+  let newRemaining = 0;
+  const hasHunkHeaders = /^@@ /m.test(diffText);
 
   for (const line of diffText.split(/\r?\n/)) {
-    if (!line) continue;
-    if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+    if (oldRemaining > 0 || newRemaining > 0) {
+      const prefix = line[0];
+      if (prefix === '+') {
+        diffLines.push({ type: 'insert', text: line.slice(1), newLineNum: newLineNum++ });
+        newRemaining--;
+        continue;
+      }
+      if (prefix === '-') {
+        diffLines.push({ type: 'delete', text: line.slice(1), oldLineNum: oldLineNum++ });
+        oldRemaining--;
+        continue;
+      }
+      // Some generators trim the space from blank context lines.
+      if (prefix === ' ' || (line === '' && oldRemaining > 0 && newRemaining > 0)) {
+        diffLines.push({ type: 'equal', text: line.slice(1), oldLineNum: oldLineNum++, newLineNum: newLineNum++ });
+        oldRemaining--;
+        newRemaining--;
+        continue;
+      }
+      if (prefix === '\\') continue;
+      // A malformed or truncated hunk ends at the first line it cannot contain.
+      oldRemaining = 0;
+      newRemaining = 0;
+    }
 
     if (line.startsWith('@@')) {
-      const match = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+      const match = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
       if (match) {
         oldLineNum = Number(match[1]);
-        newLineNum = Number(match[2]);
+        oldRemaining = match[2] === undefined ? 1 : Number(match[2]);
+        newLineNum = Number(match[3]);
+        newRemaining = match[4] === undefined ? 1 : Number(match[4]);
       }
       continue;
     }
 
+    if (hasHunkHeaders || !line || line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+
+    // Headerless diffs carry no counts; keep reading prefixed lines.
     const prefix = line[0];
     const text = line.slice(1);
     if (prefix === '+') {

@@ -1,6 +1,6 @@
 import js from '@eslint/js';
-import eslintComments from '@eslint-community/eslint-plugin-eslint-comments';
 import tseslint from '@typescript-eslint/eslint-plugin';
+import tsparser from '@typescript-eslint/parser';
 import jestPlugin from 'eslint-plugin-jest';
 import obsidianmd from 'eslint-plugin-obsidianmd';
 import { DEFAULT_ACRONYMS } from 'eslint-plugin-obsidianmd/dist/lib/rules/ui/acronyms.js';
@@ -14,6 +14,17 @@ const jestRecommended = jestPlugin.configs['flat/recommended'];
 const tsconfigRootDir = dirname(fileURLToPath(import.meta.url));
 const obsidianRuleSeverity = 'error';
 
+// Keep acronym boundaries explicit so ordinary words such as Client stay intact.
+const filenameAcronyms = [
+  'ACP', 'API', 'CLI', 'CSS', 'DOM', 'HTML', 'HTTP', 'HTTPS', 'ID', 'JS',
+  'JSON', 'JSONL', 'LAN', 'MCP', 'RPC', 'SDK', 'SQL', 'TLS', 'UI', 'URI', 'URL', 'XML',
+];
+const acronymSpellings = new Map(filenameAcronyms.map(acronym => [
+  acronym[0] + acronym.slice(1).toLowerCase(), acronym,
+]));
+const acronymWords = new RegExp(`(${[...acronymSpellings.keys()].sort((a, b) => b.length - a.length).join('|')})(s?)(?=[A-Z0-9]|$)`, 'g');
+const preserveAcronyms = name => name.replace(acronymWords, (_, word, plural) => acronymSpellings.get(word) + plural);
+
 // Enforces the file naming conventions from AGENTS.md without extra dependencies.
 // Exported so scripts/check-eslint-config.test.mjs can exercise it directly.
 export const fileNamingRule = {
@@ -23,6 +34,8 @@ export const fileNamingRule = {
     messages: {
       invalidCase:
         "Filename '{{name}}' must use camelCase, PascalCase, or kebab-case (see AGENTS.md naming conventions).",
+      acronymCase:
+        "Filename '{{name}}' must preserve acronym capitals ('{{expected}}').",
       conceptMismatch:
         "File '{{name}}' exports '{{concept}}'; modules with a primary named concept use a PascalCase filename ('{{concept}}.ts').",
     },
@@ -42,8 +55,15 @@ export const fileNamingRule = {
           context.report({ node, messageId: 'invalidCase', data: { name: base } });
           return;
         }
+        const expected = preserveAcronyms(first);
+        if (expected !== first) {
+          context.report({ node, messageId: 'acronymCase', data: {
+            name: base, expected: expected + base.slice(first.length),
+          } });
+          return;
+        }
         if (!isCamel) return;
-        const concept = first.charAt(0).toUpperCase() + first.slice(1);
+        const concept = preserveAcronyms(first.charAt(0).toUpperCase() + first.slice(1));
         for (const statement of node.body) {
           if (statement.type !== 'ExportNamedDeclaration' || !statement.declaration) continue;
           const declaration = statement.declaration;
@@ -65,7 +85,17 @@ export const fileNamingRule = {
 
 const localPlugin = { rules: { 'file-naming': fileNamingRule } };
 
-const stagedObsidianRules = {
+// Hard-coded ISO timestamps for expiries or injected clocks make tests depend on the date they run.
+const ISO_TIMESTAMP = "/^\\d{4}-\\d{2}-\\d{2}T/";
+const TIME_KEY = '/^now$|[eE]xpiresAt$/';
+const hardCodedTestTimeSelectors = [
+  `Property[key.name=${TIME_KEY}] > Literal[value=${ISO_TIMESTAMP}]`,
+  `Property[key.name=${TIME_KEY}] NewExpression[callee.name='Date'] > Literal[value=${ISO_TIMESTAMP}]`,
+  `AssignmentExpression[left.property.name=${TIME_KEY}] NewExpression[callee.name='Date'] > Literal[value=${ISO_TIMESTAMP}]`,
+];
+
+// Keep the existing source policy stricter than the preset's advisory severities.
+const strictObsidianRules = {
   'obsidianmd/commands/no-command-in-command-id': obsidianRuleSeverity,
   'obsidianmd/commands/no-command-in-command-name': obsidianRuleSeverity,
   'obsidianmd/commands/no-default-hotkeys': obsidianRuleSeverity,
@@ -98,8 +128,8 @@ const stagedObsidianRules = {
   'obsidianmd/ui/sentence-case': [
     obsidianRuleSeverity,
     {
-      ignoreWords: ['Claudian', 'Codex', 'OpenCode', 'Pi', 'WSL'],
-      brands: [...DEFAULT_BRANDS, 'Claudian', 'Codex', 'OpenCode', 'Pi'],
+      ignoreWords: ['Claudian', 'Codex', 'Grok', 'OpenCode', 'Pi', 'WSL'],
+      brands: [...DEFAULT_BRANDS, 'Claude Code', 'Claudian', 'Codex', 'Grok Build', 'OpenCode', 'Pi'],
       acronyms: [...DEFAULT_ACRONYMS, 'TOML', 'WSL'],
       ignoreRegex: ['\\.(?:claude|codex|opencode)/'],
       enforceCamelCaseLower: true,
@@ -144,6 +174,20 @@ export default defineConfig([
   },
   ...tseslint.configs['flat/recommended'],
   {
+    files: ['src/**/*.ts', 'package.json'],
+    extends: obsidianmd.configs.recommended,
+  },
+  {
+    files: ['manifest.json'],
+    languageOptions: { parser: tsparser, parserOptions: { project: false } },
+    plugins: { obsidianmd },
+    rules: {
+      'obsidianmd/validate-manifest': 'error',
+      // JSON is parsed as an object expression for the official manifest rule.
+      '@typescript-eslint/no-unused-expressions': 'off',
+    },
+  },
+  {
     files: ['src/**/*.ts', 'tests/**/*.ts'],
     plugins: {
       'simple-import-sort': simpleImportSort,
@@ -159,7 +203,6 @@ export default defineConfig([
         'error',
         { args: 'none', ignoreRestSiblings: true },
       ],
-      '@typescript-eslint/no-explicit-any': 'off',
       'prefer-promise-reject-errors': 'error',
       'simple-import-sort/imports': 'error',
       'simple-import-sort/exports': 'error',
@@ -173,22 +216,20 @@ export default defineConfig([
         tsconfigRootDir,
       },
     },
-    plugins: {
-      'eslint-comments': eslintComments,
-      obsidianmd,
-    },
-    linterOptions: {
-      reportUnusedDisableDirectives: 'error',
-      reportUnusedInlineConfigs: 'error',
-    },
     rules: {
-      ...stagedObsidianRules,
+      ...strictObsidianRules,
       ...strictTypeAwareRules,
-      'eslint-comments/no-restricted-disable': [
-        'error',
-        'obsidianmd/*',
-      ],
-      'eslint-comments/require-description': 'error',
+      // Preserve project constraints that the official preset relaxes.
+      '@typescript-eslint/no-unused-expressions': ['error', { allowShortCircuit: false, allowTernary: false }],
+      'prefer-const': 'error',
+      '@typescript-eslint/ban-ts-comment': 'error',
+      '@typescript-eslint/no-explicit-any': 'error',
+      'no-console': 'error',
+      // Desktop-only plugin; legacy display() and license checks do not apply here.
+      'obsidianmd/no-nodejs-modules': 'off',
+      'obsidianmd/settings-tab/require-display': 'off',
+      'obsidianmd/validate-license': 'off',
+      'obsidianmd/validate-manifest': 'off',
       'obsidianmd/prefer-create-el': 'error',
       '@typescript-eslint/naming-convention': [
         'error',
@@ -209,6 +250,30 @@ export default defineConfig([
     rules: {
       ...jestRecommended.rules,
       '@typescript-eslint/no-explicit-any': 'off',
+      'no-restricted-syntax': [
+        'error',
+        ...hardCodedTestTimeSelectors.map(selector => ({
+          selector,
+          message: 'Express expiries and clocks with testTime/testDate/testClock from @test/helpers/testClock.',
+        })),
+      ],
+    },
+  },
+  {
+    files: ['tests/helpers/testClock.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        ...[
+          'Literal[value=/\\d{4}-\\d{2}-\\d{2}T/]',
+          'TemplateElement[value.raw=/\\d{4}-\\d{2}-\\d{2}T/]',
+          "NewExpression[callee.name='Date'][arguments.length>1][arguments.0.type='Literal']",
+          "CallExpression[callee.object.name='Date'][callee.property.name='UTC'][arguments.0.type='Literal']",
+        ].map(selector => ({
+          selector,
+          message: 'Derive fixture timestamps from @test/helpers/testClock instead of a fixed calendar date.',
+        })),
+      ],
     },
   },
 ]);

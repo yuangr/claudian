@@ -4,9 +4,8 @@ import { createMockEl } from '@test/helpers/MockElement';
 import { applyTextInput } from '@test/helpers/settingsControls';
 
 const mockRenderEnvironmentSettingsSection = jest.fn();
-const mockCliResolverReset = jest.fn();
+const mockCLIResolverReset = jest.fn();
 const mockDiscoverModels = jest.fn();
-const mockNotices: string[] = [];
 
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
   ProviderSettingsCoordinator: {
@@ -41,28 +40,8 @@ interface MockTextComponent {
   onChange(callback: (value: string) => Promise<void> | void): MockTextComponent;
 }
 
-interface MockButtonComponent {
-  disabled: boolean;
-  onClickCallback: (() => Promise<void> | void) | null;
-  setButtonText: jest.Mock;
-  setDisabled: jest.Mock;
-  text: string;
-  onClick(callback: () => Promise<void> | void): MockButtonComponent;
-}
-
-interface MockDropdownComponent {
-  onChangeCallback: ((value: string) => Promise<void> | void) | null;
-  options: Record<string, string>;
-  setValue: jest.Mock;
-  value: string;
-  addOption(value: string, label: string): MockDropdownComponent;
-  onChange(callback: (value: string) => Promise<void> | void): MockDropdownComponent;
-}
-
 class MockSetting {
-  buttonComponents: MockButtonComponent[] = [];
   desc = '';
-  dropdownComponents: MockDropdownComponent[] = [];
   heading = false;
   name = '';
   settingEl = { addClass: jest.fn() };
@@ -101,56 +80,32 @@ class MockSetting {
     callback(component);
     return this;
   }
-
-  addButton(callback: (button: MockButtonComponent) => void): this {
-    const component = createButtonComponent();
-    this.buttonComponents.push(component);
-    callback(component);
-    return this;
-  }
-
-  addDropdown(callback: (dropdown: MockDropdownComponent) => void): this {
-    const component = createDropdownComponent();
-    this.dropdownComponents.push(component);
-    callback(component);
-    return this;
-  }
 }
 
 jest.mock('node:fs');
 jest.mock('obsidian', () => ({
-  Notice: class MockNotice {
-    constructor(message: string) {
-      mockNotices.push(message);
-    }
-  },
   Setting: MockSetting,
 }));
 jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
-jest.mock('@/providers/pi/app/PiWorkspaceServices', () => ({
-  maybeGetPiWorkspaceServices: jest.fn(() => ({
+function createSettingsRenderer() {
+  return createPiSettingsTabRenderer({
+    modelCatalog: { markStale: jest.fn() },
     cliResolver: {
-      reset: mockCliResolverReset,
+      reset: mockCLIResolverReset,
     },
-  })),
-}));
+  } as unknown as Parameters<typeof createPiSettingsTabRenderer>[0]);
+}
 jest.mock('@/providers/pi/runtime/PiModelDiscoveryService', () => ({
   PiModelDiscoveryService: jest.fn().mockImplementation(() => ({
     discoverModels: mockDiscoverModels,
   })),
 }));
-jest.mock('@/utils/env', () => ({
-  ...jest.requireActual('@/utils/env'),
-  getHostnameKey: () => 'current-host',
-}));
-
 import { getPiProviderSettings } from '@/providers/pi/settings';
-import { piSettingsTabRenderer } from '@/providers/pi/ui/PiSettingsTab';
+import { createPiSettingsTabRenderer } from '@/providers/pi/ui/PiSettingsTab';
 
 const createdSettings: MockSetting[] = [];
-const createdDomElements: any[] = [];
 const mockedExists = fs.existsSync as jest.Mock;
 const mockedStat = fs.statSync as jest.Mock;
 
@@ -194,49 +149,8 @@ function createTextComponent(): MockTextComponent {
   return component;
 }
 
-function createButtonComponent(): MockButtonComponent {
-  const component = {} as MockButtonComponent;
-  component.disabled = false;
-  component.onClickCallback = null;
-  component.text = '';
-  component.setButtonText = jest.fn((value: string) => {
-    component.text = value;
-    return component;
-  });
-  component.setDisabled = jest.fn((value: boolean) => {
-    component.disabled = value;
-    return component;
-  });
-  component.onClick = (callback: () => Promise<void> | void): MockButtonComponent => {
-    component.onClickCallback = callback;
-    return component;
-  };
-  return component;
-}
-
-function createDropdownComponent(): MockDropdownComponent {
-  const component = {} as MockDropdownComponent;
-  component.onChangeCallback = null;
-  component.options = {};
-  component.value = '';
-  component.addOption = (value: string, label: string): MockDropdownComponent => {
-    component.options[value] = label;
-    return component;
-  };
-  component.setValue = jest.fn((value: string) => {
-    component.value = value;
-    return component;
-  });
-  component.onChange = (callback: (value: string) => Promise<void> | void): MockDropdownComponent => {
-    component.onChangeCallback = callback;
-    return component;
-  };
-  return component;
-}
-
 function createElement(): any {
   const classes = new Set<string>();
-  const eventListeners = new Map<string, Array<(...args: unknown[]) => void>>();
   const element: any = {
     ...createMockEl('div'),
     checked: false,
@@ -285,36 +199,23 @@ function createElement(): any {
     }),
     empty: jest.fn(),
     setAttribute: jest.fn(),
-    addEventListener: jest.fn((type: string, callback: (...args: unknown[]) => void) => {
-      const listeners = eventListeners.get(type) ?? [];
-      listeners.push(callback);
-      eventListeners.set(type, listeners);
-    }),
-    dispatchMockEvent: async (type: string, event?: unknown) => {
-      for (const listener of eventListeners.get(type) ?? []) {
-        await listener(event);
-      }
-    },
     blur: jest.fn(),
     createEl: jest.fn((tag?: string, attrs?: Record<string, unknown>) => {
       const child = createElement();
       child.tag = tag;
       applyElementAttrs(child, attrs);
-      createdDomElements.push(child);
       return child;
     }),
     createDiv: jest.fn((attrs?: Record<string, unknown>) => {
       const child = createElement();
       child.tag = 'div';
       applyElementAttrs(child, attrs);
-      createdDomElements.push(child);
       return child;
     }),
     createSpan: jest.fn((attrs?: Record<string, unknown>) => {
       const child = createElement();
       child.tag = 'span';
       applyElementAttrs(child, attrs);
-      createdDomElements.push(child);
       return child;
     }),
   };
@@ -362,27 +263,21 @@ function createContext(settings: Record<string, unknown>) {
   }));
   return {
     plugin: {
+      storage: { installationKey: 'current-host' },
       applyProviderRuntimeSettings,
-      notifyProviderChatOptionsChanged: jest.fn(),
       runProviderExecutionTransition,
       saveSettings,
       settings,
       mutateSettings,
     },
-    renderAgentSkillSettings: jest.fn(),
     notifyProviderModelOptionsChanged: jest.fn(),
-    renderHiddenProviderCommandSetting: jest.fn(),
   };
 }
 
 function render(settings: Record<string, unknown>) {
   const context = createContext(settings);
-  piSettingsTabRenderer.render(createElement(), context as any);
+  createSettingsRenderer().render(createElement(), context as any);
   return context;
-}
-
-async function flushPromises(): Promise<void> {
-  await new Promise<void>(resolve => setImmediate(resolve));
 }
 
 function findSetting(name: string): MockSetting {
@@ -393,32 +288,15 @@ function findSetting(name: string): MockSetting {
   return setting;
 }
 
-function findElement(tag: string, cls: string): any {
-  const element = [...createdDomElements].reverse().find(
-    candidate => candidate.tag === tag && candidate.cls === cls,
-  );
-  if (!element) {
-    throw new Error(`Element not found: ${tag}.${cls}`);
-  }
-  return element;
-}
-
-function findInputByType(type: string): any {
-  const element = [...createdDomElements].reverse().find(
-    candidate => candidate.tag === 'input' && candidate.type === type,
-  );
-  if (!element) {
-    throw new Error(`Input not found: ${type}`);
-  }
-  return element;
-}
+jest.mock('@/core/device/InstallationKey', () => ({
+  ...jest.requireActual('@/core/device/InstallationKey'),
+  getInstallationKey: () => 'current-host',
+}));
 
 describe('PiSettingsTab', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     createdSettings.length = 0;
-    createdDomElements.length = 0;
-    mockNotices.length = 0;
     mockedExists.mockReturnValue(true);
     mockedStat.mockReturnValue({ isFile: () => true });
     mockDiscoverModels.mockResolvedValue({
@@ -540,25 +418,10 @@ describe('PiSettingsTab', () => {
     expect(mockDiscoverModels).not.toHaveBeenCalled();
   });
 
-  it('renders shared skills and keeps hidden provider commands separate', () => {
-    const settings: Record<string, unknown> = { providerConfigs: { pi: {} } };
-    const context = render(settings);
+  it('leaves skill and hidden-command management to the Skills tab', () => {
+    render({ providerConfigs: { pi: {} } });
 
-    expect(context.renderAgentSkillSettings).toHaveBeenCalledWith(
-      expect.anything(),
-      'pi',
-    );
-    expect(context.renderHiddenProviderCommandSetting).toHaveBeenCalledWith(
-      expect.anything(),
-      'pi',
-      expect.objectContaining({ name: 'Hidden Pi commands and skills' }),
-    );
-  });
-
-  it('does not render the chat input tool mode setting for Pi', () => {
-    render({ providerConfigs: { pi: { toolMode: 'readonly' } } });
-
-    expect(() => findSetting('Tool mode')).toThrow('Setting not found: Tool mode');
+    expect(createdSettings.filter(setting => ['Skills', 'Commands', 'Hidden Pi commands and skills'].includes(setting.name))).toEqual([]);
   });
 
   it('validates host-scoped CLI paths and resets the resolver after valid changes', async () => {
@@ -569,7 +432,7 @@ describe('PiSettingsTab', () => {
     mockedExists.mockReturnValue(false);
     await applyTextInput(cliInput, '/missing/pi');
     expect(context.plugin.saveSettings).not.toHaveBeenCalled();
-    expect(mockCliResolverReset).not.toHaveBeenCalled();
+    expect(mockCLIResolverReset).not.toHaveBeenCalled();
 
     mockedExists.mockReturnValue(true);
     mockedStat.mockReturnValue({ isFile: () => true });
@@ -577,7 +440,7 @@ describe('PiSettingsTab', () => {
     expect(getPiProviderSettings(settings).cliPathsByHost).toEqual({
       'current-host': '/valid/pi',
     });
-    expect(mockCliResolverReset).toHaveBeenCalled();
+    expect(mockCLIResolverReset).toHaveBeenCalled();
     expect(context.plugin.saveSettings).toHaveBeenCalled();
   });
 
@@ -595,19 +458,19 @@ describe('PiSettingsTab', () => {
     });
   });
 
-  it('commits the Pi CLI path and clears discovery inside the execution transition', async () => {
+  it('commits the Pi CLI path and retains discovery inside the execution transition', async () => {
     const settings: Record<string, unknown> = {
       providerConfigs: {
         pi: {
           cliPathsByHost: { 'current-host': '/old/pi' },
-          discoveredModels: [{ id: 'cached' }],
+          discoveredModels: [{ encodedId: 'pi:test/cached', id: 'cached', provider: 'test', label: 'Cached', input: ['text'], reasoning: false, thinkingLevels: ['off'] }],
         },
       },
     };
     const context = render(settings);
     const cliInput = findSetting('CLI path').textComponents[0];
     const order: string[] = [];
-    mockCliResolverReset.mockImplementationOnce(() => {
+    mockCLIResolverReset.mockImplementationOnce(() => {
       order.push('resolver-reset');
     });
     context.plugin.runProviderExecutionTransition.mockImplementationOnce(async (
@@ -620,8 +483,8 @@ describe('PiSettingsTab', () => {
         .toBe('/old/pi');
       await mutation();
       order.push('settings-committed');
-      expect(getPiProviderSettings(settings).discoveredModels).toEqual([]);
-      expect(mockCliResolverReset).toHaveBeenCalledTimes(1);
+      expect(getPiProviderSettings(settings).discoveredModels).toHaveLength(1);
+      expect(mockCLIResolverReset).toHaveBeenCalledTimes(1);
       order.push('transition-end');
     });
 
@@ -662,7 +525,7 @@ describe('PiSettingsTab', () => {
       'current-host': '/old/pi',
     });
     expect(cliInput.inputEl.value).toBe('/failed/pi');
-    expect(mockCliResolverReset).not.toHaveBeenCalled();
+    expect(mockCLIResolverReset).not.toHaveBeenCalled();
     expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
   });
 
@@ -675,7 +538,7 @@ describe('PiSettingsTab', () => {
     const context = render(settings);
     const cliInput = findSetting('CLI path').textComponents[0];
     cliInput.inputEl.value = '/new/pi';
-    mockCliResolverReset.mockImplementationOnce(() => {
+    mockCLIResolverReset.mockImplementationOnce(() => {
       throw new Error('resolver reset failed');
     });
 
@@ -687,144 +550,6 @@ describe('PiSettingsTab', () => {
     expect(cliInput.inputEl.value).toBe('/new/pi');
     expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
   });
-
-  it('discovers models through PiModelDiscoveryService and reports failures', async () => {
-    mockDiscoverModels.mockResolvedValueOnce({
-      kind: 'completed',
-      models: [{
-        encodedId: 'pi:anthropic/claude-sonnet-4',
-        id: 'claude-sonnet-4',
-        input: ['text'],
-        label: 'Claude Sonnet 4',
-        provider: 'anthropic',
-        reasoning: true,
-        thinkingLevels: ['off', 'medium'],
-      }],
-    });
-    const settings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          visibleModels: ['pi:anthropic/claude-sonnet-4'],
-        },
-      },
-    };
-    const context = render(settings);
-
-    await findElement('button', 'claudian-provider-model-picker-action').dispatchMockEvent('click');
-    await flushPromises();
-
-    expect(mockDiscoverModels).toHaveBeenCalledTimes(1);
-    expect(getPiProviderSettings(settings).discoveredModels).toHaveLength(1);
-    expect(getPiProviderSettings(settings).visibleModels).toEqual(['pi:anthropic/claude-sonnet-4']);
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('pi');
-
-    mockDiscoverModels.mockResolvedValueOnce({
-      diagnostics: 'not logged in',
-      kind: 'completed',
-      models: [],
-    });
-    await findElement('button', 'claudian-provider-model-picker-action').dispatchMockEvent('click');
-    await flushPromises();
-    expect(mockNotices[0]).toContain('not logged in');
-  });
-
-  it('preserves cached models when discovery is skipped for a disabled provider', async () => {
-    const cachedModel = {
-      encodedId: 'pi:anthropic/claude-sonnet-4',
-      id: 'claude-sonnet-4',
-      input: ['text'],
-      label: 'Claude Sonnet 4',
-      provider: 'anthropic',
-      reasoning: true,
-      thinkingLevels: ['off', 'medium'],
-    };
-    const settings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          discoveredModels: [cachedModel],
-          enabled: false,
-          visibleModels: [cachedModel.encodedId],
-        },
-      },
-    };
-    const context = render(settings);
-    mockDiscoverModels.mockResolvedValueOnce({
-      kind: 'skipped',
-      reason: 'provider-disabled',
-    });
-
-    await findElement('button', 'claudian-provider-model-picker-action').dispatchMockEvent('click');
-    await flushPromises();
-
-    expect(getPiProviderSettings(settings).discoveredModels).toEqual([cachedModel]);
-    expect(context.plugin.saveSettings).not.toHaveBeenCalled();
-  });
-
-  it('does not publish unchanged model discovery', async () => {
-    const cachedModel = {
-      encodedId: 'pi:anthropic/claude-sonnet-4',
-      id: 'claude-sonnet-4',
-      input: ['text'] as Array<'text'>,
-      label: 'Claude Sonnet 4',
-      provider: 'anthropic',
-      reasoning: true,
-      thinkingLevels: ['off', 'medium'] as Array<'off' | 'medium'>,
-    };
-    const settings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          discoveredModels: [cachedModel],
-          visibleModels: [cachedModel.encodedId],
-        },
-      },
-    };
-    const context = render(settings);
-    mockDiscoverModels.mockResolvedValueOnce({
-      kind: 'completed',
-      models: [cachedModel],
-    });
-
-    await findElement('button', 'claudian-provider-model-picker-action').dispatchMockEvent('click');
-    await flushPromises();
-
-    expect(context.plugin.saveSettings).not.toHaveBeenCalled();
-    expect(context.notifyProviderModelOptionsChanged).not.toHaveBeenCalled();
-  });
-
-  it('persists visible model choices and aliases', async () => {
-    const settings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          discoveredModels: [{
-            encodedId: 'pi:anthropic/claude-sonnet-4',
-            id: 'claude-sonnet-4',
-            input: ['text'],
-            label: 'Claude Sonnet 4',
-            provider: 'anthropic',
-            reasoning: true,
-            thinkingLevels: ['off', 'medium'],
-          }],
-          visibleModels: [],
-        },
-      },
-    };
-    const context = render(settings);
-    const checkboxEl = findInputByType('checkbox');
-
-    checkboxEl.checked = true;
-    await checkboxEl.dispatchMockEvent('change');
-    await flushPromises();
-    expect(getPiProviderSettings(settings).visibleModels).toEqual(['pi:anthropic/claude-sonnet-4']);
-
-    const aliasInput = findElement('input', 'claudian-provider-model-picker-selected-alias');
-    aliasInput.value = 'Sonnet';
-    await aliasInput.dispatchMockEvent('blur');
-    await flushPromises();
-
-    expect(getPiProviderSettings(settings).modelAliases).toEqual({
-      'pi:anthropic/claude-sonnet-4': 'Sonnet',
-    });
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledTimes(2);
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('pi');
-  });
 });
+
+jest.mock('@/shared/settings/ProviderModelsSection', () => ({ renderProviderModelsSection: jest.fn(() => ({ refresh: jest.fn() })) }));

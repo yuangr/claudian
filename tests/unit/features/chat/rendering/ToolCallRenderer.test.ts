@@ -1,13 +1,14 @@
 import { createMockEl } from '@test/helpers/MockElement';
 import { setIcon } from 'obsidian';
 
+import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ToolCallInfo } from '@/core/types';
 import {
   getToolLabel,
   getToolName,
   getToolSummary,
+  renderExpandedContent,
   renderStoredToolCall,
-  renderTodoWriteResult,
   renderToolCall,
   setToolIcon,
   updateToolCallResult,
@@ -15,6 +16,7 @@ import {
 
 // Mock obsidian
 jest.mock('obsidian', () => ({
+  Platform: { resourcePathPrefix: 'app://local/' },
   setIcon: jest.fn(),
 }));
 
@@ -35,48 +37,6 @@ describe('ToolCallRenderer', () => {
   });
 
   describe('renderToolCall', () => {
-    it('should store element in toolCallElements map', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({ id: 'test-id' });
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolCallElements.get('test-id')).toBe(toolEl);
-    });
-
-    it('should set data-tool-id on element', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({ id: 'my-tool-id' });
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolEl.dataset.toolId).toBe('my-tool-id');
-    });
-
-    it('should set correct ARIA attributes for accessibility', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall();
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
-
-      const header = (toolEl as any)._children[0];
-      expect(header.getAttribute('role')).toBe('button');
-      expect(header.getAttribute('tabindex')).toBe('0');
-    });
-
-    it('should track isExpanded on toolCall object', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall();
-      const toolCallElements = new Map<string, HTMLElement>();
-
-      renderToolCall(parentEl, toolCall, toolCallElements);
-
-      expect(toolCall.isExpanded).toBe(false);
-    });
-
     it('should start expanded when requested', () => {
       const parentEl = createMockEl();
       const toolCall = createToolCall();
@@ -103,11 +63,11 @@ describe('ToolCallRenderer', () => {
       const content = toolEl.querySelector('.claudian-tool-content');
 
       expect(toolEl.hasClass('claudian-tool-call-bash')).toBe(true);
-      expect(toolEl.querySelector('.claudian-tool-bash-command')?.textContent).toBe('$ npm test');
       expect(setIcon).toHaveBeenCalledWith(expect.anything(), 'terminal');
 
       (header as HTMLElement | null)?.click();
       expect(toolCall.isExpanded).toBe(true);
+      expect(toolEl.querySelector('.claudian-tool-bash-command')?.textContent).toBe('$ npm test');
       expect(content?.hasClass('claudian-hidden')).toBe(false);
     });
 
@@ -242,6 +202,12 @@ describe('ToolCallRenderer', () => {
       const toolCallElements = new Map<string, HTMLElement>();
 
       const toolEl = renderToolCall(parentEl, toolCall, toolCallElements);
+      expect(toolCallElements.get('tool-1')).toBe(toolEl);
+      expect(toolEl.dataset.toolId).toBe('tool-1');
+      const header = toolEl.querySelector('.claudian-tool-header');
+      expect(header?.getAttribute('role')).toBe('button');
+      expect(header?.getAttribute('tabindex')).toBe('0');
+      expect(toolCall.isExpanded).toBe(false);
 
       // Update with completed result
       toolCall.status = 'completed';
@@ -412,7 +378,6 @@ describe('ToolCallRenderer', () => {
       expect(getToolName('EnterPlanMode', {})).toBe('Entering plan mode');
       expect(getToolName('ExitPlanMode', {})).toBe('Plan complete');
     });
-
   });
 
   describe('getToolSummary', () => {
@@ -631,6 +596,99 @@ describe('ToolCallRenderer', () => {
       expect(links[0].getAttribute('href')).toBe('https://example.com/docs');
       expect(links[0].querySelector('.claudian-tool-link-title')?.textContent).toBe('https://example.com/docs');
     });
+
+    it.each([
+      ['with', 'Synthesized answer', ['Synthesized answer']],
+      ['without', undefined, []],
+    ])('renders structured hits %s a provider summary instead of the result text', (_case, webSearchSummary, summaries) => {
+      const parentEl = createMockEl();
+      const toolCall = createToolCall({
+        name: 'WebSearch',
+        status: 'completed',
+        input: { query: 'obsidian plugin API' },
+        result: 'Provider result text',
+        webSearchResults: [{ title: 'Docs', url: 'https://docs.example.com/' }],
+        webSearchSummary,
+      });
+
+      const toolEl = renderStoredToolCall(parentEl, toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+
+      expect(Array.from(toolEl.querySelectorAll('.claudian-tool-link')).map(link => link.getAttribute('href')))
+        .toEqual(['https://docs.example.com/']);
+      expect(Array.from(toolEl.querySelectorAll('.claudian-tool-web-summary')).map(summary => summary.textContent))
+        .toEqual(summaries);
+      expect(toolEl.textContent).not.toContain('Provider result text');
+    });
+  });
+
+  describe('result presentation contracts', () => {
+    const expandedLines = (toolCall: ToolCallInfo) => {
+      const toolEl = renderStoredToolCall(createMockEl(), toolCall);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+      return Array.from(toolEl.querySelectorAll('.claudian-tool-line')).map(line => line.textContent);
+    };
+
+    it.each([
+      ['Read', '     1→alpha\n     2→beta', ['alpha', 'beta']],
+      ['Read', 'alpha\n2→ literal arrow', ['alpha', '2→ literal arrow']],
+      ['Read', '1→alpha\n7→ literal', ['1→alpha', '7→ literal']],
+      ['Grep', '1→match', ['1→match']],
+    ])('strips %s line-number gutters only when numbering is consecutive', (name, result, lines) => {
+      expect(expandedLines(createToolCall({ name, input: { file_path: 'a.md', pattern: 'x' }, status: 'completed', result }))).toEqual(lines);
+    });
+
+    it('displays normalized Read text verbatim even when it resembles consecutive gutters', () => {
+      expect(expandedLines(createToolCall({
+        name: 'Read', input: { file_path: 'a.md' }, status: 'completed',
+        result: '1→literal\n2→also literal', resultFormat: 'plain',
+      }))).toEqual(['1→literal', '2→also literal']);
+    });
+
+    it('hands web search summaries to the host markdown renderer when available', () => {
+      const renderMarkdown = jest.fn();
+      const toolCall = createToolCall({
+        name: 'WebSearch', status: 'completed', input: { query: 'q' }, result: 'text',
+        webSearchResults: [{ title: 'Docs', url: 'https://docs.example.com/' }], webSearchSummary: '**Answer**',
+      });
+
+      const toolEl = renderStoredToolCall(createMockEl(), toolCall, { renderMarkdown });
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+
+      const summaryEl = toolEl.querySelector('.claudian-tool-web-summary');
+      expect(renderMarkdown).toHaveBeenCalledWith(summaryEl, '**Answer**');
+      expect(summaryEl?.textContent).toBe('');
+    });
+
+    it.each([
+      [{ kind: 'file' as const, path: '/Users/me/out dir/a#1.png' }, 'app://local/Users/me/out%20dir/a%231.png', 'a#1.png'],
+      [{ kind: 'file' as const, path: 'C:\\out\\b.png', alt: 'B' }, 'app://local/C:/out/b.png', 'B'],
+      [{ kind: 'data' as const, mediaType: 'image/png', data: 'AAAA' }, 'data:image/png;base64,AAAA', 'image/png'],
+    ])('renders result images from %j', (image, src, alt) => {
+      const toolEl = renderStoredToolCall(createMockEl(), createToolCall({
+        name: 'GenerateImage', status: 'completed', input: { prompt: 'p' }, result: 'done', resultImages: [image],
+      }));
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+
+      const img = toolEl.querySelector('.claudian-tool-result-image');
+      expect(img?.getAttribute('src')).toBe(src);
+      expect(img?.getAttribute('alt')).toBe(alt);
+    });
+  });
+
+  describe('script tool rendering', () => {
+    it.each([
+      ['exec', { code: 'return 1;' }, 'Script: return 1;', 'code', 'JavaScript'],
+      ['Workflow', { code: 'agent("ping")', language: 'Rhai', title: 'pong' }, 'Workflow: pong', 'workflow', 'Rhai'],
+    ])('presents %s with its source language', (name, input, label, icon, language) => {
+      expect(getToolLabel(name, input)).toBe(label);
+      expect(getToolIcon(name)).toBe(icon);
+
+      const toolEl = renderStoredToolCall(createMockEl(), createToolCall({ name, input, status: 'completed', result: 'ok' }));
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+      expect(Array.from(toolEl.querySelectorAll('.claudian-tool-script-label')).map(el => el.textContent))
+        .toEqual([language, 'Output']);
+    });
   });
 
   describe('apply_patch expanded rendering', () => {
@@ -653,7 +711,13 @@ describe('ToolCallRenderer', () => {
       });
 
       const toolEl = renderStoredToolCall(parentEl, toolCall);
-      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
+      const header = toolEl.querySelector('.claudian-tool-header');
+      const content = toolEl.querySelector('.claudian-tool-content');
+      expect(toolEl.hasClass('expanded')).toBe(false);
+      expect(content?.hasClass('claudian-hidden')).toBe(true);
+      expect(header?.getAttribute('aria-expanded')).toBe('false');
+
+      (header as HTMLElement).click();
       const headers = Array.from(toolEl.querySelectorAll('.claudian-tool-patch-header')).map(el => el.textContent);
       const statusEl = toolEl.querySelector('.claudian-tool-status');
       const diffTexts = Array.from(toolEl.querySelectorAll('.claudian-diff-text')).map(el => el.textContent);
@@ -666,33 +730,6 @@ describe('ToolCallRenderer', () => {
       expect(setIcon).not.toHaveBeenCalledWith(expect.anything(), 'check');
       expect(diffTexts).toContain("import { Plugin } from 'obsidian';");
       expect(diffTexts).toContain("import { Plugin, Notice } from 'obsidian';");
-    });
-
-    it('renders stored apply_patch collapsed by default', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({
-        name: 'apply_patch',
-        status: 'completed',
-        input: {
-          patch: [
-            '*** Begin Patch',
-            '*** Update File: src/main.ts',
-            '@@',
-            '-old',
-            '+new',
-            '*** End Patch',
-          ].join('\n'),
-        },
-        result: 'Applied patch',
-      });
-
-      const toolEl = renderStoredToolCall(parentEl, toolCall);
-      const header = toolEl.querySelector('.claudian-tool-header');
-      const content = toolEl.querySelector('.claudian-tool-content');
-
-      expect(toolEl.hasClass('expanded')).toBe(false);
-      expect(content?.hasClass('claudian-hidden')).toBe(true);
-      expect(header?.getAttribute('aria-expanded')).toBe('false');
     });
 
     it('renders stored apply_patch expanded when requested', () => {
@@ -835,6 +872,7 @@ describe('ToolCallRenderer', () => {
       };
 
       updateToolCallResult('patch-1', toolCall, toolCallElements);
+      (toolEl.querySelector('.claudian-tool-header') as HTMLElement).click();
 
       const statusEl = toolEl.querySelector('.claudian-tool-status');
       const diffTexts = Array.from(toolEl.querySelectorAll('.claudian-diff-text')).map(el => el.textContent);
@@ -864,32 +902,6 @@ describe('ToolCallRenderer', () => {
 
       expect(lines).toContain('src/main.ts');
       expect(lines).not.toContain('update: src/main.ts');
-    });
-  });
-
-  describe('renderTodoWriteResult', () => {
-    it('should render todo items', () => {
-      const container = createMockEl();
-      const input = {
-        todos: [
-          { status: 'completed', content: 'Task 1', activeForm: 'Task 1' },
-          { status: 'pending', content: 'Task 2', activeForm: 'Task 2' },
-        ],
-      };
-      renderTodoWriteResult(container as unknown as HTMLElement, input);
-      expect(container.hasClass('claudian-todo-list-container')).toBe(true);
-    });
-
-    it('should show fallback text when no todos array', () => {
-      const container = createMockEl();
-      renderTodoWriteResult(container as unknown as HTMLElement, {});
-      expect(container._children[0].textContent).toBe('Tasks updated');
-    });
-
-    it('should show fallback text for non-array todos', () => {
-      const container = createMockEl();
-      renderTodoWriteResult(container as unknown as HTMLElement, { todos: 'invalid' });
-      expect(container._children[0].textContent).toBe('Tasks updated');
     });
   });
 
@@ -946,20 +958,52 @@ describe('ToolCallRenderer', () => {
   });
 
   describe('renderStoredToolCall for TodoWrite', () => {
-    it('should render stored TodoWrite with status', () => {
-      const parentEl = createMockEl();
-      const toolCall = createToolCall({
-        name: 'TodoWrite',
-        status: 'completed',
+    it.each([
+      {
+        label: 'todo items',
         input: {
           todos: [
-            { status: 'completed', content: 'Task 1', activeForm: 'Done' },
+            { status: 'completed', content: 'Task 1', activeForm: 'Task 1' },
+            { status: 'pending', content: 'Task 2', activeForm: 'Task 2' },
           ],
         },
-      });
+        expectedTasks: ['Task 1', 'Task 2'],
+        expectedFallback: null,
+      },
+      { label: 'missing todos', input: {}, expectedTasks: [], expectedFallback: 'Tasks updated' },
+      { label: 'invalid todos', input: { todos: 'invalid' }, expectedTasks: [], expectedFallback: 'Tasks updated' },
+    ])('renders $label through the stored tool boundary', ({ input, expectedTasks, expectedFallback }) => {
+      const toolEl = renderStoredToolCall(createMockEl(), createToolCall({
+        name: 'TodoWrite',
+        status: 'completed',
+        input,
+      }));
+      const content = toolEl.querySelector('.claudian-tool-content');
 
-      const toolEl = renderStoredToolCall(parentEl, toolCall);
       expect(toolEl).toBeDefined();
+      expect(content?.hasClass('claudian-todo-list-container')).toBe(true);
+      expect(Array.from(content!.querySelectorAll('.claudian-todo-text'), el => el.textContent))
+        .toEqual(expectedTasks);
+      expect(content?.querySelector('.claudian-tool-result-item')?.textContent ?? null).toBe(expectedFallback);
     });
   });
+});
+
+
+it('keeps a large tool preview bounded without splitting the undisplayed lines', () => {
+  const result = Array.from({ length: 10000 }, (_, index) => `line-${index}`).join('\r\n');
+  const split = String.prototype.split;
+  let splitWholeOutput = false;
+  const spy = jest.spyOn(String.prototype, 'split').mockImplementation(function (this: string, ...args: Parameters<typeof split>) {
+    if (String(this) === result && args[1] === undefined) splitWholeOutput = true;
+    return split.apply(this, args);
+  });
+  try {
+    const parent = createMockEl();
+    renderExpandedContent(parent, { name: 'Bash', result, input: { command: 'echo' } });
+    const element = parent;
+    expect(element.querySelectorAll('.claudian-tool-line').length).toBeLessThanOrEqual(20);
+    expect(element.querySelector('.claudian-tool-truncated')?.textContent).toContain('9980 more lines');
+    expect(splitWholeOutput).toBe(false);
+  } finally { spy.mockRestore(); }
 });

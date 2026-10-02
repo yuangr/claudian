@@ -1,4 +1,5 @@
 import {
+  isScriptTool,
   TOOL_AGENT_OUTPUT,
   TOOL_APPLY_PATCH,
   TOOL_ASK_USER_QUESTION,
@@ -6,11 +7,17 @@ import {
   TOOL_BASH_OUTPUT,
   TOOL_CLOSE_AGENT,
   TOOL_EDIT,
+  TOOL_EDIT_IMAGE,
   TOOL_ENTER_PLAN_MODE,
   TOOL_EXIT_PLAN_MODE,
+  TOOL_FOLLOWUP_TASK,
+  TOOL_GENERATE_IMAGE,
+  TOOL_GENERATE_VIDEO,
   TOOL_GLOB,
   TOOL_GREP,
+  TOOL_INTERRUPT_AGENT,
   TOOL_KILL_SHELL,
+  TOOL_LIST_AGENTS,
   TOOL_LIST_MCP_RESOURCES,
   TOOL_LS,
   TOOL_MCP,
@@ -19,6 +26,7 @@ import {
   TOOL_READ_MCP_RESOURCE,
   TOOL_RESUME_AGENT,
   TOOL_SEND_INPUT,
+  TOOL_SEND_MESSAGE,
   TOOL_SKILL,
   TOOL_SPAWN_AGENT,
   TOOL_SUBAGENT,
@@ -28,6 +36,7 @@ import {
   TOOL_WAIT_AGENT,
   TOOL_WEB_FETCH,
   TOOL_WEB_SEARCH,
+  TOOL_WORKFLOW,
   TOOL_WRITE,
   TOOL_WRITE_STDIN,
 } from './toolNames';
@@ -61,16 +70,25 @@ const TOOL_ICONS: Record<string, string> = {
   [TOOL_WRITE_STDIN]: 'terminal',
   [TOOL_SPAWN_AGENT]: 'bot',
   [TOOL_SEND_INPUT]: 'bot',
+  [TOOL_SEND_MESSAGE]: 'bot',
+  [TOOL_FOLLOWUP_TASK]: 'bot',
+  [TOOL_LIST_AGENTS]: 'bot',
+  [TOOL_INTERRUPT_AGENT]: 'bot',
   [TOOL_WAIT]: 'clock',
   [TOOL_WAIT_AGENT]: 'clock',
   [TOOL_RESUME_AGENT]: 'bot',
   [TOOL_CLOSE_AGENT]: 'bot',
+  [TOOL_WORKFLOW]: 'workflow',
+  [TOOL_GENERATE_IMAGE]: 'image',
+  [TOOL_EDIT_IMAGE]: 'image-plus',
+  [TOOL_GENERATE_VIDEO]: 'clapperboard',
 };
 
 /** Special marker for MCP tools - signals to use custom SVG. */
 export const MCP_ICON_MARKER = '__mcp_icon__';
 
 export function getToolIcon(toolName: string): string {
+  if (isScriptTool(toolName)) return TOOL_ICONS[toolName] ?? 'code';
   if (toolName.startsWith('mcp__')) {
     return MCP_ICON_MARKER;
   }

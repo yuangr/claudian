@@ -1,15 +1,25 @@
 import {
   decodeCodexExecEnvelope,
   isCodexToolOutputError,
-  normalizeCodexMcpToolInput,
-  normalizeCodexMcpToolName,
-  normalizeCodexMcpToolState,
+  normalizeCodexMCPToolInput,
+  normalizeCodexMCPToolName,
+  normalizeCodexMCPToolState,
   normalizeCodexToolCall,
   normalizeCodexToolInput,
   normalizeCodexToolName,
   normalizeCodexToolResult,
   parseCodexArguments,
+  stringifyCodexToolOutput,
 } from '@/providers/codex/normalization/codexToolNormalization';
+
+it('renders non-JSON tool outputs without losing primitive values or throwing on circular records', () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  expect(stringifyCodexToolOutput(circular)).toBe('[Unserializable value]');
+  expect(stringifyCodexToolOutput(BigInt(42))).toBe('42');
+  expect(stringifyCodexToolOutput({ ok: true })).toBe('{"ok":true}');
+  expect(stringifyCodexToolOutput([{ text: 'first' }, { text: 'second' }])).toBe('firstsecond');
+});
 
 describe('normalizeCodexToolName', () => {
   it.each([
@@ -346,16 +356,16 @@ describe('normalizeCodexToolCall', () => {
 
 describe('Codex MCP normalization helpers', () => {
   it('normalizes MCP tool names', () => {
-    expect(normalizeCodexMcpToolName('filesystem', 'read_file')).toBe('mcp__filesystem__read_file');
+    expect(normalizeCodexMCPToolName('filesystem', 'read_file')).toBe('mcp__filesystem__read_file');
   });
 
   it('normalizes MCP arguments from string and object inputs', () => {
-    expect(normalizeCodexMcpToolInput('{"path":"README.md"}')).toEqual({ path: 'README.md' });
-    expect(normalizeCodexMcpToolInput({ path: 'README.md' })).toEqual({ path: 'README.md' });
+    expect(normalizeCodexMCPToolInput('{"path":"README.md"}')).toEqual({ path: 'README.md' });
+    expect(normalizeCodexMCPToolInput({ path: 'README.md' })).toEqual({ path: 'README.md' });
   });
 
   it('normalizes MCP completed state with structured text results', () => {
-    expect(normalizeCodexMcpToolState(
+    expect(normalizeCodexMCPToolState(
       'completed',
       { content: [{ text: 'line 1' }, { text: 'line 2' }] },
       undefined,
@@ -368,7 +378,7 @@ describe('Codex MCP normalization helpers', () => {
   });
 
   it('normalizes MCP failed state with error text', () => {
-    expect(normalizeCodexMcpToolState(
+    expect(normalizeCodexMCPToolState(
       'failed',
       undefined,
       'Permission denied',
@@ -382,6 +392,12 @@ describe('Codex MCP normalization helpers', () => {
 });
 
 describe('normalizeCodexToolResult', () => {
+  it('strips only the script envelope while preserving arbitrary script output', () => {
+    const output = '{"output":"keep this object","count":2}\nOutput:\nkeep this label';
+    expect(normalizeCodexToolResult('exec', `Script completed\nWall time 0.1 seconds\nOutput:\n${output}`)).toBe(output);
+    expect(normalizeCodexToolResult('exec', output)).toBe(output);
+  });
+
   it('unwraps JSON { output: "..." } for Bash', () => {
     const result = normalizeCodexToolResult('Bash', '{"output":"hello world"}');
     expect(result).toBe('hello world');
@@ -413,6 +429,10 @@ describe('normalizeCodexToolResult', () => {
 });
 
 describe('isCodexToolOutputError', () => {
+  it('recognizes script failures even after a successful nested command', () => {
+    expect(isCodexToolOutputError('Script failed\nWall time 0.1 seconds\nOutput:\nProcess exited with code 0\nScript error: fixture failure')).toBe(true);
+  });
+
   it('detects non-zero exit code', () => {
     expect(isCodexToolOutputError('Exit code: 1\nOutput:\nerror')).toBe(true);
   });
@@ -444,10 +464,6 @@ describe('isCodexToolOutputError', () => {
   it('does not false-positive on normal output mentioning error', () => {
     expect(isCodexToolOutputError('Fixed the error in line 5')).toBe(false);
   });
-
-  it('does not false-positive on exit code 0', () => {
-    expect(isCodexToolOutputError('Exit code: 0\nOutput:\nall good')).toBe(false);
-  });
 });
 
 describe('parseCodexArguments', () => {
@@ -466,4 +482,10 @@ describe('parseCodexArguments', () => {
   it('returns empty object for undefined', () => {
     expect(parseCodexArguments(undefined)).toEqual({});
   });
+});
+
+it.each(['spawn_agent', 'followup_task', 'send_message', 'send_input'])('omits encrypted %s task messages from display inputs', name => {
+  expect(normalizeCodexToolInput(name, { target: 'helper', message: 'gAAAAAEncryptedPrompt==' }))
+    .toEqual({ target: 'helper' });
+  expect(normalizeCodexToolInput(name, { message: 'Readable task.' })).toEqual({ message: 'Readable task.' });
 });

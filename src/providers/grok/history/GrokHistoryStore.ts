@@ -2,6 +2,12 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { isWriteEditTool, TOOL_ASK_USER_QUESTION } from '../../../core/tools/toolNames';
+import {
+  extractResultImages,
+  extractToolResultFormat,
+  extractWebSearchResults,
+  extractWebSearchSummary,
+} from '../../../core/tools/toolResultContent';
 import type {
   ChatMessage,
   ContentBlock,
@@ -11,10 +17,11 @@ import type {
 } from '../../../core/types';
 import type { SDKToolUseResult } from '../../../core/types/diff';
 import { extractDiffData } from '../../../utils/diff';
-import { extractAcpDiffToolUseResult } from '../../acp/AcpToolResultNormalization';
+import { extractACPDiffToolUseResult } from '../../acp/ACPToolResultNormalization';
 import {
   type GrokRawToolNameResolution,
   normalizeGrokToolCall,
+  normalizeGrokToolUpdate,
   normalizeGrokToolUseResult,
   resolveGrokRawToolName,
 } from '../normalization/grokToolNormalization';
@@ -77,6 +84,7 @@ interface PendingTurn {
 
 interface CompletedTurn {
   messages: ChatMessage[];
+  promptId?: string;
   promptIndex: number;
   usage?: GrokHistoryUsage;
 }
@@ -84,6 +92,7 @@ interface CompletedTurn {
 export function parseGrokHistoryContent(
   content: string,
   sessionId: string,
+  resumeAt?: string,
 ): ParsedGrokHistory {
   let completedTurns: CompletedTurn[] = [];
   let pending: PendingTurn | null = null;
@@ -100,6 +109,7 @@ export function parseGrokHistoryContent(
     if (messages.length === 0 || turn.timelinePromptIndex === null) return false;
     completedTurns.push({
       messages,
+      promptId,
       promptIndex: turn.timelinePromptIndex,
       ...(usage ? { usage } : {}),
     });
@@ -233,7 +243,7 @@ export function parseGrokHistoryContent(
     }
 
     if (updateType === 'tool_call' || updateType === 'tool_call_update') {
-      reconcileToolUpdate(pending, update);
+      reconcileToolUpdate(pending, normalizeGrokToolUpdate(update));
       continue;
     }
 
@@ -253,6 +263,17 @@ export function parseGrokHistoryContent(
     }
   }
 
+  if (resumeAt !== undefined) {
+    // Live checkpoints use prompt IDs, while stored messages retain their native IDs.
+    const checkpointIndex = completedTurns.findIndex(turn => (
+      turn.promptId === resumeAt
+      || turn.messages.some(message => (
+        message.role === 'assistant' && message.assistantMessageId === resumeAt
+      ))
+    ));
+    completedTurns = completedTurns.slice(0, checkpointIndex + 1);
+  }
+
   const messages = completedTurns.flatMap(turn => turn.messages);
   let lastUsage: GrokHistoryUsage | undefined;
   for (let index = completedTurns.length - 1; index >= 0; index -= 1) {
@@ -270,10 +291,11 @@ export function parseGrokHistoryContent(
 export async function loadGrokHistory(
   sessionDirectory: string,
   sessionId: string,
+  resumeAt?: string,
 ): Promise<ParsedGrokHistory> {
   try {
     const content = await fs.readFile(path.join(sessionDirectory, 'updates.jsonl'), 'utf8');
-    return parseGrokHistoryContent(content, sessionId);
+    return parseGrokHistoryContent(content, sessionId, resumeAt);
   } catch {
     return { messages: [] };
   }
@@ -332,24 +354,6 @@ export function resolveGrokPromptIndexAfterAssistant(
     }
   }
 
-  return resolveLegacyForkTargetPromptIndex(content, sessionId, resumeAt);
-}
-
-function resolveLegacyForkTargetPromptIndex(
-  content: string,
-  sessionId: string,
-  resumeAt: string,
-): number | null {
-  let completedPrompts = 0;
-  for (const message of parseGrokHistoryContent(content, sessionId).messages) {
-    if (message.role === 'user' && message.userMessageId) {
-      completedPrompts += 1;
-      continue;
-    }
-    if (message.assistantMessageId === resumeAt) {
-      return completedPrompts;
-    }
-  }
   return null;
 }
 
@@ -392,6 +396,13 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     return;
   }
   const current = turn.tools.get(id);
+  // A backgrounded command completes its call, then reports task output on the same id.
+  if (
+    (current?.status === 'completed' || current?.status === 'error')
+    && normalizeToolStatus(readString(update.status), undefined) === 'running'
+  ) {
+    return;
+  }
   const rawNameResolution = resolveGrokRawToolName(current ? {
     provenance: current.rawNameProvenance,
     rawName: current.rawName,
@@ -412,9 +423,10 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     title: rawName,
   }, rawNameResolution);
   const status = normalizeToolStatus(readString(update.status), current?.status);
-  const nativeToolUseResult = extractAcpDiffToolUseResult(update.content)
+  const nativeToolUseResult = extractACPDiffToolUseResult(update.content)
     ?? current?.toolUseResult;
-  const output = renderedContent || (update.rawOutput === undefined
+  // Explicit text content is the presentation, even when empty (e.g. an image-only MCP result).
+  const output = hasTextContent(update.content) ? renderedContent : renderedContent || (update.rawOutput === undefined
     ? current?.output || normalized.output
     : normalized.output || current?.output) || '';
 
@@ -483,7 +495,16 @@ function finalizeTurn(
       providerPayload: providerToolUseResult.providerPayload,
       ...(tool.output ? { result: tool.output } : {}),
       status: tool.status,
+      resultFormat: extractToolResultFormat(toolUseResult),
     };
+    const webSearchResults = extractWebSearchResults(toolUseResult);
+    if (webSearchResults) {
+      toolCall.webSearchResults = webSearchResults;
+      const webSearchSummary = extractWebSearchSummary(toolUseResult);
+      if (webSearchSummary) toolCall.webSearchSummary = webSearchSummary;
+    }
+    const resultImages = extractResultImages(toolUseResult);
+    if (resultImages) toolCall.resultImages = resultImages;
     if (toolCall.name === TOOL_ASK_USER_QUESTION && providerToolUseResult.answers) {
       toolCall.resolvedAnswers = providerToolUseResult.answers;
     }
@@ -583,6 +604,10 @@ function readImageMediaType(value: unknown): ImageMediaType | null {
   }
 }
 
+function hasTextContent(value: unknown): boolean {
+  return Array.isArray(value) && value.some(entry => readRecord(entry)?.type === 'content');
+}
+
 function renderToolContent(value: unknown): string {
   if (!Array.isArray(value)) {
     return '';
@@ -620,7 +645,34 @@ export function resolveGrokUpdateMessageId(
   return readString(update.messageId)
     ?? readString(updateMetadata?.eventId)
     ?? readString(outerMetadata?.eventId)
-    ?? readString(updateMetadata?.promptId)
+    ?? readTurnMessageId(role, updateMetadata, outerMetadata);
+}
+
+/**
+ * Live Grok chunks carry a fresh eventId per streamed token, so the turn's promptId
+ * must win over eventId when deciding where a live message starts.
+ */
+export function resolveGrokLiveMessageId(
+  value: unknown,
+  role: 'assistant' | 'user',
+  notificationMetadata?: unknown,
+): string | undefined {
+  const update = readRecord(value);
+  if (!update) return undefined;
+  const updateMetadata = readRecord(update._meta);
+  const outerMetadata = readRecord(notificationMetadata);
+  return readString(update.messageId)
+    ?? readTurnMessageId(role, updateMetadata, outerMetadata)
+    ?? readString(updateMetadata?.eventId)
+    ?? readString(outerMetadata?.eventId);
+}
+
+function readTurnMessageId(
+  role: 'assistant' | 'user',
+  updateMetadata: Record<string, unknown> | null,
+  outerMetadata: Record<string, unknown> | null,
+): string | undefined {
+  return readString(updateMetadata?.promptId)
     ?? readString(outerMetadata?.promptId)
     ?? (typeof updateMetadata?.promptIndex === 'number'
       ? `${role}-${updateMetadata.promptIndex}`

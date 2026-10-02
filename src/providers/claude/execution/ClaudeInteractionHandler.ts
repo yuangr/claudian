@@ -4,6 +4,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import type {
+  ProviderApprovalDecisionOption,
   ProviderInteractionDismissReason,
   ProviderInteractionPort,
 } from '../../../core/execution';
@@ -11,15 +12,26 @@ import { getActionDescription } from '../../../core/security/approvalRules';
 import {
   TOOL_ASK_USER_QUESTION,
 } from '../../../core/tools/toolNames';
-import { buildPersistentPermissionUpdates } from '../security/ClaudePermissionUpdates';
 
 export interface ClaudeExecutionInteractionDeps {
   readonly interactionPort: ProviderInteractionPort;
   readonly sessionInstanceId: string;
-  readonly getTurnId: () => string | null;
+  readonly getTurnId: (toolId: string) => string | null;
   readonly isToolAllowed: (toolName: string) => boolean;
   readonly onToolBlocked: (toolUseId: string) => void;
 }
+
+const ONE_TIME_DECISION_OPTIONS: readonly ProviderApprovalDecisionOption[] = [
+  { label: 'Deny', value: 'deny', decision: 'deny' },
+  { label: 'Allow once', value: 'allow', decision: 'allow' },
+];
+
+// Claude Code decides what an "Always allow" persists and where; offer it only
+// when the SDK suggested permission updates to apply.
+const PERSISTABLE_DECISION_OPTIONS: readonly ProviderApprovalDecisionOption[] = [
+  ...ONE_TIME_DECISION_OPTIONS,
+  { label: 'Always allow', value: 'allow-always', decision: 'allow-always' },
+];
 
 export class ClaudeInteractionHandler {
   private readonly pendingInteractionIds = new Set<string>();
@@ -38,16 +50,16 @@ export class ClaudeInteractionHandler {
       };
     }
 
-    const turnId = this.deps.getTurnId();
+    const turnId = this.deps.getTurnId(options.toolUseID);
     if (!turnId) {
       return {
         behavior: 'deny',
-        message: 'No current Claude turn owns this interaction.',
+        message: 'No current Claude Code turn owns this interaction.',
         interrupt: true,
       };
     }
 
-    const interactionId = this.getInteractionId(options.toolUseID);
+    const interactionId = this.#getInteractionId(options.toolUseID);
     if (this.pendingInteractionIds.has(interactionId)) {
       return {
         behavior: 'deny',
@@ -102,6 +114,9 @@ export class ClaudeInteractionHandler {
         description: getActionDescription(toolName, input),
         decisionReason: options.decisionReason,
         blockedPath: options.blockedPath,
+        decisionOptions: options.suggestions?.length
+          ? PERSISTABLE_DECISION_OPTIONS
+          : ONE_TIME_DECISION_OPTIONS,
         additionalPermissions: options.suggestions,
       }, options.signal);
       assertResponseIdentity(interactionId, response.interactionId);
@@ -125,11 +140,7 @@ export class ClaudeInteractionHandler {
         return {
           behavior: 'allow',
           updatedInput: input,
-          updatedPermissions: buildPersistentPermissionUpdates(
-            toolName,
-            input,
-            options.suggestions,
-          ),
+          updatedPermissions: options.suggestions,
           decisionClassification: 'user_permanent',
         };
       }
@@ -170,15 +181,9 @@ export class ClaudeInteractionHandler {
     this.pendingInteractionIds.clear();
   }
 
-  private getInteractionId(nativeToolUseId: string): string {
+  #getInteractionId(nativeToolUseId: string): string {
     return `claude:${this.deps.sessionInstanceId}:${nativeToolUseId}`;
   }
-}
-
-export function createClaudeExecutionCanUseTool(
-  deps: ClaudeExecutionInteractionDeps,
-): CanUseTool {
-  return new ClaudeInteractionHandler(deps).canUseTool;
 }
 
 class StaleClaudeInteractionResponseError extends Error {}

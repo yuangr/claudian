@@ -3,25 +3,14 @@ import { applyTextInput } from '@test/helpers/settingsControls';
 import * as fs from 'fs';
 
 import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
-import {
-  getOpencodeProviderSettings,
-  OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
-} from '@/providers/opencode/settings';
-import { opencodeSettingsTabRenderer } from '@/providers/opencode/ui/OpencodeSettingsTab';
+import { createOpencodeSettingsTabRenderer } from '@/providers/opencode/ui/OpencodeSettingsTab';
 
 const mockGetHostnameKey = jest.fn(() => 'host-a');
 const mockRenderEnvironmentSettingsSection = jest.fn();
 const mockSaveSettings = jest.fn().mockResolvedValue(undefined);
-const mockCliResolverReset = jest.fn();
+const mockCLIResolverReset = jest.fn();
 const mockMetadataLoadCatalog = jest.fn().mockResolvedValue(false);
 const mockMetadataWarmModel = jest.fn().mockResolvedValue(false);
-const mockAgentStorage = {};
-const mockCreatedAgentSettings: Array<{
-  app: unknown;
-  containerEl: unknown;
-  onChanged?: () => Promise<void> | void;
-  storage: unknown;
-}> = [];
 
 jest.mock('fs');
 jest.mock('@/core/providers/ProviderSettingsCoordinator', () => ({
@@ -86,41 +75,18 @@ jest.mock('@/shared/settings/EnvironmentSettingsSection', () => ({
   renderEnvironmentSettingsSection: (...args: unknown[]) => mockRenderEnvironmentSettingsSection(...args),
 }));
 
-jest.mock('@/providers/opencode/ui/OpencodeAgentSettings', () => ({
-  OpencodeAgentSettings: class MockOpencodeAgentSettings {
-    constructor(
-      containerEl: unknown,
-      storage: unknown,
-      app: unknown,
-      onChanged?: () => Promise<void> | void,
-    ) {
-      mockCreatedAgentSettings.push({
-        app,
-        containerEl,
-        onChanged,
-        storage,
-      });
-    }
-  },
-}));
-
-jest.mock('@/providers/opencode/app/OpencodeWorkspaceServices', () => ({
-  maybeGetOpencodeWorkspaceServices: jest.fn(() => ({
-    agentStorage: mockAgentStorage,
+function createSettingsRenderer() {
+  return createOpencodeSettingsTabRenderer({
     cliResolver: {
-      reset: mockCliResolverReset,
+      reset: mockCLIResolverReset,
     },
+    modelCatalog: { markStale: jest.fn() } as any,
     metadataService: {
       loadCatalog: mockMetadataLoadCatalog,
       warmModelMetadata: mockMetadataWarmModel,
     },
-  })),
-}));
-
-jest.mock('@/utils/env', () => ({
-  ...jest.requireActual('@/utils/env'),
-  getHostnameKey: () => mockGetHostnameKey(),
-}));
+  });
+}
 
 interface MockTextComponent {
   value: string;
@@ -153,15 +119,7 @@ type MockSettingRecord = {
   toggleComponents: MockToggleComponent[];
 };
 
-type MockElementRecord = {
-  cls?: string;
-  tag?: string;
-  text?: string;
-};
-
 const createdSettings: MockSettingRecord[] = [];
-const createdElements: MockElementRecord[] = [];
-const createdDomElements: any[] = [];
 
 function createTextComponent(): MockTextComponent {
   const component = {} as MockTextComponent;
@@ -209,7 +167,6 @@ function createToggleComponent(): MockToggleComponent {
 
 function createElement(): any {
   const classes = new Set<string>();
-  const eventListeners = new Map<string, Array<(...args: unknown[]) => void>>();
   const element: any = {
     ...createMockEl('div'),
     value: '',
@@ -259,16 +216,6 @@ function createElement(): any {
     }),
     empty: jest.fn(),
     setAttribute: jest.fn(),
-    addEventListener: jest.fn((type: string, callback: (...args: unknown[]) => void) => {
-      const listeners = eventListeners.get(type) ?? [];
-      listeners.push(callback);
-      eventListeners.set(type, listeners);
-    }),
-    dispatchMockEvent: async (type: string, event?: unknown) => {
-      for (const listener of eventListeners.get(type) ?? []) {
-        await listener(event);
-      }
-    },
     blur: jest.fn(),
     createEl: jest.fn((_tag?: string, attrs?: Record<string, unknown>) => {
       const child = createElement();
@@ -285,12 +232,6 @@ function createElement(): any {
       if (attrs && typeof attrs.type === 'string') {
         child.type = attrs.type;
       }
-      createdElements.push({
-        cls: child.cls,
-        tag: child.tag,
-        text: child.text,
-      });
-      createdDomElements.push(child);
       return child;
     }),
     createDiv: jest.fn((attrs?: Record<string, unknown>) => {
@@ -299,12 +240,6 @@ function createElement(): any {
       if (attrs && typeof attrs.cls === 'string') {
         child.cls = attrs.cls;
       }
-      createdElements.push({
-        cls: child.cls,
-        tag: child.tag,
-        text: child.text,
-      });
-      createdDomElements.push(child);
       return child;
     }),
     createSpan: jest.fn((_attrs?: Record<string, unknown>) => createElement()),
@@ -321,12 +256,6 @@ function createContainer(): any {
       if (attrs && typeof attrs.cls === 'string') {
         child.cls = attrs.cls;
       }
-      createdElements.push({
-        cls: child.cls,
-        tag: child.tag,
-        text: child.text,
-      });
-      createdDomElements.push(child);
       return child;
     }),
     createEl: jest.fn((tag?: string, attrs?: Record<string, unknown>) => {
@@ -338,12 +267,6 @@ function createContainer(): any {
       if (attrs && typeof attrs.text === 'string') {
         child.text = attrs.text;
       }
-      createdElements.push({
-        cls: child.cls,
-        tag: child.tag,
-        text: child.text,
-      });
-      createdDomElements.push(child);
       return child;
     }),
   };
@@ -351,18 +274,17 @@ function createContainer(): any {
 
 function createPlugin(overrides: Record<string, unknown> = {}): any {
   const plugin: any = {
+    storage: { installationKey: mockGetHostnameKey() },
     settings: {
       providerConfigs: {
         opencode: {
-          availableModes: [],
           cliPath: '',
           cliPathsByHost: {},
           discoveredModels: [],
           enabled: true,
-          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
+          environmentVariables: '',
           modelAliases: {},
           preferredThinkingByModel: {},
-          selectedMode: '',
           visibleModels: [],
         },
       },
@@ -392,8 +314,6 @@ function createPlugin(overrides: Record<string, unknown> = {}): any {
 function createContext(plugin: any) {
   return {
     plugin,
-    renderAgentSkillSettings: jest.fn(),
-    renderHiddenProviderCommandSetting: jest.fn(),
     notifyProviderModelOptionsChanged: jest.fn(),
     renderCustomContextLimits: jest.fn(),
   };
@@ -435,13 +355,10 @@ function findSetting(name: string): MockSettingRecord {
   return setting;
 }
 
-function findElement(tag: string, cls: string): any {
-  const element = createdDomElements.find((candidate) => candidate.tag === tag && candidate.cls === cls);
-  if (!element) {
-    throw new Error(`Element not found: ${tag}.${cls}`);
-  }
-  return element;
-}
+jest.mock('@/core/device/InstallationKey', () => ({
+  ...jest.requireActual('@/core/device/InstallationKey'),
+  getInstallationKey: () => mockGetHostnameKey(),
+}));
 
 describe('OpencodeSettingsTab', () => {
   const mockedExistsSync = fs.existsSync as jest.MockedFunction<typeof fs.existsSync>;
@@ -449,9 +366,6 @@ describe('OpencodeSettingsTab', () => {
 
   beforeEach(() => {
     createdSettings.length = 0;
-    createdElements.length = 0;
-    createdDomElements.length = 0;
-    mockCreatedAgentSettings.length = 0;
     jest.clearAllMocks();
     mockMetadataLoadCatalog.mockResolvedValue(false);
     mockMetadataWarmModel.mockResolvedValue(false);
@@ -466,7 +380,7 @@ describe('OpencodeSettingsTab', () => {
     };
     const plugin = createPlugin();
     Object.assign(plugin.settings.providerConfigs.opencode, config);
-    opencodeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
     const input = findSetting('CLI path').textComponents[0];
     expect(input.value).toBe(hasHostOverride ? '/host/opencode' : '/legacy/opencode');
     await applyTextInput(input, '');
@@ -478,7 +392,7 @@ describe('OpencodeSettingsTab', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
 
-    opencodeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
     const enableSetting = findSetting('Enable OpenCode');
     await enableSetting.toggleComponents[0].onChangeCallback?.(false);
 
@@ -511,7 +425,7 @@ describe('OpencodeSettingsTab', () => {
     });
     const context = createContext(plugin);
 
-    opencodeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
     const toggle = findSetting('Enable OpenCode').toggleComponents[0];
     await flushPromises();
     mockMetadataLoadCatalog.mockClear();
@@ -547,7 +461,7 @@ describe('OpencodeSettingsTab', () => {
       });
       const context = createContext(plugin);
 
-      opencodeSettingsTabRenderer.render(createContainer(), context);
+      createSettingsRenderer().render(createContainer(), context);
       const toggle = findSetting('Enable OpenCode').toggleComponents[0];
       toggle.value = false;
       toggle.setValue.mockClear();
@@ -577,7 +491,7 @@ describe('OpencodeSettingsTab', () => {
       await plugin.saveSettings();
     });
 
-    opencodeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
     await applyTextInput(findSetting('CLI path').textComponents[0], '"/my tools/opencode"');
 
     expect(plugin.settings.providerConfigs.opencode.cliPathsByHost).toEqual({
@@ -608,11 +522,11 @@ describe('OpencodeSettingsTab', () => {
       await mutation(plugin.settings);
       await plugin.saveSettings();
     });
-    mockCliResolverReset.mockImplementation(() => {
+    mockCLIResolverReset.mockImplementation(() => {
       expect(transitionActive).toBe(true);
     });
 
-    opencodeSettingsTabRenderer.render(createContainer(), createContext(plugin));
+    createSettingsRenderer().render(createContainer(), createContext(plugin));
 
     const cliPathSetting = findSetting('CLI path');
     await applyTextInput(cliPathSetting.textComponents[0], '/custom/opencode');
@@ -621,7 +535,7 @@ describe('OpencodeSettingsTab', () => {
       'host-a': '/custom/opencode',
     });
     expect(mockSaveSettings).toHaveBeenCalledTimes(1);
-    expect(mockCliResolverReset).toHaveBeenCalledTimes(1);
+    expect(mockCLIResolverReset).toHaveBeenCalledTimes(1);
     expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
       ['opencode'],
       expect.any(Function),
@@ -633,229 +547,18 @@ describe('OpencodeSettingsTab', () => {
     );
   });
 
-  it('renders the shared skill manager and keeps hidden runtime commands separate', () => {
+  it('renders environment guidance without skill or command sections', () => {
     const plugin = createPlugin();
     const context = createContext(plugin);
 
-    opencodeSettingsTabRenderer.render(createContainer(), context);
+    createSettingsRenderer().render(createContainer(), context);
 
-    expect(findSetting('Skills').heading).toBe(true);
-    expect(context.renderAgentSkillSettings).toHaveBeenCalledWith(
-      expect.anything(),
-      'opencode',
-    );
-    expect(context.renderHiddenProviderCommandSetting).toHaveBeenCalledWith(
-      expect.anything(),
-      'opencode',
-      expect.objectContaining({
-        name: 'Hidden Commands and Skills',
-        desc: 'Hide specific OpenCode commands and skills from the dropdown. Enter names without the leading slash, one per line.',
-      }),
-    );
-  });
-
-  it('reloads native subagents inside an execution transition', async () => {
-    const plugin = createPlugin();
-
-    opencodeSettingsTabRenderer.render(createContainer(), createContext(plugin));
-
-    expect(findSetting('Subagents').heading).toBe(true);
-    expect(createdElements).toContainEqual({
-      cls: 'setting-item-description',
-      tag: 'p',
-      text: 'Manage vault-level OpenCode subagents from .opencode/agent/ and legacy .opencode/agents/. New entries are saved as subagent-only files.',
-    });
-
-    expect(mockCreatedAgentSettings).toHaveLength(1);
-    expect(mockCreatedAgentSettings[0].storage).toBe(mockAgentStorage);
-
-    await mockCreatedAgentSettings[0].onChanged?.();
-
-    expect(plugin.runProviderExecutionTransition).toHaveBeenCalledWith(
-      ['opencode'],
-      expect.any(Function),
-    );
-  });
-
-  it('passes the default Exa env var into the environment section copy', () => {
-    const plugin = createPlugin();
-
-    opencodeSettingsTabRenderer.render(createContainer(), createContext(plugin));
-
+    expect(createdSettings.filter(setting => ['Skills', 'Commands', 'Hidden Commands and Skills'].includes(setting.name))).toEqual([]);
     expect(mockRenderEnvironmentSettingsSection).toHaveBeenCalledWith(expect.objectContaining({
-      desc: expect.stringContaining(OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES),
-      placeholder: `${OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES}\nOPENCODE_DB=/path/to/opencode.db`,
+      desc: 'Extra environment variables passed to OpenCode.',
+      placeholder: 'OPENCODE_DB=/path/to/opencode.db',
     }));
   });
-
-  it('loads the OpenCode model catalog when the model browser is expanded', async () => {
-    const plugin = createPlugin({
-      providerConfigs: {
-        opencode: {
-          availableModes: [],
-          cliPath: '',
-          cliPathsByHost: {},
-          discoveredModels: [],
-          enabled: true,
-          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
-          modelAliases: {},
-          preferredThinkingByModel: {},
-          selectedMode: '',
-          visibleModels: ['deepseek/deepseek-v4-pro'],
-        },
-      },
-    });
-    mockMetadataLoadCatalog.mockImplementation(async () => {
-      plugin.settings.providerConfigs.opencode.discoveredModels = [
-        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
-      ];
-      return true;
-    });
-    const context = createContext(plugin);
-
-    opencodeSettingsTabRenderer.render(createContainer(), context);
-
-    const catalogEl = findElement('details', 'claudian-provider-model-picker-catalog');
-    catalogEl.open = true;
-    await catalogEl.dispatchMockEvent('toggle');
-    await flushPromises();
-
-    expect(mockMetadataLoadCatalog).toHaveBeenCalledTimes(1);
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledTimes(1);
-  });
-
-  it('loads the OpenCode model catalog immediately when a fresh picker starts expanded', async () => {
-    const plugin = createPlugin({
-      providerConfigs: {
-        opencode: {
-          availableModes: [],
-          cliPath: '',
-          cliPathsByHost: {},
-          discoveredModels: [],
-          enabled: true,
-          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
-          modelAliases: {},
-          preferredThinkingByModel: {},
-          selectedMode: '',
-          visibleModels: [],
-        },
-      },
-    });
-    mockMetadataLoadCatalog.mockImplementation(async () => {
-      plugin.settings.providerConfigs.opencode.discoveredModels = [
-        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
-      ];
-      return true;
-    });
-    const context = createContext(plugin);
-
-    opencodeSettingsTabRenderer.render(createContainer(), context);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(mockMetadataLoadCatalog).toHaveBeenCalledTimes(1);
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledTimes(1);
-  });
-
-  it('loads the OpenCode catalog when saved models start with the browser collapsed', async () => {
-    const plugin = createPlugin({
-      providerConfigs: {
-        opencode: {
-          availableModes: [],
-          cliPath: '',
-          cliPathsByHost: {},
-          discoveredModels: [],
-          enabled: true,
-          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
-          modelAliases: {},
-          preferredThinkingByModel: {},
-          selectedMode: '',
-          visibleModels: ['deepseek/deepseek-v4-pro'],
-        },
-      },
-    });
-    mockMetadataLoadCatalog.mockImplementation(async () => {
-      plugin.settings.providerConfigs.opencode.discoveredModels = [
-        { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
-      ];
-      return true;
-    });
-    const context = createContext(plugin);
-
-    opencodeSettingsTabRenderer.render(createContainer(), context);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(mockMetadataLoadCatalog).toHaveBeenCalledTimes(1);
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledTimes(1);
-  });
-
-  it('warms and persists thinking metadata when a model is added to the visible list', async () => {
-    mockMetadataWarmModel.mockResolvedValue(true);
-    const plugin = createPlugin({
-      providerConfigs: {
-        opencode: {
-          availableModes: [],
-          cliPath: '',
-          cliPathsByHost: {},
-          discoveredModels: [
-            { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
-          ],
-          enabled: true,
-          environmentVariables: OPENCODE_DEFAULT_ENVIRONMENT_VARIABLES,
-          modelAliases: {},
-          preferredThinkingByModel: {},
-          selectedMode: '',
-          visibleModels: [],
-        },
-      },
-    });
-    const context = createContext(plugin);
-
-    opencodeSettingsTabRenderer.render(createContainer(), context);
-
-    const checkboxEl = createdDomElements.find((element) => element.type === 'checkbox');
-    if (!checkboxEl) {
-      throw new Error('Expected model checkbox');
-    }
-
-    checkboxEl.checked = true;
-    await checkboxEl.dispatchMockEvent('change');
-    await flushPromises();
-
-    expect(plugin.settings.providerConfigs.opencode.visibleModels).toEqual([
-      'deepseek/deepseek-v4-pro',
-    ]);
-    expect(mockMetadataWarmModel).toHaveBeenCalledWith(
-      'opencode:deepseek/deepseek-v4-pro',
-    );
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('opencode');
-  });
-
-  it('persists aliases through the shared model picker', async () => {
-    const plugin = createPlugin({
-      providerConfigs: {
-        opencode: {
-          discoveredModels: [
-            { label: 'DeepSeek/DeepSeek V4 Pro', rawId: 'deepseek/deepseek-v4-pro' },
-          ],
-          modelAliases: {},
-          visibleModels: ['deepseek/deepseek-v4-pro'],
-        },
-      },
-    });
-    const context = createContext(plugin);
-
-    opencodeSettingsTabRenderer.render(createContainer(), context);
-
-    const aliasInput = findElement('input', 'claudian-provider-model-picker-selected-alias');
-    aliasInput.value = 'V4 Pro';
-    await aliasInput.dispatchMockEvent('blur');
-    await flushPromises();
-
-    expect(getOpencodeProviderSettings(plugin.settings).modelAliases).toEqual({
-      'deepseek/deepseek-v4-pro': 'V4 Pro',
-    });
-    expect(context.notifyProviderModelOptionsChanged).toHaveBeenCalledWith('opencode');
-  });
 });
+
+jest.mock('@/shared/settings/ProviderModelsSection', () => ({ renderProviderModelsSection: jest.fn(() => ({ refresh: jest.fn() })) }));

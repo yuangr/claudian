@@ -1,16 +1,23 @@
-import { setIcon } from 'obsidian';
+import { Platform, setIcon } from 'obsidian';
+
+import { stringifyUnknown } from '@/utils/stringify';
 
 import type { TodoItem } from '../../../core/tools/todo';
 import { getToolIcon, MCP_ICON_MARKER } from '../../../core/tools/toolIcons';
 import { extractResolvedAnswersFromResultText } from '../../../core/tools/toolInput';
 import {
   isAgentLifecycleTool,
+  isScriptTool,
   TOOL_APPLY_PATCH,
   TOOL_ASK_USER_QUESTION,
   TOOL_BASH,
+  TOOL_BASH_OUTPUT,
   TOOL_EDIT,
+  TOOL_EDIT_IMAGE,
   TOOL_ENTER_PLAN_MODE,
   TOOL_EXIT_PLAN_MODE,
+  TOOL_GENERATE_IMAGE,
+  TOOL_GENERATE_VIDEO,
   TOOL_GLOB,
   TOOL_GREP,
   TOOL_LS,
@@ -20,12 +27,20 @@ import {
   TOOL_TOOL_SEARCH,
   TOOL_WEB_FETCH,
   TOOL_WEB_SEARCH,
+  TOOL_WORKFLOW,
   TOOL_WRITE,
   TOOL_WRITE_STDIN,
 } from '../../../core/tools/toolNames';
-import type { AskUserQuestionItem, AskUserQuestionOption, ToolCallInfo } from '../../../core/types';
+import type {
+  AskUserQuestionItem,
+  AskUserQuestionOption,
+  ScriptToolCallItem,
+  ToolCallInfo,
+  ToolResultImage,
+  WebSearchResultItem,
+} from '../../../core/types';
 import type { DiffStats } from '../../../core/types/diff';
-import { appendMcpIcon } from '../../../shared/icons';
+import { appendMCPIcon } from '../../../shared/icons';
 import { parseApplyPatchDiffs, parseFileUpdateChangeDiffs } from '../../../utils/diff';
 import { setupCollapsible } from './collapsible';
 import { renderDiffContent, renderDiffStats } from './DiffRenderer';
@@ -34,7 +49,7 @@ import { renderTodoItems } from './todoUtils';
 export function setToolIcon(el: HTMLElement, name: string): void {
   const icon = getToolIcon(name);
   if (icon === MCP_ICON_MARKER) {
-    appendMcpIcon(el);
+    appendMCPIcon(el);
   } else {
     setIcon(el, icon);
   }
@@ -57,6 +72,7 @@ function getInputText(input: Record<string, unknown>, key: string, fallback = ''
 }
 
 export function getToolName(name: string, input: Record<string, unknown>): string {
+  if (isScriptTool(name)) return name === TOOL_WORKFLOW ? 'Workflow' : 'Script';
   switch (name) {
     case TOOL_TODO_WRITE: {
       const todos = input.todos as Array<{ status: string }> | undefined;
@@ -66,6 +82,14 @@ export function getToolName(name: string, input: Record<string, unknown>): strin
       }
       return 'Tasks';
     }
+    case 'send_message':
+      return 'Message agent';
+    case 'followup_task':
+      return 'Continue agent';
+    case 'list_agents':
+      return 'List agents';
+    case 'interrupt_agent':
+      return 'Interrupt agent';
     case TOOL_ENTER_PLAN_MODE:
       return 'Entering plan mode';
     case TOOL_EXIT_PLAN_MODE:
@@ -76,6 +100,7 @@ export function getToolName(name: string, input: Record<string, unknown>): strin
 }
 
 export function getToolSummary(name: string, input: Record<string, unknown>): string {
+  if (isScriptTool(name)) return getScriptSummary(input);
   switch (name) {
     case TOOL_READ:
     case TOOL_WRITE:
@@ -83,10 +108,15 @@ export function getToolSummary(name: string, input: Record<string, unknown>): st
       const filePath = getInputText(input, 'file_path');
       return fileNameOnly(filePath);
     }
-    case TOOL_BASH: {
+    case TOOL_BASH:
+    case TOOL_BASH_OUTPUT: {
       const cmd = getInputText(input, 'command');
       return truncateText(cmd, 60);
     }
+    case TOOL_GENERATE_IMAGE:
+    case TOOL_EDIT_IMAGE:
+    case TOOL_GENERATE_VIDEO:
+      return truncateText(getInputText(input, 'prompt'), 60);
     case TOOL_GLOB:
     case TOOL_GREP:
       return getInputText(input, 'pattern');
@@ -116,6 +146,7 @@ export function getToolSummary(name: string, input: Record<string, unknown>): st
 
 /** Combined name+summary for ARIA labels (collapsible regions need a single descriptive phrase). */
 export function getToolLabel(name: string, input: Record<string, unknown>): string {
+  if (isScriptTool(name)) return `${getToolName(name, input)}: ${getScriptSummary(input) || getScriptLanguage(input)}`;
   switch (name) {
     case TOOL_READ:
       return `Read: ${shortenPath(getInputText(input, 'file_path')) || 'file'}`;
@@ -160,6 +191,13 @@ export function getToolLabel(name: string, input: Record<string, unknown>): stri
       return 'Entering plan mode';
     case TOOL_EXIT_PLAN_MODE:
       return 'Plan complete';
+    case TOOL_BASH_OUTPUT:
+    case TOOL_GENERATE_IMAGE:
+    case TOOL_EDIT_IMAGE:
+    case TOOL_GENERATE_VIDEO: {
+      const summary = getToolSummary(name, input);
+      return summary ? `${name}: ${summary}` : name;
+    }
     case TOOL_APPLY_PATCH: {
       const summary = getApplyPatchSummary(input);
       return summary ? `apply_patch: ${summary}` : 'apply_patch';
@@ -171,7 +209,7 @@ export function getToolLabel(name: string, input: Record<string, unknown>): stri
     default:
       if (isAgentLifecycleTool(name)) {
         const summary = getAgentLifecycleSummary(name, input);
-        return summary ? `${name}: ${summary}` : name;
+        return summary ? `${getToolName(name, input)}: ${summary}` : getToolName(name, input);
       }
       return name;
   }
@@ -181,6 +219,25 @@ export function fileNameOnly(filePath: string): string {
   if (!filePath) return '';
   const normalized = filePath.replace(/\\/g, '/');
   return normalized.split('/').pop() ?? normalized;
+}
+
+function getScriptSource(input: Record<string, unknown>): string {
+  return [input.code, input.raw, input.value].find((value): value is string => (
+    typeof value === 'string' && value.trim().length > 0
+  )) ?? '';
+}
+
+function getScriptLanguage(input: Record<string, unknown>): string {
+  return getInputText(input, 'language').trim() || 'JavaScript';
+}
+
+function getScriptSummary(input: Record<string, unknown>): string {
+  const title = getInputText(input, 'title').trim();
+  if (title) return truncateText(title, 60);
+  const firstLine = getScriptSource(input).split('\n')
+    .map(line => line.trim())
+    .find(line => line && !line.startsWith('//'));
+  return truncateText(firstLine ?? '', 60);
 }
 
 function getApplyPatchSummary(input: Record<string, unknown>): string {
@@ -215,6 +272,13 @@ function getWriteStdinSummary(input: Record<string, unknown>): string {
 
 function getAgentLifecycleSummary(name: string, input: Record<string, unknown>): string {
   switch (name) {
+    case 'send_message':
+    case 'followup_task':
+      return truncateText([getInputText(input, 'target'), getInputText(input, 'message')].filter(Boolean).join(': '), 60);
+    case 'list_agents':
+      return getInputText(input, 'path_prefix', 'All agents');
+    case 'interrupt_agent':
+      return getInputText(input, 'target');
     case 'spawn_agent': {
       const msg = typeof input.message === 'string' ? input.message : '';
       return msg.length > 50 ? `${msg.slice(0, 50)}...` : msg;
@@ -223,6 +287,7 @@ function getAgentLifecycleSummary(name: string, input: Record<string, unknown>):
       const msg = typeof input.message === 'string' ? input.message : '';
       return msg.length > 40 ? `${msg.slice(0, 40)}...` : msg;
     }
+    case 'wait_agent':
     case 'wait': {
       const ids = Array.isArray(input.ids) ? input.ids.length : 0;
       const timeoutMs = typeof input.timeout_ms === 'number' ? input.timeout_ms : undefined;
@@ -270,6 +335,7 @@ interface WebSearchDisplayData {
   queries: string[];
   url: string;
   pattern: string;
+  linkId: string;
 }
 
 function normalizeWebSearchDisplayData(input: Record<string, unknown>): WebSearchDisplayData {
@@ -291,13 +357,19 @@ function normalizeWebSearchDisplayData(input: Record<string, unknown>): WebSearc
   const actionType = explicitActionType
     || (url && pattern ? 'find_in_page' : url ? 'open_page' : (query || queries.length > 0) ? 'search' : '');
 
-  return { actionType, query, queries, url, pattern };
+  return { actionType, query, queries, url, pattern, linkId: getInputText(input, 'linkId') };
 }
 
 function getWebSearchSummary(input: Record<string, unknown>, maxLength: number): string {
+  if (Array.isArray(input.actions) && input.actions.length > 1) {
+    return `${input.actions.length} web operations`;
+  }
+  if (Array.isArray(input.requests)) return getWebOperationLabel(getInputText(input, 'actionType'));
   const data = normalizeWebSearchDisplayData(input);
 
   switch (data.actionType) {
+    case 'click':
+      return truncateText(`Click link ${data.linkId} in ${data.url}`, maxLength);
     case 'open_page':
       return truncateText(`Open ${data.url || 'page'}`, maxLength);
     case 'find_in_page': {
@@ -318,6 +390,13 @@ function getWebSearchLabel(input: Record<string, unknown>, maxLength: number): s
 }
 
 function appendToolLink(parent: HTMLElement, title: string, url: string): void {
+  // Native page references are useful text, not navigable URLs.
+  let isWebURL = false;
+  try { isWebURL = ['https:', 'http:'].includes(new URL(url).protocol); } catch { /* Reference or malformed URL. */ }
+  if (!isWebURL) {
+    parent.createDiv({ cls: 'claudian-tool-line claudian-tool-line-wrap', text: title });
+    return;
+  }
   const linkEl = parent.createEl('a', { cls: 'claudian-tool-link' });
   linkEl.setAttribute('href', url);
   linkEl.setAttribute('target', '_blank');
@@ -351,7 +430,28 @@ function parseWebSearchResult(result: string): { links: WebSearchLink[]; summary
   }
 }
 
+function getWebOperationLabel(actionType: string): string {
+  const label = actionType.replace(/_/g, ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 function renderWebSearchActionExpanded(container: HTMLElement, input: Record<string, unknown>): boolean {
+  if (Array.isArray(input.actions)) {
+    let rendered = false;
+    for (const action of input.actions) {
+      if (action && typeof action === 'object' && !Array.isArray(action)) {
+        const { actions: _nested, ...single } = action as Record<string, unknown>;
+        rendered = renderWebSearchActionExpanded(container, single) || rendered;
+      }
+    }
+    return rendered;
+  }
+  if (Array.isArray(input.requests)) {
+    const lines = container.createDiv({ cls: 'claudian-tool-lines' });
+    lines.createDiv({ cls: 'claudian-tool-line', text: getWebOperationLabel(getInputText(input, 'actionType')) });
+    renderLinesExpanded(container, JSON.stringify(input.requests, null, 2), 20);
+    return true;
+  }
   const data = normalizeWebSearchDisplayData(input);
   const hasStructuredData = Boolean(data.actionType || data.query || data.queries.length || data.url || data.pattern);
   if (!hasStructuredData) {
@@ -361,6 +461,10 @@ function renderWebSearchActionExpanded(container: HTMLElement, input: Record<str
   const linesEl = container.createDiv({ cls: 'claudian-tool-lines' });
 
   switch (data.actionType) {
+    case 'click':
+      linesEl.createDiv({ cls: 'claudian-tool-line', text: `Click link ${data.linkId}` });
+      if (data.url) appendToolLink(linesEl, data.url, data.url);
+      return true;
     case 'open_page':
       linesEl.createDiv({ cls: 'claudian-tool-line', text: 'Open page' });
       if (data.url) {
@@ -405,11 +509,41 @@ function renderWebSearchActionExpanded(container: HTMLElement, input: Record<str
   }
 }
 
+function renderWebSearchResultItems(container: HTMLElement, items: WebSearchResultItem[]): void {
+  const linesEl = container.createDiv({ cls: 'claudian-tool-lines' });
+  for (const item of items) {
+    appendToolLink(linesEl, item.title, item.url);
+    const details = [item.publishedAt, item.snippet && truncateText(item.snippet.replace(/\s+/g, ' '), 240)]
+      .filter(Boolean).join(' · ');
+    if (details) linesEl.createDiv({ cls: 'claudian-tool-line claudian-tool-line-wrap', text: details });
+  }
+}
+
+function renderWebSearchSummary(container: HTMLElement, summary: string, renderMarkdown?: MarkdownRenderHook): void {
+  const summaryEl = container.createDiv({ cls: 'claudian-tool-web-summary' });
+  if (renderMarkdown) {
+    summaryEl.addClass('claudian-tool-web-summary-markdown');
+    void renderMarkdown(summaryEl, summary);
+    return;
+  }
+  summaryEl.setText(summary.length > 800 ? summary.slice(0, 800) + '...' : summary);
+}
+
 function renderWebSearchExpanded(
   container: HTMLElement,
   input: Record<string, unknown>,
   result: string | undefined,
+  structuredResults?: WebSearchResultItem[],
+  structuredSummary?: string,
+  renderMarkdown?: MarkdownRenderHook,
 ): void {
+  const hasActions = Array.isArray(input.actions);
+  if (hasActions) renderWebSearchActionExpanded(container, input);
+  if (structuredResults?.length) {
+    renderWebSearchResultItems(container, structuredResults);
+    if (structuredSummary) renderWebSearchSummary(container, structuredSummary, renderMarkdown);
+    return;
+  }
   const parsed = result ? parseWebSearchResult(result) : null;
   if (parsed && parsed.links.length > 0) {
     const linksEl = container.createDiv({ cls: 'claudian-tool-lines' });
@@ -417,19 +551,18 @@ function renderWebSearchExpanded(
       appendToolLink(linksEl, link.title, link.url);
     }
 
-    if (parsed.summary) {
-      const summaryEl = container.createDiv({ cls: 'claudian-tool-web-summary' });
-      summaryEl.setText(parsed.summary.length > 800 ? parsed.summary.slice(0, 800) + '...' : parsed.summary);
-    }
+    if (parsed.summary) renderWebSearchSummary(container, parsed.summary, renderMarkdown);
     return;
   }
 
   const data = normalizeWebSearchDisplayData(input);
-  const shouldRenderAction = Boolean(data.actionType || data.query || data.queries.length || data.url || data.pattern)
+  const shouldRenderAction = !hasActions && Boolean(data.actionType || data.query || data.queries.length || data.url || data.pattern)
     && (!result
       || isPlaceholderWebSearchResult(result)
       || data.actionType === 'open_page'
-      || data.actionType === 'find_in_page');
+      || data.actionType === 'find_in_page'
+      || data.actionType === 'click'
+      || Array.isArray(input.requests));
 
   if (shouldRenderAction && renderWebSearchActionExpanded(container, input)) {
     if (result && !isPlaceholderWebSearchResult(result)) {
@@ -438,10 +571,11 @@ function renderWebSearchExpanded(
     return;
   }
 
-  if (result) {
+  if (result && !isPlaceholderWebSearchResult(result)) {
     renderLinesExpanded(container, result, 20);
     return;
   }
+  if (hasActions) return;
 
   if (renderWebSearchActionExpanded(container, input)) {
     return;
@@ -451,12 +585,24 @@ function renderWebSearchExpanded(
 }
 
 function renderFileSearchExpanded(container: HTMLElement, result: string): void {
-  const lines = result.split(/\r?\n/).filter(line => line.trim());
-  if (lines.length === 0) {
+  if (!result.trim()) {
     container.createDiv({ cls: 'claudian-tool-empty', text: 'No matches found' });
     return;
   }
   renderLinesExpanded(container, result, 15, true);
+}
+
+/** Strips `N→` line-number gutters only when every leading line carries the next consecutive number. */
+function stripLegacyLineNumberGutters(result: string): string {
+  const lines = result.split(/\r?\n/);
+  const first = lines[0]?.match(/^\s*(\d+)→/);
+  const second = lines[1]?.match(/^\s*(\d+)→/);
+  if (!first || (lines.length > 1 && lines[1] !== '' && Number(second?.[1]) !== Number(first[1]) + 1)) return result;
+  const start = Number(first[1]);
+  return lines.map((line, index) => {
+    const gutter = line.match(/^\s*(\d+)→/);
+    return gutter && Number(gutter[1]) === start + index ? line.slice(gutter[0].length) : line;
+  }).join('\n');
 }
 
 function renderLinesExpanded(
@@ -465,22 +611,22 @@ function renderLinesExpanded(
   maxLines: number,
   hoverable = false
 ): void {
-  const lines = result.split(/\r?\n/);
-  const truncated = lines.length > maxLines;
-  const displayLines = truncated ? lines.slice(0, maxLines) : lines;
+  const displayLines = result.split(/\r?\n/, maxLines);
+  let lineCount = 1;
+  for (let offset = result.indexOf('\n'); offset !== -1; offset = result.indexOf('\n', offset + 1)) lineCount++;
+  const truncated = lineCount > maxLines;
 
   const linesEl = container.createDiv({ cls: 'claudian-tool-lines' });
   for (const line of displayLines) {
-    const stripped = line.replace(/^\s*\d+→/, '');
     const lineEl = linesEl.createDiv({ cls: 'claudian-tool-line' });
     if (hoverable) lineEl.addClass('hoverable');
-    lineEl.setText(stripped || ' ');
+    lineEl.setText(line || ' ');
   }
 
   if (truncated) {
     linesEl.createDiv({
       cls: 'claudian-tool-truncated',
-      text: `... ${lines.length - maxLines} more lines`,
+      text: `... ${lineCount - maxLines} more lines`,
     });
   }
 }
@@ -640,7 +786,23 @@ function getDiffStatsAriaLabel(stats: DiffStats): string {
   return `Changes: +${stats.added} -${stats.removed}`;
 }
 
-function renderAgentLifecycleExpanded(container: HTMLElement, result: string): void {
+function renderAgentLifecycleExpanded(
+  container: HTMLElement,
+  result: string,
+  input: Record<string, unknown>,
+  initialText?: string,
+): void {
+  const target = getInputText(input, 'target');
+  const message = getInputText(input, 'message');
+  if (target || message) {
+    const inputEl = container.createDiv({ cls: 'claudian-tool-lines' });
+    if (target) inputEl.createDiv({ cls: 'claudian-tool-line', text: `Agent: ${target}` });
+    if (message) inputEl.createDiv({ cls: 'claudian-tool-line claudian-tool-line-wrap', text: message });
+  }
+  if (!result) {
+    contentFallback(container, initialText ?? 'No output');
+    return;
+  }
   // Try to parse as JSON for structured display
   const trimmed = result.trim();
   if (trimmed.startsWith('{')) {
@@ -666,15 +828,61 @@ function formatToolDisplayValue(value: unknown): string {
   if (value === null || value === undefined) {
     return '';
   }
-  return JSON.stringify(value);
+  return JSON.stringify(value, null, 2);
 }
+
+/** Neutral tool fields the expanded view can present. */
+export type ExpandedToolContent = Pick<
+  ToolCallInfo,
+  'name' | 'result' | 'resultFormat' | 'input' | 'webSearchResults' | 'webSearchSummary' | 'resultImages' | 'scriptToolCalls'
+> & Partial<Pick<ToolCallInfo, 'status'>>;
+
+/** Host markdown rendering for prose inside tool results; plain text is used without it. */
+export type MarkdownRenderHook = (el: HTMLElement, markdown: string) => Promise<void> | void;
 
 export function renderExpandedContent(
   container: HTMLElement,
-  toolName: string,
-  result: string | undefined,
-  input: Record<string, unknown> = {},
+  toolCall: ExpandedToolContent,
+  options: Pick<ToolCallRenderOptions, 'renderMarkdown'> = {},
 ): void {
+  const images = toolCall.resultImages ?? [];
+  // An image-only result needs no empty-state placeholder above its preview.
+  if (toolCall.result || images.length === 0) renderExpandedResult(container, toolCall, options.renderMarkdown);
+  if (images.length > 0) renderResultImages(container, images);
+}
+
+/** Resolves a provider image to a URL the host webview can load. */
+function getResultImageSource(image: ToolResultImage): string {
+  if (image.kind === 'data') return `data:${image.mediaType};base64,${image.data}`;
+  const segments = image.path.replace(/\\/g, '/').replace(/^\/+/, '').split('/');
+  return Platform.resourcePathPrefix + segments
+    .map((segment, index) => (index === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)))
+    .join('/');
+}
+
+function renderResultImages(container: HTMLElement, images: ToolResultImage[]): void {
+  const imagesEl = container.createDiv({ cls: 'claudian-tool-result-images' });
+  for (const image of images) {
+    const alt = image.alt ?? (image.kind === 'file' ? fileNameOnly(image.path) : image.mediaType);
+    imagesEl.createEl('img', { cls: 'claudian-tool-result-image', attr: { alt, loading: 'lazy', src: getResultImageSource(image) } });
+  }
+}
+
+function renderExpandedResult(
+  container: HTMLElement,
+  toolCall: ExpandedToolContent,
+  renderMarkdown: MarkdownRenderHook | undefined,
+): void {
+  const { name: toolName, result, input } = toolCall;
+  if (isAgentLifecycleTool(toolName)) {
+    renderAgentLifecycleExpanded(container, result ?? '', input);
+    return;
+  }
+
+  if (isScriptTool(toolName)) {
+    renderScriptContent(container, toolCall);
+    return;
+  }
   if (!result && toolName !== TOOL_WEB_SEARCH && toolName !== TOOL_BASH && toolName !== TOOL_APPLY_PATCH) {
     container.createDiv({ cls: 'claudian-tool-empty', text: 'No result' });
     return;
@@ -682,20 +890,19 @@ export function renderExpandedContent(
 
   const resolvedResult = result ?? '';
 
-  if (isAgentLifecycleTool(toolName)) {
-    renderAgentLifecycleExpanded(container, resolvedResult);
-    return;
-  }
-
   switch (toolName) {
     case TOOL_BASH:
       renderBashContent(container, input, resolvedResult);
+      break;
+    case TOOL_BASH_OUTPUT:
+      if (getInputText(input, 'command')) renderBashContent(container, input, resolvedResult);
+      else renderLinesExpanded(container, resolvedResult, 20);
       break;
     case TOOL_WRITE_STDIN:
       renderLinesExpanded(container, resolvedResult, 20);
       break;
     case TOOL_READ:
-      renderLinesExpanded(container, resolvedResult, 15);
+      renderLinesExpanded(container, toolCall.resultFormat === 'plain' ? resolvedResult : stripLegacyLineNumberGutters(resolvedResult), 15);
       break;
     case TOOL_GLOB:
     case TOOL_GREP:
@@ -703,7 +910,7 @@ export function renderExpandedContent(
       renderFileSearchExpanded(container, resolvedResult);
       break;
     case TOOL_WEB_SEARCH:
-      renderWebSearchExpanded(container, input, result);
+      renderWebSearchExpanded(container, input, result, toolCall.webSearchResults, toolCall.webSearchSummary, renderMarkdown);
       break;
     case TOOL_WEB_FETCH:
       renderWebFetchExpanded(container, resolvedResult);
@@ -788,7 +995,7 @@ function setGenericToolHeaderRight(statusEl: HTMLElement, toolCall: ToolCallInfo
   setToolStatus(statusEl, toolCall.status);
 }
 
-export function renderTodoWriteResult(
+function renderTodoWriteResult(
   container: HTMLElement,
   input: Record<string, unknown>
 ): void {
@@ -818,6 +1025,7 @@ interface ToolElementStructure {
 
 export interface ToolCallRenderOptions {
   initiallyExpanded?: boolean;
+  renderMarkdown?: MarkdownRenderHook;
 }
 
 function createToolElementStructure(
@@ -825,6 +1033,7 @@ function createToolElementStructure(
   toolCall: ToolCallInfo
 ): ToolElementStructure {
   const toolEl = parentEl.createDiv({ cls: 'claudian-tool-call' });
+  toolEl.dataset.toolId = toolCall.id;
   if (toolCall.name === TOOL_BASH) {
     toolEl.addClass('claudian-tool-call-bash');
   }
@@ -873,10 +1082,12 @@ function resolveAskUserAnswers(toolCall: ToolCallInfo): Record<string, unknown> 
 }
 
 function renderAskUserQuestionResult(container: HTMLElement, toolCall: ToolCallInfo): boolean {
-  container.empty();
   const questions = toolCall.input.questions as AskUserQuestionItem[] | undefined;
   const answers = resolveAskUserAnswers(toolCall);
   if (!questions || !Array.isArray(questions) || !answers) return false;
+  if (!questions.some(question => (question.id && question.id in answers) || question.question in answers)) return false;
+  if (toolCall.input.replyMode === 'user-message' && !questions.every(question => (question.id && question.id in answers) || question.question in answers)) return false;
+  container.empty();
 
   const reviewEl = container.createDiv({ cls: 'claudian-ask-review' });
   for (let i = 0; i < questions.length; i++) {
@@ -885,7 +1096,6 @@ function renderAskUserQuestionResult(container: HTMLElement, toolCall: ToolCallI
       (q.id ? answers[q.id] : undefined) ?? answers[q.question]
     );
     const pairEl = reviewEl.createDiv({ cls: 'claudian-ask-review-pair' });
-    pairEl.createDiv({ text: `${i + 1}.`, cls: 'claudian-ask-review-num' });
     const bodyEl = pairEl.createDiv({ cls: 'claudian-ask-review-body' });
     bodyEl.createDiv({ text: q.question, cls: 'claudian-ask-review-q-text' });
     bodyEl.createDiv({
@@ -895,6 +1105,14 @@ function renderAskUserQuestionResult(container: HTMLElement, toolCall: ToolCallI
   }
 
   return true;
+}
+
+function renderQuestionContent(container: HTMLElement, tool: ToolCallInfo, initialText?: string): void {
+  if (renderAskUserQuestionResult(container, tool)) return;
+  const prompt = tool.input.replyMode === 'user-message'
+    ? tool.questionStatus === 'pending' ? 'Answer in the question panel below.' : 'Question expired.'
+    : initialText;
+  renderAskUserQuestionFallback(container, tool, prompt);
 }
 
 function renderAskUserQuestionFallback(container: HTMLElement, toolCall: ToolCallInfo, initialText?: string): void {
@@ -920,7 +1138,6 @@ function renderAskUserQuestionFallback(container: HTMLElement, toolCall: ToolCal
     const question = questions[questionIndex];
     const reviewEl = container.createDiv({ cls: 'claudian-ask-review' });
     const pairEl = reviewEl.createDiv({ cls: 'claudian-ask-review-pair' });
-    pairEl.createDiv({ text: `${questionIndex + 1}.`, cls: 'claudian-ask-review-num' });
     const bodyEl = pairEl.createDiv({ cls: 'claudian-ask-review-body' });
     bodyEl.createDiv({ text: question.question, cls: 'claudian-ask-review-q-text' });
 
@@ -930,8 +1147,8 @@ function renderAskUserQuestionFallback(container: HTMLElement, toolCall: ToolCal
     }
 
     const listEl = bodyEl.createDiv({ cls: 'claudian-ask-list' });
-    question.options.forEach((option, optionIndex) => {
-      renderAskUserQuestionOption(listEl, option, optionIndex, question.multiSelect === true);
+    question.options.forEach((option) => {
+      renderAskUserQuestionOption(listEl, option, question.multiSelect === true);
     });
   }
 }
@@ -939,15 +1156,14 @@ function renderAskUserQuestionFallback(container: HTMLElement, toolCall: ToolCal
 function renderAskUserQuestionOption(
   parentEl: HTMLElement,
   option: AskUserQuestionOption,
-  optionIndex: number,
   isMultiSelect: boolean,
 ): void {
   const itemEl = parentEl.createDiv({ cls: 'claudian-ask-item is-disabled' });
 
   if (isMultiSelect) {
-    itemEl.createDiv({ cls: 'claudian-ask-check', text: '[ ] ' });
+    itemEl.createDiv({ cls: 'claudian-ask-check', attr: { 'aria-hidden': 'true' } });
   } else {
-    itemEl.createDiv({ cls: 'claudian-ask-item-num', text: `${optionIndex + 1}. ` });
+    itemEl.createDiv({ cls: 'claudian-ask-radio', attr: { 'aria-hidden': 'true' } });
   }
 
   const contentEl = itemEl.createDiv({ cls: 'claudian-ask-item-content' });
@@ -963,6 +1179,79 @@ function contentFallback(container: HTMLElement, text: string): void {
   const resultRow = container.createDiv({ cls: 'claudian-tool-result-row' });
   const resultText = resultRow.createSpan({ cls: 'claudian-tool-result-text' });
   resultText.setText(text);
+}
+
+const SCRIPT_CALL_STATUS_ICONS: Partial<Record<ScriptToolCallItem['status'], string>> = {
+  completed: 'check',
+  error: 'x',
+  cancelled: 'ban',
+};
+
+function formatScriptCallDuration(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** `key: value` pairs for tools without a dedicated summary. */
+function summarizeToolInput(input: Record<string, unknown>): string {
+  return Object.entries(input)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${key}: ${stringifyUnknown(value)}`)
+    .join(', ');
+}
+
+function getScriptToolCallSummary(call: ScriptToolCallItem): string {
+  if (!call.input) return call.args ?? '';
+  return getToolSummary(call.name, call.input) || summarizeToolInput(call.input);
+}
+
+function renderScriptToolCalls(container: HTMLElement, calls: ScriptToolCallItem[]): void {
+  container.createDiv({ cls: 'claudian-tool-script-label', text: 'Tool calls' });
+  const listEl = container.createEl('ul', { cls: 'claudian-tool-script-calls', attr: { 'aria-label': 'Tool calls' } });
+  for (const call of calls) {
+    const itemEl = listEl.createEl('li', { cls: 'claudian-tool-script-call' });
+    const statusEl = itemEl.createSpan({
+      cls: `claudian-tool-status status-${call.status}`,
+      attr: { role: 'img', 'aria-label': `Status: ${call.status}` },
+    });
+    const icon = SCRIPT_CALL_STATUS_ICONS[call.status];
+    if (icon) setIcon(statusEl, icon);
+    const summary = truncateText(getScriptToolCallSummary(call), 80);
+    itemEl.createSpan({ cls: 'claudian-tool-script-call-name', text: call.input ? getToolName(call.name, call.input) : call.name });
+    if (summary) {
+      itemEl.append(' ');
+      itemEl.createSpan({ cls: 'claudian-tool-script-call-detail', text: summary });
+    }
+    if (call.durationMs !== undefined) {
+      itemEl.append(' ');
+      itemEl.createSpan({ cls: 'claudian-tool-script-call-detail', text: formatScriptCallDuration(call.durationMs) });
+    }
+    if (call.error) {
+      itemEl.createDiv({ cls: 'claudian-tool-script-call-error', text: call.error });
+    }
+  }
+}
+
+function renderScriptContent(
+  container: HTMLElement,
+  toolCall: ExpandedToolContent,
+  initialText?: string,
+): void {
+  const source = getScriptSource(toolCall.input);
+  if (source) {
+    container.createDiv({ cls: 'claudian-tool-script-label', text: getScriptLanguage(toolCall.input) });
+    const sourceEl = container.createEl('pre', { cls: 'claudian-tool-script-code' });
+    sourceEl.createEl('code', { text: source });
+  }
+  if (toolCall.scriptToolCalls?.length) {
+    renderScriptToolCalls(container, toolCall.scriptToolCalls);
+  }
+  const result = toolCall.result ?? '';
+  container.createDiv({ cls: 'claudian-tool-script-label', text: 'Output' });
+  if (result) {
+    container.createEl('pre', { cls: 'claudian-tool-script-output', text: result });
+  } else {
+    contentFallback(container, initialText ?? (toolCall.status === 'running' ? 'Running...' : 'No result'));
+  }
 }
 
 function renderBashContent(
@@ -1016,26 +1305,29 @@ function createTodoToggleHandler(
 function renderToolContent(
   content: HTMLElement,
   toolCall: ToolCallInfo,
-  initialText?: string
+  initialText?: string,
+  options: ToolCallRenderOptions = {},
 ): void {
   if (toolCall.name === TOOL_TODO_WRITE) {
     content.addClass('claudian-tool-content-todo');
     renderTodoWriteResult(content, toolCall.input);
   } else if (toolCall.name === TOOL_ASK_USER_QUESTION) {
     content.addClass('claudian-tool-content-ask');
-    if (initialText) {
-      renderAskUserQuestionFallback(content, toolCall, 'Waiting for answer...');
-    } else if (!renderAskUserQuestionResult(content, toolCall)) {
-      renderAskUserQuestionFallback(content, toolCall);
-    }
+    renderQuestionContent(content, toolCall, initialText ? 'Waiting for answer...' : undefined);
+  } else if (isAgentLifecycleTool(toolCall.name)) {
+    renderAgentLifecycleExpanded(content, toolCall.result ?? '', toolCall.input, initialText);
+  } else if (isScriptTool(toolCall.name)) {
+    renderScriptContent(content, toolCall, initialText);
   } else if (toolCall.name === TOOL_BASH) {
     renderBashContent(content, toolCall.input, toolCall.result ?? '', initialText);
   } else if (initialText) {
     contentFallback(content, initialText);
   } else {
-    renderExpandedContent(content, toolCall.name, toolCall.result, toolCall.input);
+    renderExpandedContent(content, toolCall, options);
   }
 }
+
+const liveContentUpdates = new WeakMap<HTMLElement, (toolCall: ToolCallInfo) => void>();
 
 export function renderToolCall(
   parentEl: HTMLElement,
@@ -1046,21 +1338,38 @@ export function renderToolCall(
   const { toolEl, header, statusEl, content, currentTaskEl } =
     createToolElementStructure(parentEl, toolCall);
 
-  toolEl.dataset.toolId = toolCall.id;
   toolCallElements.set(toolCall.id, toolEl);
 
   setGenericToolHeaderRight(statusEl, toolCall);
 
-  renderToolContent(content, toolCall, 'Running...');
-
   const initiallyExpanded = options.initiallyExpanded ?? false;
   const state = { isExpanded: initiallyExpanded };
+  let currentTool = toolCall;
+  let initial = true;
+  let dirty = true;
+  const renderCurrentContent = () => {
+    if (!dirty) return;
+    content.empty();
+    if (initial) renderToolContent(content, currentTool, 'Running...', options);
+    else renderExpandedContent(content, currentTool, options);
+    dirty = false;
+  };
+  const eager = toolCall.name === TOOL_TODO_WRITE || toolCall.name === TOOL_ASK_USER_QUESTION;
+  if (eager || initiallyExpanded) renderCurrentContent();
+  if (!eager) liveContentUpdates.set(toolEl, next => {
+    currentTool = next;
+    currentTool.isExpanded = state.isExpanded;
+    initial = false;
+    dirty = true;
+    if (state.isExpanded) renderCurrentContent();
+  });
   toolCall.isExpanded = initiallyExpanded;
   const todoStatusEl = toolCall.name === TOOL_TODO_WRITE ? statusEl : null;
   setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded,
     onToggle: createTodoToggleHandler(currentTaskEl, todoStatusEl, (expanded) => {
-      toolCall.isExpanded = expanded;
+      currentTool.isExpanded = expanded;
+      if (expanded && !eager) renderCurrentContent();
     }),
     baseAriaLabel: getToolLabel(toolCall.name, toolCall.input)
   });
@@ -1106,17 +1415,21 @@ export function updateToolCallResult(
     const content = toolEl.querySelector('.claudian-tool-content') as HTMLElement;
     if (content) {
       content.addClass('claudian-tool-content-ask');
-      if (!renderAskUserQuestionResult(content, toolCall)) {
-        renderAskUserQuestionFallback(content, toolCall);
-      }
+      renderQuestionContent(content, toolCall);
     }
+    return;
+  }
+
+  const updateLiveContent = liveContentUpdates.get(toolEl);
+  if (updateLiveContent) {
+    updateLiveContent(toolCall);
     return;
   }
 
   const content = toolEl.querySelector('.claudian-tool-content') as HTMLElement;
   if (content) {
     content.empty();
-    renderExpandedContent(content, toolCall.name, toolCall.result, toolCall.input);
+    renderExpandedContent(content, toolCall);
   }
 }
 
@@ -1138,7 +1451,7 @@ export function renderStoredToolCall(
   let contentRendered = false;
   const renderContentOnce = () => {
     if (contentRendered) return;
-    renderToolContent(content, toolCall);
+    renderToolContent(content, toolCall, undefined, options);
     contentRendered = true;
   };
   const deferContent = toolCall.status !== 'running'

@@ -1,24 +1,33 @@
 import type { StreamChunk } from '../../../core/types';
 import {
+  extractPiToolResultText,
   extractPiToolTextContent,
   getPiToolId,
   getPiToolName,
   normalizePiToolInput,
+  normalizePiToolUseResult,
 } from './piToolNormalization';
 
 export interface PiEventNormalizationState {
   emittedToolIds: Set<string>;
+  /** Latest native partial-result snapshot per running tool. */
   toolOutputs: Map<string, string>;
+  /** Running tools whose snapshot stopped extending the text already streamed. */
+  divergedToolOutputIds: Set<string>;
+  /** Complete arguments of calls a running tool made, by calling tool and nested call ID. */
+  nestedToolArguments: Map<string, Map<string, unknown>>;
 }
 
 export function createPiEventNormalizationState(): PiEventNormalizationState {
   return {
+    divergedToolOutputIds: new Set<string>(),
     emittedToolIds: new Set<string>(),
+    nestedToolArguments: new Map<string, Map<string, unknown>>(),
     toolOutputs: new Map<string, string>(),
   };
 }
 
-export function normalizePiRpcEvent(
+export function normalizePiRPCEvent(
   event: Record<string, unknown>,
   state: PiEventNormalizationState,
 ): StreamChunk[] {
@@ -29,12 +38,14 @@ export function normalizePiRpcEvent(
       return normalizeMessageUpdate(event);
     case 'toolcall_end':
       return normalizeToolUse(getNestedRecord(event, 'toolCall') ?? event, state);
+    // Calls a tool makes while it runs (codemode scripts) never reach the model;
+    // the calling tool's result summarizes them, as session history does.
     case 'tool_execution_start':
-      return normalizeToolUse(getNestedRecord(event, 'toolCall') ?? event, state);
     case 'tool_execution_update':
-      return normalizeToolOutput(event, state);
     case 'tool_execution_end':
-      return normalizeToolResult(event, state);
+      return typeof event.parentToolCallId === 'string'
+        ? recordNestedToolCall(event, event.parentToolCallId, state)
+        : normalizeToolExecution(event, state);
     case 'message_end':
     case 'turn_end':
       return normalizeTerminalError(event);
@@ -48,6 +59,35 @@ export function normalizePiRpcEvent(
       return [{ type: 'notice', content: getString(event.error) ?? 'Pi extension error.', level: 'warning' }];
     default:
       return [];
+  }
+}
+
+/** Keeps nested call arguments for the calling tool's summary; nested calls emit no chunks. */
+function recordNestedToolCall(
+  event: Record<string, unknown>,
+  parentId: string,
+  state: PiEventNormalizationState,
+): StreamChunk[] {
+  const id = getPiToolId(event);
+  if (event.type === 'tool_execution_start' && id && event.args !== undefined) {
+    const calls = state.nestedToolArguments.get(parentId) ?? new Map<string, unknown>();
+    calls.set(id, event.args);
+    state.nestedToolArguments.set(parentId, calls);
+  }
+  return [];
+}
+
+function normalizeToolExecution(
+  event: Record<string, unknown>,
+  state: PiEventNormalizationState,
+): StreamChunk[] {
+  switch (event.type) {
+    case 'tool_execution_start':
+      return normalizeToolUse(getNestedRecord(event, 'toolCall') ?? event, state);
+    case 'tool_execution_update':
+      return normalizeToolOutput(event, state);
+    default:
+      return normalizeToolResult(event, state);
   }
 }
 
@@ -133,13 +173,35 @@ function normalizeToolOutput(
     return [];
   }
 
-  const content = extractPiToolTextContent(event.partialResult ?? event.output ?? event.result ?? event.content);
+  const content = getToolOutputDelta(id, event.partialResult ?? event.output ?? event.result ?? event.content, state);
+  // Script tools report the calls they make as they run.
+  const toolUseResult = normalizePiToolUseResult(getPiToolName(event), event.partialResult, state.nestedToolArguments.get(id));
+  return content || toolUseResult
+    ? [{ type: 'tool_output', id, content, ...(toolUseResult ? { toolUseResult } : {}) }]
+    : [];
+}
+
+function getToolOutputDelta(id: string, snapshot: unknown, state: PiEventNormalizationState): string {
+  const content = extractPiToolTextContent(snapshot);
   if (!content) {
-    return [];
+    return '';
   }
 
+  // Pi's partialResult is the tool's latest snapshot (native bash sends its
+  // rolling output tail), but tool_output chunks are appended by consumers.
+  // Stream only suffix growth. Once a snapshot stops extending the streamed
+  // text (window shift, reset, or replacement), the neutral contract cannot
+  // replace it, so live output stops until tool_result supplies the final text.
+  const previous = state.toolOutputs.get(id) ?? '';
   state.toolOutputs.set(id, content);
-  return [{ type: 'tool_output', id, content }];
+  if (state.divergedToolOutputIds.has(id)) {
+    return '';
+  }
+  if (!content.startsWith(previous)) {
+    state.divergedToolOutputIds.add(id);
+    return '';
+  }
+  return content.slice(previous.length);
 }
 
 function normalizeToolResult(
@@ -151,10 +213,13 @@ function normalizeToolResult(
     return [];
   }
 
-  const content = extractPiToolTextContent(event.result ?? event.output ?? event.content)
+  const content = extractPiToolResultText(getPiToolName(event), event.result ?? event.output ?? event.content)
     || state.toolOutputs.get(id)
     || '';
-  const toolUseResult = getNestedRecord(event, 'result');
+  state.toolOutputs.delete(id);
+  state.divergedToolOutputIds.delete(id);
+  const toolUseResult = normalizePiToolUseResult(getPiToolName(event), event.result, state.nestedToolArguments.get(id));
+  state.nestedToolArguments.delete(id);
   return [{
     type: 'tool_result',
     content,

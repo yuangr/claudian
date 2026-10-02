@@ -36,7 +36,7 @@ const settings: Record<string, unknown> = {
 };
 
 describe('PiChatUIConfig', () => {
-  it('returns visible model options in reverse order with aliases', () => {
+  it('returns visible model options in saved order with aliases', () => {
     const piSettings = (settings.providerConfigs as Record<string, Record<string, unknown>>).pi;
     const options = piChatUIConfig.getModelOptions({
       ...settings,
@@ -53,12 +53,12 @@ describe('PiChatUIConfig', () => {
 
     expect(options).toEqual([
       expect.objectContaining({
-        label: 'GPT-5',
-        value: 'pi:openai/gpt-5',
-      }),
-      expect.objectContaining({
         label: 'Sonnet',
         value: 'pi:anthropic/claude-sonnet-4',
+      }),
+      expect.objectContaining({
+        label: 'GPT-5',
+        value: 'pi:openai/gpt-5',
       }),
     ]);
   });
@@ -104,7 +104,7 @@ describe('PiChatUIConfig', () => {
   });
 
   it('maps reasoning options and defaults from cached model metadata', () => {
-    expect(piChatUIConfig.isAdaptiveReasoningModel('pi:anthropic/claude-sonnet-4', settings)).toBe(true);
+    expect(piChatUIConfig.supportsReasoningEffort('pi:anthropic/claude-sonnet-4', settings)).toBe(true);
     expect(piChatUIConfig.getReasoningOptions('pi:anthropic/claude-sonnet-4', settings)).toEqual([
       { label: 'Off', value: 'off' },
       { label: 'Medium', value: 'medium' },
@@ -151,38 +151,6 @@ describe('PiChatUIConfig', () => {
     expect(withoutPreference.effortLevel).toBe('medium');
   });
 
-  it('resolves context windows from cached Pi model metadata before falling back', () => {
-    const contextSettings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          discoveredModels: [{
-            contextWindow: 1_000_000,
-            encodedId: 'pi:anthropic/claude-sonnet-4',
-            id: 'claude-sonnet-4',
-            input: ['text'],
-            label: 'Claude Sonnet 4',
-            provider: 'anthropic',
-            reasoning: true,
-            thinkingLevels: ['off', 'medium', 'high'],
-          }],
-          visibleModels: ['pi:anthropic/claude-sonnet-4'],
-        },
-      },
-    };
-
-    expect(piChatUIConfig.getContextWindowSize(
-      'pi:anthropic/claude-sonnet-4',
-      { 'pi:anthropic/claude-sonnet-4': 123_000 },
-      contextSettings,
-    )).toBe(1_000_000);
-    expect(piChatUIConfig.getContextWindowSize(
-      'pi:missing/model',
-      { 'pi:missing/model': 123_000 },
-      contextSettings,
-    )).toBe(123_000);
-    expect(piChatUIConfig.getContextWindowSize('pi:missing/model', undefined, contextSettings)).toBe(200_000);
-  });
-
   it('keeps decoded models on Pi effort controls when discovery metadata is stale', () => {
     const staleSettings: Record<string, unknown> = {
       providerConfigs: {
@@ -195,13 +163,8 @@ describe('PiChatUIConfig', () => {
       },
     };
 
-    expect(piChatUIConfig.getModelOptions(staleSettings)).toEqual([
-      expect.objectContaining({
-        label: 'custom/model',
-        value: 'pi:custom/model',
-      }),
-    ]);
-    expect(piChatUIConfig.isAdaptiveReasoningModel('pi:custom/model', staleSettings)).toBe(true);
+    expect(piChatUIConfig.getModelOptions(staleSettings)).toEqual([]);
+    expect(piChatUIConfig.supportsReasoningEffort('pi:custom/model', staleSettings)).toBe(true);
     expect(piChatUIConfig.getReasoningOptions('pi:custom/model', staleSettings)).toEqual([
       { label: 'Off', value: 'off' },
       { label: 'Minimal', value: 'minimal' },
@@ -215,19 +178,5 @@ describe('PiChatUIConfig', () => {
     expect(getPiProviderSettings(staleSettings).preferredThinkingByModel).toEqual({
       'pi:custom/model': 'high',
     });
-  });
-
-  it('maps toolbar permission mode to Pi tool mode', () => {
-    const mutableSettings: Record<string, unknown> = {
-      providerConfigs: {
-        pi: {
-          toolMode: 'readonly',
-        },
-      },
-    };
-
-    expect(piChatUIConfig.resolvePermissionMode?.(mutableSettings)).toBe('normal');
-    piChatUIConfig.applyPermissionMode?.('yolo', mutableSettings);
-    expect(piChatUIConfig.resolvePermissionMode?.(mutableSettings)).toBe('yolo');
   });
 });
