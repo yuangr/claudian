@@ -1,7 +1,7 @@
+import { deferred } from '@test/helpers/ChatInputHarness';
 import { FakeSideBackend, waitFor } from '@test/helpers/features/chat/SideChatSessionHarness';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
-import { WarmExecutionCapacityError, WarmExecutionPool } from '@/features/chat/execution/WarmExecutionPool';
+import { ProviderExecutionLifecycleRegistry, type ProviderExecutionRequest, type ProviderSessionEvent } from '@/core/execution';
 import { SideChatSession } from '@/features/chat/side-chat/SideChatSession';
 
 function createSession(overrides: Partial<ConstructorParameters<typeof SideChatSession>[0]> = {}) {
@@ -38,6 +38,87 @@ function turn(text: string) {
 }
 
 describe('SideChatSession', () => {
+  it('rejects duplicate, out-of-order, foreign, and completed background events before publishing them', async () => {
+    const events: ProviderSessionEvent[] = [];
+    const harness = createSession({ onSessionEvent: event => { events.push(event); } });
+    const running = harness.session.execute(turn('Explore'));
+    await waitFor(() => harness.backend.sessions.length === 1);
+    const native = harness.backend.latest;
+    native.establishChild('child-session');
+    native.complete();
+    await running;
+    const sessionScope = { kind: 'session' as const, sessionInstanceId: native.sessionInstanceId, sequence: 2 };
+    native.emitRawSessionEvent({ type: 'task_notification', content: 'Current', scope: sessionScope });
+    native.emitRawSessionEvent({ type: 'task_notification', content: 'Duplicate', scope: sessionScope });
+    native.emitRawSessionEvent({ type: 'task_notification', content: 'Old', scope: { ...sessionScope, sequence: 1 } });
+    native.emitRawSessionEvent({ type: 'task_notification', content: 'Foreign', scope: { ...sessionScope, sessionInstanceId: 'other', sequence: 3 } });
+    const scope = { kind: 'background' as const, sessionInstanceId: native.sessionInstanceId, turnId: 'background', sequence: 1 };
+    native.emitRawSessionEvent({ type: 'text_delta', text: 'Before start', scope });
+    native.emitRawSessionEvent({ type: 'background_turn_started', scope });
+    native.emitRawSessionEvent({ type: 'background_turn_started', scope: { ...scope, sequence: 2 } });
+    native.emitRawSessionEvent({ type: 'text_delta', text: 'Current output', scope: { ...scope, sequence: 3 } });
+    native.emitRawSessionEvent({ type: 'text_delta', text: 'Duplicate output', scope: { ...scope, sequence: 3 } });
+    native.emitRawSessionEvent({ type: 'background_turn_completed', reason: 'completed', scope: { ...scope, sequence: 4 } });
+    native.emitRawSessionEvent({ type: 'background_turn_started', scope: { ...scope, sequence: 5 } });
+    native.emitRawSessionEvent({ type: 'text_delta', text: 'After completion', scope: { ...scope, sequence: 6 } });
+    await waitFor(() => !harness.session.hasBackgroundWork || events.length > 4);
+    expect(events.map(event => event.type)).toEqual(['task_notification', 'background_turn_started', 'text_delta', 'background_turn_completed']);
+    await harness.session.dispose();
+  });
+
+  it('keeps a replacement interaction pending when a dismissed request with the same id settles late', async () => {
+    const firstReply = deferred<{ interactionId: string; decision: 'allow' }>();
+    const nextReply = deferred<{ interactionId: string; decision: 'allow' }>();
+    const requestApproval = jest.fn().mockReturnValueOnce(firstReply.promise).mockReturnValueOnce(nextReply.promise);
+    const harness = createSession({ interactionPort: {
+      askUserQuestion: async () => { throw new Error('unexpected'); }, dismissInteraction: jest.fn(), requestApproval,
+    } });
+    const running = harness.session.execute(turn('Explore'));
+    await waitFor(() => harness.backend.sessions.length === 1);
+    const native = harness.backend.latest;
+    const port = native.config.interactionPort;
+    const request = { kind: 'approval' as const, interactionId: 'reused', sessionInstanceId: native.sessionInstanceId,
+      turnId: native.activeTurnId, toolName: 'Read', input: {}, description: 'Read note' };
+    const first = port.requestApproval(request, new AbortController().signal);
+    port.dismissInteraction(request.interactionId, 'superseded');
+    const next = port.requestApproval(request, new AbortController().signal);
+    firstReply.resolve({ interactionId: 'reused', decision: 'allow' });
+    await expect(first).rejects.toThrow(/stale/i);
+    expect(harness.session.hasPendingInteractions).toBe(true);
+    nextReply.resolve({ interactionId: 'reused', decision: 'allow' });
+    await expect(next).resolves.toMatchObject({ decision: 'allow' });
+    expect(harness.session.hasPendingInteractions).toBe(false);
+    native.complete();
+    await running;
+    await harness.session.dispose();
+  });
+
+  it('steers only the live child execution and carries its cancellation signal and configuration', async () => {
+    const harness = createSession();
+    expect(await harness.session.steer('Before execution')).toBe(false);
+    expect(harness.backend.sessions).toHaveLength(0);
+    const request = { ...turn('Explore'), configuration: { ...turn('Explore').configuration, model: 'active-model', reasoning: 'high' } };
+    const running = harness.session.execute(request);
+    await waitFor(() => harness.backend.sessions.length === 1);
+    const native = harness.backend.latest;
+    const steer = jest.fn(async (_request: ProviderExecutionRequest) => true);
+    Object.assign(native, { steer });
+    expect(await harness.session.steer('Answer')).toBe(true);
+    const submitted = steer.mock.calls[0][0];
+    expect(submitted).toMatchObject({
+      configuration: request.configuration, input: [{ type: 'text', text: 'Answer' }], toolPolicy: { kind: 'provider-default' },
+    });
+    expect(submitted.signal.aborted).toBe(false);
+    harness.session.cancel();
+    expect(submitted.signal.aborted).toBe(true);
+    await running;
+    expect(await harness.session.steer('After cancellation')).toBe(false);
+    await harness.session.dispose();
+    expect(await harness.session.steer('After disposal')).toBe(false);
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(native.requests).toHaveLength(1);
+  });
+
   it('seeds the child with fork state only and keeps both turns on the same native child', async () => {
     const harness = createSession();
     const first = harness.session.execute(turn('Explore B'));
@@ -80,17 +161,15 @@ describe('SideChatSession', () => {
     await harness.session.dispose();
   });
 
-  it('resumes the normalized child snapshot after idle cooling instead of reforking the parent', async () => {
-    const pool = new WarmExecutionPool(() => 5);
-    const harness = createSession({ warmExecution: { ownerId: 'side-1', pool } });
+  it('resumes the normalized child snapshot after a provider transition instead of reforking the parent', async () => {
+    const harness = createSession();
     const first = harness.session.execute(turn('Explore B'));
     await waitFor(() => harness.backend.sessions.length === 1);
     harness.backend.latest.establishChild('child-session', { childKey: 'value' });
     harness.backend.latest.complete();
     await first;
 
-    expect(harness.session.canCool()).toBe(true);
-    await harness.session.cool();
+    await harness.lifecycleRegistry.runTransition(['claude'], async () => undefined);
     expect(harness.backend.sessions[0].disposeCalls).toBe(1);
 
     const second = harness.session.execute(turn('Continue'));
@@ -105,7 +184,7 @@ describe('SideChatSession', () => {
     await harness.session.dispose();
   });
 
-  it('retains newer child state when snapshot revisions restart after cooling', async () => {
+  it('retains newer child state when snapshot revisions restart after a provider transition', async () => {
     const harness = createSession();
     for (const [index, value] of ['first', 'second'].entries()) {
       const running = harness.session.execute(turn('Continue'));
@@ -113,43 +192,13 @@ describe('SideChatSession', () => {
       harness.backend.latest.establishChild('child-session', { childKey: value });
       harness.backend.latest.complete();
       await running;
-      await harness.session.cool();
+      await harness.lifecycleRegistry.runTransition(['claude'], async () => undefined);
     }
     const resumed = harness.session.execute(turn('Continue'));
     await waitFor(() => harness.backend.sessions.length === 3);
     expect(harness.backend.latest.config.resumeSeed?.providerState).toMatchObject({ childKey: 'second' });
     harness.backend.latest.complete();
     await resumed;
-    await harness.session.dispose();
-  });
-
-  it('protects an executing owner from cooling and reports capacity errors without losing the turn', async () => {
-    const pool = new WarmExecutionPool(() => 5);
-    const harness = createSession({ warmExecution: { ownerId: 'side-1', pool } });
-    const running = harness.session.execute(turn('Explore B'));
-    await waitFor(() => harness.backend.sessions.length === 1);
-    expect(harness.session.canCool()).toBe(false);
-    await expect(harness.session.cool()).rejects.toThrow(/busy/i);
-    harness.backend.latest.complete();
-    await running;
-
-    // A child without a verified native identity stays protected from eviction.
-    expect(harness.session.canCool()).toBe(false);
-    const established = harness.session.execute(turn('Establish'));
-    await waitFor(() => harness.backend.latest.requests.length === 2);
-    harness.backend.latest.establishChild('child-session');
-    harness.backend.latest.complete();
-    await established;
-    expect(harness.session.canCool()).toBe(true);
-
-    const blockers = Array.from({ length: 5 }, (_unused, index) => ({
-      canCool: () => false,
-      cool: async () => undefined,
-      id: `blocker-${index}`,
-    }));
-    await harness.session.cool();
-    for (const blocker of blockers) await pool.acquire(blocker);
-    await expect(harness.session.execute(turn('Blocked'))).rejects.toBeInstanceOf(WarmExecutionCapacityError);
     await harness.session.dispose();
   });
 
@@ -201,6 +250,23 @@ describe('SideChatSession', () => {
     ]);
     harness.backend.latest.complete();
     await retry;
+    await harness.session.dispose();
+  });
+
+  it('withdraws a request whose handoff guard fails while fork preparation is pending', async () => {
+    const preparation = deferred<Record<string, unknown>>();
+    const preparing = jest.fn(() => preparation.promise);
+    const harness = createSession({ buildChildResumeState: preparing });
+    let expired = false;
+    const running = harness.session.execute({
+      ...turn('Expired answer'),
+      assertBeforeHandoff: () => { if (expired) throw new Error('The answer was not sent. Please try again.'); },
+    });
+    await waitFor(() => preparing.mock.calls.length === 1);
+    expired = true;
+    preparation.resolve({ forkSource: { resumeAt: 'checkpoint-1', sessionId: 'main-session' } });
+    await expect(running).rejects.toThrow('not sent');
+    expect(harness.backend.sessions.flatMap(session => session.requests)).toEqual([]);
     await harness.session.dispose();
   });
 
@@ -271,7 +337,6 @@ describe('SideChatSession', () => {
     }, new AbortController().signal);
     await waitFor(() => resolveApproval !== null);
     expect(harness.session.hasPendingInteractions).toBe(true);
-    expect(harness.session.canCool()).toBe(false);
     resolveApproval!({ decision: 'allow', interactionId: 'side-approval-1' });
     await expect(approval).resolves.toMatchObject({ decision: 'allow' });
 

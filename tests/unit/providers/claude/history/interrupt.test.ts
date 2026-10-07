@@ -1,0 +1,60 @@
+import {
+  isCompactionCanceledStderr,
+  isInterruptSignalText,
+} from '@/providers/claude/history/interrupt';
+
+describe('interrupt utils', () => {
+  describe('isCompactionCanceledStderr', () => {
+    it('matches canonical compaction stderr marker', () => {
+      expect(
+        isCompactionCanceledStderr(
+          '<local-command-stderr>Error: Compaction canceled.</local-command-stderr>',
+        ),
+      ).toBe(true);
+    });
+
+    it('accepts whitespace around canonical compaction stderr marker', () => {
+      expect(
+        isCompactionCanceledStderr(
+          '\n<local-command-stderr> Error: Compaction canceled. </local-command-stderr>\n',
+        ),
+      ).toBe(true);
+    });
+
+    it('rejects embedded mentions and non-canonical wrappers', () => {
+      expect(
+        isCompactionCanceledStderr(
+          '## Context\\n<local-command-stderr>Error: Compaction canceled.</local-command-stderr>',
+        ),
+      ).toBe(false);
+      expect(
+        isCompactionCanceledStderr(
+          '<task-notification><result><local-command-stderr>Error: Compaction canceled.</local-command-stderr></result></task-notification>',
+        ),
+      ).toBe(false);
+    });
+  });
+
+  describe('isInterruptSignalText', () => {
+    it('matches all supported interrupt markers', () => {
+      expect(isInterruptSignalText('[Request interrupted by user]')).toBe(true);
+      expect(isInterruptSignalText('[Request interrupted by user for tool use]')).toBe(true);
+      expect(isInterruptSignalText('  [Request interrupted by user]  ')).toBe(true);
+      expect(isInterruptSignalText('\n[Request interrupted by user for tool use]\n')).toBe(true);
+      expect(
+        isInterruptSignalText(
+          '<local-command-stderr>Error: Compaction canceled.</local-command-stderr>',
+        ),
+      ).toBe(true);
+    });
+
+    it('rejects regular content', () => {
+      expect(isInterruptSignalText('Hello')).toBe(false);
+      expect(isInterruptSignalText('[Request interrupted by user] extra')).toBe(false);
+      expect(isInterruptSignalText('prefix [Request interrupted by user]')).toBe(false);
+      expect(isInterruptSignalText('[Request interrupted]')).toBe(false);
+      expect(isInterruptSignalText('<local-command-stderr>Error: Timeout.</local-command-stderr>')).toBe(false);
+    });
+  });
+
+});

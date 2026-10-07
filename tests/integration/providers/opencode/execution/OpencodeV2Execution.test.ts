@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -7,8 +7,8 @@ import { createForkTestEnvironment } from '@test/helpers/features/chat/ProviderF
 import { isSteerableExecutionSession, type ProviderExecutionEvent, ProviderExecutionLifecycleRegistry, type ProviderExecutionRequest, type ProviderSessionEvent } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ChatMessage } from '@/core/types';
-import { providerOutputEventToStreamChunk } from '@/features/chat/controllers/StreamController';
-import { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { ChatExecutionCoordinator, type ChatSteerOutcome } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
 import { OpencodeExecutionBackend } from '@/providers/opencode/execution/OpencodeExecutionBackend';
 import { OpencodeServerService } from '@/providers/opencode/http/OpencodeServerService';
 
@@ -17,7 +17,7 @@ const fixture = `#!/usr/bin/env node
 const http = require('node:http');
 if (process.argv.includes('--version')) { console.log('opencode v2.0.12'); return; }
 if (!process.argv.includes('serve')) process.exit(3);
-let onSteer, selectedAgents = [], inbox = [], lateChild, feed, permission, grandApproval, form, mcpAnswer, settleInventory = false, cancelRace = false, ownedForms = [], idle = true, waiter, messages = [], turn = 0;
+let onSteer, selectedAgents = [], inbox = [], lateChild, feed, permission, grandApproval, form, mcpAnswer, settleInventory = false, cancelRace = false, ownedForms = [], idle = true, waiter, messages = [], turn = 0, modelRequests = 0, releaseModel;
 let activated = !process.env.ACTIVATION_DELAY_MS, activation;
 const emit = (type, data) => feed.write('data: ' + JSON.stringify({ type, data: { sessionID: 'ses_test', ...data } }) + '\\n\\n');
 const server = http.createServer(async (req, res) => {
@@ -67,6 +67,10 @@ const server = http.createServer(async (req, res) => {
     emit('session.inbox.cancelled', { inboxID: id }); res.writeHead(204).end(); return;
   }
   if (route.endsWith('/interrupt')) { emit('session.execution.interrupted', { reason: 'user' }); res.end(JSON.stringify({ interrupted: true })); return; }
+  if (route.endsWith('/model') && process.env.HOLD_SECOND_MODEL && ++modelRequests === 2) {
+    require('node:fs').writeFileSync(process.env.HOLD_SECOND_MODEL, '');
+    await new Promise(resolve => { releaseModel = resolve; setTimeout(resolve, 1000); });
+  }
   if (route.endsWith('/model') || route.endsWith('/agent')) { if (body.agent) selectedAgents.push(body.agent); if (process.env.LATE_CHILD_STAGE === 'configuration') lateChild?.(); res.writeHead(204).end(); return; }
   if (route === '/api/session/ses_grand/permission/per_grand/reply') { grandApproval = body.decision; res.writeHead(204).end(); return; }
   if (route.endsWith('/permission/per_test/reply')) { permission = body.decision; res.writeHead(204).end(); return; }
@@ -74,6 +78,7 @@ const server = http.createServer(async (req, res) => {
   if (route.endsWith('/message')) { res.end(JSON.stringify({ data: messages, cursor: {} })); return; }
   if (route.endsWith('/wait')) { if (idle) res.writeHead(204).end(); else waiter = res; return; }
   if (route.endsWith('/prompt') || route.endsWith('/command')) {
+    releaseModel?.();
     if (body.text.includes('Old local history')) { res.writeHead(400).end(); return; }
     const assistantMessageID = 'msg_assistant_' + (++turn);
     idle = false; res.end(JSON.stringify({ data: { id: body.id ?? 'msg_user' } }));
@@ -388,6 +393,29 @@ it('interrupts HTTP execution and continues the same native session on the next 
   } finally { await f.dispose(); }
 }, 15000);
 
+it('keeps a turn cancelled during configuration from changing the next turn approval policy', async () => {
+  const hold = path.join(realpathSync(mkdtempSync(path.join(tmpdir(), 'claudian-http-hold-'))), 'model');
+  const f = createFixture(false, undefined, `HOLD_SECOND_MODEL=${hold}`);
+  try {
+    for await (const event of f.session.execute(request()).events) void event;
+    expect(f.approvals).toHaveLength(1);
+    const yolo = request();
+    const cancelled = f.session.execute({ ...yolo, configuration: { ...yolo.configuration, permissionMode: 'yolo' } });
+    const cancelledEvents: ProviderExecutionEvent[] = [];
+    const consumed = (async () => { for await (const event of cancelled.events) cancelledEvents.push(event); })();
+    const deadline = Date.now() + 3000;
+    while (!existsSync(hold) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(existsSync(hold)).toBe(true);
+    cancelled.cancel();
+    await consumed;
+    expect(cancelledEvents.at(-1)?.type).toBe('cancelled');
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request()).events) events.push(event);
+    expect(events.at(-1)?.type).toBe('turn_completed');
+    expect(f.approvals).toHaveLength(2);
+  } finally { await f.dispose(); rmSync(path.dirname(hold), { recursive: true, force: true }); }
+}, 15000);
+
 describe('native steering', () => {
   function steer(f: ReturnType<typeof createFixture>, text: string): Promise<boolean> {
     if (!isSteerableExecutionSession(f.session)) throw new Error('Missing steering');
@@ -467,7 +495,7 @@ describe('native steering', () => {
     const backend = new OpencodeExecutionBackend(env.host, { serverService });
     const conversation = await env.repository.create({ providerId: 'opencode' });
     const events: ProviderExecutionEvent[] = [];
-    let steered: Promise<boolean> | undefined;
+    let steered: Promise<ChatSteerOutcome> | undefined;
     let ids = 0;
     const turn = (submissionId: string, body: string, messages?: { user: ChatMessage; assistant: ChatMessage }) => ({
       submissionId, timestamp: 1, rawDisplayText: body, canonicalText: body, images: [],
@@ -489,7 +517,7 @@ describe('native steering', () => {
       await coordinator.bindConversation({ conversationId: conversation.id, providerId: 'opencode' });
       const result = await coordinator.execute(turn('user-main', text, { user, assistant }));
       expect(result.status).toBe('completed');
-      await expect(steered).resolves.toBe(true);
+      await expect(steered).resolves.toEqual({ delivery: 'accepted' });
       const [prompt, steer] = events.filter(event => event.type === 'user_message_started');
       expect(steer).toMatchObject({ content: 'Also check tests' });
       expect(user.userMessageId).toBe(prompt.nativeUserMessageId);
@@ -601,10 +629,8 @@ it.each(['background-approval', 'background-nested', 'mcp-form-late'])('keeps %s
     expect(result.status).toBe('completed');
     if (text === 'mcp-form-late') await asked;
     expect(coordinator.hasBackgroundWork).toBe(true);
-    expect(coordinator.canCool()).toBe(false);
     await asked;
     expect(interactions).toEqual(text === 'mcp-form-late' ? ['question'] : ['approval', 'question']);
-    expect(coordinator.canCool()).toBe(false);
     release();
     await automaticReply;
     await settled;
@@ -758,4 +784,18 @@ it('executes a selected title model through the real resolver and native backend
   } finally {
     await f.dispose();
   }
+});
+
+
+it('sends hidden session reference paths through the HTTP v2 prompt boundary', async () => {
+  const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request('ref @"Review"'),
+      context: { sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }] },
+    }).events) events.push(event);
+    const received = JSON.parse(events.flatMap(event => event.type === 'text_delta' ? [event.text] : []).join(''));
+    expect(received.body.text).toBe('ref @"Review"\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>');
+  } finally { await f.dispose(); }
 });

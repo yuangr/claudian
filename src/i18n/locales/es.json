@@ -8,10 +8,10 @@
     "clearAll": "Limpiar todo",
     "error": "Error",
     "confirm": "Confirmar",
-    "advanced": "Avanzado",
     "refresh": "Actualizar"
   },
   "chat": {
+    "promptSuggestionHint": "Tab para aceptar",
     "selectAvailableModel": "Selecciona un modelo disponible antes de enviar.",
     "selectAvailableTitleModel": "Selecciona un modelo de títulos disponible en los ajustes de Claudian.",
     "rewind": {
@@ -105,6 +105,7 @@
     "content": "Contenido",
     "input": "Entrada",
     "models": "Modelos",
+    "responses": "Respuestas",
     "experimental": "Experimental",
     "userName": {
       "name": "¿Cómo debería Claudian llamarte?",
@@ -145,24 +146,14 @@
       "name": "Requerir Command/Ctrl+Enter para enviar",
       "desc": "Cuando está activado, Enter inserta un salto de línea. Command+Enter envía en macOS; Ctrl+Enter envía en Windows y Linux."
     },
-    "hotkeys": "Atajos de teclado",
-    "inlineEditHotkey": {
-      "name": "Edición en línea"
-    },
-    "openChatHotkey": {
-      "name": "Abrir chat"
-    },
-    "newSessionHotkey": {
-      "name": "Reemplazar conversación actual"
-    },
     "safety": "Seguridad",
     "loadUserSettings": {
       "name": "Cargar configuración de usuario de Claude Code",
       "desc": "Carga la configuración de Claude Code a nivel de usuario desde ~/.claude: settings.json, skills, comandos, agentes y plugins. Si está deshabilitado, solo está disponible la configuración a nivel de bóveda. Si está habilitado, las reglas de permisos del usuario pueden eludir el modo seguro."
     },
-    "codexSafeMode": {
-      "name": "Modo seguro",
-      "desc": "Modo de sandbox usado cuando el interruptor Seguro está activo."
+    "codexSandbox": {
+      "name": "Sandbox",
+      "desc": "Acceso a archivos en los modos Approve for me y Ask for approval. Solo lectura pide aprobación antes de cada edición; Full access lo ignora."
     },
     "environment": "Entorno",
     "sharedEnvironment": {
@@ -176,7 +167,7 @@
     "envSnippets": {
       "name": "Fragmentos",
       "addBtn": "Añadir fragmento",
-      "noSnippets": "No hay fragmentos de entorno guardados. Haga clic en + para guardar su configuración actual.",
+      "saveCurrent": "Guardar el entorno actual como fragmento",
       "nameRequired": "Por favor ingrese un nombre para el fragmento",
       "insert": "Insertar",
       "modal": {
@@ -211,10 +202,6 @@
     "enableChrome": {
       "name": "Habilitar extensión de Chrome",
       "desc": "Permitir que Claude Code interactúe con Chrome a través de la extensión claude-in-chrome. Requiere que la extensión esté instalada. Requiere reinicio de sesión."
-    },
-    "maxWarmAgentProcesses": {
-      "name": "Máximo de sesiones en ejecución simultáneas",
-      "desc": "Número máximo de sesiones de agente listas a la vez (5-10). Las sesiones inactivas más antiguas se pausan automáticamente y se reanudan al usarlas."
     },
     "enableDualPane": {
       "name": "Activar modo de panel doble",
@@ -320,7 +307,6 @@
       "reorderLabel": "Reordenar {model}; arrastra o usa las teclas de flecha arriba y abajo",
       "default": "Predeterminado",
       "unavailable": "No disponible",
-      "unavailableTitle": "{provider} no informa actualmente del modelo configurado",
       "aliasLabel": "Alias (opcional)",
       "removeLabel": "Quitar {model}",
       "noMatch": "Ningún modelo coincide con tu filtro.",
@@ -329,12 +315,16 @@
       "stale": "El catálogo de modelos de {provider} está desactualizado. Haz clic en Descubrir para actualizarlo."
     },
     "claude": {
+      "promptSuggestions": {
+        "name": "Sugerencias de prompts",
+        "desc": "Mostrar el siguiente prompt predicho por Claude en el campo vacío. Cada sugerencia es una solicitud adicional a Claude tras cada turno y puede agotar tus límites de uso más rápido."
+      },
       "configuration": "Configuración",
       "responseStyle": {
         "name": "Estilo de respuesta",
-        "desc": "Predeterminado usa el estilo habitual de Claude Code. Conciso empieza con los resultados y omite preámbulos. Requiere Claude Code 2.1.237 o posterior.",
+        "desc": "Estilo de salida de Claude Code para las respuestas, incluidos los estilos personalizados. «Configuración de Claude Code» sigue tu configuración de Claude Code. La lista se actualiza al refrescar los modelos o al iniciar un chat.",
         "default": "Predeterminado",
-        "concise": "Conciso"
+        "inherit": "Configuración de Claude Code"
       }
     },
     "codex": {
@@ -360,9 +350,18 @@
       },
       "responseStyle": {
         "name": "Estilo de respuesta",
-        "desc": "Elige cómo se comunica Codex CLI en los modelos compatibles. Se aplica a partir del siguiente mensaje.",
+        "desc": "Elige cómo se comunica Codex CLI en los modelos compatibles.",
         "pragmatic": "Pragmático",
-        "friendly": "Amigable"
+        "friendly": "Amigable",
+        "neutral": "Neutral"
+      },
+      "responseVerbosity": {
+        "name": "Nivel de detalle de las respuestas",
+        "desc": "Elige el nivel de detalle de las respuestas en los modelos compatibles. La opción predeterminada usa tu configuración de Codex.",
+        "default": "Predeterminado",
+        "low": "Bajo",
+        "medium": "Medio",
+        "high": "Alto"
       },
       "reasoningSummary": {
         "name": "Resumen de razonamiento",

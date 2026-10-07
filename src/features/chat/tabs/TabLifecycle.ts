@@ -1,11 +1,16 @@
 import { Notice } from 'obsidian';
 
-import type { ChatFeatureHost } from '../ChatFeatureHost';
-import type {
-  AssembledTabRuntime,
-  TabRuntimeCleanupFailure,
-  TabRuntimeResourceOwner,
-} from './types';
+import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import type { AssembledTabRuntime, TabRuntimeResourceState } from '@/features/chat/tabs/types';
+
+export interface TabRuntimeCleanupFailure {
+  readonly resource: string;
+  readonly error: unknown;
+}
+
+export interface TabRuntimeResourceOwner extends TabRuntimeResourceState {
+  dispose(): Promise<readonly TabRuntimeCleanupFailure[]>;
+}
 
 const tabDestructionPromises = new WeakMap<AssembledTabRuntime, Promise<void>>();
 const tabShutdownDrainPromises = new WeakMap<
@@ -44,19 +49,16 @@ export function activateTab(tab: AssembledTabRuntime): void {
   tab.dom.contentEl.removeClass('claudian-hidden');
   tab.controllers.streamController.setTabActive(true);
   tab.controllers.sideChatController.setTabActive(true);
-  tab.controllers.selectionController.start();
-  tab.controllers.browserSelectionController.start();
-  tab.controllers.canvasSelectionController.start();
+  tab.controllers.composerSelections.start();
   tab.ui.navigationSidebar.updateVisibility();
 }
 
 export function deactivateTab(tab: AssembledTabRuntime): void {
+  tab.ui.promptSuggestion.discard();
   tab.controllers.streamController.setTabActive(false);
   tab.controllers.sideChatController.setTabActive(false);
   tab.dom.contentEl.addClass('claudian-hidden');
-  tab.controllers.selectionController.stop();
-  tab.controllers.browserSelectionController.stop();
-  tab.controllers.canvasSelectionController.stop();
+  tab.controllers.composerSelections.stop();
 }
 
 export class TabRuntimeTeardownError extends Error {
@@ -107,25 +109,17 @@ async function drainTabForShutdownSnapshotOnce(
   tab.session.pauseBackgroundWork();
   const cleanupFailures: TabRuntimeCleanupFailure[] = [];
   const cancelledActiveTurn = tab.session.turns.isActive;
-  if (cancelledActiveTurn) {
-    tab.state.cancelRequested = true;
-    tab.state.bumpStreamGeneration();
-    tab.session.turns.cancel('shutdown');
-  }
-
   await captureTeardownFailure(
     cleanupFailures,
-    'tab pending provider interaction',
-    () => tab.controllers.inputController.dismissPendingApproval(),
+    'tab turn cancellation',
+    () => { tab.session.cancelTurn('shutdown', { dismissInteractions: true }); },
   );
-  if (cancelledActiveTurn) {
-    await captureTeardownFailure(
-      cleanupFailures,
-      'tab active execution cancellation',
-      () => tab.executionCoordinator.cancel(),
-    );
-    await tab.session.turns.drain().catch(() => undefined);
-  }
+  if (cancelledActiveTurn) await tab.session.turns.drain().catch(() => undefined);
+  await captureTeardownFailure(
+    cleanupFailures,
+    'tab session mention preparation',
+    () => tab.controllers.inputController.drainSessionMentionPreparations(),
+  );
   await captureTeardownFailure(
     cleanupFailures,
     'tab background work',
@@ -167,7 +161,7 @@ async function destroyTabOnce(tab: AssembledTabRuntime): Promise<void> {
   await captureTeardownFailure(
     cleanupFailures,
     'tab resume dropdown',
-    () => tab.controllers.inputController.destroyResumeDropdown(),
+    () => tab.controllers.builtInCommandController.destroyResumeDropdown(),
   );
   const resourceOwner = tabRuntimeResourceOwners.get(tab);
   if (resourceOwner) {

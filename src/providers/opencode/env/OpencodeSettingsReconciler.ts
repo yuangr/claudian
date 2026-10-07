@@ -1,4 +1,5 @@
 import { getInstallationKey } from '@/core/device/InstallationKey';
+import { parseEnvironmentVariables } from '@/core/process/env';
 
 import {
   type CLIPathFingerprintInputs,
@@ -9,7 +10,6 @@ import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvir
 import { createRuntimeInputFingerprint } from '../../../core/providers/settings/RuntimeInputFingerprint';
 import type { ProviderSettingsReconciler } from '../../../core/providers/types';
 import type { Conversation } from '../../../core/types';
-import { parseEnvironmentVariables } from '../../../utils/env';
 import {
   getOpencodeProviderSettings,
   updateOpencodeProviderSettings
@@ -43,6 +43,10 @@ function invalidateOpencodeConversationSessions(conversations: Conversation[]): 
     }
 
     const state = getOpencodeState(conversation.providerState);
+    // V2 resumes against its captured database, including while the old launch drains.
+    if (state.nativeVersion === 2 && state.databasePath && state.databasePath !== ':memory:') {
+      continue;
+    }
     if (!conversation.sessionId && !state.databasePath) {
       continue;
     }

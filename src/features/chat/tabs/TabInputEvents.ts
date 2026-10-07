@@ -1,7 +1,7 @@
 import { Platform } from 'obsidian';
 
-import type { ClaudianSettings } from '../../../core/types';
-import type { AssembledTabRuntime } from './types';
+import type { ClaudianSettings } from '@/core/types';
+import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 
 function isEnterWithoutShiftOrComposition(event: KeyboardEvent): boolean {
   return event.key === 'Enter' && !event.shiftKey && !event.isComposing;
@@ -45,7 +45,7 @@ export function cancelSelectedDestinationTurn(tab: AssembledTabRuntime): boolean
     sideChat.cancelSide();
     return true;
   }
-  if (!tab.state.isStreaming) return false;
+  if (!tab.state.isStreaming && !tab.controllers.inputController.isPreparingMainTurn) return false;
   tab.controllers.inputController.cancelStreaming();
   return true;
 }

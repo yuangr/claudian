@@ -1,15 +1,15 @@
-import {
-  cancelSelectedDestinationTurn,
-  sendTabInputMessageFromEnterKey,
-  sendTabInputMessageFromExplicitEnterShortcut,
-} from '../TabInputEvents';
-import { commitProvisionalTab } from '../TabLifecycle';
-import type { TabControllers, TabInputBindings, TabUIComponents } from '../types';
 import type {
   PublishedTabRuntimeRef,
   TabRuntimeConstructionContext,
   TabRuntimeShellBundle,
-} from './TabRuntimeConstruction';
+} from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
+import {
+  cancelSelectedDestinationTurn,
+  sendTabInputMessageFromEnterKey,
+  sendTabInputMessageFromExplicitEnterShortcut,
+} from '@/features/chat/tabs/TabInputEvents';
+import { commitProvisionalTab } from '@/features/chat/tabs/TabLifecycle';
+import type { TabControllers, TabInputBindings, TabUIComponents } from '@/features/chat/tabs/types';
 
 export function buildTabRuntimeInputBindings(
   shell: TabRuntimeShellBundle,
@@ -28,13 +28,15 @@ export function buildTabRuntimeInputBindings(
       return;
     }
 
-    if (controllers.inputController.handleResumeKeydown(event)) {
+    if (controllers.builtInCommandController.handleResumeKeydown(event)) {
       return;
     }
 
     if (ui.composerDropdown.handleKeydown(event)) {
       return;
     }
+
+    if (ui.promptSuggestion.handleKeydown(event)) return;
 
     if (event.key === 'Escape' && !event.isComposing) {
       if (cancelSelectedDestinationTurn(tab)) {

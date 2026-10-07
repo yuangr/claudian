@@ -2,13 +2,12 @@ import type { ProviderCommandDropdownConfig } from '@/core/providers/commands/Pr
 import type { ProviderCommandDiscoverySource } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
 import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import type { ProviderId } from '@/core/providers/types';
+import type { FileContextManager } from '@/features/chat/composer/FileContextManager';
 import {
   ComposerDropdownController,
   SlashCommandSource,
 } from '@/shared/composer-dropdown';
 import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
-
-import type { FileContextManager } from '../ui/FileContext';
 
 export interface MainChatComposerDropdownOptions {
   readonly hiddenCommands?: ReadonlySet<string>;
@@ -21,6 +20,7 @@ export class MainChatComposerDropdown {
   private readonly controller: ComposerDropdownController;
   private readonly slashSource: SlashCommandSource;
   private readonly mentionSource: ReturnType<FileContextManager['getMentionSource']>;
+  private readonly removeCommandPresentation: () => void;
 
   constructor(
     containerEl: HTMLElement,
@@ -40,6 +40,14 @@ export class MainChatComposerDropdown {
       inputEl,
       [this.slashSource, this.mentionSource],
     );
+    const resolveCommand = (token: string, atInputStart: boolean) =>
+      this.slashSource.resolveCommandKind(token, atInputStart);
+    inputEl.setCommandResolver?.(resolveCommand);
+    const unsubscribe = this.slashSource.subscribeInvalidation(() => inputEl.setCommandResolver?.(resolveCommand));
+    this.removeCommandPresentation = () => {
+      unsubscribe();
+      inputEl.setCommandResolver?.(null);
+    };
   }
 
   clearProviderCatalog(): void {
@@ -51,6 +59,7 @@ export class MainChatComposerDropdown {
   }
 
   destroy(): void {
+    this.removeCommandPresentation();
     this.controller.destroy();
     this.slashSource.destroy();
   }

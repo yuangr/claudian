@@ -1,28 +1,19 @@
 /** @jest-environment jsdom */
 import '@/providers';
 
+import { createClaudianView } from '@test/helpers/features/chat/ClaudianViewHarness';
 import {
   createHarness,
   releaseSideChatHarnesses,
   startSideChat,
 } from '@test/helpers/features/chat/SideChatDOMHarness';
+import { testDate } from '@test/helpers/testClock';
 import { fireEvent, screen, waitFor } from '@testing-library/dom';
 
-import { ClaudianView } from '@/features/chat/ClaudianView';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import { buildTabRuntimePorts } from '@/features/chat/tabs/runtime/TabRuntimePorts';
 
 afterEach(releaseSideChatHarnesses);
-
-it('passes global dynamic instructions to side chat execution', async () => {
-  const dynamicSections = ['Use the active workspace context.'];
-  const harness = createHarness({ getMainAgentDynamicSystemPromptSections: async () => dynamicSections });
-  const { started } = await startSideChat(harness);
-  expect(harness.backend.latest.requests[0].configuration.systemInstructions).toEqual({
-    kind: 'provider-default', dynamicSections,
-  });
-  harness.backend.latest.complete();
-  await started;
-});
 
 it('delivers an admitted prompt to the child even when the panel collapses during preparation', async () => {
   const harness = createHarness();
@@ -141,16 +132,17 @@ it('is safe to discard repeatedly and cannot be resurrected by late events', asy
   expect(screen.queryByRole('heading', { name: 'Side chat' })).toBeNull();
 });
 
-it('shows completed side work duration and the completion timestamp using the main renderer', async () => {
+it.each([false, true])('shows completed side work duration and the completion timestamp (compaction: %s)', async compaction => {
   const harness = createHarness({ settings: { showMessageTimestamps: true } });
   const elapsed = jest.spyOn(performance, 'now').mockReturnValue(1000);
-  const clock = jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-09-20T10:00:00Z').getTime());
+  const clock = jest.spyOn(Date, 'now').mockReturnValue(testDate().getTime());
   try {
     const { started } = await startSideChat(harness);
     harness.backend.latest.establishChild('child-session');
+    if (compaction) harness.backend.latest.emitOutput({ type: 'context_compacted' });
     harness.backend.latest.emitText('A completed side answer.');
     elapsed.mockReturnValue(67000);
-    const completedAt = new Date('2026-09-20T10:01:06Z');
+    const completedAt = testDate({ seconds: 66 });
     clock.mockReturnValue(completedAt.getTime());
     harness.backend.latest.complete();
     await started;
@@ -167,14 +159,14 @@ it('refreshes side completion timestamps when the view timestamp setting changes
   const settings = { showMessageTimestamps: false };
   const harness = createHarness({ settings });
   const mainRenderer = new MessageRenderer(harness.plugin, {} as never, document.createElement('div'));
-  const tab = {
-    ...harness.tab,
-    controllers: { ...harness.tab.controllers, sideChatController: harness.controller },
-    renderer: mainRenderer,
-  };
-  const view = Object.assign(Object.create(ClaudianView.prototype), {
-    tabManager: { getAllTabs: () => [tab] },
-  }) as ClaudianView;
+  const tab = buildTabRuntimePorts(
+    {} as never,
+    {} as never,
+    { controllers: { ...harness.tab.controllers, sideChatController: harness.controller }, renderer: mainRenderer },
+    harness.plugin,
+    () => { throw new Error('Timestamp refresh must not read the runtime'); },
+  );
+  const view = createClaudianView({ tabManager: { getAllTabs: () => [tab] } });
   const clock = jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-09-20T10:00:00Z').getTime());
   try {
     const { started } = await startSideChat(harness);

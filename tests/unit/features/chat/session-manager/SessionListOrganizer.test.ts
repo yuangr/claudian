@@ -2,7 +2,7 @@ import { testClock } from '@test/helpers/testClock';
 
 import type { ConversationMeta } from '@/core/types';
 import {
-  isProvisionalNotePath,
+  deriveSessionListModel,
   organizeSessionList,
 } from '@/features/chat/session-manager/SessionListOrganizer';
 
@@ -23,26 +23,6 @@ function createConversation(
 }
 
 describe('SessionListOrganizer', () => {
-  it.each([
-    ['Untitled.md', 'en'],
-    ['Untitled 1.md', 'en'],
-    ['Untitled 42.md', 'en'],
-    ['未命名.md', 'zh'],
-    ['未命名 2.md', 'zh-TW'],
-    ['Notes/Sans titre 3.md', 'fr'],
-  ])('recognizes the localized provisional note path %s', (path, language) => {
-    expect(isProvisionalNotePath(path, language)).toBe(true);
-  });
-
-  it.each([
-    ['Untitled project.md', 'en'],
-    ['Untitled-1.md', 'en'],
-    ['未命名项目.md', 'zh'],
-    ['Sans titre final.md', 'fr'],
-  ])('does not overmatch the ordinary note path %s', (path, language) => {
-    expect(isProvisionalNotePath(path, language)).toBe(false);
-  });
-
   it('groups by full note path and keeps same-name notes in separate groups', () => {
     const sections = organizeSessionList([
       createConversation('a', { linkedContentPath: 'Projects/A/Plan.md', lastActivityAt: 10 }),
@@ -209,4 +189,61 @@ describe('SessionListOrganizer', () => {
       ]);
     },
   );
+});
+
+describe('deriveSessionListModel', () => {
+  const conversations = [
+    createConversation('plan-a', { title: 'Plan draft', linkedContentPath: 'Projects/Plan.md', lastActivityAt: 5 }),
+    createConversation('plan-b', { title: 'Plan review', linkedContentPath: 'Projects/Plan.md', lastActivityAt: 4 }),
+    createConversation('pinned', { title: 'Pinned chat', isPinned: true, lastActivityAt: 3 }),
+    createConversation('loose', { title: 'Loose chat', lastActivityAt: 2 }),
+    createConversation('archived', { title: 'Old chat', isArchived: true, lastActivityAt: 1 }),
+  ];
+  const base = { organization: 'linked-content', sort: 'last-updated', language: 'en', scope: 'active' } as const;
+
+  it('partitions pinned sessions and pinned Linked content out of the session groups', () => {
+    const model = deriveSessionListModel(conversations, {
+      ...base,
+      showPinnedSection: true,
+      pinnedLinkedContentPaths: new Set(['Projects/Plan.md']),
+    });
+
+    expect(model.pinnedContentSections.map(section => section.conversations.map(({ id }) => id)))
+      .toEqual([['plan-a', 'plan-b']]);
+    expect(model.pinnedConversations.map(({ id }) => id)).toEqual(['pinned']);
+    expect(model.sections.flatMap(section => section.conversations.map(({ id }) => id))).toEqual(['loose']);
+    expect(model.groupKeys).toEqual(['content:Projects/Plan.md', 'ungrouped']);
+    expect(model.visibleConversationTotal).toBe(4);
+  });
+
+  it('keeps group actions on every in-scope session while search narrows the rows', () => {
+    const model = deriveSessionListModel(conversations, { ...base, searchQuery: 'review' });
+
+    expect(model.sections.flatMap(section => section.conversations.map(({ id }) => id))).toEqual(['plan-b']);
+    expect(model.conversationsByLinkedContent.get('Projects/Plan.md')?.map(({ id }) => id))
+      .toEqual(['plan-a', 'plan-b']);
+    expect(model.hasSearchTerms).toBe(true);
+  });
+
+  it('excludes collapsed groups from the paged total', () => {
+    const model = deriveSessionListModel(conversations, {
+      ...base,
+      collapsedGroupKeys: new Set(['content:Projects/Plan.md']),
+    });
+
+    expect(model.visibleConversationTotal).toBe(2);
+  });
+
+  it('reports an empty archived search with no group keys for a flat list', () => {
+    const model = deriveSessionListModel(conversations, {
+      ...base,
+      organization: 'list',
+      scope: 'archived',
+      searchQuery: 'missing',
+    });
+
+    expect(model.isEmpty).toBe(true);
+    expect(model.hasSearchTerms).toBe(true);
+    expect(model.groupKeys).toBeNull();
+  });
 });

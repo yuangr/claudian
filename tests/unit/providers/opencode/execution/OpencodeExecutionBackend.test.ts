@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { capturedSelectionPrompt, capturedSelections } from '@test/helpers/capturedSelections';
+
 import {
   isSteerableExecutionSession,
   type ProviderExecutionEvent,
@@ -587,7 +589,7 @@ describe('OpencodeExecutionBackend', () => {
   it('encodes path-only Linked content without changing the Vault-root kernel CWD', async () => {
     const harness = createHarness();
     const run = harness.session.execute(createRequest({
-      context: { linkedContent: { path: 'Projects/Research' } },
+      context: { ...capturedSelections, sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }], linkedContent: { path: 'Projects/Research' } },
       input: [{ text: 'Inspect linked content', type: 'text' }],
     }));
     await waitForPrompt(harness.kernels[0]);
@@ -597,7 +599,7 @@ describe('OpencodeExecutionBackend', () => {
     expect(harness.kernels[0].options.config.vaultWorkingDirectory).toBe('/vault');
     expect(harness.kernels[0].prompts[0]).toEqual({
       prompt: [{
-        text: 'Inspect linked content\n\n<linked_content path="Projects/Research" />',
+        text: 'Inspect linked content\n\n<linked_content path="Projects/Research" />\n\n' + capturedSelectionPrompt + '\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>',
         type: 'text',
       }],
       sessionId: 'native-session',
@@ -852,10 +854,10 @@ describe('OpencodeExecutionBackend', () => {
     ]);
   });
 
-  it('reconnects when provider-default dynamic system sections change', async () => {
+  it('reconnects when explicit system instructions change', async () => {
     const harness = createHarness();
     const execute = async (
-      dynamicSections: readonly string[],
+      instructions: string,
       expectedKernelCount: number,
       expectedPromptCount: number,
     ): Promise<void> => {
@@ -863,10 +865,7 @@ describe('OpencodeExecutionBackend', () => {
       const run = harness.session.execute(createRequest({
         configuration: {
           ...base.configuration,
-          systemInstructions: {
-            dynamicSections,
-            kind: 'provider-default',
-          },
+          systemInstructions: { kind: 'explicit', instructions },
         },
       }));
       await waitForCondition(() => harness.kernels.length === expectedKernelCount);
@@ -876,22 +875,16 @@ describe('OpencodeExecutionBackend', () => {
       await collect(run.events);
     };
 
-    await execute(['dynamic-a'], 1, 1);
-    await execute(['dynamic-a'], 1, 2);
-    await execute(['dynamic-b'], 2, 1);
+    await execute('instructions-a', 1, 1);
+    await execute('instructions-a', 1, 2);
+    await execute('instructions-b', 2, 1);
 
     expect(harness.kernels.map(kernel => kernel.connectCalls[0])).toEqual([
       expect.objectContaining({
-        systemInstructions: {
-          dynamicSections: ['dynamic-a'],
-          kind: 'provider-default',
-        },
+        systemInstructions: { kind: 'explicit', instructions: 'instructions-a' },
       }),
       expect.objectContaining({
-        systemInstructions: {
-          dynamicSections: ['dynamic-b'],
-          kind: 'provider-default',
-        },
+        systemInstructions: { kind: 'explicit', instructions: 'instructions-b' },
       }),
     ]);
   });
@@ -1091,7 +1084,6 @@ describe('OpencodeExecutionBackend', () => {
         content: expect.stringContaining('Updated file'),
         isError: false,
         toolCallId: 'tool-edit',
-        toolUseResult: { filePath: '/vault/notes/today.md' },
         type: 'tool_completed',
       }),
     ]));
@@ -1110,6 +1102,20 @@ describe('OpencodeExecutionBackend', () => {
 
     expect((await collect(run.events)).at(-1)?.type).toBe('turn_completed');
     expect(harness.kernels[0].prompts).toHaveLength(1);
+  });
+
+  it('cancels a request whose signal aborted before execution without starting native work', async () => {
+    const harness = createHarness();
+    const controller = new AbortController();
+    controller.abort();
+
+    const run = harness.session.execute(createRequest({ signal: controller.signal }));
+    for (let attempt = 0; attempt < 20; attempt += 1) await Promise.resolve();
+
+    expect(harness.kernels).toEqual([]);
+    const events = await collect(run.events);
+    expect(events.at(-1)).toMatchObject({ reason: 'cancelled', type: 'cancelled' });
+    expect(events.some(event => event.type === 'turn_started')).toBe(false);
   });
 
   it('cancels, invalidates, fences late events, and resumes lazily on a fresh kernel', async () => {

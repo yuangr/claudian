@@ -1,11 +1,12 @@
 import type { StreamChunk } from '../../../core/types';
+import { getPiCustomMessageDisplayText } from './piCustomMessageNormalization';
 import {
   extractPiToolResultText,
   extractPiToolTextContent,
   getPiToolId,
   getPiToolName,
   normalizePiToolInput,
-  normalizePiToolUseResult,
+  normalizePiToolResultDetails,
 } from './piToolNormalization';
 
 export interface PiEventNormalizationState {
@@ -46,6 +47,8 @@ export function normalizePiRPCEvent(
       return typeof event.parentToolCallId === 'string'
         ? recordNestedToolCall(event, event.parentToolCallId, state)
         : normalizeToolExecution(event, state);
+    case 'message_start':
+      return normalizeCustomMessage(event);
     case 'message_end':
     case 'turn_end':
       return normalizeTerminalError(event);
@@ -89,6 +92,19 @@ function normalizeToolExecution(
     default:
       return normalizeToolResult(event, state);
   }
+}
+
+/** Extension messages (`pi.sendMessage`) enter the conversation as role `custom`. */
+function normalizeCustomMessage(event: Record<string, unknown>): StreamChunk[] {
+  const message = getNestedRecord(event, 'message');
+  if (message?.role !== 'custom') return [];
+  const content = getPiCustomMessageDisplayText(message);
+  return content ? [{ type: 'task_notification', content }] : [];
+}
+
+/** A custom message that renders, so it opens a notification boundary in the transcript. */
+export function isPiDisplayedCustomMessageStart(event: Record<string, unknown>): boolean {
+  return event.type === 'message_start' && normalizeCustomMessage(event).length > 0;
 }
 
 export function getPiTerminalErrorMessage(event: Record<string, unknown>): string | null {
@@ -175,9 +191,9 @@ function normalizeToolOutput(
 
   const content = getToolOutputDelta(id, event.partialResult ?? event.output ?? event.result ?? event.content, state);
   // Script tools report the calls they make as they run.
-  const toolUseResult = normalizePiToolUseResult(getPiToolName(event), event.partialResult, state.nestedToolArguments.get(id));
-  return content || toolUseResult
-    ? [{ type: 'tool_output', id, content, ...(toolUseResult ? { toolUseResult } : {}) }]
+  const resultDetails = normalizePiToolResultDetails(getPiToolName(event), event.partialResult, state.nestedToolArguments.get(id));
+  return content || resultDetails
+    ? [{ type: 'tool_output', id, content, ...(resultDetails ? { resultDetails } : {}) }]
     : [];
 }
 
@@ -218,14 +234,14 @@ function normalizeToolResult(
     || '';
   state.toolOutputs.delete(id);
   state.divergedToolOutputIds.delete(id);
-  const toolUseResult = normalizePiToolUseResult(getPiToolName(event), event.result, state.nestedToolArguments.get(id));
+  const resultDetails = normalizePiToolResultDetails(getPiToolName(event), event.result, state.nestedToolArguments.get(id));
   state.nestedToolArguments.delete(id);
   return [{
     type: 'tool_result',
     content,
     id,
     isError: event.isError === true || event.error === true || event.success === false,
-    ...(toolUseResult ? { toolUseResult } : {}),
+    ...(resultDetails ? { resultDetails } : {}),
   }];
 }
 

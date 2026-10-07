@@ -29,6 +29,14 @@ export class CodexSubagentTracker {
     return [...this.agents.values()].some(agent => agent.info.status === 'running');
   }
 
+  threadClosed(threadId: string): void {
+    const agent = this.agents.get(threadId);
+    if (!agent) return;
+    agent.revision++;
+    agent.info = { ...agent.info, status: agent.info.status === 'running' ? 'error' : agent.info.status, completedAt: Date.now() };
+    this.publish({ ...agent.info });
+  }
+
   clear(): void { this.agents.clear(); }
 
   seed(thread: Thread): void {
@@ -141,6 +149,7 @@ export class CodexSubagentTracker {
       if (index < 0) return;
       tools[index] = { ...tools[index], result: chunk.type === 'tool_output' ? (tools[index].result ?? '') + chunk.content : chunk.content,
         ...(chunk.type === 'tool_result' ? { status: chunk.isError ? 'error' as const : 'completed' as const,
+          webSearchResults: chunk.resultDetails?.webSearchResults ?? tools[index].webSearchResults,
           providerPayload: { ...tools[index].providerPayload, ...chunk.providerPayload } } : {}) };
     }
     agent.revision += 1;

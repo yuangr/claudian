@@ -1,25 +1,29 @@
 import { Notice } from 'obsidian';
 
 import type {
-  ProviderBackgroundOutputEvent,
   ProviderSessionEvent,
-} from '../../../core/execution';
-import type { ChatMessage, SubagentInfo } from '../../../core/types';
-import type { ChatFeatureHost } from '../ChatFeatureHost';
-import type { ChatExecutionEventContext } from '../execution/ChatExecutionCoordinator';
-import { type BackgroundTurnRenderTarget, discardBackgroundTurn, renderAutoTriggeredTurn, renderSessionTaskNotification, reserveBackgroundTurn } from '../rendering/BackgroundTurnRenderer';
-import { updateTabPermissionMode } from './TabProviderState';
-import type { AssembledTabRuntime } from './types';
+} from '@/core/execution';
+import type { ChatMessage, SubagentInfo } from '@/core/types';
+import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import type { ChatExecutionEventContext } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { updateTabPermissionMode } from '@/features/chat/tabs/tabProviderUI';
+import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
+import { BackgroundResponses } from '@/features/chat/turns/BackgroundResponses';
+import { renderSessionTaskNotification } from '@/features/chat/turns/BackgroundTurnRenderer';
 
-interface BackgroundTurnBuffer {
-  events: ProviderBackgroundOutputEvent[];
-  target?: BackgroundTurnRenderTarget;
+const backgroundResponses = new WeakMap<AssembledTabRuntime, BackgroundResponses>();
+
+function getBackgroundResponses(tab: AssembledTabRuntime): BackgroundResponses {
+  let responses = backgroundResponses.get(tab);
+  if (!responses) {
+    responses = new BackgroundResponses({
+      state: tab.state, renderer: tab.renderer, stream: tab.controllers.streamController,
+      isConnected: () => tab.dom.contentEl.isConnected, createMessageId: createTabMessageId,
+    });
+    backgroundResponses.set(tab, responses);
+  }
+  return responses;
 }
-
-const backgroundTurnBuffers = new WeakMap<
-  AssembledTabRuntime,
-  Map<string, Map<string, BackgroundTurnBuffer>>
->();
 
 async function handleTabSessionEvent(
   tab: AssembledTabRuntime,
@@ -43,14 +47,13 @@ async function handleTabSessionEvent(
   }
   if (event.type === 'subagent_updated') {
     await tab.controllers.conversationController.save(true);
-    tab.executionCoordinator.notifyMayCool();
     return;
   }
   if (event.type === 'async_subagent_completed') {
     const providerSessionId = event.providerSessionId
       ?? tab.executionCoordinator.snapshot?.providerSessionId;
     if (!providerSessionId) return;
-    const applied = await tab.controllers.streamController.handleAsyncSubagentCompletion({
+    const applied = await tab.controllers.streamController.subagents.handleAsyncSubagentCompletion({
       type: 'async_subagent_completion',
       providerSessionId,
       taskId: event.subagentId,
@@ -71,47 +74,15 @@ async function handleTabSessionEvent(
     new Notice(event.message);
     return;
   }
-  if (event.scope.kind !== 'background') return;
-
-  const turns = getBackgroundTurnBuffers(tab, context.bindingId);
-  if (event.type === 'background_turn_started') {
-    return;
-  }
-  if (event.type === 'background_turn_completed') {
-    const hasBufferedTurn = turns.has(event.scope.turnId);
-    const buffer = turns.get(event.scope.turnId);
-    const events = buffer?.events ?? [];
-    turns.delete(event.scope.turnId);
-    deleteBackgroundTurnBuffersIfEmpty(tab, context.bindingId, turns);
-    if (!hasBufferedTurn) return;
-    const hasVisibleOutput = await renderAutoTriggeredTurn({
-      state: tab.state,
-      renderer: tab.renderer,
-      stream: tab.controllers.streamController,
-      isConnected: () => tab.dom.contentEl.isConnected,
-      createMessageId: createTabMessageId,
-    }, {
-      events,
-      target: buffer?.target,
-      metadata: {
-        ...(event.nativeAssistantId
-          ? { assistantMessageId: event.nativeAssistantId }
-          : {}),
-      },
-    }, isCurrent);
-    if (isCurrent()) {
-      const reportReviewableSettlement = hasVisibleOutput
-        ? tab.captureReviewableSettlement?.('completed')
-        : null;
-      try {
-        await tab.controllers.conversationController.save(true);
-      } finally {
-        if (isCurrent()) reportReviewableSettlement?.();
-      }
+  const hasVisibleOutput = await getBackgroundResponses(tab).handle(context.bindingId, event, isCurrent);
+  if (hasVisibleOutput !== undefined && isCurrent()) {
+    const reportReviewableSettlement = hasVisibleOutput ? tab.captureReviewableSettlement?.('completed') : null;
+    try {
+      await tab.controllers.conversationController.save(true);
+    } finally {
+      if (isCurrent()) reportReviewableSettlement?.();
     }
-    return;
   }
-  turns.get(event.scope.turnId)?.events.push(event as ProviderBackgroundOutputEvent);
 }
 
 export function enqueueTabSessionEvent(
@@ -126,48 +97,51 @@ export function enqueueTabSessionEvent(
     && coordinator.isEventContextCurrent(context)
   );
   if (!isCurrent()) {
-    discardBackgroundTurnBuffers(tab, context.bindingId);
+    backgroundResponses.get(tab)?.discard(context.bindingId);
     return undefined;
   }
 
   if (!canAcceptTabBackgroundWork(tab)) {
-    discardBackgroundTurnBuffers(tab, context.bindingId);
+    backgroundResponses.get(tab)?.discard(context.bindingId);
+    return undefined;
+  }
+  if (event.type === 'prompt_suggestion') {
+    // Transient composer presentation never enters transcript rendering or persistence. A queued
+    // turn can start after deactivation discarded, so arrival into a hidden tab is dropped here.
+    if (!tab.dom.contentEl.hasClass('claudian-hidden')) {
+      tab.ui.promptSuggestion.receive(event.originatingTurnId, event.suggestion);
+    }
     return undefined;
   }
   // Display-only progress must not wait behind queued background rendering.
   if (event.type === 'subagent_updated') {
     const previousStatus = findSubagentStatus(tab.state.messages, event.subagent.id);
-    if (!tab.controllers.streamController.handleSubagentUpdate(event.subagent)) return undefined;
+    if (!tab.controllers.streamController.subagents.handleSubagentUpdate(event.subagent)) return undefined;
     // Lifecycle transitions persist in order below; same-status progress shares one trailing save.
     if (previousStatus === event.subagent.status) {
       return tab.controllers.conversationController.scheduleProgressSave(() => enqueueTabBackgroundWork(tab, async () => {
         if (!isCurrent()) return;
         await tab.controllers.conversationController.save(true);
-        tab.executionCoordinator.notifyMayCool();
       }));
     }
   }
   if (event.type === 'subagent_progress') {
-    tab.controllers.streamController.handleSubagentProgress(event.progress);
+    tab.controllers.streamController.subagents.handleSubagentProgress(event.progress);
     return undefined;
   }
   if (event.type === 'background_turn_started') {
-    getBackgroundTurnBuffers(tab, context.bindingId).set(event.scope.turnId, {
-      events: [],
-      target: tab.dom.contentEl.isConnected ? reserveBackgroundTurn({
-        state: tab.state, renderer: tab.renderer, createMessageId: createTabMessageId,
-      }) : undefined,
-    });
+    tab.ui.promptSuggestion.discard();
+    getBackgroundResponses(tab).reserve(context.bindingId, event.scope.turnId);
   }
   const pending = enqueueTabBackgroundWork(tab, async () => {
     if (!isCurrent()) {
-      discardBackgroundTurnBuffers(tab, context.bindingId);
+      backgroundResponses.get(tab)?.discard(context.bindingId);
       return;
     }
     await handleTabSessionEvent(tab, plugin, event, context, isCurrent);
   }, event.type === 'task_notification' && event.scope.kind === 'session');
   if (!pending) {
-    discardBackgroundTurnBuffers(tab, context.bindingId);
+    backgroundResponses.get(tab)?.discard(context.bindingId);
   }
   return pending ?? undefined;
 }
@@ -183,46 +157,9 @@ function findSubagentStatus(
   return undefined;
 }
 
-function getBackgroundTurnBuffers(
-  tab: AssembledTabRuntime,
-  bindingId: string,
-): Map<string, BackgroundTurnBuffer> {
-  let bindings = backgroundTurnBuffers.get(tab);
-  if (!bindings) {
-    bindings = new Map();
-    backgroundTurnBuffers.set(tab, bindings);
-  }
-  let turns = bindings.get(bindingId);
-  if (!turns) {
-    turns = new Map();
-    bindings.set(bindingId, turns);
-  }
-  return turns;
-}
-
-function deleteBackgroundTurnBuffersIfEmpty(
-  tab: AssembledTabRuntime,
-  bindingId: string,
-  turns: Map<string, BackgroundTurnBuffer>,
-): void {
-  if (turns.size > 0) return;
-  const bindings = backgroundTurnBuffers.get(tab);
-  bindings?.delete(bindingId);
-  if (bindings?.size === 0) backgroundTurnBuffers.delete(tab);
-}
-
-function discardBackgroundTurnBuffers(tab: AssembledTabRuntime, bindingId: string): void {
-  const bindings = backgroundTurnBuffers.get(tab);
-  for (const buffer of bindings?.get(bindingId)?.values() ?? []) {
-    if (buffer.target) discardBackgroundTurn(tab.state, buffer.target);
-  }
-  bindings?.delete(bindingId);
-  if (bindings?.size === 0) backgroundTurnBuffers.delete(tab);
-}
-
 function canAcceptTabBackgroundWork(tab: AssembledTabRuntime): boolean {
   return tab.lifecycleState !== 'closing'
-    && !tab.state.isCreatingConversation
+    && !tab.state.isResettingToNewChat
     && !tab.state.isSwitchingConversation;
 }
 

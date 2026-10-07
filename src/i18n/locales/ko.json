@@ -8,10 +8,10 @@
     "clearAll": "모두 지우기",
     "error": "오류",
     "confirm": "확인",
-    "advanced": "고급",
     "refresh": "새로고침"
   },
   "chat": {
+    "promptSuggestionHint": "Tab으로 수락",
     "selectAvailableModel": "전송하기 전에 사용 가능한 모델을 선택하세요.",
     "selectAvailableTitleModel": "Claudian 설정에서 사용 가능한 제목 생성 모델을 선택하세요.",
     "rewind": {
@@ -105,6 +105,7 @@
     "content": "콘텐츠",
     "input": "입력",
     "models": "모델",
+    "responses": "응답",
     "experimental": "실험적 기능",
     "userName": {
       "name": "Claudian이 당신을 어떻게 불러야 합니까?",
@@ -145,24 +146,14 @@
       "name": "Command/Ctrl+Enter로 보내기 필수",
       "desc": "활성화하면 Enter는 줄바꿈을 삽입합니다. macOS에서는 Command+Enter, Windows와 Linux에서는 Ctrl+Enter로 보냅니다."
     },
-    "hotkeys": "단축키",
-    "inlineEditHotkey": {
-      "name": "인라인 편집"
-    },
-    "openChatHotkey": {
-      "name": "채팅 열기"
-    },
-    "newSessionHotkey": {
-      "name": "현재 대화 바꾸기"
-    },
     "safety": "보안",
     "loadUserSettings": {
       "name": "사용자 Claude Code 설정 로드",
       "desc": "~/.claude에서 사용자 수준 Claude Code 구성(settings.json, 스킬, 명령, 에이전트, 플러그인)을 로드합니다. 비활성화하면 Vault 수준 구성만 사용할 수 있습니다. 활성화하면 사용자의 허용 규칙이 보안 모드를 우회할 수 있습니다."
     },
-    "codexSafeMode": {
-      "name": "안전 모드",
-      "desc": "Safe 토글이 활성화되었을 때 사용하는 샌드박스 모드입니다."
+    "codexSandbox": {
+      "name": "샌드박스",
+      "desc": "Approve for me 및 Ask for approval 모드의 파일 접근 권한입니다. 읽기 전용은 편집할 때마다 확인을 요청하며, Full access에서는 무시됩니다."
     },
     "environment": "환경",
     "sharedEnvironment": {
@@ -176,7 +167,7 @@
     "envSnippets": {
       "name": "스니펫",
       "addBtn": "스니펫 추가",
-      "noSnippets": "저장된 환경 변수 스니펫이 없습니다. +를 클릭하여 현재 구성을 저장하세요.",
+      "saveCurrent": "현재 환경을 스니펫으로 저장",
       "nameRequired": "스니펫 이름을 입력하세요",
       "insert": "삽입",
       "modal": {
@@ -211,10 +202,6 @@
     "enableChrome": {
       "name": "Chrome 확장 프로그램 활성화",
       "desc": "claude-in-chrome 확장 프로그램을 통해 Claude Code가 Chrome과 상호작용할 수 있도록 합니다. 확장 프로그램이 설치되어 있어야 합니다. 세션 재시작이 필요합니다."
-    },
-    "maxWarmAgentProcesses": {
-      "name": "최대 동시 실행 세션 수",
-      "desc": "동시에 준비 상태로 유지할 에이전트 세션의 최대 수(5-10). 오래된 유휴 세션은 자동으로 일시 중지되고 사용할 때 재개됩니다."
     },
     "enableDualPane": {
       "name": "이중 창 모드 활성화",
@@ -320,7 +307,6 @@
       "reorderLabel": "{model} 순서 변경. 드래그하거나 위/아래 화살표 키를 사용하세요",
       "default": "기본값",
       "unavailable": "사용 불가",
-      "unavailableTitle": "구성된 모델이 현재 {provider}에서 보고되지 않습니다",
       "aliasLabel": "별칭 (선택)",
       "removeLabel": "{model} 제거",
       "noMatch": "필터와 일치하는 모델이 없습니다.",
@@ -329,12 +315,16 @@
       "stale": "{provider} 모델 카탈로그가 오래되었습니다. 검색을 클릭하여 새로 고치세요."
     },
     "claude": {
+      "promptSuggestions": {
+        "name": "프롬프트 제안",
+        "desc": "빈 입력창에 Claude가 예측한 다음 프롬프트를 표시합니다. 제안마다 매 턴 후 추가 Claude 요청이 발생하며 사용량 한도를 더 빨리 소진할 수 있습니다."
+      },
       "configuration": "구성",
       "responseStyle": {
         "name": "응답 스타일",
-        "desc": "기본은 Claude Code의 일반 스타일입니다. 간결 모드는 결과부터 제시하고 서두를 생략합니다. Claude Code 2.1.237 이상이 필요합니다.",
-        "default": "기본",
-        "concise": "간결"
+        "desc": "답변에 사용할 Claude Code 출력 스타일입니다(사용자 지정 스타일 포함). “Claude Code 설정”은 Claude Code 구성을 따릅니다. 모델을 새로 고치거나 채팅을 시작하면 목록이 업데이트됩니다.",
+        "default": "기본값",
+        "inherit": "Claude Code 설정"
       }
     },
     "codex": {
@@ -360,9 +350,18 @@
       },
       "responseStyle": {
         "name": "응답 스타일",
-        "desc": "지원되는 모델에서 Codex CLI의 대화 스타일을 선택합니다. 다음 메시지부터 적용됩니다.",
+        "desc": "지원되는 모델에서 Codex CLI의 대화 스타일을 선택합니다.",
         "pragmatic": "실용적",
-        "friendly": "친근함"
+        "friendly": "친근함",
+        "neutral": "중립적"
+      },
+      "responseVerbosity": {
+        "name": "응답 상세 수준",
+        "desc": "지원되는 모델의 응답 상세 수준을 선택합니다. 기본값은 Codex 설정을 사용합니다.",
+        "default": "기본값",
+        "low": "낮음",
+        "medium": "중간",
+        "high": "높음"
       },
       "reasoningSummary": {
         "name": "추론 요약",

@@ -1,5 +1,5 @@
-import { scheduleAnimationFrame } from '../../../utils/animationFrame';
-import type { TabBarItem, TabId } from './types';
+import type { TabBarItem, TabId } from '@/features/chat/tabs/ChatTab';
+import { scheduleAnimationFrame } from '@/features/chat/utils/animationFrame';
 
 const EXPANDED_TITLE_MAX_LENGTH = 32;
 const TRUNCATED_TITLE_SUFFIX = '...';

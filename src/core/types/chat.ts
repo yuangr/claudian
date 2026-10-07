@@ -1,7 +1,7 @@
+import type { ProviderSelectionSnapshot, ProviderSessionReference } from '../execution/ProviderExecutionRequest';
 import type { ProviderCapabilities } from '../providers/types';
-import type { SDKToolUseResult } from './diff';
 import type { ProviderId } from './provider';
-import type { SubagentMode, ToolCallInfo, ToolProviderPayload } from './tools';
+import type { SubagentMode, ToolCallInfo, ToolProviderPayload, ToolResultDetails } from './tools';
 
 /** Fork origin reference: identifies the source session and checkpoint. */
 export interface ForkSource {
@@ -63,6 +63,8 @@ export interface ExecutionInputCanvasSnapshot {
 }
 
 export interface ExecutionInputContextSnapshot {
+  selections?: readonly ProviderSelectionSnapshot[];
+  sessionReferences?: readonly ProviderSessionReference[];
   linkedContent?: ExecutionInputLinkedContentSnapshot;
   editorSelection?: ExecutionInputEditorSnapshot | null;
   browserSelection?: ExecutionInputBrowserSnapshot | null;
@@ -217,6 +219,8 @@ export interface ConversationMeta {
   isArchived?: boolean;
   /** Status of AI title generation. */
   titleGenerationStatus?: 'pending' | 'success' | 'failed';
+  /** Cheap availability hint; native history may still be missing at hydration. */
+  hasSessionReference?: boolean;
   /** Whether metadata still uses a writable legacy namespace. */
   isLegacySession?: boolean;
 }
@@ -275,7 +279,7 @@ export type StreamChunk =
       content: string;
       isError?: boolean;
       isBlocked?: boolean;
-      toolUseResult?: SDKToolUseResult;
+      resultDetails?: ToolResultDetails;
       providerPayload?: ToolProviderPayload;
     }
   | {
@@ -284,7 +288,7 @@ export type StreamChunk =
       /** Text to append to the tool's result. */
       content: string;
       /** Latest structured snapshot of a running tool, replacing earlier ones. */
-      toolUseResult?: SDKToolUseResult;
+      resultDetails?: ToolResultDetails;
     }
   | {
       type: 'error';
@@ -306,7 +310,7 @@ export type StreamChunk =
       content: string;
       isError?: boolean;
       isBlocked?: boolean;
-      toolUseResult?: SDKToolUseResult;
+      resultDetails?: ToolResultDetails;
       providerPayload?: ToolProviderPayload;
     };
 

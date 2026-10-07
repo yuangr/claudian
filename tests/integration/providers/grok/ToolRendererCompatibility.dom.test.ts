@@ -10,11 +10,12 @@ import type { ProviderExecutionEvent, ProviderSessionConfig } from '@/core/execu
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ChatMessage, StreamChunk, ToolCallInfo } from '@/core/types';
-import { providerOutputEventToStreamChunk, StreamController } from '@/features/chat/controllers/StreamController';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
-import { renderStoredToolCall } from '@/features/chat/rendering/ToolCallRenderer';
-import { SubagentManager } from '@/features/chat/services/SubagentManager';
+import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
+import { renderStoredToolCall } from '@/features/chat/rendering/tools/ToolCallRenderer';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
+import { StreamController } from '@/features/chat/turns/StreamController';
 import type { ACPSessionNotification } from '@/providers/acp';
 import { GrokExecutionBackend, type GrokExecutionNativeConnection } from '@/providers/grok/execution/GrokExecutionBackend';
 import { parseGrokHistoryContent } from '@/providers/grok/history/GrokHistoryStore';
@@ -339,7 +340,7 @@ describe.each(['live', 'history'] as const)('%s Grok tool presentation', mode =>
     expect(tool).toMatchObject({ name: 'LS', status: 'error', result: message });
   });
 
-  it('renders web search citations as links alongside the synthesized answer', async () => {
+  it('renders web search citations as links without the synthesized answer', async () => {
     const answer = 'The Obsidian Plugin API lets you extend Obsidian.[[1]](https://github.com/obsidianmd/obsidian-api)';
     const tool = await restore(mode, editUpdates('search', 'web_search', { query: 'Obsidian plugin API' }, {
       status: 'completed',
@@ -353,7 +354,7 @@ describe.each(['live', 'history'] as const)('%s Grok tool presentation', mode =>
     expect(within(block).getByRole('link', { name: 'https://github.com/obsidianmd/obsidian-api' }).getAttribute('href'))
       .toBe('https://github.com/obsidianmd/obsidian-api');
     expect(within(block).getByRole('link', { name: 'https://docs.obsidian.md/' })).toBeDefined();
-    expect(block.querySelector('.claudian-tool-web-summary')?.textContent).toBe(answer);
+    expect(block.textContent).not.toContain('lets you extend Obsidian');
     expect((await axe(block)).violations).toEqual([]);
   });
 

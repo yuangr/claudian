@@ -8,10 +8,10 @@
     "clearAll": "Alle löschen",
     "error": "Fehler",
     "confirm": "Bestätigen",
-    "advanced": "Erweitert",
     "refresh": "Aktualisieren"
   },
   "chat": {
+    "promptSuggestionHint": "Mit Tab übernehmen",
     "selectAvailableModel": "Wähle vor dem Senden ein verfügbares Modell aus.",
     "selectAvailableTitleModel": "Wähle in den Claudian-Einstellungen ein verfügbares Titelmodell aus.",
     "rewind": {
@@ -105,6 +105,7 @@
     "content": "Inhalte",
     "input": "Eingabe",
     "models": "Modelle",
+    "responses": "Antworten",
     "experimental": "Experimentell",
     "userName": {
       "name": "Wie soll Claudian dich nennen?",
@@ -145,24 +146,14 @@
       "name": "Command/Ctrl+Enter zum Senden erfordern",
       "desc": "Wenn aktiviert, fügt Enter einen Zeilenumbruch ein. Command+Enter sendet unter macOS; Ctrl+Enter sendet unter Windows und Linux."
     },
-    "hotkeys": "Tastenkürzel",
-    "inlineEditHotkey": {
-      "name": "Inline-Bearbeitung"
-    },
-    "openChatHotkey": {
-      "name": "Chat öffnen"
-    },
-    "newSessionHotkey": {
-      "name": "Aktuelle Unterhaltung ersetzen"
-    },
     "safety": "Sicherheit",
     "loadUserSettings": {
       "name": "Claude-Code-Benutzereinstellungen laden",
       "desc": "Lädt die Claude-Code-Konfiguration auf Benutzerebene aus ~/.claude: settings.json, Skills, Befehle, Agenten und Plugins. Wenn deaktiviert, ist nur die Konfiguration auf Vault-Ebene verfügbar. Wenn aktiviert, können Benutzer-Berechtigungsregeln den Sicherheitsmodus umgehen."
     },
-    "codexSafeMode": {
-      "name": "Sicherheitsmodus",
-      "desc": "Sandbox-Modus, der verwendet wird, wenn der Safe-Schalter aktiv ist."
+    "codexSandbox": {
+      "name": "Sandbox",
+      "desc": "Dateizugriff in den Modi „Approve for me“ und „Ask for approval“. „Nur lesen“ fragt vor jeder Änderung; „Full access“ ignoriert diese Einstellung."
     },
     "environment": "Umgebung",
     "sharedEnvironment": {
@@ -176,7 +167,7 @@
     "envSnippets": {
       "name": "Snippets",
       "addBtn": "Snippet hinzufügen",
-      "noSnippets": "Keine gespeicherten Umgebungsvariablen-Snippets. Klicken Sie auf +, um Ihre aktuelle Konfiguration zu speichern.",
+      "saveCurrent": "Aktuelle Umgebung als Snippet speichern",
       "nameRequired": "Bitte geben Sie einen Namen für das Snippet ein",
       "insert": "Einfügen",
       "modal": {
@@ -211,10 +202,6 @@
     "enableChrome": {
       "name": "Chrome-Erweiterung aktivieren",
       "desc": "Erlaubt Claude Code die Interaktion mit Chrome über die claude-in-chrome-Erweiterung. Die Erweiterung muss installiert sein. Erfordert Neustart der Sitzung."
-    },
-    "maxWarmAgentProcesses": {
-      "name": "Maximale gleichzeitig laufende Sitzungen",
-      "desc": "Maximale Anzahl gleichzeitig bereiter Agent-Sitzungen (5-10). Ältere inaktive Sitzungen pausieren automatisch und werden bei Nutzung fortgesetzt."
     },
     "enableDualPane": {
       "name": "Zwei-Spalten-Modus aktivieren",
@@ -320,7 +307,6 @@
       "reorderLabel": "{model} neu anordnen; ziehen oder die Pfeiltasten nach oben und unten verwenden",
       "default": "Standard",
       "unavailable": "Nicht verfügbar",
-      "unavailableTitle": "Konfiguriertes Modell wird derzeit nicht von {provider} gemeldet",
       "aliasLabel": "Alias (optional)",
       "removeLabel": "{model} entfernen",
       "noMatch": "Keine Modelle entsprechen Ihrem Filter.",
@@ -329,12 +315,16 @@
       "stale": "Der {provider}-Modellkatalog ist veraltet. Klicken Sie auf Erkennen, um ihn zu aktualisieren."
     },
     "claude": {
+      "promptSuggestions": {
+        "name": "Prompt-Vorschläge",
+        "desc": "Zeigt Claudes Vorschlag für den nächsten Prompt im leeren Eingabefeld. Jeder Vorschlag ist eine zusätzliche Claude-Anfrage nach jeder Runde und kann Ihre Nutzungslimits schneller aufbrauchen."
+      },
       "configuration": "Konfiguration",
       "responseStyle": {
         "name": "Antwortstil",
-        "desc": "Standard verwendet den üblichen Stil von Claude Code. Knapp beginnt mit Ergebnissen und verzichtet auf Einleitungen. Erfordert Claude Code 2.1.237 oder neuer.",
+        "desc": "Claude-Code-Ausgabestil für Antworten, einschließlich eigener Stile. „Claude-Code-Einstellung“ folgt deiner Claude-Code-Konfiguration. Die Liste wird aktualisiert, wenn Modelle aktualisiert werden oder ein Chat startet.",
         "default": "Standard",
-        "concise": "Knapp"
+        "inherit": "Claude-Code-Einstellung"
       }
     },
     "codex": {
@@ -360,9 +350,18 @@
       },
       "responseStyle": {
         "name": "Antwortstil",
-        "desc": "Wähle den Kommunikationsstil von Codex CLI bei unterstützten Modellen. Gilt ab der nächsten Nachricht.",
+        "desc": "Wähle den Kommunikationsstil von Codex CLI bei unterstützten Modellen.",
         "pragmatic": "Pragmatisch",
-        "friendly": "Freundlich"
+        "friendly": "Freundlich",
+        "neutral": "Neutral"
+      },
+      "responseVerbosity": {
+        "name": "Antwortumfang",
+        "desc": "Wählen Sie den Detailgrad der Antworten bei unterstützten Modellen. Standard verwendet Ihre Codex-Konfiguration.",
+        "default": "Standard",
+        "low": "Niedrig",
+        "medium": "Mittel",
+        "high": "Hoch"
       },
       "reasoningSummary": {
         "name": "Reasoning-Zusammenfassung",

@@ -1,6 +1,8 @@
 import type { App } from 'obsidian';
 import { Modal, Notice, setIcon, Setting } from 'obsidian';
 
+import { parseEnvironmentVariables } from '@/core/process/env';
+
 import {
   getEnvironmentScopeUpdates,
   resolveEnvironmentSnippetScope,
@@ -9,8 +11,8 @@ import type { ProviderHost } from '../../core/providers/ProviderHost';
 import { ProviderRegistry } from '../../core/providers/ProviderRegistry';
 import type { EnvironmentScope, EnvSnippet } from '../../core/types';
 import { t } from '../../i18n/i18n';
-import { formatContextLimit, parseContextLimit, parseEnvironmentVariables } from '../../utils/env';
 import { confirmDelete } from '../modals/ConfirmModal';
+import { formatContextLimit, parseContextLimit } from './contextLimit';
 
 export class EnvSnippetModal extends Modal {
   plugin: ProviderHost;
@@ -236,22 +238,30 @@ export class EnvSnippetManager {
     const headerEl = this.containerEl.createDiv({ cls: 'claudian-snippet-header' });
     headerEl.createSpan({ text: t('settings.envSnippets.name'), cls: 'claudian-snippet-label' });
 
+    const snippets = this.plugin.settings.envSnippets.filter((snippet) => this.#shouldDisplaySnippet(snippet));
+
+    // The empty state is itself the save action, so the header button only appears beside a list.
+    if (snippets.length === 0) {
+      const emptyBtn = this.containerEl.createEl('button', {
+        cls: 'claudian-snippet-empty',
+        attr: { type: 'button' },
+      });
+      setIcon(emptyBtn.createSpan({ cls: 'claudian-snippet-empty-icon' }), 'plus');
+      emptyBtn.createSpan({ text: t('settings.envSnippets.saveCurrent') });
+      emptyBtn.addEventListener('click', () => {
+        void this.#saveCurrentEnv();
+      });
+      return;
+    }
+
     const saveBtn = headerEl.createEl('button', {
       cls: 'claudian-settings-action-btn',
-      attr: { 'aria-label': t('settings.envSnippets.addBtn') },
+      attr: { type: 'button', 'aria-label': t('settings.envSnippets.addBtn') },
     });
     setIcon(saveBtn, 'plus');
     saveBtn.addEventListener('click', () => {
       void this.#saveCurrentEnv();
     });
-
-    const snippets = this.plugin.settings.envSnippets.filter((snippet) => this.#shouldDisplaySnippet(snippet));
-
-    if (snippets.length === 0) {
-      const emptyEl = this.containerEl.createDiv({ cls: 'claudian-snippet-empty' });
-      emptyEl.setText(t('settings.envSnippets.noSnippets'));
-      return;
-    }
 
     const listEl = this.containerEl.createDiv({ cls: 'claudian-snippet-list' });
 

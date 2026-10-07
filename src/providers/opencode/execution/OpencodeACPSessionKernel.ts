@@ -6,6 +6,7 @@ import {
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { getEnhancedPath } from '@/core/process/env';
 import { resolveTitleGenerationLocale } from '@/core/prompt/titleGeneration';
 import {
   ACPClientConnection,
@@ -24,7 +25,6 @@ import {
   mapACPApprovalDecision,
   resolveACPLoadSessionId,
 } from '@/providers/acp';
-import { getEnhancedPath } from '@/utils/env';
 
 import { getSystemPromptSettings } from '../runtime/OpencodeExecutionAgents';
 import {
@@ -150,9 +150,7 @@ export class DefaultOpencodeACPSessionKernel
             systemPromptKey: options.systemInstructions.instructions,
             systemPromptText: options.systemInstructions.instructions,
           }
-          : {
-            dynamicSystemPromptSections: options.systemInstructions.dynamicSections,
-          }),
+          : {}),
         workspaceRoot: this.options.config.vaultWorkingDirectory,
       });
       this.#assertNotDisposed();

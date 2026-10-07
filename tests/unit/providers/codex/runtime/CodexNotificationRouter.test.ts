@@ -395,6 +395,27 @@ describe('CodexNotificationRouter', () => {
       ]);
     });
 
+    it.each([
+      ['raw tool call', 'rawResponseItem/completed', { item: {
+        type: 'function_call', name: 'shell_command', call_id: 'call_ls', arguments: '{"command":"ls"}',
+      } }],
+      ['canonical tool item', 'item/started', { item: {
+        type: 'imageView', id: 'view_1', path: '/workspace/diagram.png',
+      } }],
+    ])('starts a new assistant segment after a %s', (_label, method, params) => {
+      router.handleNotification('item/agentMessage/delta', { threadId: 't1', turnId: 'turn1', itemId: 'msg1', delta: 'Checking' });
+      router.handleNotification(method, params);
+      // A later raw message that repeats earlier text as its prefix is new text, not a completion.
+      router.handleNotification('rawResponseItem/completed', { item: {
+        type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking done' }],
+      } });
+
+      expect(chunks.filter(chunk => chunk.type === 'text')).toEqual([
+        { type: 'text', content: 'Checking' },
+        { type: 'text', content: 'Checking done' },
+      ]);
+    });
+
     it('does not render raw user bootstrap messages as assistant text', () => {
       router.handleNotification('rawResponseItem/completed', {
         threadId: 't1',
@@ -702,6 +723,33 @@ describe('CodexNotificationRouter', () => {
 
       expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
       expect(chunks[chunks.length - 1]).toEqual({ type: 'done' });
+    });
+
+    it('hides script-wrapped empty write_stdin polls and their cell waits', () => {
+      router.beginTurn();
+      const notify = (item: Record<string, unknown>) => router.handleNotification('rawResponseItem/completed', {
+        threadId: 't1', turnId: 'turn1', item,
+      });
+      notify({ type: 'custom_tool_call', name: 'exec', call_id: 'poll1',
+        input: 'text(await tools.write_stdin({session_id:40281,chars:"",yield_time_ms:1000}));\n' });
+      notify({ type: 'custom_tool_call_output', call_id: 'poll1', output: [
+        { type: 'input_text', text: 'Script completed\nWall time 5.0 seconds\nOutput:\n' },
+        { type: 'input_text', text: '{"session_id":40281,"output":""}' },
+      ] });
+      notify({ type: 'custom_tool_call', name: 'exec', call_id: 'poll2',
+        input: 'text(await tools.write_stdin({session_id:40281,chars:"",yield_time_ms:60000}));\n' });
+      notify({ type: 'custom_tool_call_output', call_id: 'poll2',
+        output: 'Script running with cell ID 3\nWall time 31.0 seconds\nOutput:\n' });
+      notify({ type: 'function_call', name: 'wait', call_id: 'wait1', arguments: '{"cell_id":"3"}' });
+      notify({ type: 'function_call_output', call_id: 'wait1', output: [
+        { type: 'input_text', text: 'Script completed\nWall time 9.0 seconds\nOutput:\n' },
+        { type: 'input_text', text: '{"exit_code":0,"output":"done\\n"}' },
+      ] });
+      router.handleNotification('turn/completed', {
+        threadId: 't1', turn: { id: 'turn1', items: [], status: 'completed', error: null },
+      });
+
+      expect(chunks.filter(chunk => chunk.type.startsWith('tool'))).toEqual([]);
     });
 
     it.each([false, true])('keeps an undecoded script running across cell waits (failure: %s)', (failed) => {
@@ -3755,7 +3803,61 @@ describe('CodexNotificationRouter', () => {
     });
   });
 
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('keeps the native command outcome when its script also calls hidden internal tools (child stream: %s, native late: %s)', (streamRawExecCalls, nativeLate) => {
+    const scriptRouter = new CodexNotificationRouter(chunk => chunks.push(chunk), '/workspace', streamRawExecCalls);
+    scriptRouter.beginTurn();
+    scriptRouter.handleNotification('rawResponseItem/completed', { item: {
+      type: 'custom_tool_call', name: 'exec', call_id: 'mixed',
+      input: 'text(await tools.exec_command({cmd:"check"})); text(await tools.get_context_remaining({}));',
+    } });
+    const command = {
+      type: 'commandExecution', id: 'exec-check', command: 'check', cwd: '/workspace', status: 'failed',
+      commandActions: [{ type: 'unknown', command: 'check' }], aggregatedOutput: 'check failed\n', exitCode: 7,
+    };
+    scriptRouter.handleNotification('item/started', { item: { ...command, status: 'inProgress', aggregatedOutput: null, exitCode: null } });
+    if (!nativeLate) scriptRouter.handleNotification('item/completed', { item: command });
+    scriptRouter.handleNotification('rawResponseItem/completed', { item: {
+      type: 'custom_tool_call_output', call_id: 'mixed', output: 'Script completed\nWall time 0.1 seconds\nOutput:\ncheck failed\n{"tokens_left":1}',
+    } });
+    if (nativeLate) scriptRouter.handleNotification('item/completed', { item: command });
+    scriptRouter.handleNotification('turn/completed', { turn: { id: 'turn1', items: [], status: 'completed', error: null } });
+
+    expect(new Set(chunks.filter(chunk => chunk.type === 'tool_use').map(chunk => chunk.id)).size).toBe(1);
+    expect(chunks.filter(chunk => chunk.type === 'tool_result').at(-1)).toMatchObject({ content: 'check failed\n', isError: true });
+    expect(JSON.stringify(chunks)).not.toContain('tokens_left');
+  });
+
   describe('webSearch tool', () => {
+    it.each([
+      [{ type: 'openPage', url: 'https://example.com/page' }, { actionType: 'open_page', url: 'https://example.com/page' }],
+      [{ type: 'findInPage', url: 'https://example.com/page', pattern: 'term' }, { actionType: 'find_in_page', url: 'https://example.com/page', pattern: 'term' }],
+    ])('labels native-only %j actions with their operation', (action, input) => {
+      router.handleNotification('item/completed', { item: { type: 'webSearch', id: 'native', query: '', action, status: 'completed' } });
+      expect(chunks[0]).toEqual({ type: 'tool_use', id: 'native', name: 'WebSearch', input });
+    });
+
+    it('keeps native child search sources when the script output arrives before the native completion', () => {
+      const childRouter = new CodexNotificationRouter(chunk => chunks.push(chunk), '/workspace', true);
+      childRouter.beginTurn();
+      childRouter.handleNotification('rawResponseItem/completed', { item: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'call-web', input: 'text(await tools.web__run({search_query:[{q:"HBM supply"}]}));',
+      } });
+      const native = { type: 'webSearch', id: 'exec-web', query: 'HBM supply', action: { type: 'search', query: 'HBM supply' } };
+      childRouter.handleNotification('item/started', { item: native });
+      childRouter.handleNotification('rawResponseItem/completed', { item: {
+        type: 'custom_tool_call_output', call_id: 'call-web', output: 'Script completed\nWall time 0.1 seconds\nOutput:\nSource (https://example.com/source)',
+      } });
+      childRouter.handleNotification('item/completed', { item: { ...native, status: 'completed',
+        results: [{ type: 'text_result', title: 'Source', url: 'https://example.com/source' }] } });
+      childRouter.handleNotification('turn/completed', { turn: { id: 'turn1', items: [], status: 'completed', error: null } });
+
+      const results = chunks.filter(chunk => chunk.type === 'tool_result');
+      expect(new Set(results.map(chunk => chunk.id))).toEqual(new Set(['call-web']));
+      expect(results.at(-1)).toMatchObject({ resultDetails: { webSearchResults: [expect.objectContaining({ title: 'Source' })] } });
+    });
+
     it.each([false, true])('keeps all raw web actions when a same-id native event summarizes one (native first: %s)', nativeFirst => {
       router.beginTurn();
       const native = { type: 'webSearch', id: 'web-call', action: { type: 'open_page', url: 'https://example.com/one' }, status: 'completed' };

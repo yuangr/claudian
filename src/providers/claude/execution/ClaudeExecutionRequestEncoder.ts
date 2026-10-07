@@ -4,6 +4,17 @@ import type {
   PermissionMode as SDKPermissionMode,
 } from '@anthropic-ai/claude-agent-sdk';
 
+import {
+  buildContextFromHistory,
+  buildPromptWithHistoryContext,
+} from '@/core/prompt/historyContext';
+import {
+  appendLinkedContent,
+  appendLinkedContentBody,
+  appendSelectionContexts,
+  appendSessionReferences,
+} from '@/core/prompt/promptContext';
+
 import type {
   ProviderExecutionRequest,
   ProviderSessionConfig,
@@ -18,17 +29,6 @@ import {
 } from '../../../core/tools/toolNames';
 import type { ImageAttachment } from '../../../core/types';
 import type { ClaudianSettings } from '../../../core/types/settings';
-import { appendBrowserContext } from '../../../utils/browser';
-import { appendCanvasContext } from '../../../utils/canvas';
-import {
-  appendLinkedContent,
-  appendLinkedContentBody,
-} from '../../../utils/context';
-import { appendEditorContext } from '../../../utils/editor';
-import {
-  buildContextFromHistory,
-  buildPromptWithHistoryContext,
-} from '../../../utils/session';
 import { findEnabledClaudeModelOption } from '../modelOptions';
 import { toClaudeRuntimeModelId } from '../modelSelection';
 import { isClaudePermissionMode, toClaudeSDKPermissionMode } from '../permissionModes';
@@ -38,10 +38,7 @@ import {
   DISABLED_BUILTIN_TASK_TOOLS,
   UNSUPPORTED_SDK_TOOLS,
 } from '../runtime/types';
-import {
-  type ClaudeResponseStyle,
-  getClaudeProviderSettings,
-} from '../settings';
+import { getClaudeProviderSettings } from '../settings';
 import {
   type EffortLevel,
   isEffortLevel,
@@ -66,7 +63,8 @@ export interface ClaudeEncodedExecutionRequest {
   readonly model: string;
   /** Explicit effort, or null when Claude Code reported no capabilities for the model. */
   readonly effort: EffortLevel | null;
-  readonly responseStyle: ClaudeResponseStyle;
+  /** Native output style; null leaves Claude Code's own setting in force. */
+  readonly outputStyle: string | null;
   readonly sdkPermissionMode: SDKPermissionMode;
   readonly restartKey: string;
   readonly allowedTools: ReadonlySet<string> | null;
@@ -132,11 +130,10 @@ export class ClaudeExecutionRequestEncoder {
         customPrompt: settings.systemPrompt,
         vaultPath: sessionConfig.vaultWorkingDirectory,
         userName: settings.userName,
-      }, {
-        dynamicSections: request.configuration.systemInstructions.dynamicSections
-          ? [...request.configuration.systemInstructions.dynamicSections]
-          : undefined,
       });
+    const promptSuggestions = Boolean(
+      request.configuration.promptSuggestions && claudeSettings.promptSuggestions,
+    );
     const options: Options = {
       ...buildClaudeLaunchOptions(
         this.deps.host,
@@ -150,8 +147,16 @@ export class ClaudeExecutionRequestEncoder {
         snapshot: false,
       },
       model,
+      ...(request.configuration.readableRoots?.length ? { additionalDirectories: [...request.configuration.readableRoots] } : {}),
       ...(effort ? { effort } : {}),
-      settings: { outputStyle: claudeSettings.responseStyle },
+      ...(claudeSettings.outputStyle || promptSuggestions ? {
+        settings: {
+          ...(claudeSettings.outputStyle ? { outputStyle: claudeSettings.outputStyle } : {}),
+          // The flag layer outranks `promptSuggestionEnabled: false` in settings.json. The
+          // CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION override would also bypass near-limit suppression.
+          ...(promptSuggestions ? { promptSuggestionEnabled: true } : {}),
+        },
+      } : {}),
       thinking: { type: 'adaptive' },
       abortController,
       permissionMode: sdkPermissionMode,
@@ -166,6 +171,7 @@ export class ClaudeExecutionRequestEncoder {
       includePartialMessages: true,
       // Subagent cards show the SDK's periodic one-line summaries while they run.
       agentProgressSummaries: true,
+      ...(promptSuggestions ? { promptSuggestions: true } : {}),
       enableFileCheckpointing: true,
       canUseTool,
       disallowedTools: [
@@ -185,6 +191,11 @@ export class ClaudeExecutionRequestEncoder {
     } else if (sessionConfig.nativePersistence === 'enabled') {
       options.persistSession = true;
     }
+    if (resume.fork && options.persistSession === false) {
+      // An ephemeral fork runs beside its live parent. Without this marker Claude Code treats
+      // the parent's running background work as orphaned and tells the child it ended.
+      options.env = { ...options.env, CLAUDE_CODE_RESUME_SOURCE_ALIVE: '1' };
+    }
     if (request.configuration.reasoning === null) {
       delete options.thinking;
     }
@@ -196,15 +207,17 @@ export class ClaudeExecutionRequestEncoder {
       model,
       effort,
       sdkPermissionMode,
-      responseStyle: claudeSettings.responseStyle,
+      outputStyle: claudeSettings.outputStyle,
       restartKey: JSON.stringify({
         systemPrompt,
         tools: policy.tools,
         hooks: Boolean(policy.hooks),
         cliPath,
         settingSources: options.settingSources,
+        additionalDirectories: options.additionalDirectories,
         enableChrome: claudeSettings.enableChrome,
         persistSession: options.persistSession,
+        promptSuggestions: options.promptSuggestions,
       }),
       allowedTools: policy.allowedTools,
     };
@@ -251,15 +264,8 @@ export class ClaudeExecutionRequestEncoder {
           context.linkedContent.content,
         );
     }
-    if (context?.editorSelection) {
-      prompt = appendEditorContext(prompt, context.editorSelection);
-    }
-    if (context?.browserSelection) {
-      prompt = appendBrowserContext(prompt, context.browserSelection);
-    }
-    if (context?.canvasSelection) {
-      prompt = appendCanvasContext(prompt, context.canvasSelection);
-    }
+    prompt = appendSelectionContexts(prompt, context);
+    prompt = appendSessionReferences(prompt, context?.sessionReferences);
 
     const history = replayConversationHistory
       ? request.conversationHistory

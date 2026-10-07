@@ -27,7 +27,7 @@ Open Claudian interface from the ribbon icon or command palette. Everything work
 
 **Slash Commands & Skills** — Type `/` or `$` for reusable prompt templates or Skills from user- and vault-level scopes.
 
-**@mention** — Type `@` to reference vault files and folders.
+**@mention** — Type `@` to reference vault files, folders and other Claudian sessions.
 
 **Side Chat (`/side` or `/btw`)** — Explore a separate, temporary conversation with follow-ups and tools while keeping the main chat unchanged.
 
@@ -104,6 +104,8 @@ If Claudian cannot auto-detect a provider CLI, verify that the CLI is installed 
 
 Leave the CLI path setting empty first so Claudian can auto-detect the CLI. If auto-detection fails, find the executable path and set it in Settings → Advanced → Claude Code CLI path.
 
+For Codex on macOS, auto-detection also checks ChatGPT.app in `/Applications` and `~/Applications`, including its nested `codex-cli/CodexCLI.app` runtime. A configured CLI path or shared PATH entry takes precedence.
+
 | Platform | Command | Example Path |
 |----------|---------|--------------|
 | macOS/Linux | `which claude` | `/Users/you/.volta/bin/claude` |
@@ -138,30 +140,30 @@ For provider-specific installation and configuration guidance, refer to the prov
 
 ```
 src/
-├── main.ts                      # Plugin entry point
-├── app/                         # Application services, and storage
+├── main.ts                      # Plugin entry point and sole composition root
+├── composition/                 # Host objects and view wiring shared by app and features
+├── app/                         # Startup, conversations, settings, and storage
 ├── core/                        # Provider-neutral execution, registry, and type contracts
-│   ├── execution/               # Provider execution, session lifecycle, and interaction contracts
+│   ├── execution/               # Run, session snapshot, and interaction primitives
 │   ├── providers/               # Provider registry and workspace services
+│   ├── process/                 # CLI discovery and managed child processes
+│   ├── prompt/                  # Prompt and context encoding
 │   ├── auxiliary/               # Shared provider auxiliary services
-│   ├── bootstrap/               # Plugin bootstrap wiring
-│   ├── security/                # Approval utilities
-│   └── ...                      # commands, prompt, storage, tools, types
+│   └── ...                      # bootstrap, commands, rpc, security, storage, tools, types
 ├── providers/
-│   ├── claude/                  # Claude SDK adaptor, prompt encoding, storage, MCP, plugins
-│   ├── codex/                   # Codex app-server adaptor, JSON-RPC transport, JSONL history
+│   ├── claude/                  # Claude Agent SDK adaptor, native history, plugins
+│   ├── codex/                   # Codex shared app-server adaptor, JSON-RPC, JSONL history
 │   ├── grok/                    # Grok Build ACP adaptor, native history, models, and tools
-│   ├── opencode/                # OpenCode adaptor
+│   ├── opencode/                # OpenCode ACP and HTTP adaptors, shared server
 │   ├── pi/                      # Pi RPC adaptor, model discovery, JSONL history
-│   └── acp/                     # Agent Client Protocol shared transport
+│   └── acp/                     # Agent Client Protocol shared mechanics
 ├── features/
-│   ├── chat/                    # Sidebar chat: tabs, controllers, renderers
+│   ├── chat/                    # Sidebar chat: tabs, workspace lifecycle, controllers, renderers
 │   ├── inline-edit/             # Inline edit modal and provider-backed edit services
-│   └── settings/                # Settings shell with provider tabs
-├── shared/                      # Reusable UI components and modals
+│   └── settings/                # Settings shell, provider tabs, Vault skill management
+├── shared/                      # Reusable UI components, settings controls, mention/dropdown
 ├── i18n/                        # Internationalization (10 locales)
-├── types/                       # Shared ambient types
-├── utils/                       # Cross-cutting utilities
+├── utils/                       # Domain-free leaf helpers
 └── style/                       # Modular CSS
 ```
 
