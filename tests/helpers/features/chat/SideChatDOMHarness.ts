@@ -6,8 +6,8 @@ import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ProviderCapabilities, ProviderConversationHistoryService, ProviderRegistration } from '@/core/providers/types';
 import { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
-import { WarmExecutionPool } from '@/features/chat/execution/WarmExecutionPool';
 import { SideChatController } from '@/features/chat/side-chat/SideChatController';
+import { captureLatestCompletedForkSource } from '@/features/chat/tabs/forking/ForkSource';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 
 Object.assign(HTMLElement.prototype, {
@@ -60,7 +60,6 @@ export function createHarness(options: {
   supportsEphemeralFork?: boolean;
   forkMode?: ProviderCapabilities['forkMode'];
   buildForkProviderState?: ProviderConversationHistoryService['buildForkProviderState'];
-  getMainAgentDynamicSystemPromptSections?: () => Promise<string[]>;
 } = {}) {
   const backend = new FakeSideBackend();
   const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
@@ -120,13 +119,12 @@ export function createHarness(options: {
   const app = { vault: { adapter: { basePath: '/vault' }, getFiles: () => [] } };
   const settings = options.settings ?? {};
   const plugin = {
+    getSessionSnapshotDirectory: () => '/tmp/claudian-sessions',
     app,
     getConversationSummary(id: string) { return (this as unknown as { getConversationSync: (id: string) => any }).getConversationSync(id); },
     getConversationSync: () => options.providerState ? { id: 'conversation-1', providerId: 'claude', providerState: options.providerState } : null,
-    getMainAgentDynamicSystemPromptSections: options.getMainAgentDynamicSystemPromptSections,
     providerHost: { app, settings, executionLifecycleRegistry: lifecycleRegistry },
     settings,
-    warmExecutionPool: new WarmExecutionPool(() => 5),
   } as never;
 
   const destinationChanges: string[] = [];
@@ -138,9 +136,15 @@ export function createHarness(options: {
     composerEl,
     drafts,
     getInputEl: () => inputEl as never,
-    getTab: () => tab,
+    parent: {
+      get conversationId() { return tab.conversationId; },
+      get providerId() { return tab.providerId; },
+      get isLive() { return true; },
+      get isStreaming() { return tab.state.isStreaming; },
+      get lastMessageId() { return tab.state.messages.at(-1)?.id; },
+      captureForkSource: () => captureLatestCompletedForkSource(tab, plugin, () => true),
+    },
     inputWrapperEl,
-    isRuntimeLive: () => true,
     onDestinationChanged: () => { destinationChanges.push(controller.destination); options.onDestinationChanged?.(); },
     plugin,
   });

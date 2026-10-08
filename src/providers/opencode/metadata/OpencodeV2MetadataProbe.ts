@@ -1,7 +1,8 @@
 import { formatReasoningValueLabel } from '@/core/providers/reasoning';
+import type { SlashCommand } from '@/core/types';
 import { normalizeACPAvailableCommands } from '@/providers/acp';
 
-import { pollOpencodeUntil } from '../http/OpencodeHTTPClient';
+import { OpencodeHTTPError, pollOpencodeUntil } from '../http/OpencodeHTTPClient';
 import type { OpencodeServerLease } from '../http/OpencodeServerService';
 import type {
   OpencodeMetadataCatalogResult,
@@ -25,14 +26,44 @@ export class OpencodeV2MetadataProbe implements OpencodeMetadataProbe {
   async loadCatalog(signal?: AbortSignal): Promise<OpencodeMetadataCatalogResult> {
     const ownedSignal = this.client.signal(signal);
     const models = this.models = await this.loadModels(ownedSignal);
-    const commands = await this.read('command', ownedSignal);
     return {
-      commands: normalizeACPAvailableCommands(commands.filter(isNamedRecord).map(command => ({
-        name: command.name,
-        ...(typeof command.description === 'string' ? { description: command.description } : {}),
-      }))),
+      commands: await this.readCommands(ownedSignal),
       models: modelState(models),
     };
+  }
+
+  async loadCommands(signal?: AbortSignal): Promise<SlashCommand[]> {
+    const ownedSignal = this.client.signal(signal);
+    await this.client.waitForActivation(ownedSignal);
+    return this.readCommands(ownedSignal);
+  }
+
+  private async readCommands(signal: AbortSignal): Promise<SlashCommand[]> {
+    // A fresh native instance lists no commands until its catalog loads; built-ins always follow.
+    const [commands, skills] = await Promise.all([
+      pollOpencodeUntil(async () => (await this.read('command', signal)).filter(isNamedRecord), commands => commands.length > 0, 5_000, signal),
+      // Earlier V2 releases have no skill catalog route.
+      this.read('skill', signal).catch((error: unknown): unknown[] => {
+        if (error instanceof OpencodeHTTPError && error.status === 404) return [];
+        throw error;
+      }),
+    ]);
+    const names = new Set(commands.map(command => command.name));
+    return [
+      ...normalizeACPAvailableCommands(commands.map(command => ({
+        name: command.name,
+        ...(typeof command.description === 'string' ? { description: command.description } : {}),
+      }))).map(command => ({ ...command, kind: 'command' as const })),
+      // V2 lists skills separately; a same-named command takes the slash invocation.
+      ...skills.filter(isNamedRecord).flatMap((skill): SlashCommand[] => typeof skill.id !== 'string' || names.has(skill.id) ? [] : [{
+        id: `opencode-skill:${skill.id}`,
+        name: skill.id,
+        content: '',
+        kind: 'skill',
+        source: 'sdk',
+        ...(typeof skill.description === 'string' ? { description: skill.description } : {}),
+      }]),
+    ];
   }
 
   async warmModel(rawModelId: string, signal?: AbortSignal): Promise<OpencodeMetadataWarmResult> {
@@ -72,7 +103,7 @@ export class OpencodeV2MetadataProbe implements OpencodeMetadataProbe {
       : models.length > 0, 5_000, signal);
   }
 
-  private async read(resource: 'model' | 'command', signal: AbortSignal): Promise<unknown[]> {
+  private async read(resource: 'model' | 'command' | 'skill', signal: AbortSignal): Promise<unknown[]> {
     const result = await this.client.request(`/api/${resource}`, { signal });
     if (!isRecord(result) || !Array.isArray(result.data)) throw new Error('Invalid OpenCode catalog response.');
     return result.data as unknown[];

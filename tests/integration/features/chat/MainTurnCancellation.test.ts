@@ -16,7 +16,7 @@ beforeEach(() => {
 });
 afterEach(() => { jest.restoreAllMocks(); });
 
-test.each(['execution initialization', 'dynamic configuration', 'handoff authority'] as const)(
+test.each(['execution initialization', 'handoff authority'] as const)(
   'Stop during %s prevents a later native handoff', async phase => {
     const native = createHarness();
     await native.coordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
@@ -35,13 +35,6 @@ test.each(['execution initialization', 'dynamic configuration', 'handoff authori
         await release.promise;
         return true;
       };
-    }
-    if (phase === 'dynamic configuration') {
-      Object.assign(input.plugin, { getMainAgentDynamicSystemPromptSections: async () => {
-        started.resolve();
-        await release.promise;
-        return [];
-      } });
     }
     const sending = input.controller.sendMessage({ content: 'Do not execute after Stop' });
     await started.promise;
@@ -68,21 +61,21 @@ test('shutdown cancels a preparing turn and retains its unsent input for the fin
   const native = createHarness();
   await native.coordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
   const session = new TabSession({
-    id: 'tab-1', conversationId: 'conversation-1', providerId: 'claude', draftModel: null, lifecycleState: 'cold',
+    id: 'tab-1', conversationId: 'conversation-1', providerId: 'claude', draftModel: null, lifecycleState: 'open',
   }, native.coordinator);
   const started = deferred<void>();
   const release = deferred<void>();
   const input = createFixture({
     getExecutionCoordinator: () => native.coordinator,
-    turnOwner: session.turns,
+    session,
     isClosing: () => session.lifecycleState === 'closing',
     canStartTurn: () => session.acceptsIntents,
   });
-  Object.assign(input.plugin, { getMainAgentDynamicSystemPromptSections: async () => {
+  input.deps.ensureExecutionInitialized = async () => {
     started.resolve();
     await release.promise;
-    return [];
-  } });
+    return true;
+  };
   const sending = input.controller.sendMessage({ content: 'Retain this unsent input' });
   await started.promise;
   session.pauseIntentAdmission();

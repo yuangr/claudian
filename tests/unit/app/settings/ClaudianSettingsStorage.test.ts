@@ -1,12 +1,12 @@
 import '@/providers';
 
 import { TEST_CODEX_CATALOG } from '@test/helpers/codexModels';
+import { DEFAULT_CLAUDIAN_SETTINGS as DEFAULT_SETTINGS } from '@test/helpers/defaultSettings';
 
 import {
   CLAUDIAN_SETTINGS_PATH,
   ClaudianSettingsStorage
 } from '@/app/settings/ClaudianSettingsStorage';
-import { DEFAULT_CLAUDIAN_SETTINGS as DEFAULT_SETTINGS } from '@/app/settings/defaultSettings';
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import { getClaudeProviderSettings } from '@/providers/claude/settings';
 import {
@@ -47,7 +47,7 @@ describe('ClaudianSettingsStorage', () => {
     mockAdapter.delete.mockResolvedValue(undefined);
     mockGetHostnameKey.mockReturnValue('host-a');
     mockGetLegacyDeviceSettingsKey.mockReturnValue(null);
-    storage = new ClaudianSettingsStorage(mockAdapter);
+    storage = new ClaudianSettingsStorage(mockAdapter, DEFAULT_SETTINGS);
   });
 
   afterEach(() => {
@@ -55,11 +55,12 @@ describe('ClaudianSettingsStorage', () => {
   });
 
   describe('load', () => {
-    it('retires saved directory selections while preserving current settings and provider configuration', async () => {
+    it('retires obsolete saved settings while preserving current settings and provider configuration', async () => {
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
         ...DEFAULT_SETTINGS,
         persistentExternalContextPaths: ['/old/project'],
+        maxWarmAgentProcesses: 7,
         userName: 'Ada',
         providerConfigs: { claude: { loadUserSettings: true } },
       }));
@@ -72,6 +73,8 @@ describe('ClaudianSettingsStorage', () => {
       expect(written.providerConfigs.claude.loadUserSettings).toBe(true);
       expect(loaded).not.toHaveProperty('persistentExternalContextPaths');
       expect(written).not.toHaveProperty('persistentExternalContextPaths');
+      expect(loaded).not.toHaveProperty('maxWarmAgentProcesses');
+      expect(written).not.toHaveProperty('maxWarmAgentProcesses');
     });
 
 
@@ -344,6 +347,20 @@ describe('ClaudianSettingsStorage', () => {
 
       expect(result.enableZenMode).toBe(true);
       expect(JSON.parse(mockAdapter.write.mock.calls.at(-1)![1]).enableZenMode).toBe(true);
+    });
+
+    it.each([
+      ['missing', {}, null],
+      ['docked', { zenModePosition: null }, null],
+      ['moved', { zenModePosition: { x: -0.2, y: 0.375 } }, { x: -0.2, y: 0.375 }],
+      ['malformed', { zenModePosition: { x: '1', y: 0.5 } }, null],
+    ])('loads a %s zen panel position', async (_label, stored, expected) => {
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify(stored));
+
+      const result = await storage.load();
+
+      expect(result.zenModePosition).toEqual(expected);
     });
 
     it('normalizes claude provider CLI paths from loaded data', async () => {
@@ -966,7 +983,7 @@ describe('ClaudianSettingsStorage Linked content migration', () => {
       signalWriteStarted();
       releaseWrite = resolve;
     }));
-    const storage = new ClaudianSettingsStorage(adapter);
+    const storage = new ClaudianSettingsStorage(adapter, DEFAULT_SETTINGS);
 
     let resolved = false;
     const load = storage.load().then((settings) => {
@@ -1000,7 +1017,7 @@ describe('ClaudianSettingsStorage Linked content migration', () => {
       pinnedLinkedContentPaths: [],
       pinnedLinkedNotePaths: ['Notes/Legacy.md'],
     });
-    const storage = new ClaudianSettingsStorage(adapter);
+    const storage = new ClaudianSettingsStorage(adapter, DEFAULT_SETTINGS);
 
     const settings = await storage.load();
 
@@ -1020,7 +1037,7 @@ describe('ClaudianSettingsStorage Linked content migration', () => {
       ],
       pinnedLinkedNotePaths: ['Notes/Legacy.md'],
     });
-    const storage = new ClaudianSettingsStorage(adapter);
+    const storage = new ClaudianSettingsStorage(adapter, DEFAULT_SETTINGS);
 
     const settings = await storage.load();
 
@@ -1032,7 +1049,7 @@ describe('ClaudianSettingsStorage Linked content migration', () => {
 
   it('omits legacy pinned paths from future writes', async () => {
     const adapter = createAdapter({});
-    const storage = new ClaudianSettingsStorage(adapter);
+    const storage = new ClaudianSettingsStorage(adapter, DEFAULT_SETTINGS);
 
     await storage.save({
       ...await storage.load(),

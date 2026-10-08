@@ -4,20 +4,21 @@ import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { buildImageAttachmentFromBase64 } from '@/core/execution/imageAttachment';
+import { extractUserQuery } from '@/core/prompt/promptContext';
+import { resolveToolDiffData } from '@/core/tools/toolDiff';
+
 import { isWriteEditTool } from '../../../core/tools/toolNames';
-import { extractScriptToolCalls, extractToolResultFormat, extractWebSearchResults } from '../../../core/tools/toolResultContent';
 import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo, TurnStats } from '../../../core/types';
 import { createTurnStats, isTokenCount } from '../../../core/types';
-import { extractUserQuery } from '../../../utils/context';
-import { extractDiffData } from '../../../utils/diff';
-import { buildImageAttachmentFromBase64 } from '../../../utils/imageAttachment';
 import { encodePiModelId } from '../models';
+import { getPiCustomMessageDisplayText } from '../normalization/piCustomMessageNormalization';
 import {
   extractPiToolResultText,
   normalizePiToolInput,
   normalizePiToolName,
-  normalizePiToolUseResult,
-} from '../normalizations/piToolNormalization';
+  normalizePiToolResultDetails,
+} from '../normalization/piToolNormalization';
 import type { PiTreeCursor } from '../types';
 import { decodePiRecoveryPrompt } from './PiRecoveryPromptCodec';
 
@@ -522,13 +523,19 @@ function mapPiSessionEntries(
 ): ChatMessage[] {
   const messages: ChatMessage[] = [];
   let turnStartedAt: number | undefined;
+  // An extension message outside a prompted turn starts an automatic response.
+  let promptedTurnOpen = false;
   const stats = new PiTurnStats();
 
   for (const entry of entries) {
     const mapped = mapPiSessionEntry(entry, messages, syntheticIdNamespace);
     if (mapped) {
+      if (entry.type === 'custom_message' && !promptedTurnOpen) mapped.isAutomaticResponse = true;
       const previous = messages[messages.length - 1];
-      if (isAssistantMessageEntry(entry) && canMergeAssistantContinuation(previous, mapped)) {
+      // Results steered into a prompted turn stay in its response, as live output renders them.
+      const continuesResponse = isAssistantMessageEntry(entry)
+        || (entry.type === 'custom_message' && promptedTurnOpen);
+      if (continuesResponse && canMergeAssistantContinuation(previous, mapped)) {
         mergeAssistantContinuation(previous, mapped);
       } else {
         messages.push(mapped);
@@ -537,8 +544,10 @@ function mapPiSessionEntries(
       const nativeMessage = entry.message ?? entry.raw;
       const turnStats = stats.add(entry);
       if (mapped.role === 'user') {
+        promptedTurnOpen = true;
         turnStartedAt = parseTimestamp(nativeMessage.timestamp) ?? parseTimestamp(entry.raw.timestamp);
       } else if (isBoundaryMessage(mapped)) {
+        promptedTurnOpen = false;
         turnStartedAt = undefined;
       } else if (isAssistantMessageEntry(entry)) {
         const stopReason = getString(nativeMessage.stopReason);
@@ -550,7 +559,10 @@ function mapPiSessionEntries(
           messages[messages.length - 1].completedAt = completedAt;
           messages[messages.length - 1].durationSeconds = Math.floor((completedAt - turnStartedAt) / 1_000);
         }
-        if (stopReason && stopReason !== 'toolUse') turnStartedAt = undefined;
+        if (stopReason && stopReason !== 'toolUse') {
+          promptedTurnOpen = false;
+          turnStartedAt = undefined;
+        }
       }
     }
   }
@@ -718,8 +730,25 @@ function mapPiSessionEntry(
     };
   }
 
+  if (entry.type === 'custom_message') {
+    // Extension messages render as notifications, as live output renders them.
+    const content = getPiCustomMessageDisplayText(entry.raw);
+    if (!content) return null;
+    return {
+      content: '',
+      contentBlocks: [{ type: 'task_notification', content }],
+      id: entry.id ?? createSyntheticPiMessageId(
+        'notice',
+        messages.length,
+        syntheticIdNamespace,
+      ),
+      role: 'assistant',
+      timestamp,
+    };
+  }
+
   if (
-    (entry.type === 'branch_summary' || entry.type === 'compactionSummary' || entry.type === 'custom_message')
+    (entry.type === 'branch_summary' || entry.type === 'compactionSummary')
     && entry.raw.display !== false
   ) {
     const content = extractTextContent(entry.raw.content ?? entry.raw.summary ?? entry.raw.message);
@@ -910,18 +939,17 @@ function applyToolResult(messages: ChatMessage[], entry: PiSessionEntry): void {
     const resultMessage = entry.message ?? entry.raw;
     toolCall.status = resultMessage.error === true || resultMessage.isError === true ? 'error' : 'completed';
     toolCall.result = extractPiToolResultText(toolCall.name, resultMessage.result ?? resultMessage.content ?? resultMessage.output);
-    const toolUseResult = normalizePiToolUseResult(toolCall.name, resultMessage, getNestedCallArguments(resultMessage));
-    toolCall.resultFormat = extractToolResultFormat(toolUseResult);
-    const webSearchResults = extractWebSearchResults(toolUseResult);
-    if (webSearchResults) {
-      toolCall.webSearchResults = webSearchResults;
+    const details = normalizePiToolResultDetails(toolCall.name, resultMessage, getNestedCallArguments(resultMessage));
+    toolCall.resultFormat = details?.resultFormat;
+    if (details?.resultImages) toolCall.resultImages = details.resultImages;
+    if (details?.webSearchResults) {
+      toolCall.webSearchResults = details.webSearchResults;
     }
-    const scriptToolCalls = extractScriptToolCalls(toolUseResult);
-    if (scriptToolCalls) {
-      toolCall.scriptToolCalls = scriptToolCalls;
+    if (details?.scriptToolCalls) {
+      toolCall.scriptToolCalls = details.scriptToolCalls;
     }
     if (toolCall.status === 'completed' && isWriteEditTool(toolCall.name)) {
-      const diffData = extractDiffData(toolUseResult, toolCall);
+      const diffData = resolveToolDiffData(details?.diff, toolCall);
       if (diffData) {
         toolCall.diffData = diffData;
       }

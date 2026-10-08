@@ -182,8 +182,6 @@
   box-shadow: none;
   color: var(--text-normal);
   font: inherit;
-  font-size: inherit;
-  line-height: inherit;
 }
 
 .claudian-linked-content-picker-search:hover {
@@ -276,17 +274,11 @@
 .claudian-linked-content-picker-empty {
   color: var(--text-muted);
   font-size: 11px;
-}
-
-.claudian-linked-content-picker-empty {
   padding: 8px;
   text-align: center;
 }
 
 .claudian-message {
-  padding: 10px 14px;
-  border-radius: 8px;
-  max-width: 95%;
   overflow-wrap: break-word;
 }
 
@@ -295,8 +287,8 @@
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  padding: 0;
   align-self: flex-end;
+  max-width: 95%;
 }
 
 .claudian-message-user > .claudian-message-content {
@@ -327,11 +319,9 @@
   flex-shrink: 0;
   content-visibility: auto;
   contain-intrinsic-size: auto 23.5rem;
-  background: transparent;
   align-self: stretch;
   width: 100%;
-  max-width: 100%;
-  border-end-start-radius: 4px;
+  padding: 10px 14px;
   text-align: start;
 }
 
@@ -358,7 +348,6 @@ body.mod-windows .claudian-message-assistant {
 
 .claudian-text-block {
   position: relative;
-  margin: 0;
 }
 
 button.claudian-text-copy-btn {
@@ -425,16 +414,8 @@ button.claudian-text-copy-btn.copied {
   font-family: var(--font-monospace);
 }
 
-.claudian-text-block+.claudian-tool-call {
-  margin-top: 8px;
-}
-
-.claudian-tool-call+.claudian-text-block {
-  margin-top: 8px;
-}
-
 .claudian-message-content p {
-  margin: 0 0 8px 0;
+  margin: 0 0 8px;
 }
 
 .claudian-message-content p:last-child {
@@ -489,16 +470,8 @@ button.claudian-text-copy-btn.copied {
   background: var(--background-modifier-border-hover);
 }
 
-/* Message timestamps and throughput share the toolbar's text size. */
-.claudian-message-timestamp,
-.claudian-response-throughput {
-  font-size: 11px;
-}
-
 .claudian-message-timestamp {
-  margin-top: 6px;
   color: var(--text-faint);
-  line-height: 1.2;
   user-select: none;
   -webkit-user-select: none;
 }
@@ -509,7 +482,6 @@ button.claudian-text-copy-btn.copied {
 
 .claudian-message-images .claudian-message-timestamp {
   flex-basis: 100%;
-  margin-top: 0;
   text-align: end;
 }
 
@@ -574,16 +546,13 @@ button.claudian-work-header:disabled {
   align-items: center;
   gap: 12px;
   margin-top: 8px;
+  /* Keep the row in the message's hover area without shifting the conversation. */
+  opacity: 0;
+  pointer-events: none;
 }
 
 .claudian-message-user > .claudian-user-msg-actions {
   justify-content: flex-end;
-}
-
-/* Keep the row in the message's hover area without shifting the conversation. */
-.claudian-message-actions {
-  opacity: 0;
-  pointer-events: none;
 }
 
 /* Focus reveals the row only from its own buttons: collapsible headers elsewhere in
@@ -633,10 +602,6 @@ button.claudian-work-header:disabled {
 .claudian-message-user:hover .claudian-branch-marker,
 .claudian-message-user:focus-within .claudian-branch-marker {
   opacity: 0;
-}
-
-.claudian-message-actions .claudian-message-timestamp {
-  margin-top: 0;
 }
 
 /* Toolbar text sits in the same 16px box as the action icons. */

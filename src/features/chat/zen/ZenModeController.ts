@@ -1,21 +1,19 @@
 import type { App, EventRef, WorkspaceLeaf } from 'obsidian';
 import { Platform } from 'obsidian';
 
-import { VIEW_TYPE_CLAUDIAN } from '../../../core/types';
-import { scheduleAnimationFrame } from '../../../utils/animationFrame';
-import type { AssembledTabRuntime } from '../tabs/types';
-import type { ZenModeSource } from './types';
-import {
-  captureZenScrollIntent,
-  restoreZenScrollIntent,
-  ZenModePanel,
-  type ZenScrollSnapshot,
-} from './ZenModePanel';
+import { VIEW_TYPE_CLAUDIAN, type ZenModePosition } from '@/core/types';
+import { scheduleAnimationFrame } from '@/features/chat/utils/animationFrame';
+import type { ZenModeSource, ZenPresentationPort, ZenScrollSnapshot } from '@/features/chat/zen/types';
+import { ZenModePanel } from '@/features/chat/zen/ZenModePanel';
 
 export interface ZenModeControllerDeps {
   readonly app: App;
   /** Reads the committed setting. */
   isEnabled(): boolean;
+  /** Reads where the panel was left; null keeps it docked. */
+  getPosition(): ZenModePosition | null;
+  /** Remembers where the user moved the panel. */
+  savePosition(position: ZenModePosition | null): void;
 }
 
 interface ZenAttachment {
@@ -65,6 +63,7 @@ export class ZenModeController {
         // Sidebar collapse flips synchronously; resize follows the toggle animation.
         workspace.on('resize', () => this.reconcile()),
         workspace.on('layout-change', () => this.reconcile()),
+        workspace.on('css-change', () => this.reconcile()),
         workspace.on('active-leaf-change', (leaf) => this.#handleActiveLeafChange(leaf)),
       );
       this.reconcile();
@@ -101,7 +100,7 @@ export class ZenModeController {
     const attachment = this.#attachment;
     if (attachment && attachment.source === target) {
       // The source already placed a replaced runtime; only the bound state changes.
-      attachment.panel.bind(target.getZenRuntime(), target.getZenProviderId());
+      attachment.panel.bind(target.getZenPresentation(), target.getZenProviderId());
       return;
     }
     this.#detach();
@@ -161,7 +160,7 @@ export class ZenModeController {
   }
 
   #isEligible(source: ZenModeSource): boolean {
-    if (!source.getZenRuntime()) return false;
+    if (!source.getZenPresentation()) return false;
     return this.#isInCollapsedSidebar(source.leaf);
   }
 
@@ -192,7 +191,7 @@ export class ZenModeController {
   }
 
   #attach(source: ZenModeSource): void {
-    const runtime = source.getZenRuntime();
+    const runtime = source.getZenPresentation();
     const hostEl = findCentralWorkspaceHost(this.deps.app);
     if (!runtime || !hostEl) return;
 
@@ -200,6 +199,8 @@ export class ZenModeController {
       keymap: this.deps.app.keymap ?? null,
       historyExpanded: this.#historyExpanded.get(source) ?? false,
       onHistoryExpandedChange: expanded => this.#historyExpanded.set(source, expanded),
+      position: this.deps.getPosition(),
+      onPositionChange: position => this.deps.savePosition(position),
     });
     this.#attachment = { source, panel, release: source.attachZenPresentation(panel.slots) };
     panel.bind(runtime, source.getZenProviderId());
@@ -211,7 +212,7 @@ export class ZenModeController {
     if (!attachment) return;
     this.#attachment = null;
     const runtime = attachment.panel.runtime;
-    const scroll = runtime ? captureZenScrollIntent(runtime) : null;
+    const scroll = runtime ? runtime.captureScroll() : null;
     try {
       attachment.release();
     } finally {
@@ -220,13 +221,13 @@ export class ZenModeController {
     if (runtime && scroll) this.#restoreScroll(runtime, scroll);
   }
 
-  #restoreScroll(runtime: AssembledTabRuntime, scroll: ZenScrollSnapshot): void {
-    restoreZenScrollIntent(runtime, scroll);
+  #restoreScroll(runtime: ZenPresentationPort, scroll: ZenScrollSnapshot): void {
+    runtime.restoreScroll(scroll);
     // A reopening sidebar may still be hidden; reapply once it has layout.
     scheduleAnimationFrame(() => {
       if (this.#attachment?.panel.runtime === runtime) return;
-      restoreZenScrollIntent(runtime, scroll);
-    }, runtime.dom.messagesEl.ownerDocument.defaultView);
+      runtime.restoreScroll(scroll);
+    }, runtime.window);
   }
 
 }

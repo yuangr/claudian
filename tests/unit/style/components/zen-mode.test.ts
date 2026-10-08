@@ -5,7 +5,8 @@ import path from 'node:path';
 
 import { fireEvent, within } from '@testing-library/dom';
 
-import { createInputToolbar, type ToolbarCallbacks } from '@/features/chat/ui/InputToolbar';
+import { createInputToolbar } from '@/features/chat/composer/toolbar/InputToolbar';
+import type { ToolbarCallbacks } from '@/features/chat/composer/toolbar/types';
 
 beforeAll(() => {
   Object.assign(HTMLElement.prototype, {
@@ -108,8 +109,11 @@ describe('Zen mode styles', () => {
             </div>
           </div>
           <div class="claudian-zen-side-chat-chip-slot claudian-side-chat-chip-slot">
-            <div class="claudian-side-chat"><div class="claudian-side-chat-status"></div></div>
+            <div class="claudian-side-chat"><div class="claudian-side-chat-status">
+              <button type="button" class="claudian-side-chat-status-toggle">Side chat</button>
+            </div></div>
           </div>
+          <button type="button" class="claudian-zen-grip" aria-label="Move chat panel"></button>
         </div>
       </div>
     `;
@@ -144,7 +148,7 @@ describe('Zen mode styles', () => {
       radius: 'var(--radius-l) var(--radius-l) 0 0',
     });
     // No gap, so the drawer's sides meet the composer's top border.
-    expect(window.getComputedStyle(panel).gap).toBe('0');
+    expect(['', 'normal', '0']).toContain(window.getComputedStyle(panel).gap);
     expect(window.getComputedStyle(panel.querySelector('.claudian-zen-history')!).borderStyle).toBe('');
   });
 
@@ -169,9 +173,13 @@ describe('Zen mode styles', () => {
     strip.classList.replace('claudian-hidden', 'claudian-visible-flex');
     const style = window.getComputedStyle(strip);
     expect(style.display).toBe('flex');
-    // The strip spans the pill edge to edge, over the wrapper's inline padding.
+    const wrapper = composer.querySelector<HTMLElement>('.claudian-input-wrapper')!;
+    const inset = window.getComputedStyle(wrapper).getPropertyValue('padding-inline');
+    expect(inset).not.toBe('');
+    // jsdom retains var() expressions. Both offsets must derive from the wrapper's inset
+    // so the strip stays edge to edge when that inset changes.
     expect({ basis: style.flexBasis, margin: style.getPropertyValue('margin-inline') })
-      .toEqual({ basis: 'calc(100% + 12px)', margin: '-6px' });
+      .toEqual({ basis: `calc(100% + 2 * ${inset})`, margin: `calc(-1 * ${inset})` });
   });
 
   it('drops the header line while expanded so the transcript meets the composer', () => {
@@ -326,13 +334,54 @@ describe('Zen mode styles', () => {
     }).toEqual({ backgroundColor: 'rgba(0, 0, 0, 0)', borderStyle: '', boxShadow: '' });
   });
 
-  // Nothing renders behind the panel, so translucent themes cannot show notes through it.
-  it('reserves the panel height below the central workspace content', () => {
+  it('targets floating surfaces and controls while letting note clicks through layout wrappers', () => {
     const panel = renderPanel();
-    expect(window.getComputedStyle(panel.parentElement!).paddingBottom)
-      .toContain('var(--claudian-zen-reserved-height');
+    const pointerEvents = (el: Element) => window.getComputedStyle(el).pointerEvents;
+    expect(pointerEvents(panel)).toBe('none');
+    for (const selector of [
+      '.claudian-zen-composer',
+      '.claudian-zen-side-chat-chip-slot',
+      '.claudian-zen-side-chat-chip-slot .claudian-side-chat',
+    ]) {
+      expect([selector, pointerEvents(panel.querySelector(selector)!)]).toEqual([selector, 'none']);
+    }
+    for (const selector of [
+      '.claudian-zen-drawer',
+      '.claudian-zen-disclosure',
+      '.claudian-input-composer',
+      '.claudian-composer-editor',
+      '.claudian-side-chat-status',
+      '.claudian-zen-grip',
+    ]) {
+      expect([selector, pointerEvents(panel.querySelector(selector)!)]).toEqual([selector, 'auto']);
+    }
+    fireEvent.click(within(panel).getByRole('button', { name: /^Model:/ }));
+    expect(pointerEvents(within(panel).getByRole('dialog', { name: 'Model options' }))).toBe('auto');
+  });
+
+  it('floats over the central workspace content without reserving a strip below it', () => {
+    const panel = renderPanel();
+    expect(window.getComputedStyle(panel.parentElement!).paddingBottom).toBe('');
     for (const selector of ['.cm-scroller', '.markdown-preview-view']) {
       expect(window.getComputedStyle(panel.parentElement!.querySelector(selector)!).paddingBottom).toBe('');
+    }
+  });
+
+  it('subtracts status-bar clearance from the available panel height', () => {
+    // jsdom cannot lay out the history, but this guards the TS/CSS property contract used to shrink it.
+    expect(window.getComputedStyle(renderPanel()).maxHeight).toContain('var(--claudian-zen-bottom-clearance, 0px)');
+  });
+
+  // Notes render behind the floating surfaces, so translucent themes must not show through them.
+  it('backs every floating surface with an opaque color', () => {
+    const panel = renderPanel();
+    for (const selector of [
+      '.claudian-zen-drawer',
+      '.claudian-zen-composer > .claudian-input-composer',
+      '.claudian-zen-side-chat-chip-slot .claudian-side-chat-status',
+    ]) {
+      expect(window.getComputedStyle(panel.querySelector(selector)!).backgroundColor)
+        .toBe('var(--background-secondary)');
     }
   });
 });

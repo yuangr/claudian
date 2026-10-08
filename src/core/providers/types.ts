@@ -1,10 +1,9 @@
-import type { CursorContext } from '../../utils/editor';
-import type { SharedAppStorage } from '../bootstrap/storage';
+import type { CursorContext } from '@/core/prompt/editorContext';
+
 import type {
   ProviderExecutionBackend,
   ProviderExecutionTransitionScope,
 } from '../execution';
-import type { VaultFileAdapter } from '../storage/VaultFileAdapter';
 import type {
   AskUserAnswers,
   AuxiliaryContinuityReset,
@@ -14,6 +13,7 @@ import type {
   SubagentInfo,
   SubagentProgress,
   ToolCallInfo,
+  ToolProviderPayload,
 } from '../types';
 import type { ProviderId } from '../types/provider';
 import type { ProviderCommandCatalog } from './commands/ProviderCommandCatalog';
@@ -26,6 +26,8 @@ export type { ProviderId } from '../types/provider';
 export interface ProviderCapabilities {
   providerId: ProviderId;
   supportsNativeHistory: boolean;
+  /** Tab presence may start a shared runtime without creating a session, thread, or turn. */
+  startsSharedRuntimeOnTabPresence?: boolean;
   /** Can execute without saving native conversation history, including clarification turns. */
   supportsEphemeralSessions: boolean;
   supportsRewind: boolean;
@@ -121,13 +123,6 @@ export interface ProviderSettingsReconciler {
 // App-level service interfaces
 // ---------------------------------------------------------------------------
 
-/** Tab manager state persisted across restarts. */
-export interface AppTabManagerState {
-  openTabs: Array<{ tabId: string; conversationId: string | null; draftModel?: string; providerId?: ProviderId | null }>;
-  activeTabId: string | null;
-  expandedTitleTabIds?: string[];
-}
-
 /** Provider-neutral session metadata storage. */
 export interface SessionMetadataListOptions {
   /** Receives successful reads incrementally. Batches may follow completion order. */
@@ -148,8 +143,8 @@ export interface SessionMetadataScanResult {
 //
 // These remain here as standalone types so app-level settings/chat code can
 // depend on stable provider workspace contracts without importing concrete
-// provider implementations. They are NOT part of the shared bootstrap storage
-// contract (`SharedAppStorage`).
+// provider implementations. They are NOT part of the provider-facing host
+// storage contract (`ProviderHostStorage`).
 // ---------------------------------------------------------------------------
 
 export interface AppCommandStorage {
@@ -366,6 +361,7 @@ export interface ProviderCommandLoader {
 }
 
 export interface ProviderWorkspaceServices {
+  startRuntime?(): Promise<void>;
   onAgentSkillsChanged?(): Promise<void> | void;
   commandCatalog?: ProviderCommandCatalog | null;
   cliResolver?: ProviderCLIResolver | null;
@@ -416,8 +412,6 @@ export interface ProviderSettingsTabRenderer {
 
 export interface ProviderWorkspaceInitContext {
   plugin: ProviderHost;
-  storage: SharedAppStorage;
-  vaultAdapter: VaultFileAdapter;
   transitionScope: ProviderExecutionTransitionScope;
 }
 
@@ -528,6 +522,8 @@ export interface ProviderSubagentHistoryService {
 }
 
 export interface ProviderHistoryPathContext {
+  /** Initialize provider-owned resources lazily when native history needs them. */
+  ensureWorkspace?: () => Promise<void>;
   environment: NodeJS.ProcessEnv;
   hostPlatform?: NodeJS.Platform;
   settings?: Record<string, unknown>;
@@ -564,13 +560,21 @@ export interface ProviderTaskResultContext {
   agentId?: string;
 }
 
-/** Native task formats and output recovery stay behind this provider boundary. */
+/**
+ * Native task formats and output recovery stay behind this provider boundary. `providerPayload`
+ * is the payload the same provider attached to the task tool's result; only its owner reads it.
+ */
 export interface ProviderTaskResultInterpreter {
   describeTask(input: Readonly<Record<string, unknown>>): ProviderTaskDescription;
-  interpretLaunch(result: unknown, isError: boolean, toolUseResult?: unknown): ProviderTaskLaunch;
+  interpretLaunch(result: unknown, isError: boolean, providerPayload?: ToolProviderPayload): ProviderTaskLaunch;
   /** Correlate native input/output without recovering result files. */
   getOutputTaskId(input: Readonly<Record<string, unknown>> | undefined, result?: unknown): string | null;
-  interpretResult(result: unknown, isError: boolean, context: ProviderTaskResultContext, toolUseResult?: unknown): ProviderTaskResult;
+  interpretResult(
+    result: unknown,
+    isError: boolean,
+    context: ProviderTaskResultContext,
+    providerPayload?: ToolProviderPayload,
+  ): ProviderTaskResult;
 }
 
 export interface ProviderSubagentLaunchResult {

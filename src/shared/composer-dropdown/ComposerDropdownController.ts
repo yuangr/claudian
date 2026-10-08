@@ -79,7 +79,8 @@ export class ComposerDropdownController {
     } else {
       for (const source of this.sources) {
         const match = source.match(this.inputEl.value, cursor);
-        if (match && (!sourceMatch || match.start > sourceMatch.match.start)) {
+        if (match && !this.inputEl.isChipRange?.(match.start, match.end)
+          && (!sourceMatch || match.start > sourceMatch.match.start)) {
           sourceMatch = { match, source };
         }
       }
@@ -89,9 +90,11 @@ export class ComposerDropdownController {
       return;
     }
     const { match, source } = sourceMatch;
-    if (this.activeSource?.id !== source.id) this.activeFolder = null;
+    const opening = this.activeSource?.id !== source.id;
+    if (opening) this.activeFolder = null;
     this.activeSource = source;
     this.activeMatch = match;
+    if (opening) source.onOpen?.();
     this.#requestActiveLoad(inputDriven);
   }
 

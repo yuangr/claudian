@@ -10,7 +10,7 @@ import { Component, MarkdownRenderer } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ChatMessage } from '@/core/types';
-import { ConversationController } from '@/features/chat/controllers/ConversationController';
+import { ConversationController } from '@/features/chat/conversation/ConversationController';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { createResponseTextBlock } from '@/features/chat/rendering/ResponseLayout';
 import { createThinkingBlock, finalizeThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
@@ -56,9 +56,14 @@ beforeEach(() => {
   });
 });
 
-it('collapses completed history above the answer and puts copy, fork, time below it', async () => {
+it.each([false, true])('collapses completed history above the answer and puts copy, fork, time below it (compaction: %s)', async compaction => {
   const { renderer, messagesEl, fork } = setup();
-  renderer.renderMessages(messages, () => 'Hello');
+  const historyMessages: ChatMessage[] = [...messages];
+  if (compaction) historyMessages.splice(2, 0, {
+    id: 'compact', role: 'assistant', content: '', timestamp: testDate().getTime(),
+    contentBlocks: [{ type: 'context_compacted' }],
+  });
+  renderer.renderMessages(historyMessages, () => 'Hello');
   await Promise.resolve();
   const header = within(messagesEl).getByRole('button', { name: 'Worked for 01:05' });
   expect(header.hasAttribute('aria-label')).toBe(false);
@@ -68,6 +73,7 @@ it('collapses completed history above the answer and puts copy, fork, time below
   expect(history.hidden).toBe(true);
   expect(history.textContent).toContain('Checking the code.');
   expect(history.textContent).toContain('Check the edge case.');
+  expect(history.contains(within(messagesEl).queryByText('Conversation compacted'))).toBe(compaction);
   expect(history.textContent).not.toContain('Fixed the bug.');
   fireEvent.click(header);
   expect(history.hidden).toBe(false);
@@ -659,7 +665,7 @@ it('previews a branch without saving it and restores history when focus leaves t
     { navigationSidebar: { setOnScrollIntent: jest.fn() }, composerDropdown: { handleInputChange: jest.fn() } } as any,
     { conversationController: controller, sideChatController: { handleComposerInput: jest.fn() } } as any,
     { plugin, registerCleanup: (_name: string, fn: () => void) => cleanup.push(fn) } as any,
-    { requirePublished: () => ({ lifecycleState: 'warm', session: { claimUserOwnership: jest.fn() } }) } as any);
+    { requirePublished: () => ({ lifecycleState: 'open', session: { claimUserOwnership: jest.fn() } }) } as any);
   renderer.renderMessages(history, () => 'Hello');
   fireEvent.click(within(messagesEl).getByRole('button', { name: 'Branch from this prompt' }));
   await new Promise(resolve => setTimeout(resolve, 0));

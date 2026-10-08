@@ -1,4 +1,5 @@
-import type { UsageInfo } from '../../../core/types';
+import type { UsageInfo } from '@/core/types';
+import { cleanupThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
 import type {
   ChatActivity,
   ChatMessage,
@@ -10,15 +11,22 @@ import type {
   TabReviewOutcome,
   ThinkingBlockState,
   WriteEditState,
-} from './types';
+} from '@/features/chat/state/types';
+import { mergeReportedUsage } from '@/features/chat/state/usageInfo';
+import type { TurnActivity } from '@/features/chat/turns/TurnCoordinator';
+
+/** Presentation without a foreground turn owner, such as replayed background output. */
+const NO_TURN_ACTIVITY: TurnActivity = Object.freeze({
+  isInFlight: false,
+  cancelRequested: false,
+  streamGeneration: 0,
+  subscribe: () => () => undefined,
+});
 
 function createInitialState(): ChatStateData {
   return {
     messages: [],
-    isStreaming: false,
-    cancelRequested: false,
-    streamGeneration: 0,
-    isCreatingConversation: false,
+    isResettingToNewChat: false,
     isSwitchingConversation: false,
     isRewinding: false,
     hasPendingConversationSave: false,
@@ -35,7 +43,6 @@ function createInitialState(): ChatStateData {
     writeEditStates: new Map(),
     pendingTools: new Map(),
     usage: null,
-    ignoreUsageUpdates: false,
     attention: null,
     autoScrollEnabled: true, // Default; controllers will override based on settings
     responseStartTime: null,
@@ -53,15 +60,26 @@ export class ChatState {
   } | null = null;
   /** Null derives activity from the latest message after transcript changes. */
   #activity: ChatActivity | null = null;
+  #waitingStatus: string | null = null;
   readonly #activityListeners = new Set<() => void>();
   /** Last transcript scroll offset seen while laid out; a hidden scroller reports zero. */
   readingScrollTop = 0;
   private thinkingIndicatorTimeoutWindow: Window | null = null;
   private flavorTimerIntervalWindow: Window | null = null;
 
-  constructor(callbacks: ChatStateCallbacks = {}, private readonly conversationIdentity?: { get(): string | null; set(id: string | null): void }) {
+  #wasStreaming = false;
+  #queuedMessageClaimed = false;
+  #transitionWriterClaimed = false;
+
+  constructor(
+    callbacks: ChatStateCallbacks = {},
+    private readonly conversationIdentity?: { get(): string | null; set(id: string | null): void },
+    /** The single owner of foreground turn state; presentation only derives from it. */
+    private readonly turnActivity: TurnActivity = NO_TURN_ACTIVITY,
+  ) {
     this.state = createInitialState();
     this._callbacks = callbacks;
+    turnActivity.subscribe(() => this.#onTurnActivityChanged());
   }
 
   // ============================================
@@ -115,6 +133,17 @@ export class ChatState {
     this.#notifyActivity();
   }
 
+  /** Label of the visible waiting indicator, so other presentations can mirror it. */
+  get waitingStatus(): string | null {
+    return this.#waitingStatus;
+  }
+
+  set waitingStatus(value: string | null) {
+    if (value === this.#waitingStatus) return;
+    this.#waitingStatus = value;
+    this.#notifyActivity();
+  }
+
   /** Listeners must stay cheap; they run for every recorded chunk. */
   subscribeActivity(listener: () => void): () => void {
     this.#activityListeners.add(listener);
@@ -127,56 +156,39 @@ export class ChatState {
   // Streaming Control
   // ============================================
 
+  /** Derived from the turn owner: a response is admitted and not yet settled. */
   get isStreaming(): boolean {
-    return this.state.isStreaming;
-  }
-
-  set isStreaming(value: boolean) {
-    this.state.isStreaming = value;
-    this._callbacks.onStreamingStateChanged?.(value);
-    this.#notifyActivity();
+    return this.turnActivity.isInFlight;
   }
 
   get cancelRequested(): boolean {
-    return this.state.cancelRequested;
-  }
-
-  set cancelRequested(value: boolean) {
-    this.state.cancelRequested = value;
+    return this.turnActivity.cancelRequested;
   }
 
   get streamGeneration(): number {
-    return this.state.streamGeneration;
+    return this.turnActivity.streamGeneration;
   }
 
-  bumpStreamGeneration(): number {
-    this.state.streamGeneration += 1;
-    return this.state.streamGeneration;
-  }
-
-  get isCreatingConversation(): boolean {
-    return this.state.isCreatingConversation;
-  }
-
-  set isCreatingConversation(value: boolean) {
-    this.state.isCreatingConversation = value;
+  get isResettingToNewChat(): boolean {
+    return this.state.isResettingToNewChat;
   }
 
   get isSwitchingConversation(): boolean {
     return this.state.isSwitchingConversation;
   }
 
-  set isSwitchingConversation(value: boolean) {
-    this.state.isSwitchingConversation = value;
-  }
-
   get isRewinding(): boolean {
     return this.state.isRewinding;
   }
 
-  set isRewinding(value: boolean) {
-    this.state.isRewinding = value;
-    this._callbacks.onRewindingStateChanged?.(value);
+  /** ConversationController is the only writer of navigation transition state. */
+  claimTransitionWriter(): (key: 'isResettingToNewChat' | 'isSwitchingConversation' | 'isRewinding', value: boolean) => void {
+    if (this.#transitionWriterClaimed) throw new Error('Conversation transitions already have an owner.');
+    this.#transitionWriterClaimed = true;
+    return (key, value) => {
+      this.state[key] = value;
+      if (key === 'isRewinding') this._callbacks.onRewindingStateChanged?.(value);
+    };
   }
 
   get hasPendingConversationSave(): boolean {
@@ -209,8 +221,11 @@ export class ChatState {
     return this.state.queuedMessage;
   }
 
-  set queuedMessage(value: QueuedMessage | null) {
-    this.state.queuedMessage = value;
+  /** The tab's turn queue is the single writer; a second claim is a wiring error. */
+  claimQueuedMessageWriter(): (value: QueuedMessage | null) => void {
+    if (this.#queuedMessageClaimed) throw new Error('The queued message already has an owner.');
+    this.#queuedMessageClaimed = true;
+    return value => { this.state.queuedMessage = value; };
   }
 
   // ============================================
@@ -298,12 +313,8 @@ export class ChatState {
     this._callbacks.onUsageChanged?.(value);
   }
 
-  get ignoreUsageUpdates(): boolean {
-    return this.state.ignoreUsageUpdates;
-  }
-
-  set ignoreUsageUpdates(value: boolean) {
-    this.state.ignoreUsageUpdates = value;
+  reportUsage(next: UsageInfo): void {
+    this.usage = mergeReportedUsage(this.usage, next);
   }
 
   // ============================================
@@ -408,6 +419,15 @@ export class ChatState {
   // Reset Methods
   // ============================================
 
+  resetStreamingPresentation(): void {
+    cleanupThinkingBlock(this.currentThinkingState);
+    this.currentContentEl = null;
+    this.currentTextEl = null;
+    this.currentTextContent = '';
+    this.currentThinkingState = null;
+    this.responseStartTime = null;
+  }
+
   setThinkingIndicatorTimeout(value: number | null, ownerWindow: Window | null): void {
     this.state.thinkingIndicatorTimeout = value;
     this.thinkingIndicatorTimeoutWindow = value === null ? null : ownerWindow;
@@ -434,6 +454,14 @@ export class ChatState {
       this.state.flavorTimerInterval = null;
       this.flavorTimerIntervalWindow = null;
     }
+  }
+
+  #onTurnActivityChanged(): void {
+    const isStreaming = this.isStreaming;
+    if (isStreaming === this.#wasStreaming) return;
+    this.#wasStreaming = isStreaming;
+    this._callbacks.onStreamingStateChanged?.(isStreaming);
+    this.#notifyActivity();
   }
 
   #resetActivity(): void {

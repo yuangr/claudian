@@ -1,15 +1,15 @@
-import {
-  cancelSelectedDestinationTurn,
-  sendTabInputMessageFromEnterKey,
-  sendTabInputMessageFromExplicitEnterShortcut,
-} from '../TabInputEvents';
-import { commitProvisionalTab } from '../TabLifecycle';
-import type { TabControllers, TabInputBindings, TabUIComponents } from '../types';
 import type {
   PublishedTabRuntimeRef,
   TabRuntimeConstructionContext,
   TabRuntimeShellBundle,
-} from './TabRuntimeConstruction';
+} from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
+import {
+  cancelSelectedDestinationTurn,
+  sendTabInputMessageFromEnterKey,
+  sendTabInputMessageFromExplicitEnterShortcut,
+} from '@/features/chat/tabs/TabInputEvents';
+import { commitProvisionalTab } from '@/features/chat/tabs/TabLifecycle';
+import type { TabControllers, TabInputBindings, TabUIComponents } from '@/features/chat/tabs/types';
 
 export function buildTabRuntimeInputBindings(
   shell: TabRuntimeShellBundle,
@@ -28,13 +28,15 @@ export function buildTabRuntimeInputBindings(
       return;
     }
 
-    if (controllers.inputController.handleResumeKeydown(event)) {
+    if (controllers.builtInCommandController.handleResumeKeydown(event)) {
       return;
     }
 
     if (ui.composerDropdown.handleKeydown(event)) {
       return;
     }
+
+    if (ui.promptSuggestion.handleKeydown(event)) return;
 
     if (event.key === 'Escape' && !event.isComposing) {
       if (cancelSelectedDestinationTurn(tab)) {
@@ -92,6 +94,20 @@ export function buildTabRuntimeInputBindings(
   options.registerCleanup('tab scroll navigation binding', () => {
     ui.navigationSidebar.setOnScrollIntent(null);
   });
+
+  let isPointerHeld = false;
+  const isScrollbarPress = (event: PointerEvent): boolean => {
+    if (event.target !== dom.messagesEl) return false;
+    const scrollbarWidth = dom.messagesEl.offsetWidth - dom.messagesEl.clientWidth;
+    if (scrollbarWidth <= 0 || dom.messagesEl.scrollHeight <= dom.messagesEl.clientHeight) return false;
+    const bounds = dom.messagesEl.getBoundingClientRect();
+    const pointerX = event.clientX - bounds.left;
+    const direction = dom.messagesEl.ownerDocument.defaultView
+      ?.getComputedStyle?.(dom.messagesEl).direction;
+    return direction === 'rtl'
+      ? pointerX <= scrollbarWidth
+      : pointerX >= bounds.width - scrollbarWidth;
+  };
 
   const nativeBoundaryScrollKeys = new Set(['end', 'home']);
   const nativePageScrollKeys = new Set(['pagedown', 'pageup']);
@@ -155,17 +171,12 @@ export function buildTabRuntimeInputBindings(
     }
     if (event.type === 'pointerdown') {
       const pointerEvent = event as PointerEvent;
-      if (pointerEvent.target !== dom.messagesEl) return;
-      const scrollbarWidth = dom.messagesEl.offsetWidth - dom.messagesEl.clientWidth;
-      if (scrollbarWidth <= 0 || dom.messagesEl.scrollHeight <= dom.messagesEl.clientHeight) return;
-      const bounds = dom.messagesEl.getBoundingClientRect();
-      const pointerX = pointerEvent.clientX - bounds.left;
-      const direction = dom.messagesEl.ownerDocument.defaultView
-        ?.getComputedStyle?.(dom.messagesEl).direction;
-      const isInScrollbarGutter = direction === 'rtl'
-        ? pointerX <= scrollbarWidth
-        : pointerX >= bounds.width - scrollbarWidth;
-      if (!isInScrollbarGutter) return;
+      // Scrollbar presses and middle-button autoscroll scroll without further input events.
+      if (pointerEvent.button !== 1 && !isScrollbarPress(pointerEvent)) {
+        // A held press can drag-select past the edge, which also scrolls the transcript.
+        isPointerHeld = true;
+        return;
+      }
     }
     navigationScrollIntent = null;
     state.autoScrollEnabled = false;
@@ -185,6 +196,21 @@ export function buildTabRuntimeInputBindings(
     }
   });
 
+  // The pointer can be released outside the transcript.
+  const pointerDocument = dom.messagesEl.ownerDocument;
+  const pointerReleaseEvents = ['pointerup', 'pointercancel'] as const;
+  const pointerReleaseHandler = () => {
+    isPointerHeld = false;
+  };
+  for (const eventName of pointerReleaseEvents) {
+    pointerDocument.addEventListener(eventName, pointerReleaseHandler, { capture: true, passive: true });
+  }
+  options.registerCleanup('tab pointer release binding', () => {
+    for (const eventName of pointerReleaseEvents) {
+      pointerDocument.removeEventListener(eventName, pointerReleaseHandler, { capture: true });
+    }
+  });
+
   const scrollHandler = () => {
     if (dom.messagesEl.clientHeight > 0) state.readingScrollTop = dom.messagesEl.scrollTop;
     if (!isAutoScrollAllowed()) {
@@ -197,7 +223,8 @@ export function buildTabRuntimeInputBindings(
 
     if (!isMessagesAtBottom()) {
       navigationScrollIntent = null;
-      state.autoScrollEnabled = false;
+      // Layout changes also emit scroll events; only user intent should pause following.
+      if (isPointerHeld) state.autoScrollEnabled = false;
       return;
     }
 

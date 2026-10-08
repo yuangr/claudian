@@ -5,9 +5,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
+import { capturedSelectionPrompt, capturedSelections } from '@test/helpers/capturedSelections';
 import { claudeCatalogFixture } from '@test/helpers/claudeModels';
 import { createProviderRecoveryTestHarness } from '@test/helpers/features/chat/ProviderRecoveryTestHarness';
-import { testTime } from '@test/helpers/testClock';
+import { testDate, testTime } from '@test/helpers/testClock';
 
 import {
   type ProviderExecutionEvent,
@@ -22,6 +23,7 @@ import { ProviderModelUnavailableError } from '@/core/providers/models/ProviderM
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import type { ClaudianSettings } from '@/core/types';
 type MutableTestHost = ProviderHost & { settings: ClaudianSettings };
+import * as env from '@/core/process/env';
 import type { Conversation } from '@/core/types';
 import { createClaudeWorkspaceServices } from '@/providers/claude/app/ClaudeWorkspaceServices';
 import { ClaudeExecutionBackend } from '@/providers/claude/execution/ClaudeExecutionBackend';
@@ -30,8 +32,7 @@ import { ClaudeConversationHistoryService } from '@/providers/claude/history/Cla
 import * as historyStore from '@/providers/claude/history/ClaudeHistoryStore';
 import { assertClaudeModelAvailable } from '@/providers/claude/runtime/ClaudeModelAvailability';
 import { buildClaudeSDKUserMessage } from '@/providers/claude/runtime/ClaudeUserMessageFactory';
-import { getClaudeProviderSettings } from '@/providers/claude/settings';
-import * as env from '@/utils/env';
+import { getClaudeProviderSettings, updateClaudeProviderSettings } from '@/providers/claude/settings';
 
 jest.mock('@/providers/claude/runtime/ClaudeUserMessageFactory', () => {
   const actual = jest.requireActual('@/providers/claude/runtime/ClaudeUserMessageFactory');
@@ -70,6 +71,7 @@ const sdkMock = sdkModule as unknown as {
     }>,
   ) => void;
   setMockSupportedModels: (models: sdkModule.ModelInfo[]) => void;
+  setMockOutputStyles: (styles: string[]) => void;
   setMockContextUsage: (
     contextUsage: { rawMaxTokens: number } | null,
   ) => void;
@@ -407,11 +409,11 @@ describe('ClaudeExecutionBackend', () => {
       }),
       notifyProviderChatOptionsChanged: jest.fn(),
     });
-    const services = await createClaudeWorkspaceServices(host, { commandProbe: async () => [], modelProbe: jest.fn() });
+    const services = await createClaudeWorkspaceServices(host, { commandProbe: async () => [], catalogProbe: jest.fn() });
     const publications: Array<Promise<void>> = [];
     const backend = new ClaudeExecutionBackend(host, {
-      publishSessionModels: models => {
-        const publication = services.publishSessionModels(models);
+      publishSessionCatalog: catalog => {
+        const publication = services.publishSessionCatalog(catalog);
         publications.push(publication);
         return publication;
       },
@@ -449,9 +451,52 @@ describe('ClaudeExecutionBackend', () => {
     }
   });
 
+  it('writes live session output styles back once while keeping the stored model list', async () => {
+    const host = createHost();
+    const registry = new ProviderExecutionLifecycleRegistry();
+    let writes = 0;
+    Object.assign(host, {
+      executionLifecycleRegistry: registry,
+      mutateSettingsConditionally: jest.fn(async (mutation: (settings: ClaudianSettings) => Promise<boolean> | boolean) => {
+        if (await mutation(host.settings)) writes += 1;
+      }),
+      notifyProviderChatOptionsChanged: jest.fn(),
+    });
+    const services = await createClaudeWorkspaceServices(host, { commandProbe: async () => [], catalogProbe: jest.fn() });
+    const publications: Array<Promise<void>> = [];
+    const backend = new ClaudeExecutionBackend(host, {
+      publishSessionCatalog: catalog => {
+        const publication = services.publishSessionCatalog(catalog);
+        publications.push(publication);
+        return publication;
+      },
+    });
+    const storedModels = getClaudeProviderSettings(host.settings).discoveredModels;
+    sdkMock.setMockOutputStyles(['default', 'Concise', 'My Style']);
+
+    try {
+      for (let sessionIndex = 1; sessionIndex <= 2; sessionIndex += 1) {
+        const session = backend.createSession(createConfig());
+        await collectEvents(session.execute(createRequest()).events);
+        await waitFor(() => publications.length === sessionIndex);
+        await Promise.all(publications);
+        await session.dispose();
+        expect(writes).toBe(1);
+      }
+      expect(getClaudeProviderSettings(host.settings)).toMatchObject({
+        discoveredOutputStyles: ['default', 'Concise', 'My Style'],
+        discoveredModels: storedModels,
+      });
+    } finally {
+      await services.dispose();
+      await registry.dispose();
+    }
+  });
+
   it('creates a persistent session that normalizes SDK output and publishes commands', async () => {
     sdkMock.setMockSupportedCommands([
       { name: 'review', description: 'Review changes', argumentHint: '[path]' },
+      { name: 'pdf', description: 'Work with PDFs', argumentHint: '' },
     ]);
     sdkMock.setMockMessages([
       {
@@ -459,6 +504,7 @@ describe('ClaudeExecutionBackend', () => {
         subtype: 'init',
         session_id: 'native-session',
         agents: ['Explore'],
+        skills: ['documents:pdf'],
       },
       {
         type: 'stream_event',
@@ -535,6 +581,16 @@ describe('ClaudeExecutionBackend', () => {
         argumentHint: '[path]',
         content: '',
         source: 'sdk',
+        kind: 'command',
+      },
+      {
+        id: 'sdk:pdf',
+        name: 'pdf',
+        description: 'Work with PDFs',
+        argumentHint: '',
+        content: '',
+        source: 'sdk',
+        kind: 'skill',
       },
     ]);
   });
@@ -751,6 +807,41 @@ describe('ClaudeExecutionBackend', () => {
     },
   );
 
+  it.each([
+    ['/compact', '/compact'],
+    [' \t/CoMpAcT keep recent edits\nFocus on tests  ', '/compact keep recent edits\nFocus on tests'],
+  ])('compacts with only explicit instructions from %j', async (text, command) => {
+    const session = new ClaudeExecutionBackend(createHost()).createSession(createConfig());
+    try {
+      const events = await collectEvents(session.execute(createRequest({
+        input: [{ type: 'text', text }, { type: 'image', image: {
+          id: 'capture', name: 'capture.png', data: 'aW1hZ2U=',
+          mediaType: 'image/png', size: 5, source: 'paste',
+        } }],
+        context: { ...capturedSelections, linkedContent: { path: 'note.md' },
+          sessionReferences: [{ id: 'ref', title: 'Review', providerId: 'claude', updatedAt: 'updated', snapshotPath: '/tmp/ref.md' }],
+        },
+      })).events);
+      expect(mockBuildClaudeSDKUserMessage.mock.results[0]?.value.message.content).toBe(command);
+      expect(events.at(-1)?.type).toBe('turn_completed');
+    } finally { await session.dispose(); }
+  });
+
+  it('rejects compact without consuming history that still needs recovery', async () => {
+    const session = new ClaudeExecutionBackend(createHost()).createSession(createConfig());
+    const conversationHistory = [{ id: 'prior', role: 'user' as const, content: 'Remember prior context', timestamp: testDate().getTime() }];
+    try {
+      const events = await collectEvents(session.execute(createRequest({
+        input: [{ type: 'text', text: '/compact' }], conversationHistory,
+      })).events);
+      expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining('normal message') });
+      expect(getEncodedPrompts()).toEqual([]);
+      await collectEvents(session.execute(createRequest({ conversationHistory })).events);
+      expect(getEncodedPrompts()[0]).toContain('Remember prior context');
+      expect(getEncodedPrompts()[0]).toContain('Hello');
+    } finally { await session.dispose(); }
+  });
+
   it('maps images and structured context without injecting legacy MCP configuration', async () => {
     sdkMock.setMockMessages([
       { type: 'result', subtype: 'success' },
@@ -774,9 +865,12 @@ describe('ClaudeExecutionBackend', () => {
         },
       ],
       context: {
+        ...capturedSelections,
+        sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }],
         linkedContent: { path: 'note.md' },
       },
       configuration: {
+        readableRoots: ['/tmp/claudian-sessions'],
         systemInstructions: { kind: 'provider-default' },
       },
       toolPolicy: { kind: 'allow-list', names: ['Read', 'Grep'] },
@@ -788,19 +882,20 @@ describe('ClaudeExecutionBackend', () => {
         type: 'image',
         source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' },
       },
-      { type: 'text', text: '@mentioned Explain this\n\n<linked_content path="note.md" />' },
+      { type: 'text', text: '@mentioned Explain this\n\n<linked_content path="note.md" />\n\n' + capturedSelectionPrompt + '\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>' },
     ]);
     expect(getEncodedPrompts()).toEqual([
-      '@mentioned Explain this\n\n<linked_content path="note.md" />',
+      '@mentioned Explain this\n\n<linked_content path="note.md" />\n\n' + capturedSelectionPrompt + '\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>',
     ]);
     expect(sdkMock.getLastOptions()).toEqual(expect.objectContaining({
       cwd: '/vault',
+      additionalDirectories: ['/tmp/claudian-sessions'],
       tools: ['Read', 'Grep'],
     }));
     expect(sdkMock.getLastOptions()?.mcpServers).toBeUndefined();
   });
 
-  it('passes provider-default dynamic sections through a non-snapshotted custom system prompt', async () => {
+  it('sends the provider-default prompt as a non-snapshotted custom system prompt', async () => {
     sdkMock.setMockMessages([
       { type: 'result', subtype: 'success' },
     ], { appendResult: false });
@@ -808,25 +903,14 @@ describe('ClaudeExecutionBackend', () => {
       .createSession(createConfig({ lifecycle: 'ephemeral' }));
 
     await collectEvents(session.execute(createRequest({
-      configuration: {
-        systemInstructions: {
-          dynamicSections: ['## Additional context\nRuntime guidance.'],
-          kind: 'provider-default',
-        },
-      },
+      configuration: { systemInstructions: { kind: 'provider-default' } },
     })).events);
 
-    const systemPrompt = sdkMock.getLastOptions()?.systemPrompt;
-    expect(systemPrompt).toEqual({
+    expect(sdkMock.getLastOptions()?.systemPrompt).toEqual({
       type: 'custom',
       prompt: expect.stringContaining('## Runtime Context'),
       snapshot: false,
     });
-    expect((systemPrompt as { prompt: string }).prompt).toContain(
-      '## Additional context\nRuntime guidance.',
-    );
-    expect((systemPrompt as { prompt: string }).prompt.match(/## Additional context/g))
-      .toHaveLength(1);
   });
 
   it('encodes structured context with escaped XML paths and bodies', async () => {
@@ -1137,24 +1221,38 @@ describe('ClaudeExecutionBackend', () => {
     expect(interactionPort.requestApproval).not.toHaveBeenCalled();
   });
 
-  it('uses native output styles at launch and updates them on the same session', async () => {
+  it('uses native output styles at launch and updates or clears them on the same session', async () => {
     sdkMock.setMockMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1' },
       { type: 'result', subtype: 'success' },
     ], { appendResult: false });
     const host = createHost();
-    host.settings.providerConfigs = { claude: { ...claudeCatalogFixture(['claude-sonnet-4-5'], ['low', 'medium', 'high']), responseStyle: 'Concise' } };
+    const withStyle = (outputStyle: string | null) => ({
+      claude: { ...claudeCatalogFixture(['claude-sonnet-4-5'], ['low', 'medium', 'high']), outputStyle },
+    });
+    host.settings.providerConfigs = withStyle('Concise');
     const session = new ClaudeExecutionBackend(host).createSession(createConfig());
 
     await collectEvents(session.execute(createRequest()).events);
     expect(sdkMock.getLastOptions()?.settings).toEqual({ outputStyle: 'Concise' });
     const query = sdkMock.getLastResponse();
-    for (const responseStyle of ['Default', 'Concise']) {
-      host.settings.providerConfigs = { claude: { ...claudeCatalogFixture(['claude-sonnet-4-5'], ['low', 'medium', 'high']), responseStyle } };
+    for (const outputStyle of [null, 'My Style']) {
+      host.settings.providerConfigs = withStyle(outputStyle);
       await collectEvents(session.execute(createRequest()).events);
       expect(sdkMock.getLastResponse()).toBe(query);
-      expect(query?.applyFlagSettings).toHaveBeenLastCalledWith({ outputStyle: responseStyle });
+      expect(query?.applyFlagSettings).toHaveBeenLastCalledWith({ outputStyle });
     }
+    await session.dispose();
+  });
+
+  it('leaves Claude Code\'s own output style in force when none is chosen', async () => {
+    const host = createHost();
+    host.settings.providerConfigs = {
+      claude: { ...claudeCatalogFixture(['claude-sonnet-4-5'], ['low', 'medium', 'high']), outputStyle: null },
+    };
+    const session = new ClaudeExecutionBackend(host).createSession(createConfig());
+    await collectEvents(session.execute(createRequest()).events);
+    expect(sdkMock.getLastOptions()).not.toHaveProperty('settings');
     await session.dispose();
   });
 
@@ -3633,4 +3731,70 @@ it('keeps a completion during automatic request startup for the following turn',
     ]) await session.handleNativeMessage(message as any, 1);
     expect(order).toEqual(['FIRST_DONE', 'First automatic answer', 'SECOND_DONE', 'Second automatic answer']);
   } finally { await session.dispose(); }
+});
+
+
+describe('Claude prompt suggestions', () => {
+  beforeEach(() => { sdkMock.resetMockMessages(); });
+
+  it('opts in only for requested main turns and restarts when the setting changes', async () => {
+    const host = createHost();
+    const session = new ClaudeExecutionBackend(host).createSession(createConfig());
+    const request = createRequest();
+    Object.assign(request.configuration, { promptSuggestions: true });
+    const launch = () => sdkMock.getLastOptions();
+    const flagEnabled = () => (launch()?.settings as { promptSuggestionEnabled?: boolean } | undefined)
+      ?.promptSuggestionEnabled;
+    try {
+      await collectEvents(session.execute(request).events);
+      expect(launch()).not.toHaveProperty('promptSuggestions');
+      expect(flagEnabled()).toBeUndefined();
+      const initialQuery = sdkMock.getLastResponse();
+      updateClaudeProviderSettings(host.settings, { promptSuggestions: true });
+      await collectEvents(session.execute(request).events);
+      expect(launch()?.promptSuggestions).toBe(true);
+      // The flag-settings layer outranks `promptSuggestionEnabled: false` in settings.json, while
+      // leaving the env override unset keeps Claude Code's near-limit suppression.
+      expect(flagEnabled()).toBe(true);
+      expect(launch()?.env).not.toHaveProperty('CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION');
+      expect(sdkMock.getLastResponse()).not.toBe(initialQuery);
+      const enabledQuery = sdkMock.getLastResponse();
+      updateClaudeProviderSettings(host.settings, { promptSuggestions: false });
+      await collectEvents(session.execute(request).events);
+      expect(launch()).not.toHaveProperty('promptSuggestions');
+      expect(flagEnabled()).toBeUndefined();
+      expect(sdkMock.getLastResponse()).not.toBe(enabledQuery);
+      updateClaudeProviderSettings(host.settings, { promptSuggestions: true });
+      await collectEvents(session.execute(createRequest()).events);
+      expect(launch()).not.toHaveProperty('promptSuggestions');
+      expect(flagEnabled()).toBeUndefined();
+    } finally { await session.dispose(); }
+  });
+
+  it('delivers a trailing suggestion as a transient event owned by the completed turn', async () => {
+    const host = createHost();
+    updateClaudeProviderSettings(host.settings, { promptSuggestions: true });
+    const session = new ClaudeExecutionBackend(host).createSession(createConfig());
+    const events: ProviderSessionEvent[] = [];
+    session.onEvent(event => events.push(event));
+    const request = createRequest();
+    Object.assign(request.configuration, { promptSuggestions: true });
+    sdkMock.setMockMessages([
+      { type: 'system', subtype: 'init', session_id: 'suggestion-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Done' }] } },
+      { type: 'result', subtype: 'success', session_id: 'suggestion-session' },
+      { type: 'prompt_suggestion', suggestion: 'Add tests', session_id: 'suggestion-session', uuid: 'suggestion' },
+    ], { appendResult: false });
+    try {
+      const run = session.execute(request);
+      const output = await collectEvents(run.events);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(output.at(-1)?.type).toBe('turn_completed');
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'prompt_suggestion', suggestion: 'Add tests', originatingTurnId: run.turnId,
+      }));
+      expect(JSON.stringify(session.getSnapshot())).not.toContain('Add tests');
+      expect(output.some(event => (event as { type: string }).type === 'prompt_suggestion')).toBe(false);
+    } finally { await session.dispose(); }
+  });
 });

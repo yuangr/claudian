@@ -5,6 +5,15 @@ import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/type
 import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
 import { ClaudeTaskResultInterpreter } from '../runtime/ClaudeTaskResultInterpreter';
 import { isClaudeSubagentToolName } from '../subagentToolNames';
+import {
+  encodeVaultPathForSDK,
+  getSDKProjectsPath,
+  getSDKSessionPath,
+  locateSDKSession,
+  locateSDKSessions,
+  readSDKSession,
+  readSDKSessionFile,
+} from './ClaudeHistoryPathResolver';
 import { ClaudeTurnStats } from './ClaudeTurnStats';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
 import { filterActiveBranch } from './sdkBranchFilter';
@@ -20,15 +29,6 @@ import {
   parseSDKMessageToChat,
   parseTaskNotification,
 } from './sdkMessageParsing';
-import {
-  encodeVaultPathForSDK,
-  getSDKProjectsPath,
-  getSDKSessionPath,
-  locateSDKSession,
-  locateSDKSessions,
-  readSDKSession,
-  readSDKSessionFile,
-} from './sdkSessionPaths';
 import {
   isValidAgentId,
   loadSubagentFinalResult,
@@ -225,11 +225,12 @@ export async function loadSDKSessionMessages(
       if (!isClaudeSubagentToolName(toolCall.name) || toolCall.input.run_in_background === true
         || toolCall.result === undefined) continue;
       const metadata = toolUseResults.get(toolCall.id);
+      const payload = metadata === undefined ? undefined : { rawOutput: metadata };
       const mode = taskResults.describeTask(toolCall.input).mode
-        ?? taskResults.interpretLaunch(toolCall.result, toolCall.status === 'error', metadata).mode;
+        ?? taskResults.interpretLaunch(toolCall.result, toolCall.status === 'error', payload).mode;
       if (mode === 'async') continue;
       const result = taskResults.interpretResult(toolCall.result, toolCall.status === 'error',
-        { mode: 'sync' }, metadata);
+        { mode: 'sync' }, payload);
       toolCall.result = result.result;
     }
   }

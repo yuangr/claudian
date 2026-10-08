@@ -1,32 +1,3 @@
-.claudian-subagent-list {
-  margin: 8px 0;
-}
-
-.claudian-text-block+.claudian-subagent-list {
-  margin-top: 8px;
-}
-
-.claudian-subagent-list+.claudian-text-block {
-  margin-top: 8px;
-}
-
-.claudian-tool-call+.claudian-subagent-list {
-  margin-top: 8px;
-}
-
-.claudian-subagent-list+.claudian-tool-call {
-  margin-top: 8px;
-}
-
-.claudian-subagent-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-  cursor: pointer;
-  overflow: hidden;
-}
-
 .claudian-subagent-icon {
   display: flex;
   align-items: center;
@@ -58,15 +29,19 @@
   height: 14px;
 }
 
-.claudian-subagent-status.status-running {
+.claudian-subagent-status.status-running,
+.claudian-subagent-tool-status.status-running {
   color: var(--text-accent);
 }
 
-.claudian-subagent-status.status-completed {
+.claudian-subagent-status.status-completed,
+.claudian-subagent-tool-status.status-completed {
   color: var(--color-green);
 }
 
-.claudian-subagent-status.status-error {
+.claudian-subagent-status.status-error,
+.claudian-subagent-tool-status.status-error,
+.claudian-subagent-tool-status.status-blocked {
   color: var(--color-red);
 }
 
@@ -94,13 +69,6 @@
 .claudian-subagent-progress-meta {
   flex-shrink: 0;
   color: var(--text-faint);
-}
-
-.claudian-subagent-content {
-  padding: 4px 0;
-  padding-inline-start: 16px;
-  margin-inline-start: 7px;
-  border-inline-start: 1px solid var(--background-modifier-border);
 }
 
 .claudian-subagent-section {
@@ -179,10 +147,6 @@
   gap: 4px;
 }
 
-.claudian-subagent-tool-item {
-  display: block;
-}
-
 .claudian-subagent-tool-header {
   display: flex;
   align-items: center;
@@ -238,19 +202,6 @@
   height: 12px;
 }
 
-.claudian-subagent-tool-status.status-running {
-  color: var(--text-accent);
-}
-
-.claudian-subagent-tool-status.status-completed {
-  color: var(--color-green);
-}
-
-.claudian-subagent-tool-status.status-error,
-.claudian-subagent-tool-status.status-blocked {
-  color: var(--color-red);
-}
-
 .claudian-subagent-tool-content {
   padding: 2px 0 2px 16px;
 }
@@ -269,14 +220,6 @@
   color: var(--text-muted);
   margin-inline-start: auto;
   padding-inline-start: 8px;
-}
-
-.claudian-subagent-list.async .claudian-subagent-icon {
-  color: var(--interactive-accent);
-}
-
-.claudian-subagent-list.async.pending .claudian-subagent-status-text {
-  color: var(--text-muted);
 }
 
 .claudian-subagent-list.async.running .claudian-subagent-status-text {

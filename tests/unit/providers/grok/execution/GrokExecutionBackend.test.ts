@@ -1,5 +1,9 @@
 import { readFileSync } from 'node:fs';
 
+import compactCompleted from '@test/fixtures/providers/grok/runtime/compaction-completed.json';
+import { capturedSelectionPrompt, capturedSelections } from '@test/helpers/capturedSelections';
+import { testDate } from '@test/helpers/testClock';
+
 const mockLoadGrokPromptIndexAfterAssistant = jest.fn();
 const mockResolveGrokSessionDirectory = jest.fn();
 
@@ -420,6 +424,67 @@ describe('GrokExecutionBackend', () => {
     }
   });
 
+  it.each([
+    ['/compact', '/compact'],
+    [' \t/CoMpAcT keep recent edits\nFocus on tests  ', '/compact keep recent edits\nFocus on tests'],
+  ])('compacts with only explicit instructions from %j', async (text, command) => {
+    const native = new FakeNativeConnection();
+    const session = new GrokExecutionBackend(createGrokHost(), {
+      nativeFactory: { create: () => native },
+    }).createSession(sessionConfig);
+    try {
+      const events = await collect(session.execute({
+        ...executionRequest(text),
+        input: [{ type: 'text', text }, { type: 'image', image: {
+          id: 'capture', name: 'capture.png', data: 'aW1hZ2U=',
+          mediaType: 'image/png', size: 5, source: 'paste',
+        } }],
+        context: { ...capturedSelections, linkedContent: { path: 'note.md' },
+          sessionReferences: [{ id: 'ref', title: 'Review', providerId: 'grok', updatedAt: 'updated', snapshotPath: '/tmp/ref.md' }],
+        },
+      }).events);
+      expect(native.promptRequests).toEqual([{ sessionId: 'session-existing', prompt: [{ type: 'text', text: command }] }]);
+      expect(events.at(-1)?.type).toBe('turn_completed');
+    } finally { await session.dispose(); }
+  });
+
+  it('rejects compact without consuming history that still needs recovery', async () => {
+    const native = new FakeNativeConnection();
+    const session = new GrokExecutionBackend(createGrokHost(), {
+      nativeFactory: { create: () => native },
+    }).createSession({ ...sessionConfig, resumeSeed: undefined });
+    const conversationHistory = [{ id: 'prior', role: 'user' as const, content: 'Remember prior context', timestamp: testDate().getTime() }];
+    try {
+      const events = await collect(session.execute({ ...executionRequest('/compact'), conversationHistory }).events);
+      expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining('normal message') });
+      expect(native.promptRequests).toEqual([]);
+      await collect(session.execute({ ...executionRequest('Continue'), conversationHistory }).events);
+      expect(native.promptRequests[0].prompt).toEqual([{ type: 'text', text: expect.stringContaining('Remember prior context') }]);
+    } finally { await session.dispose(); }
+  });
+
+  // Native SessionUpdate::AutoCompactCompleted is used by both manual and auto compaction.
+  // Wire fields follow xai-grok-shell/src/extensions/notification.rs and session/compaction.rs.
+  it.each(['auto_compact_completed', 'auto_compact_failed', 'auto_compact_cancelled'])(
+    'maps native %s to a success divider only when completed', async sessionUpdate => {
+      const native = new FakeNativeConnection();
+      native.promptImplementation = async () => {
+        const update = { ...compactCompleted.params.update, sessionUpdate };
+        native.emit(update, 'extension', compactCompleted.params._meta);
+        native.emit(update, 'standard', compactCompleted.params._meta);
+        return { stopReason: 'end_turn' };
+      };
+      const session = new GrokExecutionBackend(createGrokHost(), {
+        nativeFactory: { create: () => native },
+      }).createSession(sessionConfig);
+      try {
+        const events = await collect(session.execute(executionRequest('/compact')).events);
+        expect(events.filter(event => event.type === 'context_compacted')).toHaveLength(sessionUpdate === 'auto_compact_completed' ? 1 : 0);
+        expect(events.at(-1)?.type).toBe('turn_completed');
+      } finally { await session.dispose(); }
+    },
+  );
+
   it('preserves standard Grok message IDs across assistant messages', async () => {
     const native = new FakeNativeConnection();
     native.promptImplementation = async () => {
@@ -587,12 +652,12 @@ describe('GrokExecutionBackend', () => {
 
     await collect(session.execute({
       ...baseRequest,
-      context: { linkedContent: { path: 'Projects/Research' } },
+      context: { ...capturedSelections, sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }], linkedContent: { path: 'Projects/Research' } },
     }).events);
 
     expect(native.loadRequests[0]?.cwd).toBe('/tmp/vault');
     expect(native.promptRequests[0]?.prompt).toEqual([{
-      text: 'Inspect linked content\n\n<linked_content path="Projects/Research" />',
+      text: 'Inspect linked content\n\n<linked_content path="Projects/Research" />\n\n' + capturedSelectionPrompt + '\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>',
       type: 'text',
     }]);
     expect(JSON.stringify(native.promptRequests[0]?.prompt)).not.toMatch(
@@ -991,7 +1056,7 @@ describe('GrokExecutionBackend', () => {
     ]);
   });
 
-  it('keeps the full Grok prompt replacement when adding provider-default dynamic sections', async () => {
+  it('sends the full Grok prompt replacement for provider-default instructions', async () => {
     const native = new FakeNativeConnection();
     const host = {
       ...createGrokHost(),
@@ -1010,10 +1075,7 @@ describe('GrokExecutionBackend', () => {
       ...base,
       configuration: {
         ...base.configuration,
-        systemInstructions: {
-          dynamicSections: ['## Additional context\nRuntime guidance.'],
-          kind: 'provider-default',
-        },
+        systemInstructions: { kind: 'provider-default' },
       },
     };
 
@@ -1026,8 +1088,6 @@ describe('GrokExecutionBackend', () => {
     expect(systemPrompt).toContain('Use `bash: date`');
     expect(systemPrompt).toContain('## Vault Media');
     expect(systemPrompt).toContain('Keep the shared instruction.');
-    expect(systemPrompt).toContain('## Additional context\nRuntime guidance.');
-    expect(systemPrompt.match(/## Additional context/g)).toHaveLength(1);
   });
 
   it('bootstraps canonical history only when creating a new native session', async () => {
@@ -1688,6 +1748,10 @@ describe('GrokExecutionBackend', () => {
           description: 'Review changes',
           input: { hint: '[path]' },
           name: 'review',
+        }, {
+          _meta: { path: '/home/user/.grok/skills/commit/SKILL.md' },
+          description: 'Commit changes',
+          name: 'commit',
         }],
         sessionUpdate: 'available_commands_update',
       });
@@ -1705,7 +1769,8 @@ describe('GrokExecutionBackend', () => {
 
     expect(events.filter(event => event.type === 'text_delta')).toHaveLength(1);
     expect(setCommandSnapshot).toHaveBeenCalledWith([
-      expect.objectContaining({ name: 'review' }),
+      expect.objectContaining({ name: 'review', kind: 'command' }),
+      expect.objectContaining({ name: 'commit', kind: 'skill' }),
     ]);
   });
 
@@ -1750,13 +1815,11 @@ describe('GrokExecutionBackend', () => {
     }));
     expect(events).toContainEqual(expect.objectContaining({
       toolCallId: 'tool-read',
-      toolUseResult: expect.objectContaining({
-        providerPayload: {
-          rawInput,
-          rawName: 'read_file',
-          rawOutput,
-        },
-      }),
+      providerPayload: {
+        rawInput,
+        rawName: 'read_file',
+        rawOutput,
+      },
       type: 'tool_completed',
     }));
   });
@@ -1795,15 +1858,20 @@ describe('GrokExecutionBackend', () => {
 
     expect(events).toContainEqual(expect.objectContaining({
       toolCallId: 'tool-write',
-      toolUseResult: {
-        filePath: 'src/write.ts',
-        newText: 'new text',
-        oldText: 'old text',
-        providerPayload: {
-          rawInput,
-          rawName: 'write',
-          rawOutput,
+      resultDetails: {
+        diff: {
+          filePath: 'src/write.ts',
+          diffLines: [
+            { type: 'delete', text: 'old text', oldLineNum: 1 },
+            { type: 'insert', text: 'new text', newLineNum: 1 },
+          ],
+          stats: { added: 1, removed: 1 },
         },
+      },
+      providerPayload: {
+        rawInput,
+        rawName: 'write',
+        rawOutput,
       },
       type: 'tool_completed',
     }));
@@ -1946,7 +2014,7 @@ describe('GrokExecutionBackend', () => {
     }
   });
 
-  it('uses native interjection and rewind without creating an unrelated session', async () => {
+  it.each(['redirect', '/compact'])('steers literal text %j with its context and rewinds without creating an unrelated session', async text => {
     const native = new FakeNativeConnection();
     native.promptImplementation = () => new Promise(() => {});
     const session = new GrokExecutionBackend(
@@ -1962,7 +2030,14 @@ describe('GrokExecutionBackend', () => {
       throw new Error('Expected Grok execution capabilities.');
     }
 
-    await expect(session.steer(executionRequest('redirect'))).resolves.toBe(true);
+    await expect(session.steer({
+      ...executionRequest(text),
+      input: [{ type: 'text', text }, { type: 'image', image: {
+        id: 'capture', name: 'capture.png', data: 'aW1hZ2U=',
+        mediaType: 'image/png', size: 5, source: 'paste',
+      } }],
+      context: capturedSelections,
+    })).resolves.toBe(true);
     run.cancel();
     await collect(run.events);
     await expect(session.previewRewind('user-1', 'assistant-1')).resolves.toMatchObject({
@@ -1970,8 +2045,51 @@ describe('GrokExecutionBackend', () => {
     });
 
     expect(native.interjectCalls).toHaveLength(1);
+    expect(native.interjectCalls[0]).toMatchObject({
+      content: [
+        { type: 'text', text: `${text}\n\n${capturedSelectionPrompt}` },
+        { type: 'image', data: 'aW1hZ2U=', mimeType: 'image/png' },
+      ],
+    });
     expect(native.rewindCalls).toHaveLength(1);
     expect(native.newRequests).toHaveLength(0);
+  });
+
+  it('keeps out-of-turn session sequences increasing across native permission changes', async () => {
+    const native = new FakeNativeConnection();
+    const session = new GrokExecutionBackend(
+      createGrokHost(),
+      {
+        nativeFactory: { create: () => native },
+        resolvePromptIndex: async () => 3,
+      },
+    ).createSession(sessionConfig);
+    const sessionEvents: Array<{ type: string; sequence: number }> = [];
+    session.onEvent(event => {
+      sessionEvents.push({ type: event.type, sequence: event.scope.sequence });
+    });
+    if (!isRewindableExecutionSession(session)) {
+      throw new Error('Expected Grok rewind capability.');
+    }
+
+    try {
+      await session.previewRewind('user-1', 'assistant-1');
+      native.emitPermissionMode('yolo');
+      // A replaced process reloads the session and republishes idle state.
+      jest.spyOn(native, 'isAlive').mockReturnValue(false);
+      await session.previewRewind('user-1', 'assistant-1');
+
+      expect(sessionEvents.map(event => event.type)).toEqual([
+        'session_state_changed',
+        'permission_mode_changed',
+        'session_state_changed',
+      ]);
+      const sequences = sessionEvents.map(event => event.sequence);
+      expect(sequences).toEqual([...sequences].sort((left, right) => left - right));
+      expect(new Set(sequences).size).toBe(sequences.length);
+    } finally {
+      await session.dispose();
+    }
   });
 
   it('rejects an ambiguous native interjection failure after handoff', async () => {
@@ -2147,10 +2265,7 @@ describe('GrokExecutionBackend', () => {
       ...base,
       configuration: {
         ...base.configuration,
-        systemInstructions: {
-          dynamicSections: ['## Additional context\nFork runtime guidance.'],
-          kind: 'provider-default',
-        },
+        systemInstructions: { kind: 'provider-default' },
       },
     };
     const events = await collect(session.execute(request).events);
@@ -2164,9 +2279,7 @@ describe('GrokExecutionBackend', () => {
     expect(native.loadRequests).toEqual([
       expect.objectContaining({
         _meta: expect.objectContaining({
-          systemPromptOverride: expect.stringContaining(
-            '## Additional context\nFork runtime guidance.',
-          ),
+          systemPromptOverride: expect.stringContaining('## Runtime Context'),
         }),
         sessionId: 'session-forked',
       }),

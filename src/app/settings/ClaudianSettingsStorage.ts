@@ -24,6 +24,7 @@ import {
   type ProviderConfigMap,
   type SessionManagerOrganization,
   type StoredChatModelSelection,
+  type ZenModePosition,
 } from '../../core/types/settings';
 import { DEFAULT_CLAUDIAN_SETTINGS } from './defaultSettings';
 
@@ -38,6 +39,7 @@ const RETIRED_SHARED_SETTING_FIELDS = [
   'enableFilePane',
   'persistentExternalContextPaths',
   'hiddenProviderCommands',
+  'maxWarmAgentProcesses',
 ] as const;
 
 function getProviderSettingsAdapters() {
@@ -70,6 +72,14 @@ function normalizeEnableZenMode(value: unknown): boolean {
   return typeof value === 'boolean'
     ? value
     : DEFAULT_CLAUDIAN_SETTINGS.enableZenMode;
+}
+
+function normalizeZenModePosition(value: unknown): ZenModePosition | null {
+  if (!value || typeof value !== 'object') return null;
+  const { x, y } = value as Record<string, unknown>;
+  return typeof x === 'number' && Number.isFinite(x) && typeof y === 'number' && Number.isFinite(y)
+    ? { x, y }
+    : null;
 }
 
 function normalizeDualPaneSide(value: unknown): DualPaneSide {
@@ -421,7 +431,10 @@ function migrateLegacyChatModelSelection(
 }
 
 export class ClaudianSettingsStorage {
-  constructor(private adapter: VaultFileAdapter) {}
+  constructor(
+    private readonly adapter: VaultFileAdapter,
+    private readonly defaults: Readonly<ClaudianSettings>,
+  ) {}
 
   async load(): Promise<StoredClaudianSettings> {
     if (!await this.adapter.exists(CLAUDIAN_SETTINGS_PATH)) {
@@ -453,6 +466,7 @@ export class ClaudianSettingsStorage {
       ? stored.chatViewPlacement
       : DEFAULT_CLAUDIAN_SETTINGS.chatViewPlacement;
     const enableZenMode = normalizeEnableZenMode(stored.enableZenMode);
+    const zenModePosition = normalizeZenModePosition(stored.zenModePosition);
     const enableDualPane = normalizeEnableDualPane(stored.enableDualPane);
     const dualPaneSide = normalizeDualPaneSide(stored.dualPaneSide);
     const skillsSynced = stored.skillsSynced === true;
@@ -488,6 +502,7 @@ export class ClaudianSettingsStorage {
       providerConfigs,
       chatViewPlacement,
       enableZenMode,
+      zenModePosition,
       enableDualPane,
       dualPaneSide,
       restoreTabsOnStartup,
@@ -578,7 +593,7 @@ export class ClaudianSettingsStorage {
   }
 
   #getDefaults(): StoredClaudianSettings {
-    return DEFAULT_CLAUDIAN_SETTINGS;
+    return structuredClone(this.defaults);
   }
 
 }

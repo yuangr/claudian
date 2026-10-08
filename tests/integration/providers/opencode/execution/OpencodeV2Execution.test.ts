@@ -1,14 +1,15 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
 import { createForkTestEnvironment } from '@test/helpers/features/chat/ProviderForkTestHarness';
+import { testDate } from '@test/helpers/testClock';
 
 import { isSteerableExecutionSession, type ProviderExecutionEvent, ProviderExecutionLifecycleRegistry, type ProviderExecutionRequest, type ProviderSessionEvent } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ChatMessage } from '@/core/types';
-import { providerOutputEventToStreamChunk } from '@/features/chat/controllers/StreamController';
-import { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { ChatExecutionCoordinator, type ChatSteerOutcome } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
 import { OpencodeExecutionBackend } from '@/providers/opencode/execution/OpencodeExecutionBackend';
 import { OpencodeServerService } from '@/providers/opencode/http/OpencodeServerService';
 
@@ -17,7 +18,7 @@ const fixture = `#!/usr/bin/env node
 const http = require('node:http');
 if (process.argv.includes('--version')) { console.log('opencode v2.0.12'); return; }
 if (!process.argv.includes('serve')) process.exit(3);
-let onSteer, selectedAgents = [], inbox = [], lateChild, feed, permission, grandApproval, form, mcpAnswer, settleInventory = false, cancelRace = false, ownedForms = [], idle = true, waiter, messages = [], turn = 0;
+let onSteer, selectedAgents = [], inbox = [], lateChild, feed, permission, grandApproval, form, mcpAnswer, settleInventory = false, cancelRace = false, ownedForms = [], idle = true, waiter, messages = [], turn = 0, modelRequests = 0, releaseModel;
 let activated = !process.env.ACTIVATION_DELAY_MS, activation;
 const emit = (type, data) => feed.write('data: ' + JSON.stringify({ type, data: { sessionID: 'ses_test', ...data } }) + '\\n\\n');
 const server = http.createServer(async (req, res) => {
@@ -40,6 +41,7 @@ const server = http.createServer(async (req, res) => {
       : [{ id: 'builtin', providerID: 'opencode', name: 'Builtin', enabled: true, variants: [] }] })); return;
   }
   if (route === '/api/command') { res.end(JSON.stringify({ data: [{ name: 'review', description: 'Review' }] })); return; }
+  if (route === '/api/skill') { res.end(JSON.stringify({ data: [{ id: 'writing', name: 'writing', path: '/skills/writing/SKILL.md', content: '' }, { id: 'writing.probe', name: 'writing.probe', path: '/skills/writing.probe/SKILL.md', content: '' }] })); return; }
   if (route === '/api/form') {
     const snapshot = [...ownedForms];
     if (settleInventory) {
@@ -62,21 +64,59 @@ const server = http.createServer(async (req, res) => {
   }
   if (route.startsWith('/api/session/ses_test/inbox/') && req.method === 'DELETE') {
     const id = decodeURIComponent(route.slice('/api/session/ses_test/inbox/'.length));
+    if (process.env.COMPACT_QUEUED_FILE && require('node:fs').existsSync(process.env.COMPACT_QUEUED_FILE) && require('node:fs').readFileSync(process.env.COMPACT_QUEUED_FILE, 'utf8') === id) {
+      require('node:fs').unlinkSync(process.env.COMPACT_QUEUED_FILE); emit('session.inbox.cancelled', { inboxID: id }); res.writeHead(204).end(); return;
+    }
     if (!inbox.includes(id)) { res.writeHead(409).end(JSON.stringify({ _tag: 'ConflictError' })); return; }
     inbox = inbox.filter(item => item !== id);
     emit('session.inbox.cancelled', { inboxID: id }); res.writeHead(204).end(); return;
   }
   if (route.endsWith('/interrupt')) { emit('session.execution.interrupted', { reason: 'user' }); res.end(JSON.stringify({ interrupted: true })); return; }
+  if (route.endsWith('/model') && process.env.HOLD_SECOND_MODEL && ++modelRequests === 2) {
+    require('node:fs').writeFileSync(process.env.HOLD_SECOND_MODEL, '');
+    await new Promise(resolve => { releaseModel = resolve; setTimeout(resolve, 1000); });
+  }
   if (route.endsWith('/model') || route.endsWith('/agent')) { if (body.agent) selectedAgents.push(body.agent); if (process.env.LATE_CHILD_STAGE === 'configuration') lateChild?.(); res.writeHead(204).end(); return; }
   if (route === '/api/session/ses_grand/permission/per_grand/reply') { grandApproval = body.decision; res.writeHead(204).end(); return; }
   if (route.endsWith('/permission/per_test/reply')) { permission = body.decision; res.writeHead(204).end(); return; }
   if (route.endsWith('/form/frm_test/reply')) { form = body.answer; res.writeHead(204).end(); return; }
   if (route.endsWith('/message')) { res.end(JSON.stringify({ data: messages, cursor: {} })); return; }
   if (route.endsWith('/wait')) { if (idle) res.writeHead(204).end(); else waiter = res; return; }
+  if (route === '/api/session/ses_test/compact') {
+    if (req.method !== 'POST' || Object.keys(body).some(key => key !== 'id')) { res.writeHead(400).end(); return; }
+    if (process.env.COMPACT_OUTCOME === 'http-error') { res.writeHead(400).end(JSON.stringify({ message: 'Cannot compact this session' })); return; }
+    const compactId = body.id ?? 'msg_compact';
+    if (process.env.COMPACT_QUEUED_FILE) {
+      require('node:fs').writeFileSync(process.env.COMPACT_QUEUED_FILE, compactId);
+      await new Promise(resolve => setTimeout(resolve, Number(process.env.COMPACT_ADMISSION_DELAY || 0)));
+      res.end(JSON.stringify({ data: { id: compactId, type: 'compaction' } })); return;
+    }
+    idle = false;
+    const compact = () => {
+      emit('session.execution.started', {});
+      if (process.env.STALE_COMPACT_FAILURE === '1') emit('session.compaction.failed', { reason: 'manual', inputID: 'msg_old_compaction', error: { type: 'compaction.interrupted', message: 'Compaction was interrupted' } });
+      emit('session.inbox.delivered', { inboxID: compactId });
+      emit('session.compaction.started', { reason: 'manual', inputID: compactId });
+      if (process.env.COMPACT_STARTED_FILE) { require('node:fs').writeFileSync(process.env.COMPACT_STARTED_FILE, ''); return; }
+      if (process.env.COMPACT_OUTCOME === 'failed') emit('session.compaction.failed', { reason: 'manual', inputID: compactId, error: { message: 'Compaction model failed' } });
+      else emit('session.compaction.ended', { reason: 'manual', text: 'Internal summary' });
+      // A failed compaction settles its barrier, so the surrounding drain can still succeed.
+      emit('session.execution.succeeded', {}); idle = true;
+    };
+    if (process.env.COMPACT_BEFORE_RESPONSE === '1') compact();
+    res.end(JSON.stringify({ data: { id: compactId, type: 'compaction' } }));
+    if (process.env.COMPACT_BEFORE_RESPONSE !== '1') setTimeout(compact, 50);
+    return;
+  }
   if (route.endsWith('/prompt') || route.endsWith('/command')) {
+    releaseModel?.();
     if (body.text.includes('Old local history')) { res.writeHead(400).end(); return; }
     const assistantMessageID = 'msg_assistant_' + (++turn);
     idle = false; res.end(JSON.stringify({ data: { id: body.id ?? 'msg_user' } }));
+    if (process.env.COMPACT_QUEUED_FILE && require('node:fs').existsSync(process.env.COMPACT_QUEUED_FILE)) {
+      require('node:fs').unlinkSync(process.env.COMPACT_QUEUED_FILE);
+      emit('session.compaction.ended', { reason: 'manual', text: 'Leaked compact' });
+    }
     if (process.env.LATE_CHILD_STAGE === 'prompt') lateChild?.();
     setTimeout(async () => {
       emit('session.execution.started', {});
@@ -88,7 +128,7 @@ const server = http.createServer(async (req, res) => {
           inbox = inbox.filter(item => item !== steer.id);
           emit('session.inbox.delivered', { inboxID: steer.id });
           emit('session.step.started', { assistantMessageID: 'msg_steered' });
-          emit('session.text.ended', { assistantMessageID: 'msg_steered', ordinal: 0, text: 'Saw ' + steer.text });
+          emit('session.text.ended', { assistantMessageID: 'msg_steered', ordinal: 0, text: process.env.ECHO_PROMPT === '1' ? JSON.stringify(steer) : 'Saw ' + steer.text });
           emit('session.execution.succeeded', {});
         };
         onSteer = steer => {
@@ -246,11 +286,25 @@ function request(text = '/review changes'): ProviderExecutionRequest {
   };
 }
 
+const writingSkill = { skills: [{ id: 'writing', mention: { start: 0, end: 8, text: '/writing' } }] };
+
 it.each([
-  ['', 'prompt', ''],
-  ['Inspect these images', 'prompt', 'Inspect these images'],
-  ['/review these images', 'command', 'these images'],
-])('sends images through the native HTTP boundary for %j', async (text, route, nativeText) => {
+  ['', 'prompt', '', {}],
+  ['Inspect these images', 'prompt', 'Inspect these images', {}],
+  ['/review these images', 'command', 'these images', {}],
+  ['/writing these images', 'prompt', '/writing these images', writingSkill],
+  ['Use /writing on these images', 'prompt', 'Use /writing on these images', { skills: [{ id: 'writing', mention: { start: 4, end: 12, text: '/writing' } }] }],
+  ['Use /writing/draft.md and /writingx', 'prompt', 'Use /writing/draft.md and /writingx', {}],
+  ['Explain this example:\n```\n/writing\n```', 'prompt', 'Explain this example:\n```\n/writing\n```', {}],
+  ['Example: `use /writing here`', 'prompt', 'Example: `use /writing here`', {}],
+  ['    /writing', 'prompt', '    /writing', {}],
+  ['Use /writing after `example /writing here`', 'prompt', 'Use /writing after `example /writing here`', { skills: [{ id: 'writing', mention: { start: 4, end: 12, text: '/writing' } }] }],
+  ['Use /writing.probe, then /writing.', 'prompt', 'Use /writing.probe, then /writing.', { skills: [
+    { id: 'writing.probe', mention: { start: 4, end: 18, text: '/writing.probe' } },
+    { id: 'writing', mention: { start: 25, end: 33, text: '/writing' } },
+  ] }],
+  ['/unknown these images', 'prompt', '/unknown these images', {}],
+])('sends images through the native HTTP boundary for %j', async (text, route, nativeText, attachments) => {
   const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
   try {
     const events: ProviderExecutionEvent[] = [];
@@ -277,9 +331,73 @@ it.each([
         ...(route === 'command' ? nativeIdentity.command : nativeIdentity.prompt),
         text: nativeText,
         files: [{ uri: 'data:image/png;base64,aGVsbG8=' }, { uri: 'data:image/webp;base64,d29ybGQ=' }],
+        ...attachments,
       },
     });
   } finally { await f.dispose(); }
+});
+
+it.each([
+  { beforeResponse: false, staleFailure: false },
+  { beforeResponse: true, staleFailure: false },
+  { beforeResponse: false, staleFailure: true },
+  { beforeResponse: true, staleFailure: true },
+])('compacts through the native endpoint (events before admission: $beforeResponse, stale failure: $staleFailure)', async ({ beforeResponse, staleFailure }) => {
+  const f = createFixture(true, undefined, `COMPACT_BEFORE_RESPONSE=${beforeResponse ? '1' : '0'}\nSTALE_COMPACT_FAILURE=${staleFailure ? '1' : '0'}`);
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request('/compact')).events) events.push(event);
+    expect(events.filter(event => event.type === 'context_compacted')).toHaveLength(1);
+    expect(events.at(-1)?.type).toBe('turn_completed');
+    expect(events.some(event => event.type === 'text_delta' || event.type === 'user_message_started')).toBe(false);
+    expect(events.find(event => event.type === 'turn_started')).not.toHaveProperty('nativeUserMessageId');
+    expect(f.approvals).toEqual([]);
+    expect(f.questions).toEqual([]);
+  } finally { await f.dispose(); }
+});
+
+it.each([
+  ['http-error', 'Cannot compact this session'],
+  ['failed', 'Compaction model failed'],
+])('reports native compaction failure (%s)', async (outcome, message) => {
+  const f = createFixture(true, undefined, `COMPACT_OUTCOME=${outcome}`);
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request('/compact')).events) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining(message) });
+    expect(events.some(event => event.type === 'context_compacted' || event.type === 'turn_completed')).toBe(false);
+  } finally { await f.dispose(); }
+});
+
+it('rejects compact arguments unsupported by the native endpoint', async () => {
+  const f = createFixture(true);
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request('/compact keep recent edits')).events) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining('/compact does not accept arguments') });
+  } finally { await f.dispose(); }
+});
+
+it('cancels native compaction, declines steering, and can continue the session', async () => {
+  const started = path.join(realpathSync(mkdtempSync(path.join(tmpdir(), 'claudian-http-compact-'))), 'started');
+  const f = createFixture(true, undefined, `COMPACT_STARTED_FILE=${started}`);
+  try {
+    const run = f.session.execute(request('/compact'));
+    const events: ProviderExecutionEvent[] = [];
+    const consumed = (async () => { for await (const event of run.events) events.push(event); })();
+    const deadline = Date.now() + 3000;
+    while (!existsSync(started) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(existsSync(started)).toBe(true);
+    if (!isSteerableExecutionSession(f.session)) throw new Error('Missing steering');
+    await expect(f.session.steer(request('Also check tests'))).resolves.toBe(false);
+    run.cancel();
+    await consumed;
+    expect(events.at(-1)?.type).toBe('cancelled');
+    expect(events.some(event => event.type === 'context_compacted')).toBe(false);
+    const continued: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request('continue')).events) continued.push(event);
+    expect(continued.at(-1)?.type).toBe('turn_completed');
+  } finally { await f.dispose(); rmSync(path.dirname(started), { recursive: true, force: true }); }
 });
 
 it('runs YOLO with automatic native approvals while still answering questions, then asks again', async () => {
@@ -388,7 +506,82 @@ it('interrupts HTTP execution and continues the same native session on the next 
   } finally { await f.dispose(); }
 }, 15000);
 
+it('keeps a turn cancelled during configuration from changing the next turn approval policy', async () => {
+  const hold = path.join(realpathSync(mkdtempSync(path.join(tmpdir(), 'claudian-http-hold-'))), 'model');
+  const f = createFixture(false, undefined, `HOLD_SECOND_MODEL=${hold}`);
+  try {
+    for await (const event of f.session.execute(request()).events) void event;
+    expect(f.approvals).toHaveLength(1);
+    const yolo = request();
+    const cancelled = f.session.execute({ ...yolo, configuration: { ...yolo.configuration, permissionMode: 'yolo' } });
+    const cancelledEvents: ProviderExecutionEvent[] = [];
+    const consumed = (async () => { for await (const event of cancelled.events) cancelledEvents.push(event); })();
+    const deadline = Date.now() + 3000;
+    while (!existsSync(hold) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(existsSync(hold)).toBe(true);
+    cancelled.cancel();
+    await consumed;
+    expect(cancelledEvents.at(-1)?.type).toBe('cancelled');
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request()).events) events.push(event);
+    expect(events.at(-1)?.type).toBe('turn_completed');
+    expect(f.approvals).toHaveLength(2);
+  } finally { await f.dispose(); rmSync(path.dirname(hold), { recursive: true, force: true }); }
+}, 15000);
+
 describe('native steering', () => {
+  it.each(['/compact', '/COMPACT'])('preserves captures and images when steering literal %j text', async text => {
+    const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+    try {
+      const events: ProviderExecutionEvent[] = [];
+      let admission: Promise<boolean> | undefined;
+      for await (const event of f.session.execute(request('steer')).events) {
+        events.push(event);
+        if (event.type === 'text_delta' && event.text === 'Working') {
+          if (!isSteerableExecutionSession(f.session)) throw new Error('Missing steering');
+          admission = f.session.steer({
+            ...request(text),
+            input: [{ type: 'text', text }, { type: 'image', image: {
+              id: 'capture', name: 'capture.png', data: 'aW1hZ2U=',
+              mediaType: 'image/png', size: 5, source: 'paste',
+            } }],
+            context: { selections: [{ kind: 'editor', selection: { notePath: 'note.md', mode: 'selection', selectedText: 'captured note' } }] },
+          });
+        }
+      }
+      expect(await admission).toBe(true);
+      expect(events.at(-1)?.type).toBe('turn_completed');
+      const echoed = events.flatMap(event => event.type === 'text_delta' && event.text !== 'Working' ? [event.text] : []).join('');
+      expect(JSON.parse(echoed)).toEqual({
+        id: expect.any(String), delivery: 'steer',
+        text: `${text}\n\n<editor_selection path="note.md">\n<![CDATA[captured note]]>\n</editor_selection>`,
+        files: [{ uri: 'data:image/png;base64,aW1hZ2U=' }],
+      });
+      expect(events.some(event => event.type === 'context_compacted')).toBe(false);
+    } finally { await f.dispose(); }
+  });
+
+  it.each([
+    ['Now apply /writing', { skills: [{ id: 'writing', mention: { start: 10, end: 18, text: '/writing' } }] }],
+    ['Explain this example:\n```\n/writing\n```', {}],
+  ])('attaches only prose skills to steered input: %s', async (text, attachments) => {
+    const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+    try {
+      const events: ProviderExecutionEvent[] = [];
+      let admission: Promise<boolean> | undefined;
+      for await (const event of f.session.execute(request('steer')).events) {
+        events.push(event);
+        if (event.type === 'text_delta' && event.text === 'Working') admission = steer(f, text);
+      }
+      expect(await admission).toBe(true);
+      const echoed = events.flatMap(event => event.type === 'text_delta' && event.text !== 'Working' ? [event.text] : []).join('');
+      expect(JSON.parse(echoed)).toEqual({
+        id: expect.any(String), delivery: 'steer', text,
+        ...attachments,
+      });
+    } finally { await f.dispose(); }
+  });
+
   function steer(f: ReturnType<typeof createFixture>, text: string): Promise<boolean> {
     if (!isSteerableExecutionSession(f.session)) throw new Error('Missing steering');
     return f.session.steer(request(text));
@@ -467,7 +660,7 @@ describe('native steering', () => {
     const backend = new OpencodeExecutionBackend(env.host, { serverService });
     const conversation = await env.repository.create({ providerId: 'opencode' });
     const events: ProviderExecutionEvent[] = [];
-    let steered: Promise<boolean> | undefined;
+    let steered: Promise<ChatSteerOutcome> | undefined;
     let ids = 0;
     const turn = (submissionId: string, body: string, messages?: { user: ChatMessage; assistant: ChatMessage }) => ({
       submissionId, timestamp: 1, rawDisplayText: body, canonicalText: body, images: [],
@@ -489,7 +682,7 @@ describe('native steering', () => {
       await coordinator.bindConversation({ conversationId: conversation.id, providerId: 'opencode' });
       const result = await coordinator.execute(turn('user-main', text, { user, assistant }));
       expect(result.status).toBe('completed');
-      await expect(steered).resolves.toBe(true);
+      await expect(steered).resolves.toEqual({ delivery: 'accepted' });
       const [prompt, steer] = events.filter(event => event.type === 'user_message_started');
       expect(steer).toMatchObject({ content: 'Also check tests' });
       expect(user.userMessageId).toBe(prompt.nativeUserMessageId);
@@ -601,10 +794,8 @@ it.each(['background-approval', 'background-nested', 'mcp-form-late'])('keeps %s
     expect(result.status).toBe('completed');
     if (text === 'mcp-form-late') await asked;
     expect(coordinator.hasBackgroundWork).toBe(true);
-    expect(coordinator.canCool()).toBe(false);
     await asked;
     expect(interactions).toEqual(text === 'mcp-form-late' ? ['question'] : ['approval', 'question']);
-    expect(coordinator.canCool()).toBe(false);
     release();
     await automaticReply;
     await settled;
@@ -758,4 +949,82 @@ it('executes a selected title model through the real resolver and native backend
   } finally {
     await f.dispose();
   }
+});
+
+
+it('attaches only skills the user typed when the prompt carries history and captured context', async () => {
+  const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request('Polish with /writing'),
+      conversationHistory: [{ id: 'old-user', role: 'user', content: 'Earlier /writing draft', timestamp: testDate().getTime() }],
+      context: { selections: [{ kind: 'editor', selection: { notePath: 'note.md', mode: 'selection', selectedText: 'Try /writing later' } }] },
+    }).events) events.push(event);
+    const received = JSON.parse(events.flatMap(event => event.type === 'text_delta' ? [event.text] : []).join(''));
+    const start = received.body.text.indexOf('User: Polish with /writing') + 'User: Polish with '.length;
+    expect(start).toBeGreaterThan('User: Polish with '.length);
+    expect(received.body.skills).toEqual([{ id: 'writing', mention: { start, end: start + 8, text: '/writing' } }]);
+  } finally { await f.dispose(); }
+});
+
+it('sends hidden session reference paths through the HTTP v2 prompt boundary', async () => {
+  const f = createFixture(false, undefined, 'ECHO_PROMPT=1');
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request('ref @"Review"'),
+      context: { sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }] },
+    }).events) events.push(event);
+    const received = JSON.parse(events.flatMap(event => event.type === 'text_delta' ? [event.text] : []).join(''));
+    expect(received.body.text).toBe('ref @"Review"\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>');
+  } finally { await f.dispose(); }
+});
+it.each(['/compact', ' \t/CoMpAcT  '])('compacts %j with captured editor context', async text => {
+  const f = createFixture(true);
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request(text),
+      context: { selections: [{ kind: 'editor', selection: { notePath: 'note.md', mode: 'selection', selectedText: 'selected note text' } }] },
+    }).events) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'turn_completed' });
+    expect(events.filter(event => event.type === 'context_compacted')).toHaveLength(1);
+  } finally { await f.dispose(); }
+});
+
+it('requires replaying recovered context before compacting a replacement native session', async () => {
+  const f = createFixture();
+  try {
+    const events: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute({
+      ...request('/compact'),
+      conversationHistory: [{ id: 'old-user', role: 'user', content: 'Earlier conversation', timestamp: testDate().getTime() }],
+    }).events) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining('normal message') });
+    expect(events.some(event => event.type === 'context_compacted')).toBe(false);
+  } finally { await f.dispose(); }
+});
+
+
+it.each([0, 150])('recalls a queued compact before continuing after cancellation (admission delay: %s)', async delay => {
+  const queued = path.join(realpathSync(mkdtempSync(path.join(tmpdir(), 'claudian-queued-compact-'))), 'queued');
+  const f = createFixture(true, undefined, `COMPACT_QUEUED_FILE=${queued}\nCOMPACT_ADMISSION_DELAY=${delay}`);
+  try {
+    const run = f.session.execute(request('/compact'));
+    const events: ProviderExecutionEvent[] = [];
+    const consumed = (async () => { for await (const event of run.events) events.push(event); })();
+    const deadline = Date.now() + 3000;
+    while (!existsSync(queued) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(existsSync(queued)).toBe(true);
+    // For the zero-delay case let the HTTP admission response arrive before cancelling.
+    if (!delay) await new Promise(resolve => setTimeout(resolve, 30));
+    run.cancel();
+    await consumed;
+    expect(events.at(-1)?.type).toBe('cancelled');
+    const continued: ProviderExecutionEvent[] = [];
+    for await (const event of f.session.execute(request('continue')).events) continued.push(event);
+    expect(continued.at(-1)?.type).toBe('turn_completed');
+    expect(continued.some(event => event.type === 'context_compacted')).toBe(false);
+  } finally { await f.dispose(); rmSync(path.dirname(queued), { recursive: true, force: true }); }
 });

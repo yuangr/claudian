@@ -1,13 +1,14 @@
+import { parseEnvironmentVariables } from '@/core/process/env';
+
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
-import { parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import {
   normalizePiDiscoveredModels,
   type PiDiscoveredModel,
 } from '../models';
 import { getPiProviderSettings } from '../settings';
-import { buildPiLaunchSpec } from './PiLaunchSpec';
+import { buildPiLaunchSpec } from './PiLaunchSpecBuilder';
 import { PiRPCTransport } from './PiRPCTransport';
 import { PiSubprocess } from './PiSubprocess';
 

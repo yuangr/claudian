@@ -88,7 +88,7 @@ it('settles an async subagent from a session notification after the requested tu
   });
   native.emitOutput({
     type: 'tool_completed', toolCallId: 'task-1', toolScope: { kind: 'main' }, content: 'Launched',
-    toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'agent-1' },
+    providerPayload: { rawOutput: { isAsync: true, status: 'async_launched', agentId: 'agent-1' } },
   });
   native.complete();
   await started;
@@ -147,7 +147,7 @@ it('shows live progress on a background subagent card after the requested turn',
   });
   native.emitOutput({
     type: 'tool_completed', toolCallId: 'task-1', toolScope: { kind: 'main' }, content: 'Launched',
-    toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'agent-1' },
+    providerPayload: { rawOutput: { isAsync: true, status: 'async_launched', agentId: 'agent-1' } },
   });
   native.complete();
   await started;
@@ -342,4 +342,32 @@ it('keeps completed automatic turns before a later notification while their rend
   const notification = screen.getByRole('button', { name: 'Task notification' });
   expect(screen.getByText('First completed response').compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   expect(second.compareDocumentPosition(notification) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+
+it('accepts usage in the next side response after a subagent response', async () => {
+  const harness = createHarness({ subagentAdapter, taskResultInterpreter });
+  const { started } = await startSideChat(harness);
+  const native = harness.backend.latest;
+  native.establishChild('side-session');
+  native.emitOutput({
+    type: 'tool_started', toolCallId: 'usage-task', toolScope: { kind: 'main' }, name: 'Agent',
+    input: { description: 'Research', prompt: 'Find details', run_in_background: false },
+  });
+  native.emitOutput({ type: 'tool_completed', toolCallId: 'usage-task', toolScope: { kind: 'main' }, content: 'Done' });
+  native.emitOutput({ type: 'usage_updated', usage: {
+    inputTokens: 900, contextTokens: 900, contextWindow: 200000, percentage: 0,
+  } });
+  native.complete();
+  await started;
+  expect(harness.controller.runtime?.state.usage).toBeNull();
+
+  const next = harness.controller.submitToSide('Follow up without a subagent', []);
+  await waitFor(() => expect(native.requests).toHaveLength(2));
+  native.emitOutput({ type: 'usage_updated', usage: {
+    inputTokens: 100, contextTokens: 100, contextWindow: 200000, percentage: 0,
+  } });
+  native.complete();
+  await next;
+  expect(harness.controller.runtime?.state.usage?.contextTokens).toBe(100);
 });

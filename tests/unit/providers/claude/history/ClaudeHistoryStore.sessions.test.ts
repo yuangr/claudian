@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { extractToolResultContent } from '@/core/tools/toolResultContent';
+import { getSDKSessionPath, isValidSessionId, readSDKSession } from '@/providers/claude/history/ClaudeHistoryPathResolver';
 import {
   encodeVaultPathForSDK,
   getLastSDKSessionModel,
@@ -17,7 +18,6 @@ import { resolveToolUseResultStatus } from '@/providers/claude/history/sdkAsyncS
 import { filterActiveBranch } from '@/providers/claude/history/sdkBranchFilter';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
 import { collectAsyncSubagentResults, parseSDKMessageToChat } from '@/providers/claude/history/sdkMessageParsing';
-import { getSDKSessionPath, isValidSessionId, readSDKSession } from '@/providers/claude/history/sdkSessionPaths';
 import { parseClaudeTaskNotification } from '@/providers/claude/normalization/claudeTaskNotification';
 
 // Mock fs, fs/promises, and os modules
@@ -1333,6 +1333,29 @@ describe('sdkSession', () => {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0].toolCalls).toHaveLength(1);
       expect(result.messages[0].toolCalls?.[0].resolvedAnswers).toEqual({ 'Color?': 'Blue' });
+    });
+
+    it('replays stored structured patches and answers through the neutral result fields', async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockFsPromises.readFile.mockResolvedValue([
+        '{"type":"assistant","uuid":"a1","timestamp":"2024-01-15T10:01:00Z","message":{"content":[{"type":"tool_use","id":"edit-1","name":"Edit","input":{"file_path":"notes/a.md","old_string":"old","new_string":"new"}},{"type":"tool_use","id":"ask-1","name":"AskUserQuestion","input":{"questions":[{"question":"Color?"}]}}]}}',
+        '{"type":"user","uuid":"u1","timestamp":"2024-01-15T10:02:00Z","toolUseResult":{"filePath":"/vault/notes/a.md","oldString":"old","newString":"new","structuredPatch":[{"oldStart":3,"oldLines":2,"newStart":3,"newLines":2,"lines":[" keep","-old","+new"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"edit-1","content":"Updated"}]}}',
+        '{"type":"user","uuid":"u2","timestamp":"2024-01-15T10:02:01Z","toolUseResult":{"answers":{"Color?":["Blue"]}},"message":{"content":[{"type":"tool_result","tool_use_id":"ask-1","content":"Answered"}]}}',
+      ].join('\n'));
+
+      const result = await loadSDKSessionMessages(vaultPath, 'session-structured-results');
+      const [edit, ask] = result.messages.flatMap(message => message.toolCalls ?? []);
+
+      expect(edit.diffData).toEqual({
+        filePath: '/vault/notes/a.md',
+        diffLines: [
+          { type: 'equal', text: 'keep', oldLineNum: 3, newLineNum: 3 },
+          { type: 'delete', text: 'old', oldLineNum: 4 },
+          { type: 'insert', text: 'new', newLineNum: 4 },
+        ],
+        stats: { added: 1, removed: 1 },
+      });
+      expect(ask.resolvedAnswers).toEqual({ 'Color?': 'Blue' });
     });
 
     it('skips skill prompt injection messages (sourceToolUseID)', async () => {

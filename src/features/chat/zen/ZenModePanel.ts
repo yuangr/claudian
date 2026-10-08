@@ -1,53 +1,32 @@
 import { type Keymap, Scope } from 'obsidian';
 
-import type { ProviderId } from '../../../core/providers/types';
-import { t } from '../../../i18n/i18n';
+import type { ProviderId } from '@/core/providers/types';
+import type { ZenModePosition } from '@/core/types';
+import { setToolIcon } from '@/features/chat/rendering/tools/toolContentPrimitives';
 import {
   cancelScheduledAnimationFrame,
   scheduleAnimationFrame,
   type ScheduledAnimationFrame,
-} from '../../../utils/animationFrame';
-import { setToolIcon } from '../rendering/ToolCallRenderer';
-import type { AssembledTabRuntime } from '../tabs/types';
-import { formatActivityPreview, type ZenActivityTone } from './activityPreview';
-import type { ZenModeSlots } from './types';
-import { ZenComposerLayout } from './ZenComposerLayout';
-
-/** Reading intent captured before the transcript is relocated. */
-export interface ZenScrollSnapshot {
-  readonly top: number;
-  readonly follow: boolean;
-}
+} from '@/features/chat/utils/animationFrame';
+import { formatActivityPreview, type ZenActivityTone } from '@/features/chat/zen/activityPreview';
+import type { ZenModeSlots, ZenPresentationPort } from '@/features/chat/zen/types';
+import { ZenComposerLayout } from '@/features/chat/zen/ZenComposerLayout';
+import { ZenPanelDock } from '@/features/chat/zen/ZenPanelDock';
+import { t } from '@/i18n/i18n';
 
 export interface ZenModePanelOptions {
   readonly keymap: Pick<Keymap, 'pushScope' | 'popScope'> | null;
   readonly historyExpanded: boolean;
   onHistoryExpandedChange(expanded: boolean): void;
+  readonly position: ZenModePosition | null;
+  onPositionChange(position: ZenModePosition | null): void;
 }
 
 const HOST_CLASS = 'claudian-zen-host';
 // Body-level surfaces that zen controls open; interacting with them is not leaving zen.
 const OWNED_OVERLAY_SELECTOR = '.menu, .modal-container, .suggestion-container';
-const RESERVED_HEIGHT_PROPERTY = '--claudian-zen-reserved-height';
 
 let panelSequence = 0;
-
-/** Reads the last visible position; a hidden transcript's own offset reads zero. */
-export function captureZenScrollIntent(runtime: AssembledTabRuntime): ZenScrollSnapshot {
-  return { top: runtime.state.readingScrollTop, follow: runtime.state.autoScrollEnabled };
-}
-
-/** Follows new output when the reader was following, otherwise keeps their position. */
-export function restoreZenScrollIntent(
-  runtime: AssembledTabRuntime,
-  snapshot: ZenScrollSnapshot = captureZenScrollIntent(runtime),
-): void {
-  const messagesEl = runtime.dom.messagesEl;
-  messagesEl.scrollTop = snapshot.follow ? messagesEl.scrollHeight : snapshot.top;
-  runtime.state.readingScrollTop = snapshot.top;
-  // Relocation can emit geometry-only scroll events; they must not replace the captured intent.
-  if (runtime.state.autoScrollEnabled !== snapshot.follow) runtime.state.autoScrollEnabled = snapshot.follow;
-}
 
 /**
  * Compact presentation for one attached runtime: a state-driven activity line,
@@ -69,14 +48,14 @@ export class ZenModePanel {
   // A parentless scope keeps the active note's hotkeys away from zen input while it has focus.
   readonly #keyScope = new Scope();
   #scopePushed = false;
-  #runtime: AssembledTabRuntime | null = null;
+  #runtime: ZenPresentationPort | null = null;
   #unsubscribeMain: (() => void) | null = null;
   #pendingFrame: ScheduledAnimationFrame | null = null;
   #historyExpanded: boolean;
   #hasHistory = false;
   #lastTone: ZenActivityTone | null = null;
-  #resizeObserver: ResizeObserver | null = null;
   readonly #composerLayout: ZenComposerLayout;
+  readonly #dock: ZenPanelDock;
   #destroyed = false;
 
   constructor(
@@ -124,6 +103,11 @@ export class ZenModePanel {
     const sideChatChipEl = this.#rootEl.createDiv({
       cls: 'claudian-zen-side-chat-chip-slot claudian-side-chat-chip-slot',
     });
+    // Under the composer, shown on hover or keyboard focus, so the chat controls keep their own clicks.
+    const gripEl = this.#rootEl.createEl('button', {
+      cls: 'claudian-zen-grip',
+      attr: { type: 'button', 'aria-label': t('chat.zen.move') },
+    });
 
     this.#statusEl = this.#rootEl.createDiv({ cls: 'claudian-zen-status', attr: { role: 'status' } });
 
@@ -140,15 +124,19 @@ export class ZenModePanel {
     this.slots = { historyEl: this.#historyEl, composerEl, sideChatChipEl };
     this.#composerLayout = new ZenComposerLayout(composerEl);
     this.#applyHistoryExpanded();
-    this.#observeReservedHeight();
+    this.#dock = new ZenPanelDock({ hostEl, rootEl: this.#rootEl, gripEl, drawerEl, composerEl }, {
+      position: options.position,
+      onPositionChange: position => options.onPositionChange(position),
+    });
   }
 
-  get runtime(): AssembledTabRuntime | null {
+  get runtime(): ZenPresentationPort | null {
     return this.#runtime;
   }
 
-  bind(runtime: AssembledTabRuntime | null, providerId: ProviderId | null): void {
+  bind(runtime: ZenPresentationPort | null, providerId: ProviderId | null): void {
     if (this.#destroyed) return;
+    this.#dock.refresh();
     if (providerId) this.#rootEl.dataset.provider = providerId;
     else delete this.#rootEl.dataset.provider;
     if (runtime === this.#runtime) {
@@ -160,8 +148,8 @@ export class ZenModePanel {
     this.#runtime = runtime;
     if (!runtime) return;
 
-    this.#unsubscribeMain = runtime.state.subscribeActivity(() => this.#scheduleRender());
-    if (this.#historyExpanded) restoreZenScrollIntent(runtime);
+    this.#unsubscribeMain = runtime.subscribeActivity(() => this.#scheduleRender());
+    if (this.#historyExpanded) runtime.restoreScroll();
     this.#render();
   }
 
@@ -169,7 +157,7 @@ export class ZenModePanel {
     if (this.#destroyed || expanded === this.#historyExpanded) return;
     this.#historyExpanded = expanded;
     this.#applyHistoryExpanded();
-    if (expanded && this.#runtime) restoreZenScrollIntent(this.#runtime);
+    if (expanded && this.#runtime) this.#runtime.restoreScroll();
     this.options.onHistoryExpandedChange(expanded);
   }
 
@@ -182,13 +170,11 @@ export class ZenModePanel {
     this.#unsubscribeMain = null;
     this.#runtime = null;
     this.#popKeyScope();
-    this.#resizeObserver?.disconnect();
-    this.#resizeObserver = null;
     this.#composerLayout.destroy();
+    this.#dock.destroy();
     this.hostEl.ownerDocument.removeEventListener('pointerdown', this.#handleOutsidePointerDown, true);
     this.#rootEl.remove();
     this.hostEl.removeClass(HOST_CLASS);
-    this.hostEl.style.removeProperty(RESERVED_HEIGHT_PROPERTY);
   }
 
   #applyHistoryExpanded(): void {
@@ -242,7 +228,7 @@ export class ZenModePanel {
     if (hasHistory !== this.#hasHistory) {
       this.#hasHistory = hasHistory;
       this.#applyHistoryExpanded();
-      if (hasHistory && this.#historyExpanded) restoreZenScrollIntent(runtime);
+      if (hasHistory && this.#historyExpanded) runtime.restoreScroll();
     }
 
     if (preview.tone !== this.#lastTone) {
@@ -273,15 +259,5 @@ export class ZenModePanel {
     if (!this.#scopePushed) return;
     this.#scopePushed = false;
     this.options.keymap?.popScope(this.#keyScope);
-  }
-
-  #observeReservedHeight(): void {
-    const ResizeObserverConstructor = this.hostEl.ownerDocument.defaultView?.ResizeObserver;
-    if (typeof ResizeObserverConstructor !== 'function') return;
-    this.#resizeObserver = new ResizeObserverConstructor(() => {
-      const height = Math.ceil(this.#rootEl.getBoundingClientRect().height);
-      this.hostEl.style.setProperty(RESERVED_HEIGHT_PROPERTY, `${height}px`);
-    });
-    this.#resizeObserver.observe(this.#rootEl);
   }
 }

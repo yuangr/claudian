@@ -1,63 +1,56 @@
 import type { Component } from 'obsidian';
 import { Notice } from 'obsidian';
 
-import { resolveNewConversationModel } from '../../../../core/providers/conversationModel';
-import { ProviderRegistry } from '../../../../core/providers/ProviderRegistry';
-import { DEFAULT_CHAT_PROVIDER_ID } from '../../../../core/providers/types';
-import { t } from '../../../../i18n/i18n';
-import { getVaultPath } from '../../../../utils/path';
-import { ComposerDraftController } from '../../composer/ComposerDraftController';
-import { BrowserSelectionController } from '../../controllers/BrowserSelectionController';
-import { CanvasSelectionController } from '../../controllers/CanvasSelectionController';
-import { ConversationController } from '../../controllers/ConversationController';
-import { InputController } from '../../controllers/InputController';
+import { resolveNewConversationModel } from '@/core/providers/conversationModel';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import { DEFAULT_CHAT_PROVIDER_ID } from '@/core/providers/types';
+import { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
+import { ConversationController } from '@/features/chat/conversation/ConversationController';
+import { BrowserSelectionController } from '@/features/chat/input/BrowserSelectionController';
+import { BuiltInCommandController } from '@/features/chat/input/BuiltInCommandController';
+import { CanvasSelectionController } from '@/features/chat/input/CanvasSelectionController';
+import { ComposerSelections } from '@/features/chat/input/ComposerSelections';
+import { InputController } from '@/features/chat/input/InputController';
 import {
   appendQuoteToComposer,
   formatSelectionQuote,
   MessageQuoteController,
-} from '../../controllers/MessageQuoteController';
-import { NavigationController } from '../../controllers/NavigationController';
-import { SelectionController } from '../../controllers/SelectionController';
-import { StreamController } from '../../controllers/StreamController';
-import { MessageRenderer } from '../../rendering/MessageRenderer';
-import { SideChatController } from '../../side-chat/SideChatController';
-import { getTabProviderId, requireTabProviderId } from '../providerResolution';
+} from '@/features/chat/input/MessageQuoteController';
+import { SelectionController } from '@/features/chat/input/SelectionController';
+import { InlineInteractionPrompts } from '@/features/chat/interactions/InlineInteractionPrompts';
+import { NavigationController } from '@/features/chat/navigation/NavigationController';
+import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import { SideChatController } from '@/features/chat/side-chat/SideChatController';
+import { AsyncSubagentHistoryRecovery } from '@/features/chat/subagents/AsyncSubagentHistoryRecovery';
+import type { TabManagerViewHost } from '@/features/chat/tabs/ChatTab';
 import {
+  captureLatestCompletedForkSource,
   handleForkAll,
   handleForkRequest,
-} from '../TabForking';
-import {
-  commitProvisionalTab,
-  isClosingLifecycleState,
-} from '../TabLifecycle';
-import {
-  applyProviderUIGating,
-  createConversationExecutionBinding,
-  getTabCapabilities,
-  getTabSelectedModel,
-  getTabSettingsSnapshot,
-  initializeTabExecution,
-  invalidateTabProviderCommands,
-  refreshTabProviderUI,
-  syncComposerDropdownForProvider,
-  syncTabProviderServices,
-  toggleTabServiceTier,
-} from '../TabProviderState';
-import {
-  createTabMessageId,
-  enqueueTabBackgroundWork,
-} from '../TabSessionEvents';
-import type {
-  TabManagerViewHost,
-  TabServices,
-  TabUIComponents,
-} from '../types';
+} from '@/features/chat/tabs/forking/ForkSource';
+import { getTabProviderId, requireTabProviderId } from '@/features/chat/tabs/providerResolution';
 import type {
   PublishedTabRuntimeRef,
   TabRuntimeConstructionContext,
   TabRuntimeControllerBundle,
   TabRuntimeShellBundle,
-} from './TabRuntimeConstruction';
+} from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
+import {
+  commitProvisionalTab,
+  isClosingLifecycleState,
+} from '@/features/chat/tabs/TabLifecycle';
+import { syncTabProviderServices } from '@/features/chat/tabs/tabProviderLifecycle';
+import { createConversationExecutionBinding, initializeTabExecution } from '@/features/chat/tabs/tabProviderLifecycle';
+import { getTabCapabilities, getTabSelectedModel, getTabSettingsSnapshot } from '@/features/chat/tabs/tabProviderSettings';
+import { applyProviderUIGating, invalidateTabProviderCommands, refreshTabProviderUI, syncComposerDropdownForProvider, toggleTabServiceTier } from '@/features/chat/tabs/tabProviderUI';
+import {
+  createTabMessageId,
+  enqueueTabBackgroundWork,
+} from '@/features/chat/tabs/TabSessionEvents';
+import type { TabServices, TabUIComponents } from '@/features/chat/tabs/types';
+import { StreamController } from '@/features/chat/turns/StreamController';
+import { t } from '@/i18n/i18n';
+import { getVaultPath } from '@/utils/path';
 
 function getSharedSelectionFocusScopeEls(component: Component): HTMLElement[] {
   const host = component as Partial<TabManagerViewHost>;
@@ -78,9 +71,8 @@ export function buildTabRuntimeControllers(
   const ensureExecutionInitialized = async (): Promise<boolean> => {
     const tab = runtimeRef.requirePublished();
     if (
-      tab.lifecycleState === 'warm'
-      && (tab.executionCoordinator.state === 'idle'
-        || tab.executionCoordinator.state === 'active')
+      tab.executionCoordinator.state === 'idle'
+      || tab.executionCoordinator.state === 'active'
     ) {
       return true;
     }
@@ -132,53 +124,38 @@ export function buildTabRuntimeControllers(
   });
   options.registerCleanup('tab message quote controller', () => messageQuoteController.dispose());
 
-  const selectionController = new SelectionController(
-    plugin.app,
-    ui.contextTray,
-    dom.inputEl,
-    undefined,
-    [dom.contentEl, dom.inputComposerEl, ...getSharedSelectionFocusScopeEls(component)],
-    () => commitProvisionalTab(runtimeRef.requirePublished()),
-    owningLeaf,
-  );
-  options.registerCleanup('tab editor selection controller', () => selectionController.stop());
-
-  const browserSelectionController = new BrowserSelectionController(
-    plugin.app,
-    ui.contextTray,
-    dom.inputEl,
-    undefined,
-    () => commitProvisionalTab(runtimeRef.requirePublished()),
-  );
-  options.registerCleanup(
-    'tab browser selection controller',
-    () => browserSelectionController.stop(),
-  );
-
-  const canvasSelectionController = new CanvasSelectionController(
-    plugin.app,
-    ui.contextTray,
-    dom.inputEl,
-    undefined,
-    () => commitProvisionalTab(runtimeRef.requirePublished()),
-  );
-  options.registerCleanup(
-    'tab canvas selection controller',
-    () => canvasSelectionController.stop(),
-  );
-
-  const streamController = new StreamController({
-    onQuestionToolChanged: tool => runtimeRef.requirePublished().controllers.inputController.updateAsyncQuestion(tool),
-    plugin,
-    state,
-    renderer,
-    subagentManager: services.subagentManager,
-    getMessagesEl: () => dom.messagesEl,
-    updateQueueIndicator: () => (
-      runtimeRef.requirePublished().controllers.inputController.updateQueueIndicator()
+  const composerSelections = new ComposerSelections({
+    editor: new SelectionController(
+      plugin.app,
+      ui.contextTray,
+      dom.inputEl,
+      [dom.contentEl, dom.inputComposerEl, ...getSharedSelectionFocusScopeEls(component)],
+      () => commitProvisionalTab(runtimeRef.requirePublished()),
+      owningLeaf,
     ),
-    getProviderId: () => requireTabProviderId(runtimeRef.requirePublished(), plugin),
-    getProviderSessionId: () => shell.executionCoordinator.snapshot?.providerSessionId ?? null,
+    browser: new BrowserSelectionController(
+      plugin.app,
+      ui.contextTray,
+      dom.inputEl,
+      () => commitProvisionalTab(runtimeRef.requirePublished()),
+    ),
+    canvas: new CanvasSelectionController(
+      plugin.app,
+      ui.contextTray,
+      dom.inputEl,
+      () => commitProvisionalTab(runtimeRef.requirePublished()),
+    ),
+  });
+  options.registerCleanup('tab composer selections', () => composerSelections.stop());
+
+  const getMessagesEl = () => dom.messagesEl;
+  const getProviderId = () => requireTabProviderId(runtimeRef.requirePublished(), plugin);
+  const getProviderSessionId = () => shell.executionCoordinator.snapshot?.providerSessionId ?? null;
+  const asyncSubagentHistoryRecovery = new AsyncSubagentHistoryRecovery({
+    subagentManager: services.subagentManager,
+    getMessagesEl,
+    getProviderId,
+    getProviderSessionId,
     loadSubagentToolCalls: async (request) => {
       const vaultPath = getVaultPath(plugin.app);
       if (!vaultPath) return undefined;
@@ -215,7 +192,29 @@ export function buildTabRuntimeControllers(
       }
     },
   });
+  const streamController = new StreamController({
+    onQuestionToolChanged: tool => runtimeRef.requirePublished().controllers.inputController.updateAsyncQuestion(tool),
+    plugin,
+    state,
+    renderer,
+    subagentManager: services.subagentManager,
+    getMessagesEl,
+    updateQueueIndicator: () => (
+      runtimeRef.requirePublished().controllers.inputController.queue.updateIndicator()
+    ),
+    getProviderId,
+    asyncSubagentHistoryRecovery,
+  });
   options.registerCleanup('tab stream controller', () => streamController.dispose());
+  const inlinePrompts = new InlineInteractionPrompts({
+    getPromptParentEl: () => dom.inputContainerEl.parentElement,
+    getSuppressedEl: () => dom.inputContainerEl,
+    onBeforeShow: () => {
+      const generation = state.streamGeneration;
+      streamController.thinkingIndicator.hide();
+      return () => streamController.thinkingIndicator.resume(generation);
+    },
+  });
   streamController.setTabActive(!dom.contentEl.hasClass('claudian-hidden'));
 
   const renderWindow = dom.messagesEl.ownerDocument.defaultView;
@@ -255,14 +254,13 @@ export function buildTabRuntimeControllers(
         }
       },
       getMessagesEl: () => dom.messagesEl,
-      navigation: shell.session,
+      session: shell.session,
       getLinkedContentController: () => ui.linkedContentController,
       clearQueuedMessage: () => (
-        runtimeRef.requirePublished().controllers.inputController.clearQueuedMessage()
+        runtimeRef.requirePublished().controllers.inputController.queue.clear()
       ),
       getExecutionCoordinator: () => shell.executionCoordinator,
       ensureExecutionInitialized,
-      getProviderId: () => requireTabProviderId(runtimeRef.requirePublished(), plugin),
       getSelectedModel: () => getTabSelectedModel(runtimeRef.requirePublished(), plugin),
       dismissPendingInlinePrompts: () => (
         runtimeRef.requirePublished().controllers.inputController.dismissPendingApproval()
@@ -335,50 +333,39 @@ export function buildTabRuntimeControllers(
     composerEl: dom.inputComposerEl,
     drafts,
     getInputEl: () => dom.inputEl,
-    getTab: () => runtimeRef.requirePublished(),
+    parent: {
+      get conversationId() { return state.currentConversationId; },
+      get providerId() { return getTabProviderId(runtimeRef.requirePublished(), plugin); },
+      get isLive() { return isRuntimeLive(runtimeRef.requirePublished()); },
+      get isStreaming() { return state.isStreaming; },
+      get lastMessageId() { return state.lastMessage?.id; },
+      captureForkSource: () => captureLatestCompletedForkSource(runtimeRef.requirePublished(), plugin, isRuntimeLive),
+    },
     inputWrapperEl: dom.inputWrapper,
-    isRuntimeLive,
     onDestinationChanged: () => {
       const tab = runtimeRef.current();
       if (!tab) return;
-      tab.controllers.inputController.setPromptActive(tab.controllers.sideChatController.destination === 'main');
+      inlinePrompts.setActive(tab.controllers.sideChatController.destination === 'main');
       if (tab.controllers.sideChatController.destination === 'side') conversationController.cancelBranchDraft();
       ui.composerDropdown.setBuiltInsEnabled(
         tab.controllers.sideChatController.destination === 'main',
       );
       refreshTabProviderUI(tab);
+      ui.promptSuggestion.refresh();
     },
     onStatusChanged: () => options.onWorkChanged?.(runtimeRef.requirePublished()),
     plugin,
   });
   options.registerCleanup('tab side chat', () => sideChatController.dispose());
 
-  const inputController = new InputController({
+  const builtInCommandController = new BuiltInCommandController({
     plugin,
-    state,
-    renderer,
-    streamController,
-    selectionController,
-    browserSelectionController,
-    canvasSelectionController,
     conversationController,
-    drafts,
-    getInputEl: () => dom.inputEl,
-    getInputContainerEl: () => dom.inputContainerEl,
-    getWelcomeEl: () => dom.welcomeEl,
-    getMessagesEl: () => dom.messagesEl,
     getLinkedContentController: () => ui.linkedContentController,
-    getTitleGenerationService: () => services.titleGenerationService,
-    generateId: createTabMessageId,
-    getSettings: () => getTabSettingsSnapshot(runtimeRef.requirePublished(), plugin),
-    getExecutionCoordinator: () => shell.executionCoordinator,
-    getSubagentManager: () => services.subagentManager,
-    getTabProviderId: () => getTabProviderId(runtimeRef.requirePublished(), plugin),
-    canStartTurn: () => shell.session.acceptsIntents,
-    isClosing: () => shell.lifecycleState === 'closing',
+    getCurrentConversationId: () => state.currentConversationId,
+    getInputContainerEl: () => dom.inputContainerEl,
+    getInputEl: () => dom.inputEl,
     getSideChatController: () => sideChatController,
-    turnOwner: shell.session.turns,
-    ensureExecutionInitialized,
     openConversation: openConversation
       ? async (conversationId) => {
           const runtime = runtimeRef.requirePublished();
@@ -401,15 +388,41 @@ export function buildTabRuntimeControllers(
         )
       : undefined,
     toggleFastMode: () => toggleTabServiceTier(runtimeRef.requirePublished(), plugin),
+  });
+
+  const inputController = new InputController({
+    plugin,
+    state,
+    renderer,
+    streamController,
+    selections: composerSelections,
+    conversationController,
+    drafts,
+    inlinePrompts,
+    getInputEl: () => dom.inputEl,
+    getWelcomeEl: () => dom.welcomeEl,
+    getMessagesEl: () => dom.messagesEl,
+    getLinkedContentController: () => ui.linkedContentController,
+    getTitleGenerationService: () => services.titleGenerationService,
+    generateId: createTabMessageId,
+    getSettings: () => getTabSettingsSnapshot(runtimeRef.requirePublished(), plugin),
+    getExecutionCoordinator: () => shell.executionCoordinator,
+    getTabProviderId: () => getTabProviderId(runtimeRef.requirePublished(), plugin),
+    canStartTurn: () => shell.session.acceptsIntents,
+    isClosing: () => shell.lifecycleState === 'closing',
+    getSideChatController: () => sideChatController,
+    session: shell.session,
+    ensureExecutionInitialized,
+    builtInCommands: builtInCommandController,
     captureReviewableSettlement: shell.captureReviewableSettlement ?? undefined,
   });
   const navigationController = new NavigationController({
     getMessagesEl: () => dom.messagesEl,
     getInputEl: () => dom.inputEl,
     getSettings: () => plugin.settings.keyboardNavigation,
-    isStreaming: () => state.isStreaming,
+    isStreaming: () => state.isStreaming || inputController.isPreparingMainTurn,
     shouldSkipEscapeHandling: () => {
-      if (inputController.isResumeDropdownVisible()) return true;
+      if (builtInCommandController.isResumeDropdownVisible()) return true;
       if (ui.composerDropdown.isVisible()) return true;
       return false;
     },
@@ -420,12 +433,12 @@ export function buildTabRuntimeControllers(
   return {
     renderer,
     controllers: {
-      selectionController,
-      browserSelectionController,
-      canvasSelectionController,
+      composerSelections,
+      inlinePrompts,
       conversationController,
       streamController,
       inputController,
+      builtInCommandController,
       navigationController,
       sideChatController,
     },

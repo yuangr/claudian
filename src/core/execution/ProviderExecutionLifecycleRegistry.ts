@@ -11,8 +11,7 @@ declare const providerExecutionTransitionScopeBrand: unique symbol;
 export type ProviderExecutionOwnerKind =
   | 'chat'
   | 'title'
-  | 'inline-edit'
-  | 'warmup';
+  | 'inline-edit';
 
 export type ProviderExecutionInvalidationReason =
   | {
@@ -57,15 +56,18 @@ type ProviderExecutionTransitionCallback = (
   context: ProviderExecutionTransitionContext,
 ) => void | Promise<void>;
 
-export type ProviderExecutionTransitionHook =
-  | {
+export type ProviderExecutionTransitionHook = {
+  /** Shared-runtime providers fence new work and drain their own native generations. */
+  preserveSessions?(session: ProviderExecutionSession): boolean;
+} & (
+  {
       beforeTransition: ProviderExecutionTransitionCallback;
       afterTransition?: ProviderExecutionTransitionCallback;
     }
   | {
       beforeTransition?: ProviderExecutionTransitionCallback;
       afterTransition: ProviderExecutionTransitionCallback;
-    };
+    });
 
 export class ProviderExecutionTransitionError extends Error {
   readonly retryable = true;
@@ -122,19 +124,22 @@ class ProviderExecutionSessionLeaseImpl
   >();
   private releasePromise: Promise<void> | null = null;
   private released = false;
+  private acceptedGeneration: number;
 
   constructor(
     readonly generation: number,
     readonly session: ProviderExecutionSession,
     readonly owner: ProviderExecutionOwnerKind,
     private readonly state: ProviderLifecycleState,
-  ) {}
+  ) { this.acceptedGeneration = generation; }
+
+  preserveAcrossTransition(): void { this.acceptedGeneration = this.state.generation; }
 
   isCurrent(): boolean {
     return (
       !this.released &&
       this.invalidationReason === null &&
-      this.state.generation === this.generation &&
+      this.state.generation === this.acceptedGeneration &&
       this.state.leases.has(this)
     );
   }
@@ -305,6 +310,9 @@ export class ProviderExecutionLifecycleRegistry {
       let result: T | undefined;
       let hasResult = false;
       const transitionHooks = states.map(({ state }) => [...state.hooks]);
+      const isPreserved = (state: ProviderLifecycleState, lease: ProviderExecutionSessionLeaseImpl) => (
+        [...state.hooks].some(hook => hook.preserveSessions?.(lease.session))
+      );
 
       try {
         const leases = states.flatMap(({ providerId, state }) => {
@@ -313,9 +321,13 @@ export class ProviderExecutionLifecycleRegistry {
             providerId,
             generation: state.generation,
           };
-          return [...state.leases].map((lease) => {
+          return [...state.leases].flatMap((lease) => {
+            if (isPreserved(state, lease)) {
+              lease.preserveAcrossTransition();
+              return [];
+            }
             lease.invalidate(reason);
-            return lease;
+            return [lease];
           });
         });
         errors.push(...await settleFailures(leases.map((lease) => lease.release())));
@@ -340,6 +352,13 @@ export class ProviderExecutionLifecycleRegistry {
       } catch (error) {
         errors.push(error);
       } finally {
+        // A mutation can disable a provider that preserved its running sessions
+        // before the transition. Invalidate those leases before runtime teardown.
+        for (const { providerId, state } of states) {
+          const leases = [...state.leases].filter(lease => !isPreserved(state, lease));
+          for (const lease of leases) lease.invalidate({ kind: 'provider-transition', providerId, generation: state.generation });
+          errors.push(...await settleFailures(leases.map(lease => lease.release())));
+        }
         for (let index = states.length - 1; index >= 0; index -= 1) {
           const hooks = [...transitionHooks[index]].reverse();
           for (const hook of hooks) {

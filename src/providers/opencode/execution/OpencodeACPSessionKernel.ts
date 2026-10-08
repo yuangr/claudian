@@ -6,6 +6,8 @@ import {
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { parseCompactCommand } from '@/core/commands/compactCommand';
+import { getEnhancedPath } from '@/core/process/env';
 import { resolveTitleGenerationLocale } from '@/core/prompt/titleGeneration';
 import {
   ACPClientConnection,
@@ -24,8 +26,8 @@ import {
   mapACPApprovalDecision,
   resolveACPLoadSessionId,
 } from '@/providers/acp';
-import { getEnhancedPath } from '@/utils/env';
 
+import { loadOpencodeV1CompactionIds } from '../history/OpencodeHistoryStore';
 import { getSystemPromptSettings } from '../runtime/OpencodeExecutionAgents';
 import {
   prepareOpencodeLaunchArtifacts,
@@ -150,9 +152,7 @@ export class DefaultOpencodeACPSessionKernel
             systemPromptKey: options.systemInstructions.instructions,
             systemPromptText: options.systemInstructions.instructions,
           }
-          : {
-            dynamicSystemPromptSections: options.systemInstructions.dynamicSections,
-          }),
+          : {}),
         workspaceRoot: this.options.config.vaultWorkingDirectory,
       });
       this.#assertNotDisposed();
@@ -279,8 +279,27 @@ export class DefaultOpencodeACPSessionKernel
     this.autoApprove = this.profile === 'managed' && enabled;
   }
 
-  prompt(request: ACPPromptRequest): Promise<ACPPromptResponse> {
-    return this.#requireConnection().prompt(request);
+  async prompt(request: ACPPromptRequest): Promise<ACPPromptResponse> {
+    const connection = this.#requireConnection();
+    const turnId = this.options.getActiveTurnId();
+    const isCompact = request.prompt.some(block => block.type === 'text' && parseCompactCommand(block.text) !== null);
+    const readCompactions = () => this.databasePath && this.databasePath !== ':memory:'
+      ? loadOpencodeV1CompactionIds(this.databasePath, request.sessionId).catch(() => null)
+      : Promise.resolve(null);
+    const before = isCompact ? await readCompactions() : null;
+    this.#assertNotDisposed();
+    // Cancellation during the history read must not start native work afterward.
+    if (turnId !== this.options.getActiveTurnId()) return { stopReason: 'cancelled' };
+    const response = await connection.prompt(request);
+    if (before && response.stopReason === 'end_turn') {
+      const after = await readCompactions();
+      if (!this.disposed && turnId === this.options.getActiveTurnId()) {
+        for (const id of after ?? []) {
+          if (!before.has(id)) this.options.onNativeOutput?.({ type: 'context_compacted' });
+        }
+      }
+    }
+    return response;
   }
 
   cancel(sessionId: string): void {

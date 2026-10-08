@@ -1,14 +1,7 @@
-.claudian-tool-call {
-  margin: 8px 0;
-}
-
-.claudian-tool-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-  cursor: pointer;
-  overflow: hidden;
+.claudian-tool-header,
+.claudian-write-edit-header {
+  /* Suppress Obsidian hover tooltips while preserving accessible labels. */
+  --no-tooltip: true;
 }
 
 .claudian-tool-header:hover {
@@ -104,12 +97,8 @@
   color: var(--color-orange);
 }
 
-/* Tool call content - border style (like thinking block) */
-.claudian-tool-content {
-  padding: 4px 0;
-  padding-inline-start: 16px;
-  margin-inline-start: 7px;
-  border-inline-start: 1px solid var(--background-modifier-border);
+.claudian-tool-status.status-cancelled {
+  color: var(--text-muted);
 }
 
 /* Tool content variants that render inline widgets instead of bordered results */
@@ -215,35 +204,6 @@
   white-space: nowrap;
 }
 
-/* Web search summary section */
-.claudian-tool-web-summary {
-  font-family: var(--font-monospace);
-  font-size: 12px;
-  color: var(--text-muted);
-  padding-top: 4px;
-  border-top: 1px solid var(--background-modifier-border);
-  margin-top: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 200px;
-  overflow-y: auto;
-}
-
-/* Markdown-rendered summaries use prose typography instead of the monospace fallback. */
-.claudian-tool-web-summary-markdown {
-  font-family: var(--font-text);
-  font-size: var(--font-ui-small);
-  white-space: normal;
-}
-
-.claudian-tool-web-summary-markdown > :first-child {
-  margin-top: 0;
-}
-
-.claudian-tool-web-summary-markdown > :last-child {
-  margin-bottom: 0;
-}
-
 /* Images produced by a tool */
 .claudian-tool-result-images {
   display: flex;
@@ -287,17 +247,11 @@
 
 .claudian-tool-result-item {
   display: block;
-  margin-bottom: 2px;
 }
 
 .claudian-tool-patch-section + .claudian-tool-patch-section {
   margin-top: 10px;
 }
-
-.claudian-tool-result-item:last-child {
-  margin-bottom: 0;
-}
-
 
 .claudian-tool-script-label {
   color: var(--text-faint);
@@ -350,7 +304,6 @@
   margin-right: 6px;
 }
 
-.claudian-tool-status.status-cancelled,
 .claudian-tool-script-call-detail {
   color: var(--text-muted);
 }

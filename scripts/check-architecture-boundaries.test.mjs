@@ -113,10 +113,6 @@ function normalizeModuleTarget(target) {
   return target.replace(/\.(?:[cm]?[jt]sx?)$/, '');
 }
 
-function resolvedImportKey(importer, target) {
-  return `${path.normalize(importer)}::${normalizeModuleTarget(path.normalize(target))}`;
-}
-
 function resolveTypeScriptImport(importer, specifier) {
   const target = resolveSourceImport(importer, specifier);
   if (!target) return null;
@@ -131,19 +127,13 @@ function resolveTypeScriptImport(importer, specifier) {
     ?? null;
 }
 
-function findResolvedImportViolations(roots, isForbidden, allowedImports = new Set()) {
+function findResolvedImportViolations(roots, isForbidden) {
   const violations = [];
   for (const root of roots) {
     for (const file of listTypeScriptFiles(root)) {
       for (const sourceImport of listSourceImports(file)) {
         const target = resolveSourceImport(file, sourceImport.specifier);
-        if (
-          !target
-          || !isForbidden(target)
-          || allowedImports.has(resolvedImportKey(file, target))
-        ) {
-          continue;
-        }
+        if (!target || !isForbidden(target)) continue;
         violations.push(
           `${path.relative(process.cwd(), file)}:${sourceImport.line}`
           + ` imports ${sourceImport.specifier} -> ${path.relative(process.cwd(), target)}`,
@@ -178,12 +168,6 @@ const concreteProviderNames = listConcreteProviderNames();
 const concreteProviderPathPattern = new RegExp(
   `providers/(?:${concreteProviderNames.map(escapeRegExp).join('|')})(?:/|['"])`,
 );
-const allowedAppProviderImports = new Set([
-  resolvedImportKey(
-    path.join(appRoot, 'settings', 'defaultSettings.ts'),
-    path.join(providersRoot, 'defaultProviderConfigs'),
-  ),
-]);
 
 test('repository paths use POSIX separators for stable cross-platform comparison', () => {
   assert.equal(normalizeRepositoryPath('src\\main.ts'), 'src/main.ts');
@@ -235,11 +219,10 @@ test('providers avoid root app imports', () => {
   ), []);
 });
 
-test('app avoids features and provider implementations outside default assembly', () => {
+test('app avoids features and provider implementations', () => {
   assert.deepEqual(findResolvedImportViolations(
     [appRoot],
     target => isPathWithin(target, featuresRoot) || isPathWithin(target, providersRoot),
-    allowedAppProviderImports,
   ), []);
 });
 
@@ -299,11 +282,11 @@ test('the shared FeatureHost contract does not depend on chat', () => {
     .map(sourceImport => `${sourceImport.line}: ${sourceImport.specifier}`);
   assert.deepEqual(violations, []);
   const contract = fs.readFileSync(featureHostFile, 'utf8');
-  assert.doesNotMatch(contract, /\b(?:getView|getAllViews|warmExecutionPool|chatModelSelection)\b/);
-
+  assert.doesNotMatch(
+    contract,
+    /\b(?:getView|getAllViews|chatModelSelection)\b/,
+  );
 });
-
-
 
 test('persisted settings changes use the coordinator boundary', () => {
   const matches = findMatches([sourceRoot], /\.saveSettings\(\)/).filter(file => ![
@@ -312,7 +295,7 @@ test('persisted settings changes use the coordinator boundary', () => {
   assert.deepEqual(matches, []);
 });
 
-test('runtime command discovery cannot import shared skill management', () => {
+test('runtime command discovery cannot import Vault skill management', () => {
   const roots = [
     path.join(sourceRoot, 'features', 'chat'),
     path.join(sourceRoot, 'shared', 'components'),
@@ -321,8 +304,11 @@ test('runtime command discovery cannot import shared skill management', () => {
       path.join(sourceRoot, 'providers', provider, 'commands'),
     ]).filter(fs.existsSync),
   ];
-  const pattern = /from\s+['"][^'"]*(?:core\/skills|AgentSkillSettings)/;
-  assert.deepEqual(findMatches(roots, pattern), []);
+  const skillManagement = [path.join(featuresRoot, 'agent-skills')];
+  assert.deepEqual(findResolvedImportViolations(
+    roots,
+    target => skillManagement.some(root => isPathWithin(normalizeModuleTarget(target), root)),
+  ), []);
 });
 
 test('renderer source does not import AsyncLocalStorage', () => {
@@ -589,10 +575,18 @@ test('production bundle policy rejects plugin artifact filename references', () 
   );
 });
 
-test('shared and utility modules do not depend on application or feature orchestration', () => {
+test('shared modules do not depend on application or feature orchestration', () => {
   assert.deepEqual(findResolvedImportViolations(
-    [path.join(sourceRoot, 'shared'), path.join(sourceRoot, 'utils')],
+    [path.join(sourceRoot, 'shared')],
     target => isPathWithin(target, appRoot) || isPathWithin(target, featuresRoot),
+  ), []);
+});
+
+test('utility modules are leaves that import only other utilities', () => {
+  const utilsRoot = path.join(sourceRoot, 'utils');
+  assert.deepEqual(findResolvedImportViolations(
+    [utilsRoot],
+    target => !isPathWithin(target, utilsRoot),
   ), []);
 });
 

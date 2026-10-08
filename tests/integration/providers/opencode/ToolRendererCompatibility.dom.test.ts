@@ -9,12 +9,13 @@ import { Component } from 'obsidian';
 import type { ProviderExecutionEvent } from '@/core/execution';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ChatMessage, StreamChunk, ToolCallInfo } from '@/core/types';
-import { providerOutputEventToStreamChunk, StreamController } from '@/features/chat/controllers/StreamController';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
-import { renderStoredToolCall } from '@/features/chat/rendering/ToolCallRenderer';
-import { renderStoredWriteEdit } from '@/features/chat/rendering/WriteEditRenderer';
-import { SubagentManager } from '@/features/chat/services/SubagentManager';
+import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
+import { renderStoredToolCall } from '@/features/chat/rendering/tools/ToolCallRenderer';
+import { renderStoredWriteEdit } from '@/features/chat/rendering/tools/WriteEditRenderer';
 import { ChatState } from '@/features/chat/state/ChatState';
+import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
+import { StreamController } from '@/features/chat/turns/StreamController';
 import { OpencodeHTTPSessionKernel } from '@/providers/opencode/execution/OpencodeHTTPSessionKernel';
 import { OpencodeSessionPersistence } from '@/providers/opencode/execution/OpencodeSessionPersistence';
 import { mapOpencodeMessages, mapOpencodeV2NativeMessages } from '@/providers/opencode/history/OpencodeHistoryStore';
@@ -44,7 +45,7 @@ async function restoreLiveV2(call: NativeToolCall): Promise<ToolCallInfo> {
   let receive!: (event: OpencodeHTTPEvent) => void;
   const output: ProviderExecutionEvent[] = [];
   const lease = {
-    databasePath: null, isReusable: () => true,
+    databasePath: null, isReusable: () => true, onRetired: () => {}, onSuperseded: () => {},
     subscribe: async (callback: typeof receive) => { receive = callback; },
     registerAgents: async () => ({}), waitForActivation: async () => {}, refreshGlobalForms: async () => {},
     dispose: async () => {},
@@ -199,7 +200,7 @@ describe.each(['live', 'history'] as const)('%s OpenCode V2 tool presentation', 
     expect(lines(block)).toEqual(fileLines);
   });
 
-  it('renders web search hits as links with their date and snippet', async () => {
+  it('renders web search hits as linked titles without their date or snippet', async () => {
     const published = testDate().toISOString();
     const tool = await restore(mode, {
       name: 'websearch', input: { query: 'AAPL price' },
@@ -210,8 +211,8 @@ describe.each(['live', 'history'] as const)('%s OpenCode V2 tool presentation', 
     expand(block, /AAPL price/);
     expect(within(block).getByRole('link', { name: 'Stock Price' }).getAttribute('href')).toBe('https://investor.apple.com/stock-price/');
     expect(within(block).getByRole('link', { name: 'AAPL Quote' }).getAttribute('href')).toBe('https://finance.example.com/AAPL');
-    expect(within(block).getByText(`${published} · Quote snippet`)).toBeDefined();
-    expect(within(block).getByText('Second snippet')).toBeDefined();
+    expect(block.textContent).not.toContain(published);
+    expect(block.textContent).not.toMatch(/Quote snippet|Second snippet/);
     expect((await axe(block)).violations).toEqual([]);
   });
 });

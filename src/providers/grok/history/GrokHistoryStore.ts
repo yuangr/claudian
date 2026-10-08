@@ -1,28 +1,25 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { resolveToolDiffData } from '@/core/tools/toolDiff';
+
 import { isWriteEditTool, TOOL_ASK_USER_QUESTION } from '../../../core/tools/toolNames';
-import {
-  extractResultImages,
-  extractToolResultFormat,
-  extractWebSearchResults,
-  extractWebSearchSummary,
-} from '../../../core/tools/toolResultContent';
+import { mergeToolResultDetails } from '../../../core/tools/toolResultDetails';
 import type {
   ChatMessage,
   ContentBlock,
   ImageAttachment,
   ImageMediaType,
   ToolCallInfo,
+  ToolResultDetails,
 } from '../../../core/types';
-import type { SDKToolUseResult } from '../../../core/types/diff';
-import { extractDiffData } from '../../../utils/diff';
-import { extractACPDiffToolUseResult } from '../../acp/ACPToolResultNormalization';
+import { extractACPDiffResultDetails } from '../../acp/ACPToolResultNormalization';
 import {
+  buildGrokToolProviderPayload,
   type GrokRawToolNameResolution,
   normalizeGrokToolCall,
+  normalizeGrokToolResultDetails,
   normalizeGrokToolUpdate,
-  normalizeGrokToolUseResult,
   resolveGrokRawToolName,
 } from '../normalization/grokToolNormalization';
 
@@ -61,7 +58,8 @@ interface StoredTool {
   rawNameProvenance: GrokRawToolNameResolution['provenance'];
   rawOutput: unknown;
   status: ToolCallInfo['status'];
-  toolUseResult?: SDKToolUseResult;
+  /** Result fields decoded from ACP `diff` content. */
+  acpResultDetails?: ToolResultDetails;
 }
 
 interface PendingTurn {
@@ -131,6 +129,25 @@ export function parseGrokHistoryContent(
     }
 
     const updateType = readString(update.sessionUpdate) ?? readString(update.type);
+    if (updateType === 'auto_compact_completed') {
+      if (pending) {
+        pending.blocks.push({ type: 'context_compacted' });
+      } else {
+        // Manual compaction has no native user turn. Keep it at the next prompt's
+        // rewind boundary without consuming that prompt index or creating a checkpoint.
+        const eventId = readString(readRecord(record.params._meta)?.eventId);
+        completedTurns.push({
+          messages: [{
+            id: eventId ?? `grok-${sanitizeId(sessionId)}-compact-${turnIndex}`,
+            role: 'assistant', content: '', timestamp: normalizeTimestamp(record.timestamp),
+            contentBlocks: [{ type: 'context_compacted' }],
+          }],
+          promptIndex: nextFallbackPromptIndex,
+        });
+        turnIndex += 1;
+      }
+      continue;
+    }
     if (updateType === 'rewind_marker') {
       const targetPromptIndex = readNonNegativeInteger(update.target_prompt_index)
         ?? readNonNegativeInteger(update.targetPromptIndex);
@@ -423,8 +440,8 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     title: rawName,
   }, rawNameResolution);
   const status = normalizeToolStatus(readString(update.status), current?.status);
-  const nativeToolUseResult = extractACPDiffToolUseResult(update.content)
-    ?? current?.toolUseResult;
+  const acpResultDetails = extractACPDiffResultDetails(update.content)
+    ?? current?.acpResultDetails;
   // Explicit text content is the presentation, even when empty (e.g. an image-only MCP result).
   const output = hasTextContent(update.content) ? renderedContent : renderedContent || (update.rawOutput === undefined
     ? current?.output || normalized.output
@@ -444,7 +461,7 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     rawNameProvenance: rawNameResolution.provenance,
     rawOutput,
     status,
-    ...(nativeToolUseResult ? { toolUseResult: nativeToolUseResult } : {}),
+    ...(acpResultDetails ? { acpResultDetails } : {}),
   });
 }
 
@@ -478,38 +495,31 @@ function finalizeTurn(
     if (!tool) {
       return [];
     }
-    const providerToolUseResult = normalizeGrokToolUseResult(
-      tool.rawName,
-      tool.input,
-      tool.rawOutput,
-      tool.rawInput,
-    );
-    const toolUseResult: SDKToolUseResult = {
-      ...tool.toolUseResult,
-      ...providerToolUseResult,
-    };
+    const grokResultDetails = normalizeGrokToolResultDetails(tool.rawName, tool.input, tool.rawOutput);
+    const details = mergeToolResultDetails(tool.acpResultDetails, grokResultDetails);
     const toolCall: ToolCallInfo = {
       id: tool.id,
       input: tool.input,
       name: tool.name,
-      providerPayload: providerToolUseResult.providerPayload,
+      providerPayload: buildGrokToolProviderPayload({
+        rawInput: tool.rawInput,
+        rawName: tool.rawName,
+        rawOutput: tool.rawOutput,
+      }),
       ...(tool.output ? { result: tool.output } : {}),
       status: tool.status,
-      resultFormat: extractToolResultFormat(toolUseResult),
+      resultFormat: details?.resultFormat,
     };
-    const webSearchResults = extractWebSearchResults(toolUseResult);
-    if (webSearchResults) {
-      toolCall.webSearchResults = webSearchResults;
-      const webSearchSummary = extractWebSearchSummary(toolUseResult);
-      if (webSearchSummary) toolCall.webSearchSummary = webSearchSummary;
+    if (details?.webSearchResults) {
+      toolCall.webSearchResults = details.webSearchResults;
+      if (details.webSearchSummary) toolCall.webSearchSummary = details.webSearchSummary;
     }
-    const resultImages = extractResultImages(toolUseResult);
-    if (resultImages) toolCall.resultImages = resultImages;
-    if (toolCall.name === TOOL_ASK_USER_QUESTION && providerToolUseResult.answers) {
-      toolCall.resolvedAnswers = providerToolUseResult.answers;
+    if (details?.resultImages) toolCall.resultImages = details.resultImages;
+    if (toolCall.name === TOOL_ASK_USER_QUESTION && grokResultDetails?.resolvedAnswers) {
+      toolCall.resolvedAnswers = grokResultDetails.resolvedAnswers;
     }
     if (toolCall.status === 'completed' && isWriteEditTool(toolCall.name)) {
-      const diffData = extractDiffData(toolUseResult, toolCall);
+      const diffData = resolveToolDiffData(details?.diff, toolCall);
       if (diffData) toolCall.diffData = diffData;
     }
     return [toolCall];

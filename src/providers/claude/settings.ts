@@ -7,14 +7,17 @@ import {
   readStoredString,
 } from '../../core/providers/settings/storedSettings';
 import type { HostnameCLIPaths } from '../../core/types/settings';
-import { type ClaudeDiscoveredModel, decodeClaudeModels } from './modelCatalog';
+import { type ClaudeDiscoveredModel, decodeClaudeModels } from './models';
 
-export type ClaudeResponseStyle = 'Default' | 'Concise';
 type ClaudeSettingSource = 'user' | 'project' | 'local';
 
 export interface ClaudeProviderSettings {
   enabled: boolean;
-  responseStyle: ClaudeResponseStyle;
+  /** Native output style name; null inherits Claude Code's own setting. */
+  outputStyle: string | null;
+  promptSuggestions: boolean;
+  /** Output style names Claude Code last reported, built-in and custom. */
+  discoveredOutputStyles: string[];
   cliPath: string;
   cliPathsByHost: HostnameCLIPaths;
   loadUserSettings: boolean;
@@ -29,7 +32,9 @@ export interface ClaudeProviderSettings {
 
 export const DEFAULT_CLAUDE_PROVIDER_SETTINGS: Readonly<ClaudeProviderSettings> = Object.freeze({
   enabled: true,
-  responseStyle: 'Default',
+  outputStyle: null,
+  promptSuggestions: false,
+  discoveredOutputStyles: [],
   cliPath: '',
   cliPathsByHost: {},
   loadUserSettings: true,
@@ -56,7 +61,9 @@ export function getClaudeProviderSettings(
       config.enabled,
       DEFAULT_CLAUDE_PROVIDER_SETTINGS.enabled,
     ),
-    responseStyle: config.responseStyle === 'Concise' ? 'Concise' : 'Default',
+    outputStyle: readOutputStyle(config),
+    promptSuggestions: readStoredBoolean(config.promptSuggestions, false),
+    discoveredOutputStyles: decodeOutputStyles(config.discoveredOutputStyles),
     cliPath: readStoredString(
       config.cliPath,
       DEFAULT_CLAUDE_PROVIDER_SETTINGS.cliPath,
@@ -85,6 +92,21 @@ export function getClaudeProviderSettings(
       DEFAULT_CLAUDE_PROVIDER_SETTINGS.environmentHash,
     ),
   };
+}
+
+/** Distinct non-empty style names in reported order. */
+export function decodeOutputStyles(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((name): name is string => typeof name === 'string')
+    .map(name => name.trim())
+    .filter(Boolean))];
+}
+
+function readOutputStyle(config: Record<string, unknown>): string | null {
+  if (config.outputStyle === null) return null;
+  if (typeof config.outputStyle === 'string' && config.outputStyle.trim()) return config.outputStyle.trim();
+  // The retired `responseStyle` always sent a style; only Concise was a deliberate choice.
+  return config.responseStyle === 'Concise' ? 'Concise' : null;
 }
 
 export function resolveClaudeSettingSources(

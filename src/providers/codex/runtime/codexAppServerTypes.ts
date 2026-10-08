@@ -67,14 +67,15 @@ export interface Thread {
   modelProvider: string;
   model?: string | null;
   reasoningEffort?: string | null;
-  source: string;
+  source: string | { subAgent: string | { thread_spawn: { parent_thread_id: string } } };
+  parentThreadId?: string | null;
   agentNickname: string | null;
   agentRole: string | null;
   gitInfo: GitInfo | null;
 }
 
 export interface ThreadStatus {
-  type: 'idle' | 'active' | 'systemError';
+  type: 'idle' | 'active' | 'systemError' | 'notLoaded';
   activeFlags?: string[];
 }
 
@@ -218,6 +219,8 @@ export interface WebSearchItem {
     url?: string;
     pattern?: string;
   };
+  /** Opaque structured sources, e.g. `{ title, url, snippet }` text results. */
+  results?: unknown[] | null;
   status?: string;
 }
 
@@ -250,7 +253,8 @@ export interface MCPToolCallItem {
   server: string;
   tool: string;
   status?: string;
-  arguments?: Record<string, unknown>;
+  /** JSON value; some servers report the raw argument string. */
+  arguments?: unknown;
   result?: { content?: Array<{ type?: string; text?: string }> } | null;
   error?: string | null;
   durationMs?: number | null;

@@ -2,8 +2,9 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { capturedSelectionPrompt, capturedSelections } from '@test/helpers/capturedSelections';
 import { createProviderRecoveryTestHarness } from '@test/helpers/features/chat/ProviderRecoveryTestHarness';
-import { testTime } from '@test/helpers/testClock';
+import { testDate, testTime } from '@test/helpers/testClock';
 
 import type {
   ProviderExecutionEvent,
@@ -11,6 +12,7 @@ import type {
   ProviderExecutionRun,
   ProviderInteractionPort,
   ProviderSessionConfig,
+  ProviderSessionEvent,
 } from '@/core/execution';
 import {
   isSteerableExecutionSession,
@@ -25,7 +27,7 @@ import {
   type PiExecutionKernelCallbacks,
 } from '@/providers/pi/execution';
 import { PiConversationHistoryService } from '@/providers/pi/history/PiConversationHistoryService';
-import type { PiLaunchSpec } from '@/providers/pi/runtime/PiLaunchSpec';
+import type { PiLaunchSpec } from '@/providers/pi/runtime/PiLaunchSpecBuilder';
 
 class FakeKernel implements PiExecutionKernel {
   readonly requests: Array<{ payload: Record<string, unknown>; type: string }> = [];
@@ -204,6 +206,7 @@ function createConversationHistory(prefix: string) {
 function completeTurn(kernel: FakeKernel): void {
   kernel.emit({ type: 'agent_start' });
   kernel.emit({ type: 'agent_end' });
+  kernel.emit({ type: 'agent_settled' });
 }
 
 function getPromptMessages(kernel: FakeKernel): string[] {
@@ -240,10 +243,10 @@ function createHarness(
       sessionFile: '/tmp/pi-session.jsonl',
       sessionId: 'pi-session-1',
     }],
-    ['prompt', { accepted: true }],
+    ['prompt', { disposition: 'started' }],
     ['set_model', {}],
     ['set_thinking_level', {}],
-    ['steer', { accepted: true }],
+    ['steer', { disposition: 'queued' }],
   ]);
   const commandCatalog = {
     getDropdownConfig: jest.fn(),
@@ -276,6 +279,45 @@ function createHarness(
 }
 
 describe('PiExecutionBackend', () => {
+  it.each([
+    ['/compact', ''],
+    [' \t/CoMpAcT keep recent edits\nFocus on tests  ', 'keep recent edits\nFocus on tests'],
+  ])('compacts with only explicit instructions from %j', async (text, instructions) => {
+    const { session, kernels, responses } = createHarness();
+    responses.set('prompt', { disposition: 'handled' });
+    try {
+      const events = await collect(session.execute(createRequest({
+        input: [{ type: 'text', text }, { type: 'image', image: {
+          id: 'capture', name: 'capture.png', data: 'aW1hZ2U=',
+          mediaType: 'image/png', size: 5, source: 'paste',
+        } }],
+        context: { ...capturedSelections, linkedContent: { path: 'note.md' },
+          sessionReferences: [{ id: 'ref', title: 'Review', providerId: 'pi', updatedAt: 'updated', snapshotPath: '/tmp/ref.md' }],
+        },
+      })).events);
+      expect(kernels[0].requests.filter(request => request.type === 'compact' || request.type === 'prompt'))
+        .toEqual([{ type: 'compact', payload: { customInstructions: instructions } }]);
+      expect(events.filter(event => event.type === 'context_compacted')).toHaveLength(1);
+      expect(events.at(-1)?.type).toBe('turn_completed');
+    } finally { await session.dispose(); }
+  });
+
+  it('rejects compact without consuming history that still needs recovery', async () => {
+    const { session, kernels, responses } = createHarness();
+    responses.set('prompt', { disposition: 'handled' });
+    const conversationHistory = [{ id: 'prior', role: 'user' as const, content: 'Remember prior context', timestamp: testDate().getTime() }];
+    try {
+      const events = await collect(session.execute(createRequest({
+        input: [{ type: 'text', text: '/compact' }], conversationHistory,
+      })).events);
+      expect(events.at(-1)).toMatchObject({ type: 'execution_error', message: expect.stringContaining('normal message') });
+      expect(kernels.flatMap(kernel => kernel.requests).filter(request => request.type === 'compact' || request.type === 'prompt')).toEqual([]);
+      await collect(session.execute(createRequest({ conversationHistory })).events);
+      expect(getPromptMessages(kernels[0])[0]).toContain('Remember prior context');
+      expect(getPromptMessages(kernels[0])[0]).toContain('Hello Pi');
+    } finally { await session.dispose(); }
+  });
+
   it('rejects explicit High when the selected model does not advertise it', async () => {
     const { host, session, kernels } = createHarness();
     host.settings.providerConfigs.pi.discoveredModels[0].thinkingLevels = ['off', 'low'];
@@ -292,6 +334,7 @@ describe('PiExecutionBackend', () => {
     const result = collect(session.execute({ ...request, configuration: { ...request.configuration, reasoning } }).events);
     await waitFor(() => kernels[0]?.requests.some(r => r.type === 'prompt') ?? false);
     kernels[0].emit({ type: 'agent_end' });
+    kernels[0].emit({ type: 'agent_settled' });
     await result;
     expect(kernels[0].requests.filter(r => r.type === 'set_thinking_level')).toEqual(
       reasoning === null ? [] : [{ type: 'set_thinking_level', payload: { level: reasoning } }],
@@ -326,8 +369,23 @@ describe('PiExecutionBackend', () => {
       await fs.writeFile(sessionFile, content);
       harness.kernels[0].emit({ type: 'agent_start' });
       harness.kernels[0].emit({ type: 'agent_end' });
+      harness.kernels[0].emit({ type: 'agent_settled' });
       expect((await eventsPromise).at(-1)).toMatchObject({ type: 'turn_completed',
         turnStats: { outputTokens: 125, durationMs: 2500 } });
+
+      const answerCursor = harness.session.getSnapshot().providerState?.leafEntryId;
+      expect(answerCursor).toBe('a');
+
+      // A command consumed by an extension must not reuse the preceding answer's identity, checkpoint, or stats.
+      harness.responses.set('prompt', { disposition: 'handled' });
+      const handledEvents = await collect(harness.session.execute(createRequest()).events);
+      expect(handledEvents.at(-1)).toMatchObject({
+        type: 'turn_completed', nativeUserMessageId: undefined, nativeAssistantId: undefined,
+      });
+      expect(handledEvents.at(-1)).not.toHaveProperty('turnStats');
+      expect(handledEvents.at(-1)).not.toHaveProperty('nativeCheckpointId');
+      // The session cursor still tracks the native leaf for the next turn.
+      expect(harness.session.getSnapshot().providerState?.leafEntryId).toBe(answerCursor);
     } finally {
       await harness.session.dispose();
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -360,6 +418,7 @@ describe('PiExecutionBackend', () => {
       ].map(r => JSON.stringify(r)).join('\n') + '\n');
       harness.kernels[0].emit({ type: 'agent_start' });
       harness.kernels[0].emit({ type: 'agent_end' });
+      harness.kernels[0].emit({ type: 'agent_settled' });
       const events = await eventsPromise;
       expect(events.at(-1)).toMatchObject({
         type: 'turn_completed', nativeAssistantId: 'assistant-2', nativeCheckpointId: 'assistant-2',
@@ -637,6 +696,7 @@ describe('PiExecutionBackend', () => {
       type: 'tool_execution_end',
     });
     kernel.emit({ type: 'agent_end' });
+    kernel.emit({ type: 'agent_settled' });
 
     const events = await eventsPromise;
     expect(events.map(event => event.type)).toEqual([
@@ -655,6 +715,7 @@ describe('PiExecutionBackend', () => {
       payload: {
         images: [{ data: 'base64-data', mimeType: 'image/png', type: 'image' }],
         message: 'Hello Pi',
+        streamingBehavior: 'followUp',
       },
       type: 'prompt',
     });
@@ -674,6 +735,126 @@ describe('PiExecutionBackend', () => {
       expect.objectContaining({ id: 'pi:runtime:compact', name: 'compact' }),
     ]);
     expect(new Set(events.map(event => event.scope.sequence)).size).toBe(events.length);
+  });
+
+  it('completes extension-handled prompts without waiting for a model run', async () => {
+    const harness = createHarness();
+    harness.responses.set('prompt', { disposition: 'handled' });
+    harness.responses.set('get_state', { sessionId: 'pi-session-1' });
+    const events: ProviderExecutionEvent[] = [];
+    const run = harness.session.execute(createRequest());
+    const consumption = (async () => {
+      for await (const event of run.events) events.push(event);
+    })();
+    try {
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      await flush();
+      expect(events).toContainEqual(expect.objectContaining({ type: 'turn_completed' }));
+      expect(events.some(event => event.type === 'assistant_message_started')).toBe(false);
+      expect(harness.session.getSnapshot().status).toBe('idle');
+    } finally {
+      run.cancel();
+      await consumption;
+      await harness.session.dispose();
+    }
+  });
+
+  it('keeps a handled command open for the run its extension starts', async () => {
+    const harness: ReturnType<typeof createHarness> = createHarness(createConfig(), undefined, async <T>(type: string) => {
+      if (type === 'prompt') {
+        const kernel = harness.kernels[0];
+        // A command calling sendUserMessage reports handled before its run starts.
+        queueMicrotask(() => {
+          kernel.emit({ type: 'agent_start' });
+          kernel.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Extension answer' } });
+        });
+        return { disposition: 'handled' } as T;
+      }
+      return harness.responses.get(type) as T;
+    });
+    harness.responses.set('get_state', { sessionId: 'pi-session-1' });
+    const events: ProviderExecutionEvent[] = [];
+    const run = harness.session.execute(createRequest({ input: [{ text: '/ask Question', type: 'text' }] }));
+    const consumption = (async () => {
+      for await (const event of run.events) events.push(event);
+    })();
+    try {
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'get_state') ?? false);
+      await flush();
+      expect(events).toContainEqual(expect.objectContaining({ type: 'text_delta', text: 'Extension answer' }));
+      expect(events.some(event => event.type === 'turn_completed')).toBe(false);
+      expect(harness.session.getSnapshot().status).not.toBe('idle');
+
+      harness.kernels[0].emit({ type: 'agent_end', messages: [], willRetry: false });
+      harness.kernels[0].emit({ type: 'agent_settled' });
+      await consumption;
+      expect(events.filter(event => event.type === 'turn_completed')).toHaveLength(1);
+    } finally {
+      run.cancel();
+      await consumption;
+      await harness.session.dispose();
+    }
+  });
+
+  it.each(['started', 'queued'])('waits for settlement with prompt disposition %s', async disposition => {
+    const harness = createHarness();
+    harness.responses.set('prompt', { disposition });
+    harness.responses.set('get_state', { sessionId: 'pi-session-1' });
+    const events: ProviderExecutionEvent[] = [];
+    const run = harness.session.execute(createRequest());
+    const consumption = (async () => {
+      for await (const event of run.events) events.push(event);
+    })();
+    try {
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      const kernel = harness.kernels[0];
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ type: 'agent_end', messages: [], willRetry: false });
+      await flush();
+      expect(events.some(event => event.type === 'turn_completed')).toBe(false);
+
+      // Pi may continue queued input after a low-level run ends without retrying.
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Continued answer' } });
+      kernel.emit({ type: 'agent_end', messages: [], willRetry: false });
+      kernel.emit({ type: 'agent_settled' });
+      await consumption;
+      expect(events).toContainEqual(expect.objectContaining({ type: 'text_delta', text: 'Continued answer' }));
+      expect(events.filter(event => event.type === 'turn_completed')).toHaveLength(1);
+    } finally {
+      run.cancel();
+      await consumption;
+      await harness.session.dispose();
+    }
+  });
+
+  // Pi before 1.0 answers prompts without a disposition and never sends agent_settled.
+  it('settles pre-1.0 Pi runs on the final agent_end', async () => {
+    const harness = createHarness();
+    harness.responses.set('prompt', {});
+    const events: ProviderExecutionEvent[] = [];
+    const run = harness.session.execute(createRequest());
+    const consumption = (async () => {
+      for await (const event of run.events) events.push(event);
+    })();
+    try {
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      const kernel = harness.kernels[0];
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ type: 'agent_end', messages: [], willRetry: true });
+      await flush();
+      expect(events.some(event => event.type === 'turn_completed')).toBe(false);
+
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Legacy answer' } });
+      kernel.emit({ type: 'agent_end', messages: [], willRetry: false });
+      await waitFor(() => events.some(event => event.type === 'turn_completed'));
+      expect(events).toContainEqual(expect.objectContaining({ type: 'text_delta', text: 'Legacy answer' }));
+    } finally {
+      run.cancel();
+      await consumption;
+      await harness.session.dispose();
+    }
   });
 
   it('keeps one execution open across native Pi retries and commits the recovered answer', async () => {
@@ -740,6 +921,7 @@ describe('PiExecutionBackend', () => {
     });
     kernel.emit({ attempt: 2, success: true, type: 'auto_retry_end' });
     kernel.emit({ messages: [], type: 'agent_end', willRetry: false });
+    kernel.emit({ type: 'agent_settled' });
 
     const events = await eventsPromise;
     expect(events.filter(event => event.type === 'text_delta')).toEqual([
@@ -760,7 +942,31 @@ describe('PiExecutionBackend', () => {
     });
   });
 
-  it('surfaces a native Pi terminal error after a non-retrying agent end', async () => {
+  it('completes a recovered context overflow after compaction starts another run', async () => {
+    const harness = createHarness();
+    const eventsPromise = collect(harness.session.execute(createRequest()).events);
+    await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+    const kernel = harness.kernels[0];
+    kernel.emit({ type: 'agent_start' });
+    kernel.emit({ type: 'message_end', message: {
+      role: 'assistant', stopReason: 'error', errorMessage: 'Context window exceeded',
+    } });
+    // Pi treats context overflow separately from its rate-limit/server-error retry policy.
+    kernel.emit({ type: 'agent_end', messages: [], willRetry: false });
+    kernel.emit({ type: 'compaction_start', reason: 'overflow' });
+    kernel.emit({ type: 'compaction_end', reason: 'overflow', aborted: false, willRetry: true });
+    kernel.emit({ type: 'agent_start' });
+    kernel.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Recovered' } });
+    kernel.emit({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop' } });
+    kernel.emit({ type: 'agent_end', messages: [], willRetry: false });
+    kernel.emit({ type: 'agent_settled' });
+    const events = await eventsPromise;
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'execution_error' }));
+    expect(events.at(-1)).toMatchObject({ type: 'turn_completed' });
+    await harness.session.dispose();
+  });
+
+  it('surfaces a native Pi terminal error after settlement', async () => {
     const harness = createHarness();
     const run = harness.session.execute(createRequest());
     const eventsPromise = collect(run.events);
@@ -778,6 +984,7 @@ describe('PiExecutionBackend', () => {
       type: 'message_end',
     });
     kernel.emit({ messages: [], type: 'agent_end', willRetry: false });
+    kernel.emit({ type: 'agent_settled' });
 
     const events = await eventsPromise;
     expect(events.at(-1)).toMatchObject({
@@ -852,6 +1059,7 @@ describe('PiExecutionBackend', () => {
       type: 'message_update',
     });
     kernel.emit({ messages: [], type: 'agent_end', willRetry: false });
+    kernel.emit({ type: 'agent_settled' });
 
     const events = await eventsPromise;
     expect(events.filter(event => (
@@ -865,10 +1073,60 @@ describe('PiExecutionBackend', () => {
     }));
   });
 
+  it.each([
+    { text: '/skill:review', context: undefined, expected: '/skill:review' },
+    {
+      text: '/skill:review', context: { linkedContent: { path: 'note.md' } },
+      expected: '/skill:review \n\n<linked_content path="note.md" />',
+    },
+    {
+      text: '/skill:review', context: capturedSelections,
+      expected: '/skill:review \n\n' + capturedSelectionPrompt,
+    },
+    {
+      text: '/skill:review',
+      context: { sessionReferences: [{ id: 'ref', title: 'Review', providerId: 'pi', updatedAt: 'updated', snapshotPath: '/tmp/ref.md' }] },
+      expected: '/skill:review \n\n<context_sessions>\n<context_session title="Review" id="ref" provider="pi" updated="updated" path="/tmp/ref.md" />\n</context_sessions>',
+    },
+    {
+      text: '/skill:review task', context: { linkedContent: { path: 'note.md' } },
+      expected: '/skill:review task\n\n<linked_content path="note.md" />',
+    },
+    {
+      text: 'Please /skill:review', context: { linkedContent: { path: 'note.md' } },
+      expected: 'Please /skill:review\n\n<linked_content path="note.md" />',
+    },
+    {
+      text: '/skill:review\nuser arguments', context: { linkedContent: { path: 'note.md' } },
+      expected: '/skill:review\nuser arguments\n\n<linked_content path="note.md" />',
+    },
+  ])('preserves Pi skill syntax when attaching context to prompts and steers: $text', async ({ text, context, expected }) => {
+    const { session, kernels } = createHarness();
+    if (!isSteerableExecutionSession(session)) throw new Error('Pi must expose steering');
+    const request = createRequest({ input: [{ type: 'text', text }], context });
+    const run = session.execute(request);
+    const events = collect(run.events);
+    try {
+      await waitFor(() => kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      expect(await session.steer(request)).toBe(true);
+      completeTurn(kernels[0]);
+      await events;
+      expect(kernels[0].requests.filter(request => request.type === 'prompt' || request.type === 'steer')
+        .map(({ type, payload }) => ({ type, message: payload.message }))).toEqual([
+        { type: 'prompt', message: expected },
+        { type: 'steer', message: expected },
+      ]);
+    } finally {
+      run.cancel();
+      await events;
+      await session.dispose();
+    }
+  });
+
   it('encodes path-only Linked content without changing the Vault-root process CWD', async () => {
     const harness = createHarness();
     const run = harness.session.execute(createRequest({
-      context: { linkedContent: { path: 'Projects/Research' } },
+      context: { ...capturedSelections, sessionReferences: [{ id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated', snapshotPath: '/tmp/claudian-sessions/ref.md' }], linkedContent: { path: 'Projects/Research' } },
       input: [{ text: 'Inspect linked content', type: 'text' }],
     }));
     const eventsPromise = collect(run.events);
@@ -878,7 +1136,7 @@ describe('PiExecutionBackend', () => {
 
     expect(harness.kernels[0].launchSpec.cwd).toBe('/vault');
     expect(getPromptMessages(harness.kernels[0])).toEqual([
-      'Inspect linked content\n\n<linked_content path="Projects/Research" />',
+      'Inspect linked content\n\n<linked_content path="Projects/Research" />\n\n' + capturedSelectionPrompt + '\n\n<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" path="/tmp/claudian-sessions/ref.md" />\n</context_sessions>',
     ]);
     expect(getPromptMessages(harness.kernels[0])[0]).not.toMatch(
       /<(?:linked_note|current_note)\b/,
@@ -917,11 +1175,12 @@ describe('PiExecutionBackend', () => {
     await flush();
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(harness.kernels[0].launchSpec.args).toContain(sessionFile);
     expect(harness.kernels[0].requests).toContainEqual({
-      payload: { message: 'Hello Pi' },
+      payload: { message: 'Hello Pi', streamingBehavior: 'followUp' },
       type: 'prompt',
     });
     const requestTypes = harness.kernels[0].requests.map(request => request.type);
@@ -1672,6 +1931,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(harness.kernels[0].launchSpec.args).toContain(expected);
@@ -1686,21 +1946,19 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(harness.kernels[0].launchSpec.args).not.toContain('--tools');
   });
 
-  it('includes provider-default dynamic sections in the complete system prompt', async () => {
+  it('sends the provider-default prompt as the complete system prompt', async () => {
     const harness = createHarness();
     const run = harness.session.execute(createRequest({
       configuration: {
         model: 'pi:anthropic/claude-sonnet-4',
         reasoning: 'high',
-        systemInstructions: {
-          dynamicSections: ['## Additional context\nRuntime guidance.'],
-          kind: 'provider-default',
-        },
+        systemInstructions: { kind: 'provider-default' },
       },
     }));
     const eventsPromise = collect(run.events);
@@ -1714,8 +1972,6 @@ describe('PiExecutionBackend', () => {
     expect(systemPrompt).toContain('## Runtime Context');
     expect(systemPrompt).toContain('Use `bash: date`');
     expect(systemPrompt).toContain('## Vault Media');
-    expect(systemPrompt).toContain('## Additional context\nRuntime guidance.');
-    expect(systemPrompt.match(/## Additional context/g)).toHaveLength(1);
   });
 
   it('maps an explicit allow-list exactly and falls back to provider model settings', async () => {
@@ -1734,6 +1990,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(harness.kernels[0].launchSpec.args).toEqual(expect.arrayContaining([
@@ -1770,6 +2027,7 @@ describe('PiExecutionBackend', () => {
     await expect(session.steer(createRequest())).resolves.toBe(false);
     expect(harness.kernels[0].requests.some(request => request.type === 'steer')).toBe(false);
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await events;
     await session.dispose();
   });
@@ -1811,7 +2069,26 @@ describe('PiExecutionBackend', () => {
     });
 
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
+  });
+
+  it.each([
+    ['queued', 1],
+    ['handled', 0],
+  ] as const)('accepts a %s steer and shows only delivered input', async (disposition, boundaries) => {
+    const harness = createHarness();
+    harness.responses.set('steer', { disposition });
+    const session = harness.session;
+    if (!isSteerableExecutionSession(session)) throw new Error('Pi session must expose steer');
+    const eventsPromise = collect(session.execute(createRequest()).events);
+    await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+
+    await expect(session.steer(createRequest({ input: [{ text: 'Correction', type: 'text' }] }))).resolves.toBe(true);
+    harness.kernels[0].emit({ type: 'agent_settled' });
+    const events = await eventsPromise;
+    expect(events.filter(event => event.type === 'user_message_started' && event.content === 'Correction'))
+      .toHaveLength(boundaries);
   });
 
   it('returns false when steer cannot reach native handoff', async () => {
@@ -1947,6 +2224,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await firstEventsPromise;
 
     const oldKernel = harness.kernels[0];
@@ -1977,6 +2255,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await firstEventsPromise;
 
     const oldKernel = harness.kernels[0];
@@ -2012,6 +2291,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await firstEventsPromise;
 
     const restartRun = harness.session.execute(createRequest({
@@ -2268,6 +2548,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1, 100);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     const retryEvents = await retryEventsPromise;
 
     expect(firstEvents.filter(event => (
@@ -2406,6 +2687,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => harness.kernels.length === 1, 100);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     const retryEvents = await retryEventsPromise;
 
     expect(retryEvents.at(-1)).toMatchObject({ type: 'turn_completed' });
@@ -2509,6 +2791,7 @@ describe('PiExecutionBackend', () => {
     });
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(forkFile).not.toBe(sourceFile);
@@ -2535,6 +2818,7 @@ describe('PiExecutionBackend', () => {
     await waitFor(() => getPromptMessages(harness.kernels[0]).length === 2);
     harness.kernels[0].emit({ type: 'agent_start' });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await continuedEventsPromise;
     expect(harness.kernels).toHaveLength(1);
     expect(harness.session.getSnapshot().providerStateDeletes).toEqual([
@@ -2558,6 +2842,7 @@ describe('PiExecutionBackend', () => {
       type: 'extension_ui_request',
     });
     harness.kernels[0].emit({ type: 'agent_end' });
+    harness.kernels[0].emit({ type: 'agent_settled' });
     await eventsPromise;
 
     expect(harness.kernels[0].sent).toContainEqual({
@@ -2578,5 +2863,309 @@ describe('PiExecutionBackend', () => {
       'Pi execution session is disposed',
     );
     expect(harness.kernels).toHaveLength(0);
+  });
+
+  describe('extension-initiated turns', () => {
+    const peepsResult = {
+      content: '[Peeps automated result — run-1 — answer]\nChild answer',
+      customType: 'peeps-result',
+      details: { runId: 'run-1', status: 'answer' },
+      display: true,
+      role: 'custom',
+    };
+
+    async function startIdleSession(harness: ReturnType<typeof createHarness>) {
+      const run = harness.session.execute(createRequest());
+      const requested = collect(run.events);
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      completeTurn(harness.kernels[0]);
+      await requested;
+      const events: ProviderSessionEvent[] = [];
+      harness.session.onEvent(event => events.push(event));
+      return { events, kernel: harness.kernels[0] };
+    }
+
+    function emitWake(kernel: FakeKernel): void {
+      kernel.emit({ type: 'entry_appended' });
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ type: 'turn_start' });
+      kernel.emit({ message: peepsResult, type: 'message_start' });
+      kernel.emit({ message: peepsResult, type: 'message_end' });
+      kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+      kernel.emit({ assistantMessageEvent: { delta: 'Parent reply', type: 'text_delta' }, type: 'message_update' });
+    }
+
+    function backgroundEvents(events: ProviderSessionEvent[]) {
+      return events.filter(event => event.scope.kind === 'background');
+    }
+
+    it('surfaces an idle extension-triggered run as one background turn and follows its native leaf', async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-background-'));
+      const sessionFile = path.join(dir, 'session.jsonl');
+      const lines = [
+        { type: 'session', id: 'pi-session-1' },
+        { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Hello Pi' } },
+        { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: 'Hi', stopReason: 'stop' } },
+      ];
+      await fs.writeFile(sessionFile, lines.map(line => JSON.stringify(line)).join('\n'));
+      const harness = createHarness();
+      harness.responses.set('get_state', { sessionFile, sessionId: 'pi-session-1' });
+      try {
+        const { events, kernel } = await startIdleSession(harness);
+        expect(harness.session.getSnapshot().providerState?.leafEntryId).toBe('a1');
+
+        emitWake(kernel);
+        kernel.emit({ toolCall: { arguments: { path: 'note.md' }, id: 'tool-bg', name: 'read' }, type: 'tool_execution_start' });
+        kernel.emit({ id: 'tool-bg', result: { content: 'note' }, type: 'tool_execution_end' });
+        expect(harness.session.getStatus()).toBe('executing');
+        await fs.appendFile(sessionFile, `\n${[
+          { type: 'custom_message', id: 'c1', parentId: 'a1', customType: 'peeps-result', display: true, content: 'Child answer' },
+          { type: 'message', id: 'a2', parentId: 'c1', message: { role: 'assistant', content: 'Parent reply', stopReason: 'stop' } },
+        ].map(line => JSON.stringify(line)).join('\n')}`);
+        kernel.emit({ messages: [], type: 'agent_end' });
+        kernel.emit({ type: 'entry_appended' });
+        kernel.emit({ type: 'agent_settled' });
+        await waitFor(() => events.some(event => event.type === 'background_turn_completed'));
+
+        const background = backgroundEvents(events);
+        expect(background.map(event => event.type)).toEqual([
+          'background_turn_started',
+          'session_state_changed',
+          'task_notification',
+          'assistant_message_started',
+          'text_delta',
+          'tool_started',
+          'tool_completed',
+          'usage_updated',
+          'session_state_changed',
+          'background_turn_completed',
+        ]);
+        expect(background).toContainEqual(expect.objectContaining({ content: 'Child answer', type: 'task_notification' }));
+        expect(background).toContainEqual(expect.objectContaining({ text: 'Parent reply', type: 'text_delta' }));
+        expect(background.at(-1)).toMatchObject({ reason: 'completed', providerSessionId: 'pi-session-1' });
+        expect(new Set(background.map(event => event.scope.kind === 'background' && event.scope.turnId)).size).toBe(1);
+        expect(background.map(event => event.scope.sequence)).toEqual(background.map((_, index) => index + 1));
+        // Reload follows the persisted leaf; a stale leaf would truncate the background turn.
+        expect(harness.session.getSnapshot()).toMatchObject({ providerState: { leafEntryId: 'a2' }, status: 'idle' });
+      } finally {
+        await harness.session.dispose();
+        await fs.rm(dir, { force: true, recursive: true });
+      }
+    });
+
+    it('settles a pre-1.0 extension-triggered run on its final agent_end', async () => {
+      const harness = createHarness();
+      harness.responses.set('prompt', {});
+      const run = harness.session.execute(createRequest());
+      const requested = collect(run.events);
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      harness.kernels[0].emit({ type: 'agent_start' });
+      harness.kernels[0].emit({ type: 'agent_end', willRetry: false });
+      await requested;
+      const events: ProviderSessionEvent[] = [];
+      harness.session.onEvent(event => events.push(event));
+
+      emitWake(harness.kernels[0]);
+      harness.kernels[0].emit({ type: 'agent_end', willRetry: true });
+      harness.kernels[0].emit({ type: 'agent_start' });
+      await flush();
+      expect(events.some(event => event.type === 'background_turn_completed')).toBe(false);
+      harness.kernels[0].emit({ type: 'agent_end', willRetry: false });
+      await waitFor(() => events.some(event => event.type === 'background_turn_completed'));
+      expect(backgroundEvents(events).filter(event => event.type === 'background_turn_started')).toHaveLength(1);
+      expect(harness.session.getStatus()).toBe('idle');
+      await harness.session.dispose();
+    });
+
+    it('renders a custom message steered into a requested run in that run', async () => {
+      const harness = createHarness();
+      const run = harness.session.execute(createRequest());
+      const eventsPromise = collect(run.events);
+      await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+      const kernel = harness.kernels[0];
+      kernel.emit({ type: 'agent_start' });
+      kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+      kernel.emit({ assistantMessageEvent: { delta: 'Waiting', type: 'text_delta' }, type: 'message_update' });
+      // Mid-work: the response called a tool, so the result belongs to it.
+      kernel.emit({ message: { role: 'assistant', stopReason: 'toolUse' }, type: 'message_end' });
+      kernel.emit({ message: peepsResult, type: 'message_start' });
+      kernel.emit({ message: peepsResult, type: 'message_end' });
+      kernel.emit({ message: { ...peepsResult, content: 'Context only', display: false }, type: 'message_start' });
+      kernel.emit({ assistantMessageEvent: { delta: 'Folded in', type: 'text_delta' }, type: 'message_update' });
+      kernel.emit({ type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+
+      const events = await eventsPromise;
+      const output = events.filter(event => ['task_notification', 'text_delta'].includes(event.type));
+      expect(output).toEqual([
+        expect.objectContaining({ text: 'Waiting', type: 'text_delta' }),
+        expect.objectContaining({ content: 'Child answer', type: 'task_notification' }),
+        expect.objectContaining({ text: 'Folded in', type: 'text_delta' }),
+      ]);
+      expect(events.at(-1)?.type).toBe('turn_completed');
+      await harness.session.dispose();
+    });
+
+    it('ends a requested turn at its answer when a result steered after it continues the native run', async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-split-'));
+      const sessionFile = path.join(dir, 'session.jsonl');
+      const answeredAt = testTime({ minutes: -2 });
+      const repliedAt = testTime({ minutes: -1 });
+      await fs.writeFile(sessionFile, [
+        { type: 'session', id: 'pi-session-1' },
+        { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Hello Pi' } },
+        { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: 'Answer', stopReason: 'stop', timestamp: answeredAt } },
+        { type: 'custom_message', id: 'c1', parentId: 'a1', customType: 'peeps-result', display: true, content: peepsResult.content },
+        { type: 'message', id: 'a2', parentId: 'c1', message: { role: 'assistant', content: 'Reply', stopReason: 'stop', timestamp: repliedAt } },
+      ].map(line => JSON.stringify(line)).join('\n'));
+      const harness = createHarness();
+      harness.responses.set('get_state', { sessionFile, sessionId: 'pi-session-1' });
+      const sessionEvents: ProviderSessionEvent[] = [];
+      harness.session.onEvent(event => sessionEvents.push(event));
+      try {
+        const run = harness.session.execute(createRequest());
+        const eventsPromise = collect(run.events);
+        await waitFor(() => harness.kernels[0]?.requests.some(request => request.type === 'prompt') ?? false);
+        const kernel = harness.kernels[0];
+        kernel.emit({ type: 'agent_start' });
+        kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+        kernel.emit({ assistantMessageEvent: { delta: 'Answer', type: 'text_delta' }, type: 'message_update' });
+        kernel.emit({ message: { role: 'assistant', stopReason: 'stop', timestamp: answeredAt }, type: 'message_end' });
+        // Pi drains steered messages after the final answer and continues the same native run.
+        kernel.emit({ message: peepsResult, type: 'message_start' });
+        kernel.emit({ message: peepsResult, type: 'message_end' });
+        kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+        kernel.emit({ assistantMessageEvent: { delta: 'Reply', type: 'text_delta' }, type: 'message_update' });
+        const requested = await eventsPromise;
+
+        expect(requested.flatMap(event => event.type === 'text_delta' ? [event.text] : [])).toEqual(['Answer']);
+        expect(requested.some(event => event.type === 'task_notification')).toBe(false);
+        expect(requested.at(-1)).toMatchObject({
+          nativeAssistantId: 'a1',
+          nativeCheckpointId: 'a1',
+          type: 'turn_completed',
+        });
+        expect(harness.session.getStatus()).toBe('executing');
+
+        kernel.emit({ message: { role: 'assistant', stopReason: 'stop', timestamp: repliedAt }, type: 'message_end' });
+        kernel.emit({ type: 'agent_end' });
+        kernel.emit({ type: 'agent_settled' });
+        await waitFor(() => sessionEvents.some(event => event.type === 'background_turn_completed'));
+        const background = backgroundEvents(sessionEvents);
+        expect(background.filter(event => ['task_notification', 'text_delta'].includes(event.type))).toEqual([
+          expect.objectContaining({ content: 'Child answer', type: 'task_notification' }),
+          expect.objectContaining({ text: 'Reply', type: 'text_delta' }),
+        ]);
+        expect(background.at(-1)).toMatchObject({ nativeAssistantId: 'a2', reason: 'completed' });
+        expect(harness.session.getSnapshot()).toMatchObject({ providerState: { leafEntryId: 'a2' }, status: 'idle' });
+      } finally {
+        await harness.session.dispose();
+        await fs.rm(dir, { force: true, recursive: true });
+      }
+    });
+
+    it('starts a new background turn for each result that follows an answered background response', async () => {
+      const harness = createHarness();
+      const { events, kernel } = await startIdleSession(harness);
+      emitWake(kernel);
+      kernel.emit({ message: { role: 'assistant', stopReason: 'stop' }, type: 'message_end' });
+      kernel.emit({ message: { ...peepsResult, content: 'Second result' }, type: 'message_start' });
+      kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+      kernel.emit({ assistantMessageEvent: { delta: 'Second reply', type: 'text_delta' }, type: 'message_update' });
+      kernel.emit({ message: { role: 'assistant', stopReason: 'stop' }, type: 'message_end' });
+      kernel.emit({ type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+      await waitFor(() => events.filter(event => event.type === 'background_turn_completed').length === 2);
+
+      const turns = new Map<string, string[]>();
+      for (const event of backgroundEvents(events)) {
+        if (event.scope.kind !== 'background') continue;
+        const output = event.type === 'task_notification' ? event.content : event.type === 'text_delta' ? event.text : null;
+        if (output) turns.set(event.scope.turnId, [...turns.get(event.scope.turnId) ?? [], output]);
+      }
+      expect([...turns.values()]).toEqual([
+        ['Child answer', 'Parent reply'],
+        ['Second result', 'Second reply'],
+      ]);
+      expect(harness.session.getStatus()).toBe('idle');
+      await harness.session.dispose();
+    });
+
+    it('answers an extension dialog that arrives while no run is requested', async () => {
+      const harness = createHarness();
+      const { kernel } = await startIdleSession(harness);
+      kernel.emit({ id: 'dialog-1', method: 'confirm', type: 'extension_ui_request' });
+      expect(kernel.sent).toContainEqual({ cancelled: true, id: 'dialog-1', type: 'extension_ui_response' });
+      expect(kernel.emitExtensionRequest({ id: 'dialog-2', method: 'select', type: 'extension_ui_request' })).toBe(false);
+      await harness.session.dispose();
+    });
+
+    it('hands a prompt sent during a background turn to its requested run at the native user boundary', async () => {
+      const harness = createHarness();
+      const { events, kernel } = await startIdleSession(harness);
+      emitWake(kernel);
+
+      harness.responses.set('prompt', { disposition: 'queued' });
+      const run = harness.session.execute(createRequest({ input: [{ text: 'Follow up', type: 'text' }] }));
+      const requestedPromise = collect(run.events);
+      await waitFor(() => kernel.requests.filter(request => request.type === 'prompt').length === 2);
+      // Pi rejects unqueued prompts while an extension run streams.
+      expect(kernel.requests.filter(request => request.type === 'prompt').at(-1)?.payload).toMatchObject({
+        message: 'Follow up',
+        streamingBehavior: 'followUp',
+      });
+      kernel.emit({ assistantMessageEvent: { delta: ' continues', type: 'text_delta' }, type: 'message_update' });
+      kernel.emit({ message: { content: 'Follow up', role: 'user' }, type: 'message_start' });
+      await waitFor(() => events.some(event => event.type === 'background_turn_completed'));
+      kernel.emit({ assistantMessageEvent: { delta: 'Requested answer', type: 'text_delta' }, type: 'message_update' });
+      kernel.emit({ type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+      const requested = await requestedPromise;
+
+      const backgroundText = backgroundEvents(events).flatMap(event => event.type === 'text_delta' ? [event.text] : []);
+      const requestedText = requested.flatMap(event => event.type === 'text_delta' ? [event.text] : []);
+      expect(backgroundText).toEqual(['Parent reply', ' continues']);
+      expect(requestedText).toEqual(['Requested answer']);
+      expect(requested.at(-1)?.type).toBe('turn_completed');
+      expect(harness.session.getStatus()).toBe('idle');
+      await harness.session.dispose();
+    });
+
+    it('aborts a background turn on Stop and completes it when Pi settles without restarting Pi', async () => {
+      const harness = createHarness();
+      const { events, kernel } = await startIdleSession(harness);
+      emitWake(kernel);
+
+      harness.session.cancel();
+      expect(kernel.sent).toContainEqual({ type: 'abort' });
+      expect(harness.session.getStatus()).toBe('cancelling');
+      kernel.emit({ type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+      await waitFor(() => events.some(event => event.type === 'background_turn_completed'));
+
+      expect(backgroundEvents(events).at(-1)).toMatchObject({ reason: 'provider-ended', type: 'background_turn_completed' });
+      expect(harness.session.getStatus()).toBe('idle');
+      expect(kernel.shutdown).not.toHaveBeenCalled();
+      await harness.session.dispose();
+    });
+
+    it.each([
+      ['process exit', 'invalidated', 'session_error'],
+      ['dispose', 'disposed', 'session_state_changed'],
+    ] as const)('completes an open background turn on %s', async (teardown, status, lastEvent) => {
+      const harness = createHarness();
+      const { events, kernel } = await startIdleSession(harness);
+      emitWake(kernel);
+
+      if (teardown === 'dispose') await harness.session.dispose();
+      else kernel.close(new Error('exit code 1'));
+
+      const background = backgroundEvents(events);
+      expect(background.at(-1)).toMatchObject({ reason: 'provider-ended', type: 'background_turn_completed' });
+      expect(background).toContainEqual(expect.objectContaining({ text: 'Parent reply', type: 'text_delta' }));
+      expect(harness.session.getStatus()).toBe(status);
+      expect(events.at(-1)).toMatchObject({ scope: { kind: 'session' }, type: lastEvent });
+      await harness.session.dispose();
+    });
   });
 });

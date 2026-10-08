@@ -4,9 +4,10 @@ import type {
   SDKControlInitializeResponse,
 } from '@anthropic-ai/claude-agent-sdk';
 
+import { getEnhancedPath, parseEnvironmentVariables } from '@/core/process/env';
+
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
 import { throwIfAborted, toAbortError } from '../../../utils/abort';
-import { getEnhancedPath, parseEnvironmentVariables } from '../../../utils/env';
 import { getVaultPath } from '../../../utils/path';
 import { loadClaudeAgentQuery } from '../loadClaudeAgentSDK';
 import { getClaudeProviderSettings, resolveClaudeSettingSources } from '../settings';
@@ -48,6 +49,9 @@ export function buildClaudeLaunchOptions(
   };
 }
 
+/** Initialization answer plus the skill names that session init reports separately from commands. */
+export type ClaudeRuntimeInitialization = SDKControlInitializeResponse & { readonly skills: readonly string[] };
+
 /** No Claude Code process can start: there is no local vault or no resolvable CLI. */
 export class ClaudeRuntimeUnavailableError extends Error {
   constructor(message: string) {
@@ -64,7 +68,7 @@ export class ClaudeRuntimeUnavailableError extends Error {
 export async function probeClaudeRuntime(
   host: ProviderHost,
   signal?: AbortSignal,
-): Promise<SDKControlInitializeResponse> {
+): Promise<ClaudeRuntimeInitialization> {
   throwIfAborted(signal, PROBE_CANCELLED);
   const controller = new AbortController();
   const cancel = (): void => controller.abort(signal?.reason);
@@ -79,7 +83,7 @@ export async function probeClaudeRuntime(
     onAbort = () => reject(toAbortError(controller.signal, PROBE_CANCELLED));
     controller.signal.addEventListener('abort', onAbort, { once: true });
   });
-  const initialize = async (): Promise<SDKControlInitializeResponse> => {
+  const initialize = async (): Promise<ClaudeRuntimeInitialization> => {
     const cwd = getVaultPath(host.app);
     if (!cwd) throw new ClaudeRuntimeUnavailableError('Claude Code discovery requires a local vault');
     const cliPath = await host.getResolvedProviderCliPath('claude');
@@ -105,16 +109,20 @@ export async function probeClaudeRuntime(
     // Claude Code answers initialize while MCP servers may still be connecting, then pushes
     // `commands_changed` as their prompts arrive. Session init follows MCP startup, and
     // supportedCommands() tracks the latest push, so read commands only after init.
+    let skills: readonly string[];
     for (;;) {
       const next = await conversation.next();
       if (next.done) throw new Error('Claude Code runtime discovery ended before initialization');
-      if (next.value.type === 'system' && next.value.subtype === 'init') break;
+      if (next.value.type === 'system' && next.value.subtype === 'init') {
+        skills = next.value.skills ?? [];
+        break;
+      }
     }
     const [initialization, commands] = await Promise.all([
       conversation.initializationResult(),
       conversation.supportedCommands(),
     ]);
-    return { ...initialization, commands };
+    return { ...initialization, commands, skills };
   };
   try {
     return await Promise.race([initialize(), aborted]);

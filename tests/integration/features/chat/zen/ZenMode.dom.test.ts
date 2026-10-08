@@ -3,6 +3,7 @@ import '@/providers';
 
 import { deserialize, serialize } from 'node:v8';
 
+import { createClaudianView } from '@test/helpers/features/chat/ClaudianViewHarness';
 import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { FakeSideSession } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { modelCatalogCases } from '@test/helpers/providerModelCatalogs';
@@ -16,13 +17,16 @@ import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { getToolIcon } from '@/core/tools/toolIcons';
-import type { ClaudianSettings, Conversation } from '@/core/types';
+import type { ClaudianSettings, Conversation, StreamChunk } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
-import { ClaudianView } from '@/features/chat/ClaudianView';
 import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
+import { FLAVOR_TEXTS } from '@/features/chat/turns/flavorTexts';
 import { ZenModeController } from '@/features/chat/zen/ZenModeController';
+import { adaptCodexStreamChunk } from '@/providers/codex/execution/CodexExecutionEventNormalizer';
+import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
+import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
 const originalResizeObserver = globalThis.ResizeObserver;
 const originalStructuredClone = globalThis.structuredClone;
@@ -77,6 +81,7 @@ function createWorkspace() {
     },
     listenerCount: () => [...listeners.values()].reduce((total, set) => total + set.size, 0),
     getLeavesOfType: () => leaves,
+    getActiveFile: () => null,
     revealLeaf: jest.fn(async (leaf: Leaf) => {
       const root = leaf.getRoot() as Split;
       root.collapsed = false;
@@ -125,6 +130,10 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
   const zen = new ZenModeController({
     app,
     isEnabled: (): boolean => settingsCoordinator.getCommittedSettings().enableZenMode,
+    getPosition: () => settingsCoordinator.getCommittedSettings().zenModePosition,
+    savePosition: (position) => {
+      void settingsCoordinator.mutate((draft) => { draft.zenModePosition = position; });
+    },
   });
   const settingsCoordinator: SettingsCoordinator<ClaudianSettings> = new SettingsCoordinator(
     settings,
@@ -165,38 +174,39 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
     conversations.push(conversation);
     const split = placement === 'left' ? layout.leftSplit : placement === 'right' ? layout.rightSplit : null;
     const viewContainerEl = (split?.containerEl ?? layout.rootEl).createDiv({ cls: 'claudian-container' });
-    const tabContentEl = viewContainerEl.createDiv({ cls: 'claudian-tab-content-container' });
-    const inputFooterEl = viewContainerEl.createDiv({ cls: 'claudian-input-footer' });
-    const sideChatChipHostEl = inputFooterEl.createDiv({ cls: 'claudian-side-chat-chip-slot' });
-    const activeInputSlotEl = inputFooterEl.createDiv({ cls: 'claudian-active-input-slot' });
+    const leaf: Leaf = { getRoot: () => split ?? layout.rootSplit, view: null };
+    const view = createClaudianView({
+      host: plugin,
+      app,
+      leaf,
+      containerEl: viewContainerEl,
+      contentEl: viewContainerEl,
+    });
+    // The view-owned footer and tab container that onOpen builds.
+    view.viewContainerEl = viewContainerEl;
+    view.buildViewLayout(viewContainerEl);
+    const activeInputSlotEl = viewContainerEl.querySelector<HTMLElement>('.claudian-active-input-slot')!;
+    const sideChatChipHostEl = viewContainerEl.querySelector<HTMLElement>('.claudian-side-chat-chip-slot')!;
     const tab: AssembledTabRuntime = await createTabRuntime({
       plugin,
       component: Object.assign(new Component(), { registerDomEvent: () => undefined, registerEvent: () => undefined }) as never,
-      containerEl: tabContentEl,
+      containerEl: view.tabContentEl,
+      mentionDataProvider: new VaultMentionDataProvider(plugin.app),
       conversation, getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
     });
     tab.state.currentConversationId = conversation.id;
     tab.dom.contentEl.removeClass('claudian-hidden');
     cleanups.push(() => destroyTab(tab));
+    view.tabManager = {
+      getActiveTab: () => tab,
+      getTab: (id: string) => id === tab.id ? tab : null,
+      getTabCount: () => 1,
+    };
 
-    const leaf: Leaf = { getRoot: () => split ?? layout.rootSplit, view: null };
-    const view = Object.create(ClaudianView.prototype) as any;
-    Object.assign(view, {
-      plugin, app, leaf, viewContainerEl, tabContentEl, inputFooterEl, sideChatChipHostEl, activeInputSlotEl,
-      activeInputTabId: null,
-      containerEl: viewContainerEl,
-      isWideSessionLayout: false,
-      viewLifecycleRevision: 1,
-      initializedTabWorkspaceLifecycleRevision: ready ? 1 : -1,
-      tabManager: {
-        getActiveTab: () => tab,
-        getTab: (id: string) => id === tab.id ? tab : null,
-        getTabCount: () => 1,
-      },
-    });
+    Object.assign(view.tabWorkspace, { lifecycleRevision: 1, initializedRevision: ready ? 1 : -1 });
     leaf.view = view;
     layout.leaves.push(leaf);
-    view.updateInputLocation();
+    view.presentation.update();
     view.startZenModeSource();
     cleanups.push(() => view.stopZenModeSource());
     return { view, tab, leaf, activeInputSlotEl, sideChatChipHostEl };
@@ -292,7 +302,7 @@ it('waits for ordinary restoration before presenting an already collapsed sideba
   expect(zenPanel()).toBeNull();
   expect(fixture.sessions).toHaveLength(0);
 
-  fixture.view.initializedTabWorkspaceLifecycleRevision = 1;
+  fixture.view.tabWorkspace.initializedRevision = 1;
   fixture.view.notifyZenPresentationChanged();
 
   expect(zenPanel()!.contains(fixture.tab.dom.inputComposerEl)).toBe(true);
@@ -399,6 +409,186 @@ it('keeps one live turn, draft and node identity across repeated presentation ch
   await waitFor(() => expect(preview()).toMatch(/^Worked for \d{2}:\d{2} · First line$/));
 });
 
+/** Text of the transcript's visible waiting indicator, or null when none is shown. */
+function waitingIndicatorText(tab: AssembledTabRuntime): string | null {
+  const indicator = tab.dom.messagesEl.querySelector('.claudian-thinking');
+  return indicator?.firstElementChild?.textContent ?? null;
+}
+
+async function waitForFlavor(tab: AssembledTabRuntime, timeout?: number): Promise<string> {
+  await waitFor(() => expect(FLAVOR_TEXTS).toContain(waitingIndicatorText(tab)), { timeout });
+  return waitingIndicatorText(tab)!;
+}
+
+function expectZenPreview(text: string): void {
+  expect(within(zenPanel()!).getByRole('button', { name: 'Show conversation', description: text })).toBeDefined();
+}
+
+it.each([
+  'item/agentMessage/delta',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/textDelta',
+])('retains waiting flavor in the transcript and Zen across empty Codex %s after a notification', async method => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, 'Explain this note');
+  const flavor = await waitForFlavor(tab);
+  session.emitSessionEvent({ type: 'task_notification', content: 'A background task finished' });
+  await waitFor(() => expect(tab.state.messages.some(message => (
+    message.contentBlocks?.some(block => block.type === 'task_notification')
+  ))).toBe(true));
+
+  const chunks: StreamChunk[] = [];
+  const router = new CodexNotificationRouter(chunk => chunks.push(chunk));
+  router.handleNotification(method, { threadId: 'thread', turnId: 'turn', itemId: 'item', delta: '' });
+  const events = chunks.flatMap(chunk => adaptCodexStreamChunk(chunk) ?? []);
+  expect(events).not.toHaveLength(0);
+  for (const event of events) session.emitOutput(event);
+  await new Promise(resolve => setTimeout(resolve, 600));
+
+  // Empty provider output must not replace the visible waiting surface or create empty reasoning.
+  expect(waitingIndicatorText(tab)).toBe(flavor);
+  expect(tab.dom.messagesEl.querySelector('.claudian-thinking-block')).toBeNull();
+  await waitFor(() => expectZenPreview(flavor));
+  session.complete();
+  await waitFor(() => expect(tab.state.isStreaming).toBe(false));
+});
+
+it('shares one status across waiting, thinking, tools, text and silent pauses, then clears it', async () => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const transcript = within(tab.dom.messagesEl);
+  const session = await sendFromZen(tab, sessions, 'Explain this note');
+
+  const waiting = await waitForFlavor(tab);
+  await waitFor(() => expectZenPreview(waiting));
+
+  session.emitOutput({ type: 'thinking_delta', text: 'Reviewing the note.' });
+  await waitFor(() => expect(preview()).toBe('Thinking…'));
+  expect(transcript.getByRole('button', { name: /^Thinking \d+s\.\.\.$/, hidden: true })).toBeDefined();
+  expect(waitingIndicatorText(tab)).toBeNull();
+
+  session.emitOutput({
+    type: 'tool_started', toolCallId: 'tool-1', name: 'Read', input: { file_path: 'note.md' },
+    toolScope: { kind: 'main' },
+  } as never);
+  // The transcript keeps its waiting surface while the tool runs; zen names the tool instead.
+  await waitForFlavor(tab);
+  expect(preview()).toBe('Read · running');
+
+  session.emitText('Here is the answer.');
+  await waitFor(() => expect(preview()).toBe('Here is the answer.'));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  expect(tab.dom.messagesEl.querySelector('.claudian-tool-call')).not.toBeNull();
+
+  // Execution continues silently after intermediate text.
+  const paused = await waitForFlavor(tab, 3_000);
+  await waitFor(() => expectZenPreview(paused));
+
+  session.complete();
+  await waitFor(() => expect(tab.state.isStreaming).toBe(false));
+  await waitFor(() => expect(preview()).toMatch(/^Worked for \d{2}:\d{2} · Here is the answer\.$/));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  // The drawer holds the moved transcript, its navigation and the preview line.
+  expect(await axe(zenPanel()!.querySelector<HTMLElement>('.claudian-zen-drawer')!)).toHaveNoViolations();
+});
+
+it('gives a pending approval priority over the waiting status and resumes it afterwards', async () => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, 'Write a note');
+  await waitForFlavor(tab);
+
+  const approval = session.config.interactionPort.requestApproval({
+    description: 'Write a note', input: {}, interactionId: 'approval-1',
+    kind: 'approval', sessionInstanceId: session.sessionInstanceId,
+    toolName: 'Write', turnId: session.activeTurnId,
+  }, new AbortController().signal);
+  await waitFor(() => expect(preview()).toBe('Needs your input'));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  // Output arriving while the prompt is open must not bring the indicator back over it.
+  session.emitOutput({
+    type: 'tool_started', toolCallId: 'tool-1', name: 'Write', input: { file_path: 'note.md' },
+    toolScope: { kind: 'main' },
+  } as never);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  expect(preview()).toBe('Needs your input');
+
+  fireEvent.click(await within(zenPanel()!).findByText('Allow once'));
+  await expect(approval).resolves.toMatchObject({ decision: 'allow' });
+  await waitForFlavor(tab);
+  await waitFor(() => expect(preview()).toBe('Write · running'));
+
+  session.complete();
+  await waitFor(() => expect(tab.state.isStreaming).toBe(false));
+  expect(waitingIndicatorText(tab)).toBeNull();
+});
+
+it('keeps explicit compaction status across a prompt', async () => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, '/compact');
+  await waitFor(() => expect(waitingIndicatorText(tab)).toBe('Compacting...'));
+  await waitFor(() => expectZenPreview('Compacting...'));
+
+  const approval = session.config.interactionPort.requestApproval({
+    description: 'Approve action', input: {}, interactionId: 'approval-compact',
+    kind: 'approval', sessionInstanceId: session.sessionInstanceId,
+    toolName: 'Write', turnId: session.activeTurnId,
+  }, new AbortController().signal);
+  await waitFor(() => expect(preview()).toBe('Needs your input'));
+  fireEvent.click(await within(zenPanel()!).findByText('Allow once'));
+  await approval;
+  await waitFor(() => expect(waitingIndicatorText(tab)).toBe('Compacting...'));
+  await waitFor(() => expectZenPreview('Compacting...'));
+  session.complete();
+  await waitFor(() => expect(tab.state.isStreaming).toBe(false));
+});
+
+it('clears a pending waiting status when provider invalidation ends the turn', async () => {
+  const { tab, view, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, 'Invalidate during text');
+  session.emitText('Partial response');
+  await waitFor(() => expect(preview()).toBe('Partial response'));
+  await view.plugin.providerHost.executionLifecycleRegistry.runTransition(['claude'], async () => undefined);
+  await tab.session.turns.drain();
+  expect(session.cancelCalls).toBeGreaterThan(0);
+
+  // Past the text-pause delay, the ended turn must not bring its indicator back.
+  await new Promise(resolve => setTimeout(resolve, 1_700));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  expect(tab.state.waitingStatus).toBeNull();
+});
+
+it('leaves no waiting indicator behind when a forced new chat dismisses a pending approval', async () => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, 'Write a note');
+  await waitForFlavor(tab);
+  const approval = session.config.interactionPort.requestApproval({
+    description: 'Write a note', input: {}, interactionId: 'approval-1',
+    kind: 'approval', sessionInstanceId: session.sessionInstanceId,
+    toolName: 'Write', turnId: session.activeTurnId,
+  }, new AbortController().signal).catch(() => undefined);
+  await waitFor(() => expect(preview()).toBe('Needs your input'));
+
+  // Persistence that outlasts the indicator delay leaves time for a stale resume to fire.
+  const { conversationController } = tab.controllers;
+  const save = conversationController.save.bind(conversationController);
+  jest.spyOn(conversationController, 'save').mockImplementation(async (...args) => {
+    await new Promise(resolve => setTimeout(resolve, 600));
+    return save(...args);
+  });
+  await conversationController.createNew({ force: true });
+  await approval;
+
+  expect(tab.state.isStreaming).toBe(false);
+  expect(tab.state.thinkingEl).toBeNull();
+  expect(tab.state.waitingStatus).toBeNull();
+});
+
 it('reports a provider failure after streamed output as an error', async () => {
   const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
   setCollapsed(rightSplit, true);
@@ -422,10 +612,16 @@ it('leaves sending and stopping to the moved composer', async () => {
   expect(within(panel).queryByRole('button', { name: 'Stop' })).toBeNull();
 
   const session = await sendFromZen(tab, sessions, 'Long task');
+  session.emitText('Partial answer');
+  await waitFor(() => expect(preview()).toBe('Partial answer'));
   fireEvent.keyDown(tab.dom.inputEl as unknown as HTMLElement, { key: 'Escape' });
 
   expect(session.cancelCalls).toBe(1);
   await waitFor(() => expect(preview()).toBe('Interrupted'));
+  // A cancelled turn leaves no waiting indicator behind, even after a text pause would have elapsed.
+  await new Promise(resolve => setTimeout(resolve, 1_500));
+  expect(waitingIndicatorText(tab)).toBeNull();
+  expect(preview()).toBe('Interrupted');
 });
 
 it('offers no history for a new conversation until it has messages', async () => {
@@ -644,6 +840,250 @@ it('collapses the expanded transcript on a click or focus move elsewhere in Obsi
   expect(hide.getAttribute('aria-expanded')).toBe('false');
 });
 
+it('moves the panel by its grip, docks it magnetically, and remembers where it was left', async () => {
+  const observers: Array<{ callback: ResizeObserverCallback; targets: Set<Element> }> = [];
+  globalThis.ResizeObserver = class {
+    readonly #entry: { callback: ResizeObserverCallback; targets: Set<Element> };
+    constructor(callback: ResizeObserverCallback) {
+      this.#entry = { callback, targets: new Set() };
+      observers.push(this.#entry);
+    }
+    observe(target: Element) { this.#entry.targets.add(target); }
+    unobserve(target: Element) { this.#entry.targets.delete(target); }
+    disconnect() { this.#entry.targets.clear(); }
+  } as unknown as typeof ResizeObserver;
+  const resize = (target: Element) => {
+    for (const { callback, targets } of observers) {
+      if (targets.has(target)) callback([], {} as ResizeObserver);
+    }
+  };
+  // jsdom lacks PointerEvent, so fireEvent would dispatch plain events without pointer coordinates.
+  const originalPointerEvent = window.PointerEvent;
+  window.PointerEvent = class extends MouseEvent {
+    readonly pointerId: number;
+    constructor(type: string, init: PointerEventInit = {}) {
+      super(type, init);
+      this.pointerId = init.pointerId ?? 0;
+    }
+  } as unknown as typeof PointerEvent;
+  cleanups.push(() => { window.PointerEvent = originalPointerEvent; });
+  const { rootEl, rightSplit, setCollapsed, settingsCoordinator, noteEditor, workspace } = await createZenFixture();
+  // jsdom has no layout: a 1000x800 central workspace holding a 600x100 panel, without zen styles.
+  // A 584x60 composer sits 8px inside the panel's bottom, which follows the bottom offset; a
+  // drawer, when shown, sits on it, 526px wide.
+  Object.defineProperty(rootEl, 'clientWidth', { configurable: true, value: 1000 });
+  Object.defineProperty(rootEl, 'clientHeight', { configurable: true, value: 800 });
+  jest.spyOn(rootEl, 'getBoundingClientRect').mockImplementation(() => ({ left: 0, right: 1000, width: 1000, top: 0, bottom: 800, height: 800 } as DOMRect));
+  let panelHeight = 100;
+  let drawerHeight = 0;
+  const stubPanel = (panel: HTMLElement) => {
+    const composerBottom = () => 800 - Number.parseFloat(panel.style.getPropertyValue('--claudian-zen-offset-y') || '0');
+    jest.spyOn(panel, 'getBoundingClientRect').mockImplementation(() => ({
+      left: 200, right: 800, top: composerBottom() + 8 - panelHeight, bottom: composerBottom() + 8,
+      width: 600, height: panelHeight,
+    } as DOMRect));
+    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-composer')!, 'getBoundingClientRect')
+      .mockImplementation(() => ({ left: 208, right: 792, top: composerBottom() - 60, bottom: composerBottom() } as DOMRect));
+    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-drawer')!, 'getBoundingClientRect')
+      .mockImplementation(() => ({
+        left: 237, right: 763, top: composerBottom() - 60 - drawerHeight, bottom: composerBottom() - 60,
+        height: drawerHeight,
+      } as DOMRect));
+  };
+  // Corner points of the hint outline, relative to the panel box; zen styles add no gap or radii here.
+  const outlinePoints = () => {
+    const d = rootEl.querySelector('.claudian-zen-dock-hint-outline')?.getAttribute('d') ?? '';
+    return (d.match(/[MLA][^MLAZ]*/g) ?? []).map((command) => {
+      const values = command.slice(1).trim().split(/[\s,]+/).map(Number);
+      return values.slice(-2);
+    });
+  };
+  const offset = (panel: HTMLElement) => [
+    panel.style.getPropertyValue('--claudian-zen-offset-x'),
+    panel.style.getPropertyValue('--claudian-zen-offset-y'),
+  ];
+  const savedPosition = () => settingsCoordinator.getCommittedSettings().zenModePosition;
+  const drag = (grip: HTMLElement, from: [number, number], to: [number, number]) => {
+    fireEvent.pointerDown(grip, { button: 0, pointerId: 1, clientX: from[0], clientY: from[1] });
+    fireEvent.pointerMove(document, { pointerId: 1, clientX: to[0], clientY: to[1] });
+    fireEvent.pointerUp(document, { pointerId: 1, clientX: to[0], clientY: to[1] });
+  };
+
+  setCollapsed(rightSplit, true);
+  let panel = zenPanel()!;
+  stubPanel(panel);
+  const grip = within(panel).getByRole('button', { name: 'Move chat panel' });
+  expect(await axe(grip)).toHaveNoViolations();
+  expect(offset(panel)).toEqual(['0px', '0px']);
+
+  // Dragging left beyond the edge stops at the workspace's side; upward is a positive bottom offset.
+  drag(grip, [500, 700], [100, 400]);
+  expect(offset(panel)).toEqual(['-200px', '300px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: -0.2, y: 0.375 }));
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(false);
+
+  // Near the top, composer menus open downward instead of past the workspace edge.
+  drag(grip, [0, 0], [0, -500]);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(true);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: -0.2, y: 0.875 }));
+
+  // A taller panel slides down to stay inside the workspace, then returns to the remembered spot.
+  panelHeight = 300;
+  resize(panel);
+  expect(offset(panel)).toEqual(['-200px', '500px']);
+  panelHeight = 100;
+  resize(panel);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+  expect(savedPosition()).toEqual({ x: -0.2, y: 0.875 });
+
+  // Reattaching restores the remembered position.
+  setCollapsed(rightSplit, false);
+  noteEditor.focus();
+  setCollapsed(rightSplit, true);
+  panel = zenPanel()!;
+  stubPanel(panel);
+  expect(offset(panel)).toEqual(['-200px', '700px']);
+
+  // While dragging, a hint marks the dock and lights up once the panel is close enough to snap.
+  const reopenedGrip = within(panel).getByRole('button', { name: 'Move chat panel' });
+  const hint = () => rootEl.querySelector<HTMLElement>('.claudian-zen-dock-hint');
+  expect(hint()).toBeNull();
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 100, clientY: 300 });
+  expect(hint()?.getAttribute('aria-hidden')).toBe('true');
+  expect([hint()!.style.width, hint()!.style.height]).toEqual(['600px', '100px']);
+  // Without a drawer, the outline is the composer alone.
+  expect(Math.min(...outlinePoints().map(([, y]) => y))).toBe(32);
+  expect(hint()!.classList.contains('claudian-zen-dock-hint--active')).toBe(false);
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(false);
+
+  // Released close to its dock, the panel snaps into it and forgets the free position.
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 190, clientY: 690 });
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  expect(hint()!.classList.contains('claudian-zen-dock-hint--active')).toBe(true);
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(true);
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 190, clientY: 690 });
+  expect(hint()).toBeNull();
+  expect(panel.classList.contains('claudian-zen--snapped')).toBe(false);
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  await waitFor(() => expect(savedPosition()).toBeNull());
+
+  // The grip also moves by keyboard, and Home docks it again.
+  reopenedGrip.focus();
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowUp' });
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowRight', shiftKey: true });
+  expect(offset(panel)).toEqual(['64px', '16px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: 0.064, y: 0.02 }));
+  fireEvent.keyDown(reopenedGrip, { key: 'Home' });
+  expect(offset(panel)).toEqual(['0px', '0px']);
+  await waitFor(() => expect(savedPosition()).toBeNull());
+
+  // Tall history lifts the panel's middle, but the composer stays low, so its menus keep opening upward.
+  panelHeight = 400;
+  drag(reopenedGrip, [0, 0], [0, -250]);
+  expect(offset(panel)).toEqual(['0px', '250px']);
+  expect(panel.classList.contains('claudian-zen--opens-below')).toBe(false);
+
+  // Growth during a drag is rechecked on release, so the panel never stays past the top edge.
+  panelHeight = 100;
+  resize(panel);
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  fireEvent.pointerMove(document, { pointerId: 1, clientX: 0, clientY: -500 });
+  expect(offset(panel)).toEqual(['0px', '700px']);
+  panelHeight = 300;
+  resize(panel);
+  expect(hint()!.style.height).toBe('300px');
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 0, clientY: -500 });
+  expect(offset(panel)).toEqual(['0px', '500px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: 0, y: 0.625 }));
+
+  // With a drawer above the composer, the hint takes the panel's stepped outline.
+  panelHeight = 100;
+  drawerHeight = 24;
+  resize(panel);
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  const points = outlinePoints();
+  expect(Math.min(...points.map(([, y]) => y))).toBe(8);
+  expect(points).toEqual(expect.arrayContaining([[37, 32], [563, 32], [8, 92], [592, 92]]));
+  // The drawer can grow while a shrinking composer keeps the root's total height unchanged.
+  drawerHeight = 32;
+  resize(panel.querySelector('.claudian-zen-drawer')!);
+  expect(Math.min(...outlinePoints().map(([, y]) => y))).toBe(0);
+  fireEvent.pointerUp(document, { pointerId: 1, clientX: 0, clientY: 0 });
+
+  // Obsidian's fixed status bar overlays the workspace; all ways home must clear it.
+  const statusBar = document.body.createDiv({ cls: 'status-bar' });
+  cleanups.push(() => statusBar.remove());
+  statusBar.style.position = 'fixed';
+  let statusLeft = 750;
+  let statusHeight = 30;
+  let statusBottom = 800;
+  jest.spyOn(statusBar, 'getBoundingClientRect').mockImplementation(() => ({
+    left: statusLeft, right: 1000, width: 1000 - statusLeft,
+    top: statusBottom - statusHeight, bottom: statusBottom, height: statusHeight,
+  } as DOMRect));
+  workspace.trigger('layout-change');
+  fireEvent.keyDown(reopenedGrip, { key: 'Home' });
+  expect(offset(panel)).toEqual(['0px', '30px']);
+  expect(panel.style.getPropertyValue('--claudian-zen-bottom-clearance')).toBe('30px');
+  await waitFor(() => expect(savedPosition()).toBeNull());
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowDown', shiftKey: true });
+  expect(offset(panel)).toEqual(['0px', '30px']);
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowUp', shiftKey: true });
+  fireEvent.dblClick(reopenedGrip);
+  expect(offset(panel)).toEqual(['0px', '30px']);
+
+  fireEvent.pointerDown(reopenedGrip, { button: 0, pointerId: 2, clientX: 0, clientY: 0 });
+  fireEvent.pointerMove(document, { pointerId: 2, clientX: 100, clientY: -80 });
+  expect(hint()!.style.bottom).toBe('30px');
+  fireEvent.pointerMove(document, { pointerId: 2, clientX: 10, clientY: -10 });
+  expect(offset(panel)).toEqual(['0px', '30px']);
+  expect(hint()!.classList.contains('claudian-zen-dock-hint--active')).toBe(true);
+  fireEvent.pointerUp(document, { pointerId: 2 });
+  await waitFor(() => expect(savedPosition()).toBeNull());
+
+  statusHeight = 45;
+  resize(statusBar);
+  expect(offset(panel)).toEqual(['0px', '45px']);
+  // No overlap on the left: the old bottom edge is still available.
+  for (let index = 0; index < 4; index++) fireEvent.keyDown(reopenedGrip, { key: 'ArrowLeft', shiftKey: true });
+  fireEvent.keyDown(reopenedGrip, { key: 'ArrowDown', shiftKey: true });
+  expect(offset(panel)).toEqual(['-200px', '0px']);
+  await waitFor(() => expect(savedPosition()).toEqual({ x: -0.2, y: 0 }));
+  statusLeft = 550;
+  resize(statusBar);
+  expect(offset(panel)).toEqual(['-200px', '45px']);
+  expect(savedPosition()).toEqual({ x: -0.2, y: 0 });
+
+  // Hidden bars (even with a stale rect), normal-flow bars, and absent bars add no clearance.
+  for (const [property, value] of [['display', 'none'], ['visibility', 'hidden'], ['opacity', '0'], ['position', 'static']]) {
+    statusBar.style.setProperty(property, value);
+    workspace.trigger('css-change');
+    expect(offset(panel)).toEqual(['-200px', '0px']);
+    statusBar.style.removeProperty(property);
+    statusBar.style.position = 'fixed';
+    workspace.trigger('css-change');
+    expect(offset(panel)).toEqual(['-200px', '45px']);
+  }
+  // A theme can move the fixed bar to the top; it must not consume the bottom workspace.
+  statusBottom = statusHeight;
+  workspace.trigger('css-change');
+  expect(offset(panel)).toEqual(['-200px', '0px']);
+  expect(panel.style.getPropertyValue('--claudian-zen-bottom-clearance')).toBe('0px');
+  // A full-height side strip also must not collapse the panel's available height.
+  statusHeight = 800;
+  statusBottom = 800;
+  workspace.trigger('css-change');
+  expect(offset(panel)).toEqual(['-200px', '0px']);
+  expect(panel.style.getPropertyValue('--claudian-zen-bottom-clearance')).toBe('0px');
+  statusBar.remove();
+  workspace.trigger('layout-change');
+  expect(offset(panel)).toEqual(['-200px', '0px']);
+  expect(savedPosition()).toEqual({ x: -0.2, y: 0 });
+  expect(observers.every(observer => !observer.targets.has(statusBar))).toBe(true);
+});
+
 it('keeps the preview line on the main chat while a side chat is selected', async () => {
   const { tab, sessions, rightSplit, setCollapsed, sideChatChipHostEl } = await createZenFixture();
   tab.state.messages = [
@@ -725,6 +1165,7 @@ it('keeps the last visible reading position when collapsing the sidebar hides th
     setCollapsed(rightSplit, true);
     laidOut = true;
   };
+  fireEvent.wheel(messagesEl, { deltaY: -100 });
   messagesEl.scrollTop = 300;
   fireEvent.scroll(messagesEl);
   expect(tab.state.autoScrollEnabled).toBe(false);

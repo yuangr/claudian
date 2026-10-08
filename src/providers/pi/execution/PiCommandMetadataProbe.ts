@@ -1,11 +1,11 @@
+import { parseEnvironmentVariables } from '@/core/process/env';
 import { OwnedProbeRegistry } from '@/core/providers/metadata/OwnedProbeRegistry';
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
 import { getRuntimeEnvironmentText } from '@/core/providers/providerEnvironment';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import type { SlashCommand } from '@/core/types';
-import { parseEnvironmentVariables } from '@/utils/env';
 
-import { buildPiLaunchSpec } from '../runtime/PiLaunchSpec';
+import { buildPiLaunchSpec } from '../runtime/PiLaunchSpecBuilder';
 import { getPiProviderSettings } from '../settings';
 import {
   createPiExecutionKernel,

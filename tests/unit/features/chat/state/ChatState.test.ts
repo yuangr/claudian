@@ -1,4 +1,7 @@
+import { holdResponse } from '@test/helpers/ConversationPorts';
+
 import { ChatState } from '@/features/chat/state/ChatState';
+import { TurnCoordinator } from '@/features/chat/turns/TurnCoordinator';
 
 describe('ChatState', () => {
   const originalWindow = (globalThis as { window?: Window }).window;
@@ -60,27 +63,18 @@ describe('ChatState', () => {
   });
 
   describe('streaming control', () => {
-    it('fires onStreamingStateChanged when isStreaming changes', () => {
+    it('derives streaming from its turn owner and reports each change once', async () => {
       const onStreamingStateChanged = jest.fn();
-      const chatState = new ChatState({ onStreamingStateChanged });
+      const turns = new TurnCoordinator();
+      const chatState = new ChatState({ onStreamingStateChanged }, undefined, turns);
 
-      chatState.isStreaming = true;
+      const release = holdResponse(turns);
+      expect(chatState.isStreaming).toBe(true);
+      await release();
 
-      expect(onStreamingStateChanged).toHaveBeenCalledWith(true);
+      expect(chatState.isStreaming).toBe(false);
+      expect(onStreamingStateChanged.mock.calls).toEqual([[true], [false]]);
     });
-
-    it('bumpStreamGeneration increments and returns the new value', () => {
-      const chatState = new ChatState();
-
-      expect(chatState.streamGeneration).toBe(0);
-      const gen1 = chatState.bumpStreamGeneration();
-      expect(gen1).toBe(1);
-      expect(chatState.streamGeneration).toBe(1);
-
-      const gen2 = chatState.bumpStreamGeneration();
-      expect(gen2).toBe(2);
-    });
-
   });
 
   describe('conversation', () => {
@@ -97,13 +91,15 @@ describe('ChatState', () => {
   });
 
   describe('queued message', () => {
-    it('stores and retrieves queued message', () => {
+    it('stores the queued message written by its single claimed owner', () => {
       const chatState = new ChatState();
-      const queued = { content: 'queued', editorContext: null, canvasContext: null };
+      const queued = { content: 'queued', turnRequest: { text: 'queued' } };
 
-      chatState.queuedMessage = queued;
+      const write = chatState.claimQueuedMessageWriter();
+      write(queued);
 
       expect(chatState.queuedMessage).toBe(queued);
+      expect(() => chatState.claimQueuedMessageWriter()).toThrow('The queued message already has an owner.');
     });
   });
 
