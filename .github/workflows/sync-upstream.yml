@@ -1,0 +1,77 @@
+name: Sync Upstream & Notify
+
+on:
+  schedule:
+    # 每天北京时间上午 10:00 (UTC 02:00) 自动运行
+    - cron: '0 2 * * *'
+  # 允许在 GitHub Actions 页面随时手动一键触发
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    name: Sync with upstream and notify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/yishentu/claudian.git
+          git fetch upstream main
+
+      - name: Check and Merge
+        id: sync_step
+        run: |
+          git checkout main
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/main)
+          echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEHIND_COUNT" -eq 0 ]; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          # 获取最新更新的 commit 简报
+          echo "commits_log<<EOF" >> "$GITHUB_OUTPUT"
+          git log --oneline HEAD..upstream/main >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "Merging upstream/main..."
+          git merge upstream/main --no-edit -m "chore(sync): auto-merge upstream/main"
+          git push origin main
+
+      - name: Send GitHub Notification via Issue
+        if: steps.sync_step.outputs.behind_count > 0
+        uses: actions/github-script@v7
+        env:
+          COMMITS_LOG: ${{ steps.sync_step.outputs.commits_log }}
+          BEHIND_COUNT: ${{ steps.sync_step.outputs.behind_count }}
+        with:
+          script: |
+            const commits = process.env.COMMITS_LOG || '';
+            const count = process.env.BEHIND_COUNT || '0';
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🎉 [Claudian 自动同步] 检测到原项目更新 (${count} 个提交) 并已自动合并`,
+              body: `原项目 \`yishentu/claudian\` 有最新代码更新，已自动合并到你的 \`main\` 分支！\n\n### 📝 包含的提交列表：\n\`\`\`text\n${commits}\n\`\`\`\n\n> 💡 提示：本通知由 GitHub Actions 定时同步任务自动生成。收到邮件后，如有需要可在本地拉取并编译更新你的 Obsidian 插件。`
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.data.number,
+              state: 'closed'
+            });
