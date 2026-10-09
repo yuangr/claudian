@@ -39,6 +39,17 @@ export class ClaudianViews {
     return leaves.map(leaf => leaf.view).filter(isClaudianView);
   }
 
+  /** Chooses a visible composer without opening or revealing a chat. */
+  getInputFocusView(zenLeaf: WorkspaceLeaf | null): ClaudianView | null {
+    const views = this.getAllViews().filter(view => view.getActiveTab()?.composer.isVisible());
+    const preferred = this.getView();
+    return views.find(view => view.getActiveTab()?.composer.isFocused())
+      ?? views.find(view => view.leaf === zenLeaf)
+      ?? views.find(view => view === preferred)
+      ?? views[0]
+      ?? null;
+  }
+
   findConversationAcrossViews(conversationId: string): { view: ClaudianView; tabId: string } | null {
     for (const view of this.getAllViews()) {
       const tabManager = view.getTabManager();

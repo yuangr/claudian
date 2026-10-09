@@ -33,6 +33,7 @@ import { VIEW_TYPE_CLAUDIAN } from './core/types';
 import { ClaudianView } from './features/chat/ClaudianView';
 import { ConversationLifecycle } from './features/chat/conversation/ConversationLifecycle';
 import { InactiveSessionArchiver } from './features/chat/conversation/InactiveSessionArchiver';
+import { createChatFocusCommand } from './features/chat/workspace/ChatFocusCommand';
 import { createChatTabCommands } from './features/chat/workspace/ChatTabCommands';
 import { ChatViewPublisher } from './features/chat/workspace/ChatViewPublisher';
 import { registerFileMenu } from './features/chat/workspace/fileMenu';
@@ -129,6 +130,10 @@ export default class ClaudianPlugin extends Plugin {
       for (const command of createChatTabCommands({ workspace: this.app.workspace, views: this.views })) {
         this.addCommand(command);
       }
+      this.addCommand(createChatFocusCommand(
+        () => this.views.getInputFocusView(this.zenMode.getActiveLeaf())?.getActiveTab()?.composer ?? null,
+      ));
+      this.addCommand(this.zenMode.createToggleHistoryCommand());
 
       this.addCommand({
         id: 'copy-startup-diagnostics',

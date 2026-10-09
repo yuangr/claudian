@@ -9,11 +9,12 @@ import { FakeSideSession } from '@test/helpers/features/chat/SideChatSessionHarn
 import { modelCatalogCases } from '@test/helpers/providerModelCatalogs';
 import { fireEvent, screen, waitFor, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
-import { App, Component, setIcon } from 'obsidian';
+import { App, Component, Scope, setIcon } from 'obsidian';
 
 import { ChatModelSelectionCoordinator } from '@/app/settings/ChatModelSelectionCoordinator';
 import { DEFAULT_CLAUDIAN_SETTINGS } from '@/app/settings/defaultSettings';
 import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
+import { ClaudianViews } from '@/composition/ClaudianViews';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import { getToolIcon } from '@/core/tools/toolIcons';
@@ -23,6 +24,7 @@ import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 import { FLAVOR_TEXTS } from '@/features/chat/turns/flavorTexts';
+import { createChatFocusCommand } from '@/features/chat/workspace/ChatFocusCommand';
 import { ZenModeController } from '@/features/chat/zen/ZenModeController';
 import { adaptCodexStreamChunk } from '@/providers/codex/execution/CodexExecutionEventNormalizer';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
@@ -81,6 +83,7 @@ function createWorkspace() {
     },
     listenerCount: () => [...listeners.values()].reduce((total, set) => total + set.size, 0),
     getLeavesOfType: () => leaves,
+    getActiveViewOfType: jest.fn(),
     getActiveFile: () => null,
     revealLeaf: jest.fn(async (leaf: Leaf) => {
       const root = leaf.getRoot() as Split;
@@ -95,6 +98,7 @@ function createWorkspace() {
   };
   const setCollapsed = (split: Split, collapsed: boolean) => {
     split.collapsed = collapsed;
+    split.containerEl.hidden = collapsed;
     workspace.trigger('resize');
   };
   return { workspace, keymap, scopes, rootEl, rootSplit, leftSplit, rightSplit, noteEditor, leaves, setCollapsed };
@@ -116,7 +120,7 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
   Object.assign(app.vault.adapter, { basePath: '/vault' });
   Object.assign(app.vault, { on: () => ({}), offref: () => undefined });
   const layout = createWorkspace();
-  Object.assign(app, { workspace: layout.workspace, keymap: layout.keymap });
+  Object.assign(app, { workspace: layout.workspace, keymap: layout.keymap, scope: new Scope() });
   const sessions: FakeSideSession[] = [];
   jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockImplementation((_host, providerId = 'claude') => ({
     providerId,
@@ -195,6 +199,16 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
       conversation, getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
     });
     tab.state.currentConversationId = conversation.id;
+    // jsdom has no layout engine; model the native visibility query at the browser boundary.
+    tab.dom.inputEl.checkVisibility = () => {
+      if (!tab.dom.inputEl.isConnected) return false;
+      for (let el: HTMLElement | null = tab.dom.inputEl; el; el = el.parentElement) {
+        const style = el.ownerDocument.defaultView!.getComputedStyle(el);
+        if (el.hidden || style.display === 'none' || style.visibility === 'hidden'
+          || style.visibility === 'collapse' || style.opacity === '0') return false;
+      }
+      return true;
+    };
     tab.dom.contentEl.removeClass('claudian-hidden');
     cleanups.push(() => destroyTab(tab));
     view.tabManager = {
@@ -215,7 +229,11 @@ async function createZenFixture(options: { enabled?: boolean; ready?: boolean } 
   zen.start();
   cleanups.push(() => zen.dispose());
   const primary = await addView('right', options.ready ?? true);
-  return { ...layout, ...primary, app, zen, sessions, settingsCoordinator, addView };
+  const views = new ClaudianViews(app.workspace, () => 'right-sidebar');
+  const focusCommand = createChatFocusCommand(
+    () => views.getInputFocusView(zen.getActiveLeaf())?.getActiveTab()?.composer ?? null,
+  );
+  return { ...layout, ...primary, app, zen, focusCommand, sessions, settingsCoordinator, addView };
 }
 
 function zenPanel(): HTMLElement | null {
@@ -741,8 +759,151 @@ it('follows chat state while transcript rendering is suspended', async () => {
   await waitFor(() => expect(tab.state.isStreaming).toBe(false));
 });
 
+it.each([true, false])('toggles the normal sidebar composer with zen enabled=%s', async (enabled) => {
+  const { focusCommand: command, tab, noteEditor, rightSplit, sessions } = await createZenFixture({ enabled });
+  noteEditor.value = 'Selected note text';
+  noteEditor.focus();
+  noteEditor.setSelectionRange(2, 7);
+  tab.dom.inputEl.value = 'Sidebar draft';
+
+  expect(command.checkCallback!(true)).toBe(true);
+  expect(document.activeElement).toBe(noteEditor);
+  expect(command.checkCallback!(false)).toBe(true);
+  const input = within(tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
+  expect(document.activeElement).toBe(input);
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+  expect([noteEditor.selectionStart, noteEditor.selectionEnd]).toEqual([2, 7]);
+  expect(tab.dom.inputEl.value).toBe('Sidebar draft');
+  expect(rightSplit.collapsed).toBe(false);
+  expect(sessions).toHaveLength(0);
+});
+
+it('focuses the selected normal chat view and keeps its return target independent from a presented zen chat', async () => {
+  const { focusCommand, addView, workspace, tab, noteEditor, rightSplit, setCollapsed } = await createZenFixture();
+  const central = await addView('main');
+  workspace.getActiveViewOfType.mockReturnValue(central.view);
+  noteEditor.focus();
+  focusCommand.checkCallback!(false);
+  const centralInput = within(central.tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
+  expect(document.activeElement).toBe(centralInput);
+
+  setCollapsed(rightSplit, true);
+  focusCommand.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+  focusCommand.checkCallback!(false);
+  const zenInput = within(tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
+  expect(document.activeElement).toBe(zenInput);
+  focusCommand.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+});
+
+it('leaves focus alone when there is no existing composer or its sidebar is collapsed without zen', async () => {
+  const { focusCommand, noteEditor, rightSplit, setCollapsed, leaves, view } = await createZenFixture({ enabled: false });
+  noteEditor.focus();
+  setCollapsed(rightSplit, true);
+  expect(focusCommand.checkCallback!(true)).toBe(false);
+  expect(focusCommand.checkCallback!(false)).toBe(false);
+  expect(document.activeElement).toBe(noteEditor);
+  expect(rightSplit.collapsed).toBe(true);
+  setCollapsed(rightSplit, false);
+  expect(focusCommand.checkCallback!(true)).toBe(true);
+  view.tabManager = null;
+  expect(focusCommand.checkCallback!(true)).toBe(false);
+  leaves.splice(0);
+  expect(focusCommand.checkCallback!(false)).toBe(false);
+  expect(document.activeElement).toBe(noteEditor);
+});
+
+it.each(['display', 'visibility', 'opacity', 'detached'])('skips a composer hidden by %s and rejects the command if none remain visible', async (reason) => {
+  const { focusCommand, addView, view, noteEditor, leftSplit, setCollapsed } = await createZenFixture({ enabled: false });
+  const other = await addView('left');
+  noteEditor.focus();
+  expect(focusCommand.checkCallback!(true)).toBe(true);
+  if (reason === 'display') view.viewContainerEl.style.display = 'none';
+  else if (reason === 'visibility') view.viewContainerEl.style.visibility = 'hidden';
+  else if (reason === 'opacity') view.viewContainerEl.style.opacity = '0';
+  else view.viewContainerEl.remove();
+
+  expect(focusCommand.checkCallback!(false)).toBe(true);
+  expect(document.activeElement).toBe(within(other.tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' }));
+  focusCommand.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+  setCollapsed(leftSplit, true);
+  expect(focusCommand.checkCallback!(true)).toBe(false);
+  expect(focusCommand.checkCallback!(false)).toBe(false);
+  expect(document.activeElement).toBe(noteEditor);
+});
+
+it('toggles focus between the attached zen composer and the previous control without changing drafts or execution', async () => {
+  const { focusCommand: command, tab, sessions, rightSplit, setCollapsed, noteEditor, scopes, settingsCoordinator } = await createZenFixture();
+  noteEditor.value = 'A note selection';
+  noteEditor.focus();
+  noteEditor.setSelectionRange(2, 6);
+  expect(command.checkCallback!(true)).toBe(true);
+  expect(document.activeElement).toBe(noteEditor);
+
+  setCollapsed(rightSplit, true);
+  tab.dom.inputEl.value = 'Unsent draft';
+  expect(command.checkCallback!(true)).toBe(true);
+  expect(document.activeElement).toBe(noteEditor);
+  expect(command.checkCallback!(false)).toBe(true);
+  const input = within(screen.getByRole('region', { name: 'Claudian chat' })).getByRole('textbox', { name: 'Message' });
+  expect(document.activeElement).toBe(input);
+  expect(scopes).toHaveLength(1);
+  expect(tab.dom.inputEl.value).toBe('Unsent draft');
+  expect(rightSplit.collapsed).toBe(true);
+  expect(sessions).toHaveLength(0);
+
+  expect(command.checkCallback!(true)).toBe(true);
+  expect(document.activeElement).toBe(input);
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(document.activeElement).toBe(noteEditor);
+  expect([noteEditor.selectionStart, noteEditor.selectionEnd]).toEqual([2, 6]);
+  expect(scopes).toHaveLength(0);
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(document.activeElement).toBe(input);
+  expect(tab.dom.inputEl.value).toBe('Unsent draft');
+
+  const otherControl = noteEditor.parentElement!.createEl('button', { text: 'Another control', attr: { type: 'button' } });
+  otherControl.focus();
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(input);
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(otherControl);
+
+  noteEditor.focus();
+  await settingsCoordinator.mutate(settings => { settings.enableZenMode = false; });
+  expect(command.checkCallback!(false)).toBe(false);
+  expect(document.activeElement).toBe(noteEditor);
+  expect(scopes).toHaveLength(0);
+});
+
+it('ignores removed focus targets and retains the return target across normal and zen presentation changes', async () => {
+  const { focusCommand: command, rightSplit, setCollapsed, noteEditor } = await createZenFixture();
+  setCollapsed(rightSplit, true);
+  noteEditor.focus();
+  command.checkCallback!(false);
+  const input = within(screen.getByRole('region', { name: 'Claudian chat' })).getByRole('textbox', { name: 'Message' });
+  noteEditor.remove();
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(input);
+
+  document.body.append(noteEditor);
+  noteEditor.focus();
+  command.checkCallback!(false);
+  setCollapsed(rightSplit, false);
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(input);
+  setCollapsed(rightSplit, true);
+  command.checkCallback!(false);
+  expect(document.activeElement).toBe(noteEditor);
+});
+
 it('sends with the existing keyboard rules and leaves note input alone', async () => {
-  const { tab, sessions, rightSplit, setCollapsed, noteEditor, scopes } = await createZenFixture();
+  const { app, tab, sessions, rightSplit, setCollapsed, noteEditor, scopes } = await createZenFixture();
   setCollapsed(rightSplit, true);
   const input = tab.dom.inputEl as unknown as HTMLElement;
 
@@ -755,6 +916,8 @@ it('sends with the existing keyboard rules and leaves note input alone', async (
 
   input.focus();
   expect(scopes).toHaveLength(1);
+  // Obsidian resolves global hotkeys through the active scope's parent chain.
+  expect(scopes[0]).toEqual(expect.objectContaining({ parent: app.scope }));
   tab.dom.inputEl.value = 'Line one';
   fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
   fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
@@ -767,6 +930,47 @@ it('sends with the existing keyboard rules and leaves note input alone', async (
   noteEditor.focus();
   expect(scopes).toHaveLength(0);
   sessions[0].complete();
+});
+
+it('toggles history through its hotkey command while preserving focus and the active conversation', async () => {
+  const { zen, focusCommand, tab, sessions, rightSplit, setCollapsed, noteEditor } = await createZenFixture();
+  const command = zen.createToggleHistoryCommand();
+  expect(command.checkCallback!(true)).toBe(false);
+  expect(command.checkCallback!(false)).toBe(false);
+  setCollapsed(rightSplit, true);
+  expect(command.checkCallback!(false)).toBe(false);
+  setCollapsed(rightSplit, false);
+  seedHistory(tab);
+  setCollapsed(rightSplit, true);
+  const panel = screen.getByRole('region', { name: 'Claudian chat' });
+  const show = within(panel).getByRole('button', { name: 'Show conversation' });
+  const history = document.getElementById(show.getAttribute('aria-controls')!)!;
+  tab.dom.inputEl.value = 'Unsent draft';
+  noteEditor.focus();
+  expect(command.checkCallback!(true)).toBe(true);
+  expect(show.getAttribute('aria-expanded')).toBe('false');
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(history.classList.contains('claudian-hidden')).toBe(false);
+  expect(document.activeElement).toBe(noteEditor);
+
+  focusCommand.checkCallback!(false);
+  const input = within(panel).getByRole('textbox', { name: 'Message' });
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(history.classList.contains('claudian-hidden')).toBe(true);
+  expect(document.activeElement).toBe(input);
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(history.classList.contains('claudian-hidden')).toBe(false);
+  history.focus();
+  expect(command.checkCallback!(false)).toBe(true);
+  expect(document.activeElement).toBe(show);
+  expect(show.getAttribute('aria-expanded')).toBe('false');
+  expect(tab.dom.inputEl.value).toBe('Unsent draft');
+  expect(tab.controllers.sideChatController.destination).toBe('main');
+  expect(rightSplit.collapsed).toBe(true);
+  expect(sessions).toHaveLength(0);
+
+  setCollapsed(rightSplit, false);
+  expect(command.checkCallback!(false)).toBe(false);
 });
 
 it('discloses the existing transcript accessibly and remembers the choice for the view lifetime', async () => {
@@ -913,6 +1117,7 @@ it('moves the panel by its grip, docks it magnetically, and remembers where it w
   let panel = zenPanel()!;
   stubPanel(panel);
   const grip = within(panel).getByRole('button', { name: 'Move chat panel' });
+  expect(grip.tabIndex).toBe(-1);
   expect(await axe(grip)).toHaveNoViolations();
   expect(offset(panel)).toEqual(['0px', '0px']);
 
