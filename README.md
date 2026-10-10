@@ -15,11 +15,11 @@
 
 ![Preview](assets/Preview.png)
 
-An Obsidian plugin that embeds AI coding agents (Claude Code, Codex CLI, Grok Build, OpenCode, Pi, and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
+An Obsidian plugin that embeds AI coding agents (Claude Code, Codex, Grok Build, OpenCode, Pi, and more to come) in your vault. Your vault becomes the agent's working directory — file read/write, search, bash, and multi-step workflows all work out of the box.
 
 ## Features & Usage
 
-Open Claudian interface from the ribbon icon or command palette. Everything works like your familiar coding agent, Claude Code, Codex CLI, Grok Build, OpenCode, and Pi — talk to the agent, and it reads, writes, edits, searches and run commands in your vault.
+Open Claudian interface from the ribbon icon or command palette. Everything works like your familiar coding agent, Claude Code, Codex, Grok Build, OpenCode, and Pi — talk to the agent, and it reads, writes, edits, searches and run commands in your vault.
 
 **Inline Edit** — Select text or start at the cursor position + hotkey to edit directly in notes with word-level diff preview.
 
@@ -131,6 +131,20 @@ Either:
 
 1. Install the native binary (recommended).
 2. Add the Node.js path in Settings → Environment: `PATH=/path/to/node/bin`.
+
+### Authentication fails while the CLI subscription works
+
+Claude can report `authentication_failed` inside Obsidian while the selected CLI works with a subscription in a terminal. An `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` inherited from the system environment takes precedence over subscription sign-in, so pointing Claudian at another CLI path does not help. The chat error includes the same recovery steps.
+
+In Settings → Providers → Claude → Custom variables, add an empty assignment for the conflicting credential so Claude falls back to the subscription:
+
+```env
+ANTHROPIC_API_KEY=
+```
+
+Use `ANTHROPIC_AUTH_TOKEN=` instead when that is the inherited credential. Override only credentials you intend to disable, and keep these assignments out of the shared environment so other providers are unaffected.
+
+When asking for help, share the variable names involved rather than their secret values.
 
 ### More help
 
