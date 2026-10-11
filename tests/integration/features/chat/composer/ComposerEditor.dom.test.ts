@@ -1,5 +1,6 @@
 /** @jest-environment jsdom */
 
+import { testDate } from '@test/helpers/testClock';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
 import { type App, type Component, MarkdownRenderer, Platform, TFile } from 'obsidian';
@@ -16,9 +17,12 @@ import { ImageContextManager } from '@/features/chat/composer/ImageContextManage
 import { MainChatComposerDropdown } from '@/features/chat/composer/MainChatComposerDropdown';
 import { CanvasSelectionController } from '@/features/chat/input/CanvasSelectionController';
 import { sendTabInputMessageFromExplicitEnterShortcut } from '@/features/chat/tabs/TabInputEvents';
+import { setLocale } from '@/i18n/i18n';
+import type { Locale } from '@/i18n/types';
 import { CodexCommandCatalog } from '@/providers/codex/commands/CodexCommandCatalog';
 import type { CodexAppServerRuntime } from '@/providers/codex/runtime/CodexAppServerRuntime';
 import { CodexSkillListingService } from '@/providers/codex/skills/CodexSkillListingService';
+import { ResumeSessionDropdown } from '@/shared/components/ResumeSessionDropdown';
 import { ComposerDropdownController } from '@/shared/composer-dropdown/ComposerDropdownController';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
@@ -33,7 +37,7 @@ const nativeLinks: Record<string, { target: string; label: string }> = {
 
 function createApp(): App {
   const file = Object.assign(new TFile(), {
-    path: 'Notes/A note.md', name: 'A note.md', basename: 'A note', stat: { mtime: 0 },
+    path: 'Notes/A note.md', name: 'A note.md', basename: 'A note', stat: { mtime: testDate().getTime() },
   });
   return {
     metadataCache: { getFirstLinkpathDest: () => file },
@@ -92,7 +96,13 @@ it('renders a wikilink through Obsidian and opens it without changing the source
   }
 });
 
-it.each(['click', 'Enter', 'Tab'])('inserts and renders a picker wikilink using %s', async method => {
+it.each<[string, Locale, string]>([
+  ['click', 'en', 'Input suggestions'],
+  ['Enter', 'en', 'Input suggestions'],
+  ['Tab', 'en', 'Input suggestions'],
+  ['click', 'de', 'Eingabevorschl\u00e4ge'],
+])('inserts and renders a picker wikilink using %s in %s', async (method, locale, menuName) => {
+  setLocale(locale);
   const parent = document.body.createDiv();
   const app = createApp();
   const editor = new ComposerEditor(parent, app, {} as Component);
@@ -101,9 +111,24 @@ it.each(['click', 'Enter', 'Tab'])('inserts and renders a picker wikilink using 
   try {
     editor.element.value = 'Read @A today';
     editor.element.selectionStart = editor.element.selectionEnd = 7;
+    dropdown.handleInputChange();
+    await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
+    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toEqual([editor.element]);
+    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
     editor.element.focus();
+    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toHaveLength(1);
+    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
+    dropdown.hide();
     dropdown.handleInputChange();
     const option = await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
+    const listbox = within(parent).getByRole('listbox');
+    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toHaveLength(1);
+    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(await axe(listbox)).toHaveNoViolations();
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
+    expect(within(parent).getByRole('listbox', { name: menuName })).toBe(listbox);
     if (method === 'click') fireEvent.click(option);
     else dropdown.handleKeydown(new KeyboardEvent('keydown', { key: method }));
     const link = await waitFor(() => within(parent).getByRole('link', { name: 'A note' }));
@@ -117,6 +142,7 @@ it.each(['click', 'Enter', 'Tab'])('inserts and renders a picker wikilink using 
     files.destroy();
     editor.destroy();
     parent.remove();
+    setLocale('en');
   }
 });
 
@@ -249,7 +275,7 @@ it.each([false, true])('inserts a plain newline without rewriting draft whitespa
   }
 });
 
-it('allows input listeners to update composer modes and forwards dropdown accessibility to the focused textbox', async () => {
+it('allows input listeners to update composer modes', async () => {
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
   const input = editor.element;
@@ -260,11 +286,6 @@ it('allows input listeners to update composer modes and forwards dropdown access
   fireEvent.keyDown(content, { key: 'Backspace', code: 'Backspace' });
   await Promise.resolve();
   expect(within(parent).getByText('Save instructions')).toBeTruthy();
-  input.setAttribute('aria-autocomplete', 'list');
-  input.setAttribute('aria-activedescendant', 'option-1');
-  await Promise.resolve();
-  expect(content.getAttribute('aria-autocomplete')).toBe('list');
-  expect(content.getAttribute('aria-activedescendant')).toBe('option-1');
   editor.destroy();
   parent.remove();
 });
@@ -640,7 +661,7 @@ it('describes a suggestion on the unfocused host textbox and hands the descripti
   } finally { suggestion.destroy(); editor.destroy(); parent.remove(); }
 });
 
-it('retains a hidden suggestion through text, attachments, dropdowns and IME composition', () => {
+it('retains a hidden suggestion through text, attachments, expanded popups and IME composition', async () => {
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
   let attachments = false;
@@ -665,12 +686,12 @@ it('retains a hidden suggestion through text, attachments, dropdowns and IME com
     attachments = false;
     suggestion.refresh();
     expect(within(parent).getByText('Add regression tests')).toBeDefined();
-    editor.element.setAttribute('aria-expanded', 'true');
-    suggestion.refresh();
-    expect(suggestion.handleKeydown(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(false);
-    expect(within(parent).queryByText('Add regression tests')).toBeNull();
-    editor.element.setAttribute('aria-expanded', 'false');
-    suggestion.refresh();
+    // Disclosures are not always native buttons.
+    const disclosure = parent.createDiv({ text: 'Details', attr: { role: 'button', tabindex: '0', 'aria-expanded': 'false' } });
+    disclosure.setAttribute('aria-expanded', 'true');
+    await waitFor(() => expect(within(parent).queryByText('Add regression tests')).toBeNull());
+    disclosure.setAttribute('aria-expanded', 'false');
+    await waitFor(() => expect(within(parent).getByText('Add regression tests')).toBeDefined());
     fireEvent.compositionStart(input);
     expect(suggestion.handleKeydown(new KeyboardEvent('keydown', { key: 'Tab' }))).toBe(false);
     fireEvent.compositionEnd(input);
@@ -679,4 +700,110 @@ it('retains a hidden suggestion through text, attachments, dropdowns and IME com
     expect(editor.element.value).toBe('');
     expect(within(parent).getByText('Add regression tests')).toBeDefined();
   } finally { suggestion.destroy(); editor.destroy(); parent.remove(); }
+});
+
+it('keeps completion relationships on the current textbox through mount and editing, then releases them', async () => {
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  const app = createApp();
+  const originalFiles = app.vault.getFiles();
+  app.vault.getFiles = () => [...originalFiles, Object.assign(new TFile(), {
+    path: 'Notes/B.md', name: 'B.md', basename: 'B', stat: { mtime: testDate().getTime() },
+  })];
+  const files = new FileContextManager(new VaultMentionDataProvider(app));
+  const input = editor.element;
+  // Another tab's composer menu shares the document, so option ids must not collide.
+  const otherParent = document.body.createDiv();
+  const otherEditor = createEditor(otherParent);
+  const otherDropdown = new ComposerDropdownController(otherParent, otherEditor.element, [files.getMentionSource()]);
+  const dropdown = new ComposerDropdownController(parent, input, [files.getMentionSource()]);
+  try {
+    otherEditor.element.value = '@';
+    otherEditor.element.selectionStart = otherEditor.element.selectionEnd = 1;
+    otherDropdown.handleInputChange();
+    await waitFor(() => within(otherParent).getByRole('option', { name: 'Notes/A note.md' }));
+    input.value = '@';
+    input.selectionStart = input.selectionEnd = 1;
+    dropdown.handleInputChange();
+    const option = await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
+    const listbox = within(parent).getByRole('listbox');
+    const expectRelationships = (textbox: HTMLElement, active: HTMLElement | null) => {
+      const activeId = textbox.getAttribute('aria-activedescendant');
+      expect(activeId === null ? null : document.getElementById(activeId)).toBe(active);
+      expect(document.getElementById(textbox.getAttribute('aria-controls') ?? '')).toBe(listbox);
+      expect(textbox.getAttribute('aria-autocomplete')).toBe('list');
+    };
+    expectRelationships(within(parent).getByRole('textbox', { name: 'Message' }), option);
+    input.focus();
+    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toHaveLength(1);
+    const textbox = within(parent).getByRole('textbox', { name: 'Message' });
+    expect(textbox).not.toBe(input);
+    expectRelationships(textbox, option);
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
+    const second = within(parent).getByRole('option', { name: 'Notes/B.md' });
+    dropdown.handleKeydown(new KeyboardEvent('keydown', { key: 'ArrowDown' }));
+    expect(second.getAttribute('aria-selected')).toBe('true');
+    expectRelationships(textbox, second);
+    fireEvent.mouseEnter(option);
+    expect(option.getAttribute('aria-selected')).toBe('true');
+    expectRelationships(textbox, option);
+    // Editor updates must not strip relationships written by the menu.
+    fireEvent.keyDown(textbox, { key: 'Enter', code: 'Enter' });
+    await waitFor(() => expect(input.value).toBe('@\n'));
+    expectRelationships(textbox, option);
+    input.value = '@nonexistent';
+    input.selectionStart = input.selectionEnd = input.value.length;
+    dropdown.handleInputChange();
+    expect(textbox.getAttribute('aria-activedescendant')).toBeNull();
+    await waitFor(() => within(parent).getByRole('option', { name: 'No matches' }));
+    expectRelationships(textbox, null);
+    expect(dropdown.handleKeydown(new KeyboardEvent('keydown', { key: 'Escape' }))).toBe(true);
+    expect(textbox.getAttribute('aria-activedescendant')).toBeNull();
+    expect(textbox.getAttribute('aria-controls')).toBeNull();
+    dropdown.destroy();
+    expect(textbox.getAttribute('aria-autocomplete')).toBeNull();
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
+  } finally {
+    dropdown.destroy(); otherDropdown.destroy(); files.destroy();
+    editor.destroy(); otherEditor.destroy(); parent.remove(); otherParent.remove();
+  }
+});
+
+it('leaves Resume picker relationships intact when an inactive completion controller is destroyed', async () => {
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  const files = new FileContextManager(new VaultMentionDataProvider(createApp()));
+  const dropdown = new ComposerDropdownController(parent, editor.element, [files.getMentionSource()]);
+  let resume: ResumeSessionDropdown | undefined;
+  try {
+    editor.element.value = '@A';
+    editor.element.selectionStart = editor.element.selectionEnd = 2;
+    dropdown.handleInputChange();
+    await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
+    dropdown.hide();
+    editor.element.focus();
+    const textbox = within(parent).getByRole('textbox', { name: 'Message' });
+    resume = new ResumeSessionDropdown(parent, editor.element, [{
+      id: 'previous', providerId: 'claude', title: 'Previous conversation',
+      createdAt: testDate({ minutes: -2 }).getTime(), lastActivityAt: testDate({ minutes: -1 }).getTime(),
+      messageCount: 1, preview: 'Previous prompt',
+    }], null, {
+      onSelect: () => undefined, onDismiss: () => resume?.destroy(),
+    });
+    const listbox = within(parent).getByRole('listbox', { name: 'Resume conversation' });
+    const option = within(listbox).getByRole('option', { name: /Previous conversation/ });
+    expect(textbox.getAttribute('aria-activedescendant')).toBe(option.id);
+    expect(textbox.getAttribute('aria-controls')).toBe(listbox.id);
+    dropdown.destroy();
+    expect(textbox.getAttribute('aria-activedescendant')).toBe(option.id);
+    expect(textbox.getAttribute('aria-controls')).toBe(listbox.id);
+    expect(textbox.getAttribute('aria-haspopup')).toBe('listbox');
+    expect(resume.isVisible()).toBe(true);
+    expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
+    resume.handleKeydown(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(textbox.getAttribute('aria-activedescendant')).toBeNull();
+    expect(textbox.getAttribute('aria-controls')).toBeNull();
+    expect(textbox.getAttribute('aria-haspopup')).toBeNull();
+    expect(textbox.getAttribute('aria-autocomplete')).toBeNull();
+  } finally { resume?.destroy(); dropdown.destroy(); files.destroy(); editor.destroy(); parent.remove(); }
 });

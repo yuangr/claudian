@@ -13,6 +13,7 @@ import { filterMarkdownTextTokens } from '@/utils/markdownTextTokens';
 
 const refreshLinks = StateEffect.define<null>();
 const programmatic = Annotation.define<boolean>();
+const INPUT_RELATIONSHIP_ATTRIBUTES = ['aria-autocomplete', 'aria-activedescendant', 'aria-controls', 'aria-haspopup'];
 
 class WikilinkWidget extends WidgetType {
   constructor(
@@ -123,7 +124,8 @@ export class ComposerEditor {
   private placeholderText = 'Ask to make changes, @mention files, run /commands';
   private ghostText: string | null = null;
   private destroyed = false;
-  private ariaObserver: MutationObserver | null = null;
+  /** The host until the editor mounts, then CodeMirror's content element, which outlives editor teardown. */
+  private textbox: HTMLElement;
   private inputPending = false;
   private linkRevision = 0;
   private commandResolver: ComposerCommandResolver | null = null;
@@ -135,6 +137,7 @@ export class ComposerEditor {
       attr: { role: 'textbox', 'aria-label': 'Message', 'aria-multiline': 'true', tabindex: '0', dir: 'auto' },
     });
     this.element = host as unknown as ComposerInputElement;
+    this.textbox = host;
     this.removeFileLinkHandler = registerFileLinkHandler(app, host);
     const decorations = StateField.define<DecorationSet>({
       create: state => this.decorate(state, Decoration.none),
@@ -231,6 +234,7 @@ export class ComposerEditor {
       this.refreshLinks();
     };
     this.element.isChipRange = (from, to) => isChipRange(this.state.field(decorations), from, to);
+    this.element.getAccessibleTextbox = () => this.textbox;
     host.setAttribute('data-placeholder', this.placeholderText);
     host.addEventListener('focusin', this.onFocusIn);
   }
@@ -272,7 +276,6 @@ export class ComposerEditor {
   destroy(): void {
     this.destroyed = true;
     this.element.removeEventListener('focusin', this.onFocusIn);
-    this.ariaObserver?.disconnect();
     this.removeFileLinkHandler();
     this.view?.destroy();
     this.view = null;
@@ -290,17 +293,13 @@ export class ComposerEditor {
       this.element.setAttribute('tabindex', '-1');
       this.view = new EditorView({ state: this.state, parent: this.element });
       this.syncHostDescription();
-      const attributes = ['aria-autocomplete', 'aria-expanded', 'aria-activedescendant', 'aria-controls', 'aria-haspopup'];
-      const syncAria = () => {
-        for (const attribute of attributes) {
-          const value = this.element.getAttribute(attribute);
-          if (value === null) this.view?.contentDOM.removeAttribute(attribute);
-          else this.view?.contentDOM.setAttribute(attribute, value);
-        }
-      };
-      syncAria();
-      this.ariaObserver = new this.element.ownerDocument.defaultView!.MutationObserver(syncAria);
-      this.ariaObserver.observe(this.element, { attributes: true, attributeFilter: attributes });
+      // Popups opened before mount keep their relationships on the new textbox.
+      for (const attribute of INPUT_RELATIONSHIP_ATTRIBUTES) {
+        const value = this.element.getAttribute(attribute);
+        this.element.removeAttribute(attribute);
+        if (value !== null) this.view.contentDOM.setAttribute(attribute, value);
+      }
+      this.textbox = this.view.contentDOM;
     }
     this.view.focus();
   };

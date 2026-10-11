@@ -21,9 +21,10 @@ export interface BuiltInCommandControllerDeps {
   openConversation?: (conversationId: string) => Promise<void>;
   /** Lets the active layout replace in-place clear with its own New action. */
   handleNewConversationCommand?: () => Promise<boolean>;
-  onForkAll?: () => Promise<void>;
   /** Toggles the active provider's fast service tier when available. */
   toggleFastMode?: () => Promise<boolean>;
+  /** Runs after the resume picker opens or closes. */
+  onResumeDropdownVisibilityChange?: () => void;
 }
 
 /** Runs main-chat built-in commands and owns the resume picker they open. */
@@ -56,18 +57,6 @@ export class BuiltInCommandController {
       case 'resume':
         this.#showResumeDropdown();
         break;
-      case 'fork': {
-        if (!capabilities.supportsFork) {
-          new Notice('Fork is not supported by this provider.');
-          return;
-        }
-        if (!this.deps.onForkAll) {
-          new Notice('Fork not available.');
-          return;
-        }
-        await this.deps.onForkAll();
-        break;
-      }
       case 'fast': {
         try {
           const toggled = await this.deps.toggleFastMode?.() ?? false;
@@ -116,6 +105,7 @@ export class BuiltInCommandController {
     if (this.activeResumeDropdown) {
       this.activeResumeDropdown.destroy();
       this.activeResumeDropdown = null;
+      this.deps.onResumeDropdownVisibilityChange?.();
     }
   }
 
@@ -150,5 +140,6 @@ export class BuiltInCommandController {
         },
       }
     );
+    this.deps.onResumeDropdownVisibilityChange?.();
   }
 }

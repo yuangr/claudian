@@ -13,6 +13,8 @@ export interface ComposerInputElement extends HTMLElement {
   setCommandResolver?: (resolver: ComposerCommandResolver | null) => void;
   /** Completed chips are not editable completion queries. */
   isChipRange?: (from: number, to: number) => boolean;
+  /** Element currently exposed as the textbox; popup relationships belong on it. Defaults to the input itself. */
+  getAccessibleTextbox?: () => HTMLElement;
 }
 
 export type ComposerCommandResolver = (token: string, atInputStart: boolean) => ProviderCommandKind | null;

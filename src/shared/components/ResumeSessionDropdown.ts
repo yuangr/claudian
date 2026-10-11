@@ -2,7 +2,7 @@
  * Claudian - Resume session dropdown
  *
  * Dropup UI for selecting a previous conversation to resume.
- * Shown when the /resume built-in command is executed.
+ * Shown when the /sessions built-in command is executed.
  */
 import { setIcon } from 'obsidian';
 
@@ -52,7 +52,7 @@ export class ResumeSessionDropdown {
     this.previousInputAttributes = new Map(
       INPUT_ACCESSIBILITY_ATTRIBUTES.map(attribute => [
         attribute,
-        this.inputEl.getAttribute(attribute),
+        this.#textbox.getAttribute(attribute),
       ])
     );
 
@@ -106,7 +106,7 @@ export class ResumeSessionDropdown {
 
   #dismiss(): void {
     this.dropdownEl.removeClass('visible');
-    this.inputEl.removeAttribute('aria-activedescendant');
+    this.#textbox.removeAttribute('aria-activedescendant');
     this.callbacks.onDismiss();
   }
 
@@ -148,9 +148,9 @@ export class ResumeSessionDropdown {
     });
 
     if (activeOptionId) {
-      this.inputEl.setAttribute('aria-activedescendant', activeOptionId);
+      this.#textbox.setAttribute('aria-activedescendant', activeOptionId);
     } else {
-      this.inputEl.removeAttribute('aria-activedescendant');
+      this.#textbox.removeAttribute('aria-activedescendant');
     }
   }
 
@@ -173,7 +173,7 @@ export class ResumeSessionDropdown {
 
     if (this.conversations.length === 0) {
       list.createDiv({ cls: 'claudian-resume-empty', text: 'No conversations' });
-      this.inputEl.removeAttribute('aria-activedescendant');
+      this.#textbox.removeAttribute('aria-activedescendant');
       return;
     }
 
@@ -215,20 +215,24 @@ export class ResumeSessionDropdown {
     this.#updateSelection(false);
   }
 
+  get #textbox(): HTMLElement {
+    return this.inputEl.getAccessibleTextbox?.() ?? this.inputEl;
+  }
+
   #configureInputAccessibility(): void {
     // Preserve the textarea's native multiline textbox semantics.
-    this.inputEl.setAttribute('aria-haspopup', 'listbox');
-    this.inputEl.setAttribute('aria-controls', this.listboxId);
-    this.inputEl.removeAttribute('aria-expanded');
+    this.#textbox.setAttribute('aria-haspopup', 'listbox');
+    this.#textbox.setAttribute('aria-controls', this.listboxId);
+    this.#textbox.removeAttribute('aria-expanded');
   }
 
   #restoreInputAccessibility(): void {
     for (const attribute of INPUT_ACCESSIBILITY_ATTRIBUTES) {
       const previousValue = this.previousInputAttributes.get(attribute) ?? null;
       if (previousValue === null) {
-        this.inputEl.removeAttribute(attribute);
+        this.#textbox.removeAttribute(attribute);
       } else {
-        this.inputEl.setAttribute(attribute, previousValue);
+        this.#textbox.setAttribute(attribute, previousValue);
       }
     }
   }

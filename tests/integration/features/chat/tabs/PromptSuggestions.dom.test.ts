@@ -325,6 +325,35 @@ it('hides a prediction while a toolbar dropdown is open and restores it on Escap
   } finally { await view.dispose(); }
 });
 
+it('hides a prediction while the completion menu or resume picker is open and restores it when they close', async () => {
+  const backend = new FakeSideBackend();
+  const view = await createView(backend);
+  try {
+    const turnId = await finishFakeTurn(view, backend);
+    backend.latest.emitSessionEvent({ type: 'prompt_suggestion', originatingTurnId: turnId, suggestion: 'Try the tests' });
+    const input = view.tab.dom.inputEl;
+    const textbox = within(input).getByRole('textbox');
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    input.value = '@';
+    fireEvent.input(input);
+    await waitFor(() => expect(view.tab.ui.composerDropdown.isVisible()).toBe(true));
+    // A programmatic draft reset leaves the menu open.
+    input.value = '';
+    view.tab.ui.promptSuggestion.refresh();
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    fireEvent.keyDown(textbox, { key: 'Escape' });
+    expect(view.tab.ui.composerDropdown.isVisible()).toBe(false);
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+    input.value = '/sessions';
+    await view.tab.controllers.inputController.sendMessage();
+    expect(within(document.body).getByRole('listbox', { name: 'Resume conversation' })).toBeDefined();
+    expect(within(input).queryByText('Try the tests')).toBeNull();
+    fireEvent.keyDown(textbox, { key: 'Escape' });
+    expect(within(document.body).queryByRole('listbox', { name: 'Resume conversation' })).toBeNull();
+    expect(within(input).getByText('Try the tests')).toBeDefined();
+  } finally { await view.dispose(); }
+});
+
 it.each(['', 'Unsent draft'])('discards the prediction when an automatic turn starts (draft: %p)', async draft => {
   const backend = new FakeSideBackend();
   const view = await createView(backend);

@@ -10,13 +10,15 @@ import type {
 } from '@/shared/composer-dropdown/types';
 
 function createInput(): HTMLTextAreaElement {
+  const attributes = new Map<string, string>();
   return {
     value: '',
     selectionStart: 0,
     selectionEnd: 0,
     focus: jest.fn(),
-    setAttribute: jest.fn(),
-    removeAttribute: jest.fn(),
+    getAttribute: (name: string) => attributes.get(name) ?? null,
+    setAttribute: jest.fn((name: string, value: string) => { attributes.set(name, value); }),
+    removeAttribute: jest.fn((name: string) => { attributes.delete(name); }),
     getBoundingClientRect: jest.fn().mockReturnValue({ top: 0, left: 0, width: 300 }),
     ownerDocument: { defaultView: { innerHeight: 800 } },
   } as unknown as HTMLTextAreaElement;

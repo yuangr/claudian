@@ -1,5 +1,6 @@
 {
   "common": {
+    "inputSuggestions": "Sugerencias de entrada",
     "save": "Guardar",
     "cancel": "Cancelar",
     "delete": "Eliminar",
@@ -44,9 +45,7 @@
       "unavailableNoUuid": "No se puede bifurcar: faltan identificadores de mensaje",
       "errorMessageNotFound": "Mensaje no encontrado",
       "errorNoSession": "No hay ningún ID de sesión disponible",
-      "errorNoActiveTab": "No hay ninguna pestaña activa",
-      "commandNoMessages": "No se puede bifurcar: no hay mensajes en la conversación",
-      "commandNoAssistantUuid": "No se puede bifurcar: no hay respuesta del asistente con identificadores"
+      "errorNoActiveTab": "No hay ninguna pestaña activa"
     },
     "quote": {
       "buttonLabel": "Citar"

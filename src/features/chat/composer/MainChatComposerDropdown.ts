@@ -11,6 +11,7 @@ import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
 
 export interface MainChatComposerDropdownOptions {
   readonly hiddenCommands?: ReadonlySet<string>;
+  readonly onVisibilityChange?: () => void;
   readonly providerConfig?: ProviderCommandDropdownConfig;
   readonly providerDiscovery?: ProviderCommandDiscoverySource<ProviderCommandEntry>;
   readonly providerId: ProviderId | null;
@@ -39,6 +40,7 @@ export class MainChatComposerDropdown {
       containerEl,
       inputEl,
       [this.slashSource, this.mentionSource],
+      { onVisibilityChange: options.onVisibilityChange },
     );
     const resolveCommand = (token: string, atInputStart: boolean) =>
       this.slashSource.resolveCommandKind(token, atInputStart);

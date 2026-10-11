@@ -96,6 +96,7 @@ function buildComposerDropdown(
   options: TabRuntimeConstructionContext,
   getHiddenCommands?: () => Set<string>,
   catalogInfo?: ProviderCatalogInfo,
+  onVisibilityChange?: () => void,
 ): MainChatComposerDropdown {
   const { dom } = shell;
   const dropdown = new MainChatComposerDropdown(
@@ -107,6 +108,7 @@ function buildComposerDropdown(
       hiddenCommands: getHiddenCommands?.() ?? new Set(),
       providerConfig: catalogInfo?.config,
       providerDiscovery: catalogInfo?.discovery,
+      onVisibilityChange,
     },
   );
   options.registerCleanup('tab composer dropdown', () => dropdown.destroy());
@@ -411,6 +413,7 @@ export function buildTabRuntimeUI(
     options,
     () => getHiddenCommandSet(plugin.settings),
     catalogInfo,
+    () => runtimeRef.current()?.ui.promptSuggestion.refresh(),
   );
   const navigationSidebar = new NavigationSidebar(
     dom.messagesWrapperEl,
@@ -423,7 +426,7 @@ export function buildTabRuntimeUI(
       const tab = runtimeRef.current();
       return !!tab && tab.controllers.sideChatController.destination === 'main'
         && !contextTray.hasContent
-        // The resume picker removes the input's aria-expanded instead of setting it.
+        && !composerDropdown.isVisible()
         && !tab.controllers.builtInCommandController.isResumeDropdownVisible();
     }, dom.inputContainerEl),
     contextTray,

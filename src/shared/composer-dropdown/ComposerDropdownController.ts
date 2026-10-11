@@ -15,6 +15,8 @@ const INPUT_LOAD_DEBOUNCE_MS = 200;
 
 export interface ComposerDropdownControllerOptions {
   readonly fixed?: boolean;
+  /** Runs after the menu shows or hides. */
+  readonly onVisibilityChange?: () => void;
 }
 
 export class ComposerDropdownController {
@@ -39,6 +41,7 @@ export class ComposerDropdownController {
     this.view = new ComposerDropdownView(containerEl, {
       fixed: options.fixed,
       inputEl,
+      onVisibilityChange: options.onVisibilityChange,
       onHover: index => this.#setSelectedIndex(index),
       onSelect: index => this.#selectIndex(index),
     });
