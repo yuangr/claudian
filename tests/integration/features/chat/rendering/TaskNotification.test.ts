@@ -1,7 +1,7 @@
 /** @jest-environment jsdom */
-
 import '@/providers';
 
+import { createTabSession } from '@test/helpers/ConversationPorts';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { testTime } from '@test/helpers/testClock';
 import { fireEvent, within } from '@testing-library/dom';
@@ -46,7 +46,7 @@ it.each([false, true])('renders a native notification and its follow-up through 
     lifecycle: 'persistent', nativePersistence: 'enabled', vaultWorkingDirectory: '/vault', interactionPort: {} as any,
   });
   let id = 0;
-  const host = { state, renderer, stream, isConnected: () => true, createMessageId: () => `message-${++id}` };
+  const host = { state, renderer, stream, createMessageId: () => `message-${++id}` };
   const output: ProviderBackgroundOutputEvent[] = [];
   session.onEvent(event => {
     if (event.type === 'task_notification') {
@@ -68,7 +68,7 @@ it.each([false, true])('renders a native notification and its follow-up through 
     expect(within(messagesEl).queryByRole('button', { name: 'Task notification' }) !== null).toBe(echoed);
     await session.handleNativeMessage({ type: 'assistant', message: { id: 'followup', content: [{ type: 'text', text: 'Agent complete: 22 files.' }] } } as any, 1);
     await session.handleNativeMessage({ type: 'result', subtype: 'success' } as any, 1);
-    await renderAutoTriggeredTurn(host, { events: output, metadata: {} }, () => true);
+    await renderAutoTriggeredTurn(host, { spans: [{ events: output }], metadata: {} }, () => true);
 
     const header = within(messagesEl).getByRole('button', { name: 'Task notification' });
     const result = within(messagesEl).getByText('There are 22 Markdown files.');
@@ -93,8 +93,7 @@ it.each([false, true])('renders a native notification and its follow-up through 
 it.each([false, true])('shows a session notification immediately with streaming=%s without disturbing the response', async (streaming) => {
   const { ProviderExecutionLifecycleRegistry } = await import('@/core/execution');
   const { ChatExecutionCoordinator } = await import('@/features/chat/execution/ChatExecutionCoordinator');
-  const { TabSession } = await import('@/features/chat/tabs/TabSession');
-  const { enqueueTabSessionEvent } = await import('@/features/chat/tabs/TabSessionEvents');
+  const { enqueueTabSessionEvent } = await import('@test/helpers/features/chat/SessionEventsHarness');
   const messagesEl = document.body.createDiv();
   const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
   const renderer = new MessageRenderer(plugin,
@@ -112,7 +111,7 @@ it.each([false, true])('shows a session notification immediately with streaming=
     resolveMissingProviderSession: async () => 'not_found',
     onSessionEvent: (event, context) => enqueueTabSessionEvent(tab, plugin, event, context),
   });
-  const session = new TabSession({ id: 'tab', conversationId: 'conversation', draftModel: null,
+  const session = createTabSession({ id: 'tab', conversationId: 'conversation', draftModel: null,
     providerId: 'claude', lifecycleState: 'ready' } as any, coordinator);
   const tab = { state, renderer, session, executionCoordinator: coordinator, lifecycleState: 'ready',
     dom: { contentEl: messagesEl }, services: { subagentManager: subagents },
@@ -138,11 +137,11 @@ it.each([false, true])('shows a session notification immediately with streaming=
       header = await within(messagesEl).findByRole('button', { name: 'Task notification' });
     } finally {
       release();
-      await session.awaitBackgroundWork();
+      await session.runtime.awaitBackgroundWork();
     }
     expect(state.currentContentEl).toBe(current);
     backend.latest.emitBackgroundEvent({ type: 'background_turn_completed', reason: 'completed' });
-    await session.awaitBackgroundWork();
+    await session.runtime.awaitBackgroundWork();
     expect(state.messages.findIndex(message => message.content === 'Earlier background response')).toBeLessThan(
       state.messages.findIndex(message => message.contentBlocks?.some(block => block.type === 'task_notification')),
     );
@@ -191,9 +190,7 @@ it.each(['text', 'image', 'image-only'])('keeps preceding output before a %s pro
     (el as HTMLElement).textContent = markdown;
   });
   const pending = renderAutoTriggeredTurn({ state, renderer, stream,
-    isConnected: () => true, createMessageId: () => 'automatic' }, {
-    events: [{ type: 'text_delta', text: 'Earlier automatic output', scope: backgroundScope(1) }], metadata: {}, target,
-  }, () => true);
+    createMessageId: () => 'automatic' }, { spans: [{ events: [{ type: 'text_delta', text: 'Earlier automatic output', scope: backgroundScope(1) }], target }], metadata: {} }, () => true);
   try {
     await entered;
     await stream.handleStreamChunk({ type: 'text', content: 'answer' }, response);
@@ -224,12 +221,10 @@ it.each([false, true])('flushes an automatic tool card before stream disposal wi
   const stream = new StreamController({ plugin, state, renderer, subagentManager: subagents,
     getMessagesEl: () => messagesEl, updateQueueIndicator: () => undefined });
   try {
-    await renderAutoTriggeredTurn({ state, renderer, stream, isConnected: () => true, createMessageId: () => 'automatic' }, {
-      events: [
+    await renderAutoTriggeredTurn({ state, renderer, stream, createMessageId: () => 'automatic' }, { spans: [{ events: [
         { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: '/tmp/output.txt' }, scope: backgroundScope(1) },
         ...(completed ? [{ type: 'tool_completed' as const, toolCallId: 'read', toolScope: { kind: 'main' as const }, content: 'Task output', scope: backgroundScope(2) }] : []),
-      ], metadata: {},
-    }, () => true);
+      ] }], metadata: {} }, () => true);
     const worked = within(messagesEl).queryByRole('button', { name: /^Worked/ });
     if (worked) fireEvent.click(worked);
     const card = within(messagesEl).getByRole('button', { name: /Read.*output.txt/ });
@@ -259,16 +254,14 @@ it.each([false, true])('keeps automatic Agent results across requested settlemen
     if (markdown === 'Automatic continuation') { entered(); await gate; }
     (el as HTMLElement).textContent = markdown;
   });
-  const pending = renderAutoTriggeredTurn({ state, renderer, stream, isConnected: () => true, createMessageId: () => 'automatic' }, {
-    events: [
+  const pending = renderAutoTriggeredTurn({ state, renderer, stream, createMessageId: () => 'automatic' }, { spans: [{ events: [
       { type: 'tool_started', toolCallId: 'agent', toolScope: { kind: 'main' }, name: 'Agent', input: { ...(pendingAgent ? {} : { run_in_background: false }), description: 'Automatic helper', prompt: 'Inspect output' }, scope: backgroundScope(1) },
       { type: 'text_delta', text: 'Automatic continuation', scope: backgroundScope(2) },
       { type: 'tool_started', toolCallId: 'main-read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: '/tmp/main.txt' }, scope: backgroundScope(3) },
       { type: 'tool_started', toolCallId: 'child', toolScope: { kind: 'subagent', subagentId: 'agent' }, name: 'Read', input: { file_path: '/tmp/output.txt' }, scope: backgroundScope(4) },
       { type: 'tool_completed', toolCallId: 'child', toolScope: { kind: 'subagent', subagentId: 'agent' }, content: 'Child output', scope: backgroundScope(5) },
       { type: 'tool_completed', toolCallId: 'agent', toolScope: { kind: 'main' }, content: 'Helper done', scope: backgroundScope(6) },
-    ], metadata: {},
-  }, () => true);
+    ] }], metadata: {} }, () => true);
   try {
     await rendering;
     stream.subagents.releaseManaged();
@@ -302,7 +295,7 @@ it.each([false, true])('matches task-notification grouping before and after repl
   const stream = new StreamController({ plugin, state, renderer, subagentManager: subagents,
     getMessagesEl: () => messagesEl, updateQueueIndicator: () => undefined });
   let id = 0;
-  const host = { state, renderer, stream, isConnected: () => true, createMessageId: () => `message-${++id}` };
+  const host = { state, renderer, stream, createMessageId: () => `message-${++id}` };
   try {
     renderSessionTaskNotification(host, 'Background bash completed.');
     if (interveningInput) {
@@ -310,11 +303,11 @@ it.each([false, true])('matches task-notification grouping before and after repl
       state.addMessage(input);
       renderer.addMessage(input);
     }
-    await renderAutoTriggeredTurn(host, { events: [
+    await renderAutoTriggeredTurn(host, { spans: [{ events: [
       { type: 'tool_started', toolCallId: 'read-output', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: '/tmp/output.txt' }, scope: backgroundScope(1) },
       { type: 'tool_completed', toolCallId: 'read-output', toolScope: { kind: 'main' }, content: '541 lines', scope: backgroundScope(2) },
       { type: 'text_delta', text: 'Bash complete: 541 lines.', scope: backgroundScope(3) },
-    ], metadata: {} }, () => true);
+    ] }], metadata: {} }, () => true);
 
     for (const replay of [false, true]) {
       if (replay) {

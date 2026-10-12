@@ -3,6 +3,7 @@ import type { Component, TFile, WorkspaceLeaf } from 'obsidian';
 import type { ProviderId, TitleGenerationService } from '@/core/providers/types';
 import type { ChatMessage } from '@/core/types';
 import type { TabAttention } from '@/features/chat/state/types';
+import type { TabIdentity } from '@/features/chat/tabs/TabIdentity';
 import type { ZenPresentationPort } from '@/features/chat/zen/types';
 
 /**
@@ -19,9 +20,6 @@ export interface TabManagerViewHost extends Component {
 
   /** Gets view-owned elements that should preserve active tab selection context. */
   getSharedSelectionFocusScopeEls?(): HTMLElement[];
-
-  /** Handles /new and /clear when the active layout gives New different semantics. */
-  handleNewConversationCommand?(): Promise<boolean>;
 }
 
 /**
@@ -34,7 +32,7 @@ export interface TabManagerInterface {
 
   /** Gets all tabs. */
   getAllTabs(): ChatTab[];
-  getTabIdentities(): readonly TabProviderCatalogContext[];
+  getTabIdentities(): readonly Readonly<TabIdentity>[];
 
   /** Reports aggregate user-visible work for a runtime tab. */
   isTabWorking(tabId: TabId): boolean;
@@ -122,7 +120,9 @@ export interface ChatTab {
    * Used to derive provider on first send. Null after binding.
    */
   readonly draftModel: string | null;
-  /** Authoritative identity, activity, and runtime owner for the tab. */
+  /** The user's custom name for the tab, absent when it shows its conversation title. */
+  readonly label?: string;
+  /** The tab's presentation identity and projections of its attached session's activity. */
   readonly session: { readonly hasActiveTurn: boolean };
   readonly hydrationState: TabHydrationState;
   /** Presentation reads; mutation stays with the tab's controllers. */
@@ -137,12 +137,6 @@ export interface ChatTab {
   refreshMessageTimestamps(): void;
 }
 
-/** Stable session projection available while a tab runtime is being assembled. */
-export type TabProviderCatalogContext = Readonly<Pick<
-  ChatTab,
-  'id' | 'conversationId' | 'providerId' | 'lifecycleState' | 'draftModel'
->>;
-
 /**
  * Tab bar item representation for rendering.
  */
@@ -151,6 +145,8 @@ export interface TabBarItem {
   /** 1-based index for display. */
   index: number;
   title: string;
+  /** The user's custom name for the tab, shown instead of the title when set. */
+  label?: string;
   isActive: boolean;
   /** True while any foreground, continuation, provider-background, or async-subagent work remains. */
   isWorking: boolean;

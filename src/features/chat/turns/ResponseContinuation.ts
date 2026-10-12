@@ -6,29 +6,15 @@ import { isStandaloneTaskNotification } from '@/features/chat/rendering/Response
 import type { ChatState } from '@/features/chat/state/ChatState';
 import type { StreamController } from '@/features/chat/turns/StreamController';
 
-/** Keep new response content after independently delivered session notifications. */
-export async function continueResponseAfterNotification(
-  host: {
-    state: ChatState;
-    renderer: MessageRenderer;
-    stream: StreamController;
-    /** Automatic rendering has private streaming buffers but shares transcript order. */
-    streamState?: ChatState;
-    isCurrent?(): boolean;
-    createMessageId(): string;
-  },
+/** Latest independent notification that precedes this event but follows its reserved response. */
+export function findFollowingNotification(
   message: ChatMessage,
-  chunk: StreamChunk,
+  messages: ChatMessage[],
   scope?: ProviderTurnEventScope,
-): Promise<ChatMessage> {
-  if (!['text', 'thinking', 'citations', 'tool_use', 'notice', 'error', 'context_compacted'].includes(chunk.type)) return message;
-  // Repeated tool snapshots update the existing card instead of starting a new segment.
-  if (chunk.type === 'tool_use' && host.state.messages.some(item => item.toolCalls?.some(tool => tool.id === chunk.id))) {
-    return message;
-  }
-  const index = host.state.messages.indexOf(message);
-  if (index < 0) return message;
-  const preceding = host.state.messages.slice(index + 1).filter(item => {
+): ChatMessage | undefined {
+  const index = messages.indexOf(message);
+  if (index < 0) return undefined;
+  return messages.slice(index + 1).filter(item => {
     if (!isStandaloneTaskNotification(item)) return false;
     const predecessor = getNotificationPredecessor(item, scope?.kind ?? 'requested');
     if (scope?.kind === 'background') {
@@ -43,6 +29,30 @@ export async function continueResponseAfterNotification(
       || predecessor.turnId !== scope.turnId
       || predecessor.sequence < scope.sequence;
   }).at(-1);
+}
+
+/** Keep new response content after independently delivered session notifications. */
+export async function continueResponseAfterNotification(
+  host: {
+    state: ChatState;
+    renderer: MessageRenderer | null;
+    stream: StreamController;
+    /** Automatic rendering has private streaming buffers but shares transcript order. */
+    streamState?: ChatState;
+    isCurrent?(): boolean;
+    createMessageId(): string;
+  },
+  message: ChatMessage,
+  chunk: StreamChunk,
+  scope?: ProviderTurnEventScope,
+): Promise<ChatMessage> {
+  if ((chunk.type === 'text' || chunk.type === 'thinking') && chunk.content.length === 0) return message;
+  if (!['text', 'thinking', 'citations', 'tool_use', 'notice', 'error', 'context_compacted'].includes(chunk.type)) return message;
+  // Repeated tool snapshots update the existing card instead of starting a new segment.
+  if (chunk.type === 'tool_use' && host.state.messages.some(item => item.toolCalls?.some(tool => tool.id === chunk.id))) {
+    return message;
+  }
+  const preceding = findFollowingNotification(message, host.state.messages, scope);
   if (!preceding) return message;
 
   await host.stream.handleStreamChunk({ type: 'done' }, message);
@@ -55,7 +65,7 @@ export async function continueResponseAfterNotification(
   if (message.isAutomaticResponse && !message.content
     && !message.contentBlocks?.length && !message.toolCalls?.length) {
     host.state.messages = host.state.messages.filter(item => item !== message);
-    host.renderer.removeMessage(message.id);
+    host.renderer?.removeMessage(message.id);
   }
   const continuation: ChatMessage = {
     id: host.createMessageId(), role: 'assistant', content: '', timestamp: Date.now(),
@@ -67,8 +77,9 @@ export async function continueResponseAfterNotification(
   const messages = host.state.messages;
   messages.splice(insertionIndex, 0, continuation);
   host.state.messages = messages;
-  const element = host.renderer.addMessage(continuation);
-  element.parentElement?.querySelector(`[data-message-id="${preceding.id}"]`)?.after(element);
-  (host.streamState ?? host.state).currentContentEl = element.querySelector<HTMLElement>('.claudian-message-content');
+  (host.streamState ?? host.state).response.messageId = continuation.id;
+  const element = host.renderer?.addMessage(continuation);
+  element?.parentElement?.querySelector(`[data-message-id="${preceding.id}"]`)?.after(element);
+  (host.streamState ?? host.state).currentContentEl = element?.querySelector<HTMLElement>('.claudian-message-content') ?? null;
   return continuation;
 }

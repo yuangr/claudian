@@ -22,7 +22,7 @@ import type { SharedStorageService } from './app/storage/SharedStorageService';
 import { AgentSkillResources } from './composition/AgentSkillResources';
 import { ClaudianChatFeatureHost, ClaudianFeatureHost } from './composition/ClaudianFeatureHosts';
 import { ClaudianProviderHost } from './composition/ClaudianProviderHost';
-import { ClaudianViews, isClaudianView } from './composition/ClaudianViews';
+import { ClaudianViews } from './composition/ClaudianViews';
 import { ProviderExecutionLifecycleRegistry } from './core/execution';
 import { ProviderRegistry } from './core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from './core/providers/ProviderSettingsCoordinator';
@@ -33,6 +33,8 @@ import { VIEW_TYPE_CLAUDIAN } from './core/types';
 import { ClaudianView } from './features/chat/ClaudianView';
 import { ConversationLifecycle } from './features/chat/conversation/ConversationLifecycle';
 import { InactiveSessionArchiver } from './features/chat/conversation/InactiveSessionArchiver';
+import { createChatSessionRuntime } from './features/chat/sessions/createChatSessionRuntime';
+import { SessionRuntimePool } from './features/chat/sessions/SessionRuntimePool';
 import { createChatFocusCommand } from './features/chat/workspace/ChatFocusCommand';
 import { createChatTabCommands } from './features/chat/workspace/ChatTabCommands';
 import { ChatViewPublisher } from './features/chat/workspace/ChatViewPublisher';
@@ -49,6 +51,7 @@ export default class ClaudianPlugin extends Plugin {
   providerHost!: ClaudianProviderHost;
   private featureHost!: ClaudianFeatureHost;
   private chatHost!: ClaudianChatFeatureHost;
+  private sessionRuntimes!: SessionRuntimePool;
   /** Live committed settings, following Obsidian's plugin convention. */
   settings!: Readonly<ClaudianSettings>;
   private settingsCoordinator!: SettingsCoordinator<ClaudianSettings>;
@@ -169,6 +172,7 @@ export default class ClaudianPlugin extends Plugin {
 
   onunload(): void {
     this.isUnloading = true;
+    this.sessionRuntimes?.beginShutdown();
     // Return any zen presentation to its view before asynchronous shutdown.
     this.zenMode.dispose();
     this.vaultContentEvents?.dispose();
@@ -192,7 +196,6 @@ export default class ClaudianPlugin extends Plugin {
       providers: ProviderRegistry,
       providerSettings: ProviderSettingsCoordinator,
       deferNonRestoredSessionMetadata: true,
-      isChatView: isClaudianView,
       isUnloading: () => this.isUnloading,
       publishCommittedSettings: async (settings, previous) => this.chatViews.publishSettings(settings, previous),
       // No chat view can hold tabs before loading completes and assigns the lifecycle.
@@ -255,23 +258,30 @@ export default class ClaudianPlugin extends Plugin {
       notifyProviderChatOptionsChanged,
     };
     this.featureHost = new ClaudianFeatureHost(featureDomains);
+    this.sessionRuntimes = new SessionRuntimePool({
+      createRuntime: identity => createChatSessionRuntime(this.chatHost, identity),
+      releaseHistory: (id, canRelease) => domains.conversationRepository.releaseHistory(id, canRelease),
+      onChanged: () => this.chatViews.notifyConversationListChanged(),
+      onError: () => { new Notice('Session state could not be saved. It remains in memory.'); },
+    });
     this.conversationLifecycle = new ConversationLifecycle({
       conversations: domains.conversations,
       views: this.views,
+      sessions: this.sessionRuntimes,
     });
     this.vaultContentEvents = new VaultContentEvents({
+      sessions: this.sessionRuntimes,
       vault: this.app.vault,
-      views: this.views,
       conversations: domains.conversations,
       notifyConversationListChanged: () => this.chatViews.notifyConversationListChanged(),
     });
     this.chatHost = new ClaudianChatFeatureHost({
       ...featureDomains,
+      sessionRuntimes: this.sessionRuntimes,
       conversationLifecycle: this.conversationLifecycle,
       executionPersistence: domains.conversationRepository,
       chatModelSelection: domains.chatModelSelection,
       sessionSnapshots: this.sessionSnapshots,
-      tabWorkspaceMigration: domains.tabWorkspaceMigration,
       zenMode: this.zenMode,
     });
     this.inactiveSessionArchiver = new InactiveSessionArchiver(this.chatHost);
@@ -285,6 +295,7 @@ export default class ClaudianPlugin extends Plugin {
       ...this.views.getAllViews().map(view => view.prepareForPluginUnload()),
     ]);
     // Admitted native archive work needs provider services that are disposed below.
+    await this.sessionRuntimes?.dispose().catch(() => undefined);
     await this.nativeSessionArchives?.dispose();
     try {
       await this.executionLifecycleRegistry.dispose();

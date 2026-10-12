@@ -15,7 +15,6 @@ import type { ProviderCapabilities, ProviderId, TitleGenerationService } from '@
 import type { AskUserAnswers, ChatMessage, ToolCallInfo } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import type { ChatSettings } from '@/features/chat/ChatSettings';
-import type { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
 import { findComposerSessionMentions } from '@/features/chat/composer/composerSessionMentions';
 import type { ConversationController } from '@/features/chat/conversation/ConversationController';
 import { FirstTurnAdmission } from '@/features/chat/conversation/FirstTurnAdmission';
@@ -25,20 +24,20 @@ import type { ComposerSelections } from '@/features/chat/input/ComposerSelection
 import { resolveSessionMentions } from '@/features/chat/input/resolveSessionMentions';
 import { SubmissionPreparations } from '@/features/chat/input/SubmissionPreparations';
 import { deliverAsyncQuestion } from '@/features/chat/interactions/asyncQuestionDelivery';
-import { AsyncQuestionPrompts } from '@/features/chat/interactions/AsyncQuestionPrompts';
-import type { InlineInteractionPrompts } from '@/features/chat/interactions/InlineInteractionPrompts';
+import type { SessionInteractions } from '@/features/chat/interactions/SessionInteractions';
 import type { LinkedContentController } from '@/features/chat/linked-content';
 import type { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
+import type { SessionComposerPort } from '@/features/chat/sessions/SessionComposer';
 import type { SideChatController } from '@/features/chat/side-chat/SideChatController';
 import type { ChatState } from '@/features/chat/state/ChatState';
 import { cloneChatTurnRequest, createQueuedMessage } from '@/features/chat/state/chatTurnRequest';
 import type { ChatTurnRequest, TabReviewOutcome } from '@/features/chat/state/types';
-import type { TabSession } from '@/features/chat/tabs/TabSession';
 import { type MainTurn, MainTurnExecution } from '@/features/chat/turns/MainTurnExecution';
 import type { StreamController } from '@/features/chat/turns/StreamController';
 import type { TurnCoordinator } from '@/features/chat/turns/TurnCoordinator';
 import { TurnQueue } from '@/features/chat/turns/TurnQueue';
-import { TurnSteering } from '@/features/chat/turns/TurnSteering';
+import { type ProviderEchoClaim, TurnSteering } from '@/features/chat/turns/TurnSteering';
 import { t } from '@/i18n/i18n';
 import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
 
@@ -48,16 +47,16 @@ type DispatchResult = 'rejected' | 'handled' | 'queued';
 export interface InputControllerDeps {
   plugin: ChatFeatureHost;
   state: ChatState;
-  renderer: MessageRenderer;
+  renderer: MessageRenderer | null;
   streamController: StreamController;
   selections: Pick<ComposerSelections, 'capture'>;
   conversationController: ConversationController;
-  drafts: ComposerDraftController;
+  drafts: SessionComposerPort;
   /** The tab's inline prompt surface, shared with its provider interaction port. */
-  inlinePrompts: InlineInteractionPrompts;
-  getInputEl: () => ComposerInputElement;
+  inlinePrompts: SessionInteractions;
+  getInputEl: () => ComposerInputElement | null;
   getWelcomeEl: () => HTMLElement | null;
-  getMessagesEl: () => HTMLElement;
+  getMessagesEl: () => HTMLElement | null;
   getLinkedContentController: () => LinkedContentController;
   getTitleGenerationService: () => TitleGenerationService | null;
   generateId: () => string;
@@ -72,8 +71,10 @@ export interface InputControllerDeps {
   captureReviewableSettlement?: (outcome: TabReviewOutcome) => () => void;
   canStartTurn: () => boolean;
   isClosing: () => boolean;
-  /** The tab-owned turn activity and its single cancellation recipe. */
-  session: Pick<TabSession, 'turns' | 'cancelTurn'>;
+  /** The session-owned turn activity and its single cancellation recipe. */
+  session: Pick<ChatSessionRuntime, 'turns' | 'cancelTurn' | 'stopMainBackgroundWork'>;
+  /** Queued work and preparation can outlive the foreground turn's idle notification. */
+  onWorkChanged?: () => void;
   /** Destination seam for the shared composer; absent means main-only. */
   getSideChatController?: () => SideChatController | null;
 }
@@ -102,13 +103,13 @@ export class InputController {
   readonly queue: TurnQueue;
   private readonly deps: InputControllerDeps;
   private readonly turns: TurnCoordinator;
-  private readonly asyncQuestions: AsyncQuestionPrompts;
   private readonly steering: TurnSteering;
   private readonly execution: MainTurnExecution;
-  private readonly preparations = new SubmissionPreparations();
+  private readonly preparations: SubmissionPreparations;
 
   constructor(deps: InputControllerDeps) {
     this.deps = deps;
+    this.preparations = new SubmissionPreparations(deps.onWorkChanged);
     this.turns = deps.session.turns;
     this.steering = new TurnSteering({
       state: deps.state,
@@ -125,6 +126,7 @@ export class InputController {
       returnUnsent: message => this.queue.returnUnsent(message),
     });
     this.queue = new TurnQueue({
+      onWorkChanged: deps.onWorkChanged,
       state: deps.state,
       turns: this.turns,
       drafts: deps.drafts,
@@ -144,18 +146,15 @@ export class InputController {
       },
       onContinuationFailed: () => this.execution.reportDeferredReview(),
     });
-    this.asyncQuestions = new AsyncQuestionPrompts({
-      prompts: deps.inlinePrompts,
+    deps.inlinePrompts.subscribe(() => deps.state.setActionRequired(deps.inlinePrompts.pendingCount > 0));
+    deps.inlinePrompts.bindAsyncQuestions({
       answer: (tool, answers, signal) => this.answerQuestion(tool, answers, this.deps.state.currentConversationId, signal),
-      onChange: tool => this.deps.renderer.updateQuestionTool(tool),
-      onPendingChange: (id, pending) => pending
-        ? this.deps.state.beginActionRequired(id)
-        : this.deps.state.endActionRequired(id),
+      onChange: tool => this.deps.renderer?.updateQuestionTool(tool),
     });
     this.execution = new MainTurnExecution({
       plugin: deps.plugin,
       state: deps.state,
-      renderer: deps.renderer,
+      get renderer() { return deps.renderer; },
       streamController: deps.streamController,
       conversationController: deps.conversationController,
       drafts: deps.drafts,
@@ -179,7 +178,7 @@ export class InputController {
       captureReviewableSettlement: deps.captureReviewableSettlement,
       isClosing: () => this.deps.isClosing(),
       canStartTurn: () => this.deps.canStartTurn(),
-      onInvalidated: () => this.asyncQuestions.expireAll(),
+      onInvalidated: () => this.deps.inlinePrompts.expireAsyncQuestions(),
     });
   }
 
@@ -213,7 +212,7 @@ export class InputController {
   }
 
   updateAsyncQuestion(tool: ToolCallInfo): void {
-    this.asyncQuestions.update(tool);
+    this.deps.inlinePrompts.updateAsyncQuestion(tool);
   }
 
   async answerQuestion(tool: ToolCallInfo, answers: AskUserAnswers, conversationId: string | null, signal?: AbortSignal): Promise<void> {
@@ -224,8 +223,7 @@ export class InputController {
         if (state.currentConversationId !== conversationId || !state.messages.some(message => message.toolCalls?.includes(tool))) {
           throw new Error('This question belongs to a different conversation.');
         }
-        if (!this.deps.canStartTurn() || state.cancelRequested || state.isSwitchingConversation
-          || state.isResettingToNewChat || state.isRewinding) {
+        if (!this.deps.canStartTurn() || state.cancelRequested || state.isRewinding) {
           throw new Error('The answer was not sent. Please try again.');
         }
       },
@@ -269,17 +267,16 @@ export class InputController {
     return this.execution.handleEvent(event);
   }
 
+  /** Capture submitted display input before a late steering acknowledgement releases its correlation. */
+  claimBackgroundUserMessage(nativeUserMessageId: string | undefined, inputId?: string): ProviderEchoClaim {
+    return this.steering.claimProviderEcho(nativeUserMessageId, inputId);
+  }
+
   async #dispatchMessage(
     options?: SendMessageOptions, skipPreparationBarrier = false, onAdmitted?: () => void,
   ): Promise<DispatchResult> {
     const { state } = this.deps;
     this.execution.discardStaleDeferredReview();
-
-    // While resetting to a new chat or switching, don't send - input is preserved so user can retry
-    if (state.isResettingToNewChat || state.isSwitchingConversation) {
-      this.execution.reportDeferredReview();
-      return 'rejected';
-    }
 
     const destination = options?.destination ?? this.deps.drafts.destination;
     const composerDraft = this.deps.drafts.capture(destination);
@@ -396,7 +393,7 @@ export class InputController {
       const prepare = async (signal: AbortSignal): Promise<void> => {
         const cancelSidePreparation = () => { if (destination === 'side') capturedSideRuntime?.cancel(); };
         signal.addEventListener('abort', cancelSidePreparation, { once: true });
-        this.deps.getInputEl().setAttribute?.('aria-busy', 'true');
+        this.deps.getInputEl()?.setAttribute?.('aria-busy', 'true');
         let handedOff = false;
         try {
           const resolved = destination === 'side' && capturedSideRuntime
@@ -432,7 +429,7 @@ export class InputController {
           } else throw error;
         } finally {
           signal.removeEventListener('abort', cancelSidePreparation);
-          this.deps.getInputEl().removeAttribute?.('aria-busy');
+          this.deps.getInputEl()?.removeAttribute?.('aria-busy');
           if (ownsMainTurn && !handedOff) this.queue.restoreToComposer();
         }
       };
@@ -533,12 +530,6 @@ export class InputController {
 
   onConversationActivated(): void {
     this.execution.discardStaleDeferredReview();
-    if (
-      this.deps.state.isSwitchingConversation
-      || this.deps.state.isResettingToNewChat
-    ) {
-      return;
-    }
     if (this.steering.resumeParked()) return;
     this.queue.updateIndicator();
   }
@@ -547,33 +538,37 @@ export class InputController {
   // Streaming Control
   // ============================================
 
-  /** Tab teardown closes admission before cancelling and joining these preparations. */
+  /** Plugin shutdown closes admission before cancelling and joining preparations. */
   async drainSessionMentionPreparations(): Promise<void> {
     this.queue.cancelScheduled();
     await this.preparations.drain();
   }
 
   cancelStreaming(): void {
+    const cancelledPreparation = this.preparations.isPreparing(this.deps.drafts.destination);
     this.preparations.abort(this.deps.drafts.destination);
     const sideChat = this.deps.getSideChatController?.() ?? null;
     if (sideChat?.destination === 'side') {
       sideChat.cancelSide();
       return;
     }
-    this.#cancelMainStreaming();
+    // Withdrawing a preparation is the whole Stop; background work keeps running.
+    if (!this.#cancelMainStreaming() && !cancelledPreparation) this.deps.session.stopMainBackgroundWork();
   }
 
-  #cancelMainStreaming(): void {
-    this.asyncQuestions.cancelSubmissions();
+  /** Returns whether an in-flight response was cancelled. */
+  #cancelMainStreaming(): boolean {
+    this.deps.inlinePrompts.cancelAsyncSubmissions();
     // Settlement already owns the response; only queued input can still be withdrawn.
     if (!this.turns.isInFlight) {
       this.queue.restoreToComposer();
-      return;
+      return false;
     }
     this.deps.session.cancelTurn('user');
     this.queue.restoreToComposer();
     this.steering.clearCurrentUi();
     this.deps.streamController.thinkingIndicator.hide();
+    return true;
   }
 
   /** Cancels the active turn and waits for its cleanup and conversation persistence. */
@@ -584,7 +579,7 @@ export class InputController {
   }
 
   dismissPendingApproval(): void {
-    this.asyncQuestions.expireAll();
+    this.deps.inlinePrompts.expireAsyncQuestions();
     this.deps.inlinePrompts.dismissAll();
   }
 }

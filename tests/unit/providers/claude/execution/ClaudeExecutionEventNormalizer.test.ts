@@ -210,7 +210,7 @@ describe('ClaudeExecutionEventNormalizer api error messages', () => {
   function expectAuthenticationOverrideGuidance(message: string): void {
     expect(message).toContain('If the same CLI works with a subscription separately');
     expect(message).toContain('inherited ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN');
-    expect(message).toContain('Settings → Providers → Claude → Custom variables');
+    expect(message).toContain('Settings → Claudian → Providers → Claude Code → Environment → Custom variables');
     expect(message).toContain('Claude only');
     expect(message).toContain('only for the conflicting credential you intend to disable');
     expect(message).toContain('ANTHROPIC_API_KEY=');

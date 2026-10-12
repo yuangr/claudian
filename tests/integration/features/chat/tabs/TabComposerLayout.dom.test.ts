@@ -2,6 +2,7 @@
 import '@/providers';
 
 import { holdResponse } from '@test/helpers/ConversationPorts';
+import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { fireEvent, within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
@@ -57,6 +58,7 @@ async function createTab(linkedContentPath?: string): Promise<AssembledTabRuntim
     getConversationSync: () => conversation,
     getConversationList: () => [conversation],
   } as unknown as ChatFeatureHost;
+  if (!plugin.sessionRuntimes) installSessionRuntimePool(plugin);
   const tab = await createTabRuntime({
     plugin,
     component: Object.assign(new Component(), { registerDomEvent: () => undefined, registerEvent: () => undefined }) as never,
@@ -64,6 +66,7 @@ async function createTab(linkedContentPath?: string): Promise<AssembledTabRuntim
     conversation,
     getProviderCatalogConfig: () => null,
     isRuntimeLive: () => true,
+    openConversation: async () => {}, startNewConversation: async () => {},
     mentionDataProvider: new VaultMentionDataProvider(app),
   });
   tab.state.messages = conversation.messages;

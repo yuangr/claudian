@@ -29,7 +29,7 @@
 }
 
 .claudian-settings .claudian-settings-group .setting-item:not(.setting-item-heading),
-:is(.claudian-sp-modal, .claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item {
+:is(.claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item {
   margin: 0;
   padding: var(--size-4-3) 0;
   border: 0;
@@ -50,7 +50,7 @@
 }
 
 .claudian-settings .setting-item-name,
-:is(.claudian-sp-modal, .claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item-name {
+:is(.claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item-name {
   font-size: var(--font-ui-small);
   font-weight: var(--font-medium);
   color: var(--text-normal);
@@ -59,7 +59,7 @@
 .claudian-settings .setting-item-description,
 .claudian-settings .claudian-sp-item-desc,
 .claudian-settings .claudian-context-limits-desc,
-:is(.claudian-sp-modal, .claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item-description {
+:is(.claudian-agent-skill-modal, .claudian-env-snippet-modal) .setting-item-description {
   margin-top: var(--size-4-1);
   font-size: var(--font-ui-smaller);
   font-weight: var(--font-normal);
@@ -83,14 +83,12 @@
 }
 
 .claudian-settings :is(
-  .claudian-sp-label,
   .claudian-snippet-label,
   .claudian-context-limits-label,
   .claudian-provider-model-picker-selected-label,
   .claudian-provider-model-picker-catalog-summary,
   .claudian-provider-model-picker-catalog-title
-),
-:is(.claudian-sp-modal, .claudian-agent-skill-modal, .claudian-env-snippet-modal) .claudian-sp-advanced-summary {
+) {
   font-size: var(--font-ui-small);
   font-weight: var(--font-semibold);
   letter-spacing: normal;
@@ -109,7 +107,6 @@
 }
 
 .claudian-settings :is(
-  .claudian-sp-settings-desc,
   .claudian-context-limits-desc,
   .claudian-provider-model-picker-summary
 ) {
@@ -149,30 +146,30 @@
 }
 
 /* Native host button defaults must not restore filled chrome. */
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:hover,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:active {
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:hover,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:active {
   border: 0;
   background: transparent;
   box-shadow: none;
   color: var(--text-muted);
 }
 
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:hover,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible {
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:hover,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible {
   color: var(--text-normal);
 }
 
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible {
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:focus-visible {
   outline: 2px solid var(--interactive-accent);
   outline-offset: -2px;
 }
 
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:hover,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:focus-visible,
-:is(.setting-item.claudian-settings, .modal.claudian-sp-modal, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:active {
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:hover,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:focus-visible,
+:is(.setting-item.claudian-settings, .modal.claudian-agent-skill-modal, .modal.claudian-env-snippet-modal) button:disabled:active {
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -203,12 +200,6 @@
 
 .claudian-settings .claudian-settings-group-body > :last-child {
   margin-bottom: 0;
-}
-
-:is(.claudian-sp-modal, .claudian-agent-skill-modal, .claudian-env-snippet-modal) .claudian-sp-advanced-section {
-  padding: var(--size-4-3);
-  border-radius: var(--radius-m);
-  background: transparent;
 }
 
 @container (max-width: 500px) {
@@ -244,6 +235,34 @@
 .claudian-settings .setting-item textarea {
   min-width: 0;
   width: 100%;
+}
+
+/* DeepSeek additional preset rows: YAML source and the read-only preset they extend. */
+.claudian-settings .claudian-deepseek-preset-plugins textarea {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  resize: vertical;
+  max-height: 480px;
+}
+
+.claudian-settings .claudian-deepseek-preset-plugins-error {
+  margin-top: var(--size-4-1);
+  color: var(--text-error);
+  font-size: var(--font-ui-smaller);
+}
+
+.claudian-settings .claudian-deepseek-preset-preview > summary {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  cursor: pointer;
+}
+
+.claudian-settings .claudian-deepseek-preset-preview > pre {
+  max-height: 320px;
+  margin: var(--size-4-2) 0 0;
+  overflow: auto;
+  font-size: var(--font-ui-smaller);
+  user-select: text;
 }
 
 /* Pages without a heading still retain their existing visual boundaries. */

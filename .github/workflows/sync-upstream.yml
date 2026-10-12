@@ -11,6 +11,10 @@ permissions:
   contents: write
   issues: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     name: Sync with upstream and notify
@@ -45,9 +49,11 @@ jobs:
           fi
 
           # 获取最新更新的 commit 简报
-          echo "commits_log<<EOF" >> "$GITHUB_OUTPUT"
-          git log --oneline HEAD..upstream/main >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "commits_log<<EOF"
+            git log --oneline HEAD..upstream/main
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Merging upstream/main..."
           git merge upstream/main --no-edit -m "chore(sync): auto-merge upstream/main"
@@ -63,6 +69,16 @@ jobs:
           script: |
             const commits = process.env.COMMITS_LOG || '';
             const count = process.env.BEHIND_COUNT || '0';
+            await core.summary
+              .addHeading('Upstream synchronisation')
+              .addRaw(`Merged ${count} upstream commits.\n`)
+              .addCodeBlock(commits, 'text')
+              .write();
+            const { data: repository } = await github.rest.repos.get(context.repo);
+            if (!repository.has_issues) {
+              core.info('Issues are disabled; the sync result is available in the job summary.');
+              return;
+            }
             const issue = await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,

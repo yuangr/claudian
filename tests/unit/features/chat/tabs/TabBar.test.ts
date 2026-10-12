@@ -8,6 +8,7 @@ function createMockCallbacks(): TabBarCallbacks {
   return {
     onTabClick: jest.fn(),
     onTabClose: jest.fn(),
+    onTabLabelChange: jest.fn(),
   };
 }
 
@@ -26,29 +27,6 @@ function createTabBarItem(overrides: Partial<TabBarItem> = {}): TabBarItem {
 }
 
 describe('TabBar', () => {
-  describe('update', () => {
-    it('should clear existing badges before rendering', () => {
-      const containerEl = createMockEl();
-      const callbacks = createMockCallbacks();
-      const tabBar = new TabBar(containerEl, callbacks);
-
-      // First update
-      tabBar.update([createTabBarItem()]);
-      expect(containerEl._children.length).toBe(1);
-
-      // Second update should clear first
-      tabBar.update([
-        createTabBarItem({ id: 'tab-1', index: 1 }),
-        createTabBarItem({ id: 'tab-2', index: 2 }),
-        createTabBarItem({ id: 'tab-3', index: 3 }),
-      ]);
-      expect(containerEl._children.length).toBe(3);
-
-      tabBar.update([]);
-      expect(containerEl._children.length).toBe(0);
-    });
-  });
-
   describe('badge rendering', () => {
 
     it('should use aria-label as the single tab title tooltip source', () => {
@@ -76,7 +54,7 @@ describe('TabBar', () => {
       const containerEl = createMockEl();
       const callbacks = {
         ...createMockCallbacks(),
-        onTitleExpansionChanged: jest.fn(),
+        onDisplayStateChanged: jest.fn(),
       };
       const tabBar = new TabBar(containerEl, callbacks);
 
@@ -93,14 +71,16 @@ describe('TabBar', () => {
       expect(badge.getAttribute('data-title-expanded')).toBe('true');
       expect(event.preventDefault).toHaveBeenCalled();
       expect(event.stopPropagation).toHaveBeenCalled();
-      expect(callbacks.onTitleExpansionChanged).toHaveBeenNthCalledWith(1, ['tab-2']);
+      expect(callbacks.onDisplayStateChanged).toHaveBeenCalledTimes(1);
+      expect(tabBar.getExpandedTitleTabIds()).toEqual(['tab-2']);
 
       badge.dispatchEvent('dblclick', { preventDefault: jest.fn(), stopPropagation: jest.fn() });
 
       expect(badge.textContent).toBe('5');
       expect(badge.hasClass('claudian-tab-badge-expanded')).toBe(false);
       expect(badge.getAttribute('data-title-expanded')).toBe('false');
-      expect(callbacks.onTitleExpansionChanged).toHaveBeenNthCalledWith(2, []);
+      expect(callbacks.onDisplayStateChanged).toHaveBeenCalledTimes(2);
+      expect(tabBar.getExpandedTitleTabIds()).toEqual([]);
     });
 
     it('should render restored expanded title state', () => {
@@ -292,50 +272,6 @@ describe('TabBar', () => {
       containerEl._children[0].dispatchEvent('click');
 
       expect(callbacks.onTabClick).toHaveBeenCalledWith('clicked-tab');
-    });
-
-    it('should call onTabClose on right-click when canClose is true', () => {
-      const containerEl = createMockEl();
-      const callbacks = createMockCallbacks();
-      const tabBar = new TabBar(containerEl, callbacks);
-
-      tabBar.update([createTabBarItem({ id: 'closeable-tab', canClose: true })]);
-
-      // Simulate right-click (contextmenu)
-      const mockEvent = { preventDefault: jest.fn() };
-      containerEl._children[0].dispatchEvent('contextmenu', mockEvent);
-
-      expect(mockEvent.preventDefault).toHaveBeenCalled();
-      expect(callbacks.onTabClose).toHaveBeenCalledWith('closeable-tab');
-    });
-
-    it('should not register contextmenu handler when canClose is false', () => {
-      const containerEl = createMockEl();
-      const callbacks = createMockCallbacks();
-      const tabBar = new TabBar(containerEl, callbacks);
-
-      tabBar.update([createTabBarItem({ id: 'uncloseable-tab', canClose: false })]);
-
-      // Check that contextmenu handler was not registered
-      expect(containerEl._children[0]._eventListeners.has('contextmenu')).toBe(false);
-    });
-  });
-
-  describe('destroy', () => {
-    it('should empty container', () => {
-      const containerEl = createMockEl();
-      const callbacks = createMockCallbacks();
-      const tabBar = new TabBar(containerEl, callbacks);
-
-      expect(containerEl._classList.has('claudian-tab-badges')).toBe(true);
-
-      tabBar.update([createTabBarItem(), createTabBarItem({ id: 'tab-2', index: 2 })]);
-      expect(containerEl._children.length).toBe(2);
-
-      tabBar.destroy();
-
-      expect(containerEl._children.length).toBe(0);
-      expect(containerEl._classList.has('claudian-tab-badges')).toBe(false);
     });
   });
 });

@@ -1,7 +1,4 @@
-import {
-  decodeTabWorkspaceViewState,
-  resolveTabRestorePlan,
-} from '@/core/bootstrap/tabManagerState';
+import { decodeTabWorkspaceViewState } from '@/core/bootstrap/tabManagerState';
 
 describe('decodeTabWorkspaceViewState', () => {
   it('decodes a complete versioned view workspace', () => {
@@ -9,14 +6,14 @@ describe('decodeTabWorkspaceViewState', () => {
       version: 1,
       activeTabId: 'tab-2',
       openTabs: [
-        { conversationId: 'conversation-1', tabId: 'tab-1' },
+        { conversationId: 'conversation-1', tabId: 'tab-1', label: 'ACP restore' },
         { conversationId: null, draftModel: 'codex:gpt-5', tabId: 'tab-2' },
       ],
       expandedTitleTabIds: ['tab-2'],
     })).toEqual({
       activeTabId: 'tab-2',
       openTabs: [
-        { conversationId: 'conversation-1', tabId: 'tab-1' },
+        { conversationId: 'conversation-1', tabId: 'tab-1', label: 'ACP restore' },
         { conversationId: null, draftModel: 'codex:gpt-5', tabId: 'tab-2' },
       ],
       expandedTitleTabIds: ['tab-2'],
@@ -51,6 +48,14 @@ describe('decodeTabWorkspaceViewState', () => {
       openTabs: [{ conversationId: null, tabId: 'tab-1' }],
       expandedTitleTabIds: ['missing-tab'],
     },
+    ...['', '   ', ' padded ', 42, null, 'x'.repeat(33)].map(label => ({
+      version: 1,
+      activeTabId: 'tab-1',
+      openTabs: [
+        { conversationId: null, tabId: 'tab-1', label: 'Valid' },
+        { conversationId: null, tabId: 'tab-2', label },
+      ],
+    })),
     {
       version: 1,
       activeTabId: 'tab-1',
@@ -74,55 +79,6 @@ describe('decodeTabWorkspaceViewState', () => {
     },
   ])('rejects the entire malformed versioned workspace', (state) => {
     expect(decodeTabWorkspaceViewState(state)).toBeNull();
-  });
-});
-
-describe('resolveTabRestorePlan', () => {
-  const state = {
-    openTabs: [
-      { tabId: 'tab-1', conversationId: 'conv-1' },
-      { tabId: 'tab-2', conversationId: null, draftModel: 'codex:gpt-5' },
-      { tabId: 'preview-tab', conversationId: 'conv-preview' },
-    ],
-    activeTabId: 'preview-tab',
-    expandedTitleTabIds: ['tab-1', 'tab-2'],
-  };
-
-  it('returns an empty plan when startup restoration is disabled', () => {
-    expect(resolveTabRestorePlan(state, {
-      restoreTabsOnStartup: false,
-      isDualPane: false,
-    })).toEqual({
-      openTabs: [],
-      activeTabId: null,
-    });
-  });
-
-  it('preserves every open tab and its order in single-pane mode', () => {
-    expect(resolveTabRestorePlan(state, {
-      restoreTabsOnStartup: true,
-      isDualPane: false,
-    })).toEqual(state);
-  });
-
-  it('selects only the last active tab in dual-pane mode', () => {
-    expect(resolveTabRestorePlan(state, {
-      restoreTabsOnStartup: true,
-      isDualPane: true,
-    })).toEqual({
-      openTabs: [{ tabId: 'preview-tab', conversationId: 'conv-preview' }],
-      activeTabId: 'preview-tab',
-    });
-  });
-
-  it('returns an empty dual-pane plan when its active target is missing', () => {
-    expect(resolveTabRestorePlan({ ...state, activeTabId: 'missing' }, {
-      restoreTabsOnStartup: true,
-      isDualPane: true,
-    })).toEqual({
-      openTabs: [],
-      activeTabId: null,
-    });
   });
 });
 

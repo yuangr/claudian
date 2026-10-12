@@ -50,7 +50,9 @@ export class TabHydration {
         const span = this.#profiledFirstHydration ? null : StartupProfiler.start('active-hydration');
         this.#profiledFirstHydration = true;
         try {
-          await tab.controllers.conversationController.switchTo(tab.conversationId);
+          // A refusal leaves nothing to hydrate here: a newer switch owns the transcript, or the
+          // conversation is gone and the tab shows it empty, as before the boolean contract.
+          await tab.session.runtime.model.hydrate();
         } finally {
           if (span) {
             StartupProfiler.finish(span);

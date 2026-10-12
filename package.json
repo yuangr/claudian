@@ -1,6 +1,6 @@
 {
   "name": "claudian",
-  "version": "2.3.16",
+  "version": "2.3.17",
   "description": "Claudian - Claude Code embedded in Obsidian sidebar",
   "main": "main.js",
   "engines": {
@@ -71,7 +71,8 @@
     "cross-spawn": "7.0.6",
     "jsonc-parser": "3.3.1",
     "tslib": "^2.8.1",
-    "ws": "8.21.2"
+    "ws": "8.21.2",
+    "yaml": "2.9.0"
   },
   "overrides": {
     "@babel/core": "7.29.7",
