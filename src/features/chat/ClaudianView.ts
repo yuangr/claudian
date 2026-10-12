@@ -97,14 +97,19 @@ export class ClaudianView extends ItemView implements ZenModeSource {
         this.presentation.updateChip();
         this.updateTabBarVisibility();
       },
-      onEnterWide: () => this.sessions.enterWide(),
+      onEnterWide: () => {
+        this.sessions.enterWide();
+        // Restore enters wide itself; afterwards entering wide unloads the narrow tabs.
+        if (!this.tabWorkspace.isReady) return;
+        void this.tabManager?.viewerSlot.enter()
+          .catch(() => new Notice('Failed to show the session in the wide layout'));
+      },
       renderSidebar: () => this.sessions.renderSidebar(),
       onLeaveWideRequested: () => this.sessions.leaveWide(),
       releaseViewerSlot: () => this.tabManager?.viewerSlot.release(),
     });
     this.presentation = new ChatPresentationPlacement({
       getActiveTab: () => this.getActiveTab(),
-      getTab: tabId => this.tabManager?.getTab(tabId) ?? null,
       isWide: () => this.layout.isWide,
       getTabCount: () => this.tabManager?.getTabCount() ?? null,
     });
@@ -464,7 +469,7 @@ export class ClaudianView extends ItemView implements ZenModeSource {
   /** Wide: tab commands open sessions and start drafts in the viewer slot; compact: in the tab. */
   private createLayoutPolicy(getTabManager: () => TabManager): TabLayoutPolicy {
     return {
-      forkTarget: () => (this.layout.isWide ? 'new-tab' : 'ask'),
+      forkTarget: () => (this.layout.isWide ? 'viewer' : 'ask'),
       openPicked: async (conversationId, sourceTab) => {
         if (!this.layout.isWide) return false;
         await getTabManager().viewerSlot.show(conversationId, { sourceTab });
@@ -475,9 +480,7 @@ export class ClaudianView extends ItemView implements ZenModeSource {
         await getTabManager().viewerSlot.startDraft({ sourceTab });
         return true;
       },
-      shouldRetainPreview: conversationId => (
-        this.plugin.getConversationSummary(conversationId)?.isPinned === true
-      ),
+      showsPreviews: () => this.layout.isWide,
     };
   }
 
@@ -689,14 +692,16 @@ export class ClaudianView extends ItemView implements ZenModeSource {
   appendToActiveInput(text: string): boolean {
     const activeTab = this.tabManager?.getActiveTab();
     if (!activeTab || !text) return false;
-    // Typing into a preview retains it, so appending does too.
-    this.tabManager?.retainTabs([activeTab.id]);
     return activeTab.composer.appendText(text);
   }
 
   notifyConversationListChanged(): void {
     for (const tab of this.tabManager?.getAllTabs() ?? []) tab.composer.invalidateSessionMentions();
+    // A held draft session may have created its conversation while its blank tab was unloaded.
+    this.tabManager?.reconcileUnloadedSessions();
     this.sessions.invalidate();
+    // Unloaded tabs read their running and attention state from session status changes.
+    this.updateTabBar();
   }
 
   private notifyConversationNavigationChanged(): void {

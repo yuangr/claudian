@@ -62,13 +62,25 @@ export const commandCatalog = {
   setCommandSnapshot: jest.fn(),
 };
 
+/** Records an explicit Linked content choice the way the controller's snapshot reports it. */
+function createMockLinkedContent() {
+  let snapshot: { mode: string; path: string | null } = { mode: 'auto-draft', path: null };
+  return {
+    getSnapshot: () => snapshot,
+    selectExplicit: jest.fn((path: string | null) => { snapshot = { mode: 'explicit-draft', path }; }),
+  };
+}
+
+const mockDraftSessions = new Map<string, ChatSessionRuntime>();
+const mockLinkedContent = new WeakMap<ChatSessionRuntime, ReturnType<typeof createMockLinkedContent>>();
+
 export function createMockTab(options: Record<string, any>): any {
   const review = new ChatState();
   const input = { value: '', focus: jest.fn() };
   const tab = {
     id: options.tabId ?? `tab-${mockTabs.length + 1}`,
     conversationId: options.conversation?.id ?? null,
-    draftModel: options.conversation ? null : 'claude-default',
+    draftModel: options.conversation ? null : (options.draftModel ?? 'claude-default'),
     executionCoordinator: {
       getCommandSnapshot: () => undefined,
       hasBackgroundWork: false,
@@ -78,7 +90,7 @@ export function createMockTab(options: Record<string, any>): any {
     },
     hydrationState: options.conversation ? 'idle' : 'ready',
     lifecycleState: options.lifecycleState ?? 'open',
-    providerId: options.conversation?.providerId ?? 'claude',
+    providerId: options.conversation?.providerId ?? options.providerId ?? 'claude',
     session: null as unknown as TabSession,
     ...options.initialState,
     captureReviewableSettlement: options.captureReviewableSettlement ?? null,
@@ -100,7 +112,7 @@ export function createMockTab(options: Record<string, any>): any {
       },
     },
     composer: { focus: jest.fn() },
-    linkedContent: { selectExplicit: jest.fn() },
+    linkedContent: null as unknown as ReturnType<typeof createMockLinkedContent>,
     controllers: {
       drafts: new ComposerDraftController({ getInput: () => input as never, getImages: () => null, getDestination: () => 'main' }),
       conversationController: {
@@ -124,14 +136,22 @@ export function createMockTab(options: Record<string, any>): any {
     ui: {
     },
   };
-  tab.session = new TabSession(tab, new ChatSessionRuntime({ ...tab }, tab.executionCoordinator as never, () => ({
-    state: tab.state,
-    get hasPendingInteraction() { return tab.state.requiresAction; },
-    hydrate: jest.fn(async () => { tab.hydrationState = 'ready'; }),
-    acknowledgeReviewIfVisible: () => tab.state.acknowledgeReview(),
-    publish: () => tab.session.runtime.notifyChanged(),
-    dismissInteractions: () => undefined,
-  }) as never));
+  // The pool port reattaches a held draft by key; every other assembly starts its own session.
+  const heldKey = options.draftSessionKey;
+  const session = (heldKey ? mockDraftSessions.get(heldKey) : undefined)
+    ?? new ChatSessionRuntime({ ...tab }, tab.executionCoordinator as never, () => ({
+      state: tab.state,
+      get hasPendingInteraction() { return tab.state.requiresAction; },
+      hydrate: jest.fn(async () => { tab.hydrationState = 'ready'; }),
+      acknowledgeReviewIfVisible: () => tab.state.acknowledgeReview(),
+      publish: () => tab.session.runtime.notifyChanged(),
+      dismissInteractions: () => undefined,
+    }) as never);
+  mockDraftSessions.set(session.sessionKey, session);
+  tab.session = new TabSession(tab, session);
+  // Linked content belongs to the session's model, so a reattached session keeps its choice.
+  tab.linkedContent = mockLinkedContent.get(session) ?? createMockLinkedContent();
+  mockLinkedContent.set(session, tab.linkedContent);
   for (const key of ['conversationId', 'providerId', 'draftModel'] as const) {
     Object.defineProperty(tab, key, { get: () => tab.session[key] });
   }
@@ -204,7 +224,11 @@ export function providerRegistryModuleMock() {
 
 export function createPlugin(overrides: Record<string, unknown> = {}) {
   return {
-    sessionRuntimes: { getAttachment: () => null, get: () => null },
+    sessionRuntimes: {
+      getAttachment: () => null,
+      get: () => null,
+      holdDraft: (runtime: ChatSessionRuntime) => ({ key: runtime.sessionKey, runtime, release: () => undefined }),
+    },
     app: {
       vault: { adapter: { basePath: '/vault' } },
       workspace: {
@@ -261,7 +285,7 @@ export function createManager(
         forkTarget: () => 'ask',
         openPicked: async () => false,
         startNew: async () => false,
-        shouldRetainPreview: () => false,
+        showsPreviews: () => false,
         ...layoutPolicy,
       },
     ) as TabManager,

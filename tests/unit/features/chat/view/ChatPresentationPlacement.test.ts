@@ -12,14 +12,15 @@ function createPlacedTab(id: string) {
   const messagesWrapperEl = contentEl.createDiv({ cls: 'messages' });
   const inputComposerEl = contentEl.createDiv({ cls: 'composer' });
   const setSideChatChipHost = jest.fn();
+  const setSideChatFullHeightHost = jest.fn();
   const dom = {
     contentEl,
     inputComposerEl,
     messagesWrapperEl,
     inputEl: inputComposerEl.createEl('textarea'),
   };
-  const tab = { id, dom, placement: createTabPlacementPort(dom, setSideChatChipHost) };
-  return { dom, setSideChatChipHost, tab: tab as unknown as ChatTab };
+  const tab = { id, dom, placement: createTabPlacementPort(dom, setSideChatChipHost, setSideChatFullHeightHost) };
+  return { dom, setSideChatChipHost, setSideChatFullHeightHost, tab: tab as unknown as ChatTab };
 }
 
 function createPlacement(tabs: ReturnType<typeof createPlacedTab>[]) {
@@ -27,7 +28,6 @@ function createPlacement(tabs: ReturnType<typeof createPlacedTab>[]) {
   let isWide = false;
   const placement = new ChatPresentationPlacement({
     getActiveTab: () => active,
-    getTab: id => tabs.find(entry => entry.tab.id === id)?.tab ?? null,
     isWide: () => isWide,
     getTabCount: () => tabs.length,
   });
@@ -35,6 +35,7 @@ function createPlacement(tabs: ReturnType<typeof createPlacedTab>[]) {
   placement.mount(chatPanelEl);
   const footerEl = chatPanelEl.querySelector<HTMLElement>('.claudian-input-footer')!;
   return {
+    chatPanelEl,
     chipHostEl: footerEl.querySelector<HTMLElement>('.claudian-side-chat-chip-slot')!,
     footerEl,
     navHostEl: footerEl.querySelector<HTMLElement>('.claudian-view-input-nav-row')!,
@@ -83,6 +84,42 @@ describe('ChatPresentationPlacement', () => {
     expect(pendingPromptEl.parentElement).toBe(entry.dom.inputComposerEl);
   });
 
+  it('replaces the footer composer when the active tab is rebound under the same id', () => {
+    const original = createPlacedTab('tab-1');
+    const tabs = [original];
+    const harness = createPlacement(tabs);
+    harness.placement.update();
+    expect(harness.slotEl.children).toHaveLength(1);
+
+    // Starting a new conversation rebuilds the runtime in place: same tab id, new DOM.
+    const rebound = createPlacedTab('tab-1');
+    tabs[0] = rebound;
+    harness.setActive(rebound.tab);
+    harness.placement.update();
+
+    expect(Array.from(harness.slotEl.children)).toEqual([rebound.dom.inputComposerEl]);
+    // The superseded composer returns to its own tab root, so destroying that root removes it.
+    expect(original.dom.inputComposerEl.parentElement).toBe(original.dom.contentEl);
+  });
+
+  it('keeps exactly one footer composer across repeated same-id rebinds', () => {
+    const tabs = [createPlacedTab('tab-1')];
+    const harness = createPlacement(tabs);
+    harness.placement.update();
+
+    for (let i = 0; i < 3; i++) {
+      const previous = tabs[0];
+      const rebound = createPlacedTab('tab-1');
+      tabs[0] = rebound;
+      harness.setActive(rebound.tab);
+      harness.placement.update();
+      // The view then destroys the superseded runtime's root.
+      previous.dom.contentEl.remove();
+    }
+
+    expect(harness.slotEl.children).toHaveLength(1);
+  });
+
   it('clears the stable input slot when no tab is active', () => {
     const entry = createPlacedTab('tab-1');
     const harness = createPlacement([entry]);
@@ -121,6 +158,7 @@ describe('ChatPresentationPlacement', () => {
     expect(entry.dom.inputComposerEl.parentElement).toBe(slots.composerEl);
     expect(entry.dom.messagesWrapperEl.parentElement).toBe(slots.historyEl);
     expect(entry.setSideChatChipHost).toHaveBeenLastCalledWith(slots.sideChatChipEl);
+    expect(entry.setSideChatFullHeightHost).toHaveBeenLastCalledWith(null);
 
     // A stale release from an earlier attachment must not undo a newer one.
     const newerSlots = createZenSlots();
@@ -130,6 +168,7 @@ describe('ChatPresentationPlacement', () => {
     expect(entry.dom.messagesWrapperEl.parentElement).toBe(newerSlots.historyEl);
 
     releaseNewer();
+    expect(entry.setSideChatFullHeightHost).toHaveBeenLastCalledWith(harness.chatPanelEl);
     expect(entry.dom.inputComposerEl.parentElement).toBe(harness.slotEl);
     expect(entry.dom.messagesWrapperEl.parentElement).toBe(entry.dom.contentEl);
     expect(entry.dom.contentEl.firstElementChild).toBe(entry.dom.messagesWrapperEl);
