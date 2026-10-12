@@ -1,6 +1,6 @@
 import type { TabId } from '@/features/chat/tabs/ChatTab';
 import type { TabIdentity } from '@/features/chat/tabs/TabIdentity';
-import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
+import { deactivateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import type { TabMembership } from '@/features/chat/tabs/TabMembership';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 
@@ -10,6 +10,8 @@ export interface TabCloseHost {
   switchToTab(tabId: TabId): Promise<void>;
   /** Creates an inactive blank tab so the view keeps one live tab. */
   createReplacement(): Promise<AssembledTabRuntime | null>;
+  /** Creates an inactive draft preview to succeed an active preview; null outside the wide layout. */
+  createPreviewReplacement(): Promise<AssembledTabRuntime | null>;
   /** Releases manager metadata (command discovery) that outlives membership; returns failures. */
   releaseMetadata(tabId: TabId): readonly unknown[];
   /** Publishes a completed close; not called once the manager is destroyed. */
@@ -41,6 +43,14 @@ export class TabClosePolicy {
   /** Closes a tab even when it is the last blank draft, installing a fresh draft when needed. */
   discard(tabId: TabId): Promise<boolean> {
     return this.#track(this.#close(tabId, false));
+  }
+
+  /**
+   * Closes a tab whose successor needs its session: tears it down first, then activates the
+   * successor, falling back to any live tab when that activation fails.
+   */
+  handOver(tabId: TabId, successorId: TabId): Promise<boolean> {
+    return this.#track(this.#handOver(tabId, successorId));
   }
 
   /** Waits for every admitted close, including ones started meanwhile; returns their failures. */
@@ -86,11 +96,16 @@ export class TabClosePolicy {
     try {
       const idsBefore = membership.getTabIdentities().map(identity => identity.id);
       const closingIndex = idsBefore.indexOf(tabId);
-      // Closing a preview returns to the retained tab the user last worked in, not its neighbour.
-      const retainedId = tab.lifecycleState === 'provisional'
+      // Closing the active wide preview shows a draft; elsewhere a preview returns to the retained
+      // tab the user last worked in, not its neighbour.
+      const previewReplacement = tab.lifecycleState === 'provisional' && membership.getActiveTabId() === tabId
+        ? await this.host.createPreviewReplacement()
+        : null;
+      const retainedId = tab.lifecycleState === 'provisional' && !previewReplacement
         ? membership.getRetainedActiveTabId(tabId, true)
         : null;
-      const successor = (retainedId ? membership.getIdentity(retainedId) : null)
+      const successor = previewReplacement
+        ?? (retainedId ? membership.getIdentity(retainedId) : null)
         ?? this.#findLiveTab(idsBefore, closingIndex)
         ?? await this.#ensureLiveTab();
       if (!successor || membership.getMember(tabId) !== member) return false;
@@ -106,26 +121,8 @@ export class TabClosePolicy {
       }
 
       // Replacement admission is complete; teardown is now irreversible.
-      membership.beginClose(tabId);
-      const closeErrors: unknown[] = [];
-      // Closing tabs cannot recreate metadata, so in-flight discovery is released once, now.
-      closeErrors.push(...this.host.releaseMetadata(tabId));
-
-      // Destroy resources, then release ownership even if teardown fails.
-      try {
-        if (runtime) await destroyTab(runtime);
-      } catch (error) {
-        closeErrors.push(error);
-      }
-      membership.remove(tabId);
-      if (membership.getActiveTabId() === tabId) membership.setActiveTabId(null);
-
+      const closeErrors = await this.#tearDown(tabId, runtime);
       if (!membership.isDestroyed()) {
-        try {
-          this.host.onTabClosed(tabId);
-        } catch (error) {
-          closeErrors.push(error);
-        }
         // Reconcile after every close because a different active tab may be closing concurrently.
         try {
           await this.#reconcileActiveTab(idsBefore, closingIndex);
@@ -139,6 +136,64 @@ export class TabClosePolicy {
     } finally {
       membership.releaseCloseClaim(tabId);
     }
+  }
+
+  async #handOver(tabId: TabId, successorId: TabId): Promise<boolean> {
+    const { membership } = this.host;
+    const member = membership.getMember(tabId);
+    const successor = membership.getIdentity(successorId);
+    if (!member || !successor || !membership.isTabAlive(successor)) return false;
+    const tab = membership.getIdentity(tabId)!;
+    if (tab.lifecycleState === 'closing' || membership.isCloseClaimed(tabId)) return false;
+    const runtime = member.kind === 'assembled' ? member.runtime : null;
+    const idsBefore = membership.getTabIdentities().map(identity => identity.id);
+
+    membership.claimClose(tabId);
+    try {
+      if (runtime && membership.getActiveTabId() === tabId) deactivateTab(runtime);
+      const closeErrors = await this.#tearDown(tabId, runtime);
+      if (membership.isDestroyed()) return true;
+      try {
+        await this.host.switchToTab(successorId);
+      } catch (error) {
+        closeErrors.push(error);
+      }
+      try {
+        await this.#reconcileActiveTab(idsBefore, idsBefore.indexOf(tabId));
+      } catch (error) {
+        closeErrors.push(error);
+      }
+      throwCollectedErrors(closeErrors, `Failed to hand tab ${tabId} over cleanly`);
+      return true;
+    } finally {
+      membership.releaseCloseClaim(tabId);
+    }
+  }
+
+  /**
+   * Irreversibly tears a claimed tab down: releases its metadata and resources, then its
+   * membership even if teardown fails, and publishes the close while the manager is live.
+   */
+  async #tearDown(tabId: TabId, runtime: AssembledTabRuntime | null): Promise<unknown[]> {
+    const { membership } = this.host;
+    membership.beginClose(tabId);
+    // Closing tabs cannot recreate metadata, so in-flight discovery is released once, now.
+    const errors: unknown[] = [...this.host.releaseMetadata(tabId)];
+    try {
+      if (runtime) await destroyTab(runtime);
+    } catch (error) {
+      errors.push(error);
+    }
+    membership.remove(tabId);
+    if (membership.getActiveTabId() === tabId) membership.setActiveTabId(null);
+    if (!membership.isDestroyed()) {
+      try {
+        this.host.onTabClosed(tabId);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    return errors;
   }
 
   async #reconcileActiveTab(idsBefore: readonly TabId[], closingIndex: number): Promise<void> {

@@ -1106,6 +1106,7 @@ describe('TabManager provider execution orchestration', () => {
     const retained = await manager.createTab('retained-conversation');
     await manager.viewerSlot.show('preview-conversation');
     const preview = manager.getActiveTab()!;
+    await manager.switchToTab(retained!.id);
     const saveFailure = deferred<void>();
     mockDestroyTab.mockImplementationOnce(() => saveFailure.promise);
 
@@ -1137,55 +1138,7 @@ describe('TabManager provider execution orchestration', () => {
     expect(manager.getAllTabs()).toHaveLength(0);
   });
 
-  it('retains only live runtime tabs and commits their provisional previews', async () => {
-    const getCachedConversation = jest.fn((id: string) => ({
-      id,
-      providerId: 'claude',
-    }));
-    const { manager } = createManager(createPlugin({ getCachedConversation }));
-    const open = await manager.createTab('open-conversation');
-    const closing = await manager.createTab('closing-conversation', undefined, { activate: false });
-    const untouched = await manager.createTab('untouched-conversation', undefined, { activate: false });
-    await manager.viewerSlot.show('preview-conversation');
-    const preview = manager.getActiveTab();
-    expect(preview?.lifecycleState).toBe('provisional');
-    await manager.restoreState({
-      openTabs: [{ tabId: 'cold-shell', conversationId: 'cold-conversation' }],
-      activeTabId: preview!.id,
-    });
-    const save = deferred<void>();
-    closing!.controllers.conversationController.save = jest.fn(() => save.promise);
-    const close = manager.closeTab(closing!.id);
-    for (let attempt = 0;
-      attempt < 10 && closing!.lifecycleState !== 'closing';
-      attempt += 1) {
-      await Promise.resolve();
-    }
-    expect(closing!.lifecycleState).toBe('closing');
-
-    manager.retainTabs([
-      open!.id,
-      preview!.id,
-      closing!.id,
-      'cold-shell',
-      'unknown-tab',
-    ]);
-
-    expect(open!.lifecycleState).toBe('open');
-    expect(open!.session.isUserClaimed).toBe(true);
-    expect(preview!.lifecycleState).toBe('open');
-    expect(preview!.session.isUserClaimed).toBe(true);
-    expect(closing!.session.isUserClaimed).toBe(false);
-    expect(untouched!.session.isUserClaimed).toBe(false);
-    expect(manager.getTab('cold-shell')).toBeNull();
-
-    save.resolve(undefined);
-    await expect(close).resolves.toBe(true);
-    await manager.viewerSlot.release();
-    expect(manager.getAllTabs()).toEqual([open, untouched, preview]);
-  });
-
-  it('persists only retained tabs and the last active retained tab while a preview is shown', async () => {
+  it('persists retained tabs and the shown session preview as the active entry', async () => {
     const getCachedConversation = jest.fn((id: string) => ({
       id,
       providerId: 'claude',
@@ -1199,34 +1152,126 @@ describe('TabManager provider execution orchestration', () => {
     const preview = manager.getActiveTab();
     expect(preview?.lifecycleState).toBe('provisional');
 
-    expect(manager.getPersistedState()).toEqual({
+    const persisted = manager.getPersistedState();
+    expect(persisted).toEqual({
       openTabs: [
         { tabId: retained!.id, conversationId: 'conversation-1' },
         { tabId: blank!.id, conversationId: null, draftModel: 'codex:gpt-5', providerId: 'codex' },
+        { tabId: preview!.id, conversationId: 'conversation-2', preview: true },
       ],
-      activeTabId: retained!.id,
+      activeTabId: preview!.id,
     });
+
+    const wide = createManager(createPlugin({ getCachedConversation }), {}, {}, { showsPreviews: () => true }).manager;
+    await wide.restoreState(persisted);
+    expect(wide.getActiveTab()).toEqual(expect.objectContaining({
+      id: preview!.id, conversationId: 'conversation-2', lifecycleState: 'provisional',
+    }));
   });
 
-  it('persists a preview only once the user retains it', async () => {
+  it('starts a wide workspace with nothing to restore on a draft preview, not a retained tab', async () => {
+    const { manager } = createManager(createPlugin(), {}, {}, { showsPreviews: () => true });
+
+    await manager.restoreState({ openTabs: [], activeTabId: null });
+
+    expect(manager.getActiveTab()).toEqual(expect.objectContaining({ conversationId: null, lifecycleState: 'provisional' }));
+  });
+
+  it('binds an unloaded blank tab to the conversation its new session creates', async () => {
     const { manager } = createManager();
+    const blank = await manager.createTab(null);
+    await manager.viewerSlot.enter();
+
+    manager.getActiveTab()!.session.runtime.setConversationId('created');
+    manager.reconcileUnloadedSessions();
+
+    expect(manager.getPersistedState().openTabs[0]).toEqual({ tabId: blank!.id, conversationId: 'created' });
+  });
+
+  it('joins an unloaded draft session creating its conversation before the shutdown snapshot', async () => {
+    const { manager } = createManager();
+    const blank = await manager.createTab(null);
+    const session = blank!.session.runtime;
+    await manager.viewerSlot.enter();
+    await manager.viewerSlot.show('conversation-1');
+    jest.spyOn(session, 'awaitIdentitySettlement').mockImplementation(async () => {
+      await Promise.resolve();
+      session.setConversationId('created');
+    });
+
+    await manager.drainForShutdownSnapshot();
+
+    expect(manager.getPersistedState().openTabs[0]).toEqual({ tabId: blank!.id, conversationId: 'created' });
+  });
+
+  it('reports an unloaded narrow tab from its running session', async () => {
+    const running = { isWorking: true, statusAttention: 'review' };
+    const { manager } = createManager(createPlugin({
+      getCachedConversation: (id: string) => ({ id, providerId: 'claude' }),
+      sessionRuntimes: { getAttachment: () => null, get: (id: string) => (id === 'conversation-1' ? running : null) },
+    }));
+    const narrow = await manager.createTab('conversation-1');
+    await manager.viewerSlot.enter();
+    expect(manager.getTab(narrow!.id)).toBeNull();
+
+    expect(manager.isTabWorking(narrow!.id)).toBe(true);
+    expect(manager.getTabBarItems().find(item => item.id === narrow!.id))
+      .toEqual(expect.objectContaining({ isWorking: true, attention: 'review' }));
+  });
+
+  it('reports an unloaded blank tab from its held draft session before it creates a conversation', async () => {
+    const { manager } = createManager();
+    const blank = await manager.createTab(null);
+    jest.spyOn(blank!.session.runtime, 'isWorking', 'get').mockReturnValue(true);
+    await manager.viewerSlot.enter();
+    await manager.viewerSlot.show('conversation-1');
+    expect(manager.getTab(blank!.id)).toBeNull();
+
+    expect(manager.isTabWorking(blank!.id)).toBe(true);
+  });
+
+  it('persists the active blank draft as a preview that survives reload', async () => {
+    const { manager } = createManager();
+    const retained = await manager.createTab(null);
     await manager.viewerSlot.startDraft();
-    const preview = manager.getActiveTab()!;
+    const draft = manager.getActiveTab()!;
+    expect(draft.lifecycleState).toBe('provisional');
 
-    expect(manager.getPersistedState()).toEqual({ activeTabId: null, openTabs: [] });
+    const persisted = manager.getPersistedState();
+    expect(persisted).toEqual({
+      activeTabId: draft.id,
+      openTabs: [
+        { tabId: retained!.id, conversationId: null, draftModel: 'claude-default', providerId: 'claude' },
+        { tabId: draft.id, conversationId: null, draftModel: 'claude-default', providerId: 'claude', preview: true },
+      ],
+    });
 
-    preview.session.claimUserOwnership();
-    preview.session.commitAdmission();
+    const wide = createManager(createPlugin(), {}, {}, { showsPreviews: () => true }).manager;
+    await wide.restoreState(persisted);
+    expect(wide.getActiveTabId()).toBe(draft.id);
+    expect(wide.getActiveTab()?.lifecycleState).toBe('provisional');
+    expect(wide.getPersistedState()).toEqual(persisted);
 
-    expect(preview.lifecycleState).toBe('open');
+    const compact = createManager().manager;
+    await compact.restoreState(persisted);
+    expect(compact.getActiveTabId()).toBe(draft.id);
+    expect(compact.getActiveTab()?.lifecycleState).toBe('open');
+    expect(compact.getPersistedState().openTabs[1]).not.toHaveProperty('preview');
+
+    draft.session.claimUserOwnership();
+    draft.session.commitAdmission();
+    expect(manager.getPersistedState().openTabs[1]).not.toHaveProperty('preview');
+  });
+
+  it('drops an inactive draft preview from persistence', async () => {
+    const { manager } = createManager();
+    const retained = await manager.createTab(null);
+    await manager.viewerSlot.startDraft();
+    await manager.switchToTab(retained!.id);
+
     expect(manager.getPersistedState()).toEqual({
-      activeTabId: preview.id,
-      openTabs: [{
-        conversationId: null,
-        draftModel: 'claude-default',
-        providerId: 'claude',
-        tabId: preview.id,
-      }],
+      activeTabId: retained!.id,
+      openTabs: [{ tabId: retained!.id, conversationId: null, draftModel: 'claude-default', providerId: 'claude' }],
     });
   });
 
@@ -1506,7 +1551,7 @@ describe('TabManager provider execution orchestration', () => {
 
   it('ignores owner intents retained by a tab after it begins closing', async () => {
     const { manager, plugin } = createManager(createPlugin(), {}, {}, {
-      forkTarget: () => 'new-tab',
+      forkTarget: () => 'viewer',
     });
     await manager.createTab();
     const source = await manager.createTab();

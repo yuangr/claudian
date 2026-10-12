@@ -145,6 +145,12 @@ export class TabMembership implements TabMembershipView {
     });
   }
 
+  /** Unloads an assembled tab to its restored identity, keeping position and activation history. */
+  unload(identity: TabIdentity): void {
+    const record = this.#records.get(identity.id);
+    if (record?.member?.kind === 'assembled') record.member = { kind: 'restored', identity };
+  }
+
   /** Replaces a restored tab's identity in place, invalidating assemblies of the old one. */
   replaceRestored(identity: TabIdentity): void {
     const record = this.#records.get(identity.id);
@@ -262,13 +268,15 @@ export class TabMembership implements TabMembershipView {
   }
 
   /**
-   * Every retained tab identity without runtime lifecycle state. Provisional previews are never
-   * persisted; while one is active, the last active retained tab is saved.
+   * Every retained tab identity without runtime lifecycle state. A preview persists only while
+   * active, so the wide viewer's selection (a session or a new draft) survives reload.
    */
   getPersistedState(): AppTabManagerState {
+    const activePreviewId = this.#activePreviewId();
     const openTabs: AppTabManagerState['openTabs'] = [];
-    for (const record of this.#records.values()) {
-      if (!this.#isRetained(record)) continue;
+    for (const [tabId, record] of this.#records) {
+      const isActivePreview = tabId === activePreviewId;
+      if (!isActivePreview && !this.#isRetained(record)) continue;
       const tab = memberIdentity(record.member!);
       openTabs.push({
         tabId: tab.id,
@@ -277,9 +285,22 @@ export class TabMembership implements TabMembershipView {
           ? { draftModel: tab.draftModel, providerId: tab.providerId }
           : {}),
         ...(tab.label ? { label: tab.label } : {}),
+        ...(isActivePreview ? { preview: true as const } : {}),
       });
     }
-    return { openTabs, activeTabId: this.getRetainedActiveTabId() };
+    return { openTabs, activeTabId: activePreviewId ?? this.getRetainedActiveTabId() };
+  }
+
+  /** The most recently activated admitted tab, when it is a provisional preview. */
+  #activePreviewId(): TabId | null {
+    let latest: { tabId: TabId; record: TabRecord } | null = null;
+    for (const [tabId, record] of this.#records) {
+      if (!record.admitted || !record.member || record.activation === null) continue;
+      if (!latest || record.activation > latest.record.activation!) latest = { tabId, record };
+    }
+    if (!latest) return null;
+    const identity = memberIdentity(latest.record.member!);
+    return identity.lifecycleState === 'provisional' ? latest.tabId : null;
   }
 
   #isRetained(record: TabRecord): boolean {

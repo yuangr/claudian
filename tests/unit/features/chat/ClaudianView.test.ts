@@ -48,10 +48,10 @@ function createFakeTabManager(overrides: Record<string, unknown> = {}): any {
     getTabCount: jest.fn().mockReturnValue(1),
     getTabIdentities: jest.fn().mockReturnValue([]),
     restoreState: jest.fn().mockResolvedValue(undefined),
-    retainTabs: jest.fn(),
     sealShutdownSnapshot: jest.fn(),
     setTabLabel: jest.fn(),
     viewerSlot: {
+      enter: jest.fn().mockResolvedValue(undefined),
       release: jest.fn().mockResolvedValue(undefined),
       show: jest.fn().mockResolvedValue(undefined),
       startDraft: jest.fn().mockResolvedValue(undefined),
@@ -304,7 +304,7 @@ describe('ClaudianView tab controls', () => {
       id: 'tab-1',
       conversationId: null,
       dom,
-      placement: createTabPlacementPort(dom as never, setSideChatChipHost),
+      placement: createTabPlacementPort(dom as never, setSideChatChipHost, () => {}),
     };
     const manager = createFakeTabManager({
       getActiveTab: jest.fn().mockReturnValue(tab),
@@ -367,17 +367,14 @@ describe('ClaudianView tab controls', () => {
     await openView({
       contentEl,
       manager,
-      plugin: { getConversationSummary: (id: string) => ({ isPinned: id === 'pinned' }) },
     });
     const policy = manager.layoutPolicy;
 
     await expect(policy.openPicked('conversation-2', source)).resolves.toBe(true);
     await expect(policy.startNew(source)).resolves.toBe(true);
-    expect(policy.forkTarget()).toBe('new-tab');
+    expect(policy.forkTarget()).toBe('viewer');
     expect(manager.viewerSlot.show).toHaveBeenCalledWith('conversation-2', { sourceTab: source });
     expect(manager.viewerSlot.startDraft).toHaveBeenCalledWith({ sourceTab: source });
-    expect(policy.shouldRetainPreview('pinned')).toBe(true);
-    expect(policy.shouldRetainPreview('other')).toBe(false);
 
     resize(400);
     await Promise.resolve();
@@ -424,6 +421,22 @@ describe('ClaudianView dual-pane wiring', () => {
     await Promise.resolve();
 
     expect(contentEl.hasClass('claudian-wide-session-layout')).toBe(false);
+  });
+
+  it('unloads narrow tabs through the viewer slot only when entering wide after restore', async () => {
+    const manager = createFakeTabManager();
+    const contentEl = createSizedContentEl(640);
+    const resize = captureResizeObserver(contentEl);
+    await openView({ contentEl, manager });
+    expect(contentEl.hasClass('claudian-wide-session-layout')).toBe(true);
+    expect(manager.viewerSlot.enter).not.toHaveBeenCalled();
+
+    resize(400);
+    await Promise.resolve();
+    await Promise.resolve();
+    resize(640);
+
+    expect(manager.viewerSlot.enter).toHaveBeenCalledTimes(1);
   });
 
   it('builds the persistent session column to the right of the chat panel', async () => {
@@ -778,7 +791,6 @@ describe('ClaudianView composer input', () => {
   function createComposerHarness(existingContent: string): {
     inputEl: HTMLTextAreaElement;
     inputHandler: jest.Mock;
-    tabManager: { retainTabs: jest.Mock };
     view: any;
   } {
     const inputEl = createMockEl('textarea') as unknown as HTMLTextAreaElement;
@@ -794,11 +806,10 @@ describe('ClaudianView composer input', () => {
         id: 'active-tab',
         composer: createTabComposerPort(inputEl as never, {} as never),
       }),
-      retainTabs: jest.fn(),
     };
     const view = createClaudianView({ tabManager });
 
-    return { inputEl, inputHandler, tabManager, view };
+    return { inputEl, inputHandler, view };
   }
 
   it('focuses the active composer', () => {
@@ -810,7 +821,7 @@ describe('ClaudianView composer input', () => {
   });
 
   it('appends text after existing composer content', () => {
-    const { inputEl, inputHandler, tabManager, view } = createComposerHarness('Review this note');
+    const { inputEl, inputHandler, view } = createComposerHarness('Review this note');
 
     const appended = view.appendToActiveInput('@projects/plan.md ');
 
@@ -820,8 +831,6 @@ describe('ClaudianView composer input', () => {
     expect(inputEl.selectionEnd).toBe(inputEl.value.length);
     expect(inputHandler).toHaveBeenCalledTimes(1);
     expect(inputEl.focus).toHaveBeenCalledTimes(1);
-    // Appending is user input, so the preview is retained through the tab manager first.
-    expect(tabManager.retainTabs).toHaveBeenCalledWith(['active-tab']);
   });
 
   it('does not add another separator when existing content ends in whitespace', () => {
