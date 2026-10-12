@@ -122,7 +122,7 @@ function describeAssistantError(error: SDKAssistantMessageError): string {
  */
 const AUTHENTICATION_CONFLICT_HINT =
   'If the same CLI works with a subscription separately, an inherited ANTHROPIC_API_KEY or '
-  + 'ANTHROPIC_AUTH_TOKEN may be interfering. In Settings → Providers → Claude → Custom variables '
+  + 'ANTHROPIC_AUTH_TOKEN may be interfering. In Settings → Claudian → Providers → Claude Code → Environment → Custom variables '
   + '(Claude only), add an empty assignment only for the conflicting credential you intend to disable, '
   + 'such as ANTHROPIC_API_KEY= or ANTHROPIC_AUTH_TOKEN=.';
 
