@@ -49,9 +49,11 @@ jobs:
           fi
 
           # 获取最新更新的 commit 简报
-          echo "commits_log<<EOF" >> "$GITHUB_OUTPUT"
-          git log --oneline HEAD..upstream/main >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "commits_log<<EOF"
+            git log --oneline HEAD..upstream/main
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Merging upstream/main..."
           git merge upstream/main --no-edit -m "chore(sync): auto-merge upstream/main"
