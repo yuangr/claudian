@@ -218,3 +218,8 @@ Claudian is proudly sponsored by Ke Holdings Inc. (BEIKE) and the MOMA team. The
 ## License
 
 Licensed under the [MIT License](LICENSE).
+
+
+### Fork CI configuration
+
+Core type checks, tests, builds, workflow lint, and dependency checks run on pull requests. Enable the repository's dependency graph and vulnerability alerts for Dependency Review. Automatic Claude Code reviews are optional: install and configure the Claude GitHub App, then set the repository variable `CLAUDE_CODE_REVIEW_ENABLED` to `true`. Without that explicit setting the optional review job is skipped; it does not replace the core checks or a human review.
