@@ -50,6 +50,8 @@ export class SessionRuntimePool {
   private readonly records = new Map<ChatSessionRuntime, SessionRecord>();
   private readonly conversations = new Map<string, SessionRecord>();
   private readonly keys = new Map<string, SessionRecord>();
+  /** Removed sessions remain owned until their asynchronous cleanup finishes. */
+  private readonly draining = new Set<Promise<void>>();
   private closing = false;
   private disposal: Promise<void> | null = null;
 
@@ -73,20 +75,33 @@ export class SessionRuntimePool {
     if (record?.attachment) return { acquired: false, attachment: record.attachment };
     if (!record) {
       const { draftSessionKey: _unused, ...sessionIdentity } = identity;
-      const runtime = this.deps.createRuntime(sessionIdentity);
-      record = {
-        runtime, status: readStatus(runtime),
-        attachment: null, eviction: null, retired: false, holds: 0, settledWaiters: [], unsubscribe: () => undefined,
-      };
-      this.records.set(runtime, record);
-      this.keys.set(runtime.sessionKey, record);
-      if (record.status.conversationId) this.conversations.set(record.status.conversationId, record);
-      const current = record;
-      record.unsubscribe = runtime.subscribe(() => this.changed(current));
+      record = this.create(sessionIdentity);
     }
     const attachment = Object.freeze({ runtime: record.runtime, owner });
     record.attachment = attachment;
     return { acquired: true, attachment };
+  }
+
+  /**
+   * Returns a conversation's session without attaching it, creating one if none exists. Creation
+   * loads neither history nor provider resources; the session stays reachable by its conversation.
+   */
+  ensure(identity: SessionIdentity & { conversationId: string }): ChatSessionRuntime {
+    if (this.closing) throw new Error('Session runtime pool is shutting down');
+    return (this.conversations.get(identity.conversationId) ?? this.create(identity)).runtime;
+  }
+
+  private create(identity: SessionIdentity): SessionRecord {
+    const runtime = this.deps.createRuntime(identity);
+    const record: SessionRecord = {
+      runtime, status: readStatus(runtime),
+      attachment: null, eviction: null, retired: false, holds: 0, settledWaiters: [], unsubscribe: () => undefined,
+    };
+    this.records.set(runtime, record);
+    this.keys.set(runtime.sessionKey, record);
+    if (record.status.conversationId) this.conversations.set(record.status.conversationId, record);
+    record.unsubscribe = runtime.subscribe(() => this.changed(record));
+    return record;
   }
 
   /**
@@ -133,7 +148,7 @@ export class SessionRuntimePool {
     if (promoted || status.isWorking !== previous.isWorking || status.attention !== previous.attention) this.deps.onChanged();
     if (!status.isWorking) this.settleWaiters(record, true);
     if (record.retired) {
-      if (this.isReleasable(record)) void this.disposeRetired(record).catch(error => this.deps.onError(error));
+      if (this.isReleasable(record)) void this.disposeRecord(record).catch(error => this.deps.onError(error));
       return;
     }
     if (record.eviction || !this.canEvict(record)) return;
@@ -165,8 +180,7 @@ export class SessionRuntimePool {
     if (!runtime.conversationId) {
       // A held draft is reattached by its key; otherwise nothing can acquire it again.
       if (record.holds > 0) return false;
-      this.remove(record);
-      await runtime.dispose();
+      await this.disposeRecord(record);
       return false;
     }
     if (!model) return false;
@@ -211,17 +225,22 @@ export class SessionRuntimePool {
     const record = this.conversations.get(id);
     if (!record) return Promise.resolve();
     record.retired = true;
-    return this.isReleasable(record) ? this.disposeRetired(record) : Promise.resolve();
+    return this.isReleasable(record) ? this.disposeRecord(record) : Promise.resolve();
   }
 
   private isReleasable(record: SessionRecord): boolean {
     return this.records.get(record.runtime) === record && !this.closing && !record.attachment && !record.runtime.isWorking;
   }
 
-  private async disposeRetired(record: SessionRecord): Promise<void> {
+  private disposeRecord(record: SessionRecord): Promise<void> {
     this.remove(record);
-    await record.eviction;
-    await record.runtime.dispose({ save: false });
+    const disposal = (async () => {
+      // Retirement joins any history release; draft eviction must not await itself.
+      if (record.retired) await record.eviction;
+      await record.runtime.dispose({ save: !record.retired });
+    })().finally(() => { this.draining.delete(disposal); });
+    this.draining.add(disposal);
+    return disposal;
   }
 
   beginShutdown(): void {
@@ -237,9 +256,9 @@ export class SessionRuntimePool {
     this.beginShutdown();
     return this.disposal ??= (async () => {
       const records = [...this.records.values()];
+      const draining = [...this.draining];
       await Promise.allSettled(records.flatMap(record => record.eviction ? [record.eviction] : []));
-      const results = await Promise.allSettled(records.map(record => record.runtime.dispose()));
-      for (const record of records) this.remove(record);
+      const results = await Promise.allSettled([...draining, ...records.map(record => this.disposeRecord(record))]);
       const failures = results.filter(result => result.status === 'rejected');
       if (failures.length) throw new AggregateError(failures.map(result => result.reason as unknown), 'Failed to drain session runtimes');
     })();

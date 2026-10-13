@@ -330,7 +330,8 @@ export class SessionBrowser {
     const groupStatusKind = groupIndicatorKind(conversationStatuses, options);
     const hasReviewConversation = canShowAttention(options)
       && conversationStatuses.some(({ attention }) => isCompletedReview(attention));
-    const showGroupReviewState = groupStatusKind === null && hasReviewConversation;
+    const showGroupReviewState = (groupStatusKind === null || groupStatusKind === 'unread')
+      && hasReviewConversation;
     const groupHeader = list.createDiv({
       cls: [
         'claudian-session-group-header',
@@ -521,9 +522,6 @@ export class SessionBrowser {
     if (options.showMetadataPopover) {
       const focusTarget = isSelectable ? content : item;
       focusTarget.setAttribute('tabindex', '0');
-      if (isSelectable) {
-        focusTarget.setAttribute('role', 'button');
-      }
       this.metadataPopover.attach(item, focusTarget, conversation, options);
     } else {
       content.createDiv({
@@ -547,7 +545,7 @@ export class SessionBrowser {
     const row = (status: HistoryConversationStatus): SessionRow => ({
       conversation,
       status,
-      attention,
+      attention: canShowAttention(options) ? status.attention ?? null : null,
       beginRename: () => this.#beginRename(item, conversation, options),
     });
 
@@ -591,16 +589,16 @@ export class SessionBrowser {
         failureMessage,
       );
     };
-    if (options.showMetadataPopover) {
-      content.addEventListener('keydown', (event) => {
-        if (event.target !== content || (event.key !== 'Enter' && event.key !== ' ')) {
-          return;
-        }
-        event.preventDefault();
-        event.stopPropagation();
-        selectConversation();
-      });
-    }
+    content.setAttribute('tabindex', '0');
+    content.setAttribute('role', 'button');
+    content.addEventListener('keydown', (event) => {
+      if (event.target !== content || (event.key !== 'Enter' && event.key !== ' ')) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      selectConversation();
+    });
 
     content.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -681,7 +679,7 @@ export class SessionBrowser {
           ].filter(Boolean).join(' '),
     });
     const { icon, label } = indicatorPresentation(kind);
-    setIcon(indicator, icon);
+    if (icon) setIcon(indicator, icon);
     indicator.setAttribute('aria-label', label);
     return indicator;
   }

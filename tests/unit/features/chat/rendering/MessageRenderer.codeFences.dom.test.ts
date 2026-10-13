@@ -1,5 +1,9 @@
 /** @jest-environment jsdom */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+import { parser } from '@lezer/markdown';
 import { within } from '@testing-library/dom';
 import { axe } from 'jest-axe';
 import { Component, MarkdownRenderer } from 'obsidian';
@@ -10,9 +14,12 @@ HTMLElement.prototype.empty = function () { this.replaceChildren(); };
 
 let renderer: MessageRenderer;
 let host: HTMLElement;
+let style: HTMLStyleElement;
 
 beforeEach(() => {
   document.body.replaceChildren();
+  style = document.head.appendChild(document.createElement('style'));
+  style.textContent = readFileSync(path.resolve('src/style/components/code.css'), 'utf8');
   host = document.body.createDiv();
   renderer = new MessageRenderer(
     { app: {}, settings: { mediaFolder: '' } } as any,
@@ -21,12 +28,15 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => renderer.dispose());
+afterEach(() => {
+  renderer.dispose();
+  style.remove();
+});
 
 it.each([
   { language: '', expectedClass: '', expectedLabel: null, hasLanguage: false },
   { language: 'typescript', expectedClass: 'language-typescript', expectedLabel: 'typescript', hasLanguage: true },
-])('adopts a fresh $language fence while preserving its native copy control', async ({
+])('adopts a fresh $language fence with an accessible copy control', async ({
   language, expectedClass, expectedLabel, hasLanguage,
 }) => {
   let pre!: HTMLPreElement;
@@ -55,7 +65,11 @@ it.each([
   expect(pre.parentElement).toBe(wrapper);
   expect(code.parentElement).toBe(pre);
   expect(code.textContent).toBe('const x = 1;');
-  expect(within(host).getByRole('button', { name: 'Copy' })).toBe(copyButton);
+  const accessibleCopy = within(host).getByRole('button', { name: hasLanguage ? 'Copy typescript code' : 'Copy' });
+  expect(accessibleCopy.getAttribute('type')).toBe('button');
+  accessibleCopy.focus();
+  expect(document.activeElement).toBe(accessibleCopy);
+  expect(accessibleCopy === copyButton).toBe(!hasLanguage);
   expect(copyButton.getAttribute('type')).toBe('button');
   expect(copyButton.parentElement).toBe(wrapper);
   expect(pre.contains(copyButton)).toBe(false);
@@ -63,17 +77,20 @@ it.each([
   expect(wrapper.classList.contains('has-language')).toBe(hasLanguage);
   expect(wrapper.querySelector('.claudian-code-lang-label')?.textContent ?? null).toBe(expectedLabel);
   expect((await axe(host)).violations).toEqual([]);
-
 });
 
-it('copies code through its language label and restores the label after feedback', async () => {
+it('copies code through its language label and exposes the copied feedback accessibly', async () => {
   jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, _markdown, target) => {
     const pre = (target as HTMLElement).createEl('pre');
     pre.createEl('code', { cls: 'language-typescript', text: 'const x = 1;' });
   });
   await renderer.renderContent(host, '```typescript\nconst x = 1;\n```');
 
-  const label = within(host).getByText('typescript');
+  // WCAG 2.5.3: the accessible name contains the visible language label and names the action.
+  const label = within(host).getByRole('button', { name: 'Copy typescript code' });
+  expect(label.textContent).toBe('typescript');
+  const status = within(host).getByRole('status');
+  expect(status.textContent).toBe('');
   const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
   const writeText = jest.fn().mockResolvedValue(undefined);
   jest.useFakeTimers();
@@ -86,9 +103,13 @@ it('copies code through its language label and restores the label after feedback
     await Promise.resolve();
     expect(writeText).toHaveBeenCalledWith('const x = 1;');
     expect(label.textContent).toBe('Copied!');
+    expect(within(host).getByRole('button', { name: 'Copied!' })).toBe(label);
+    expect(status.textContent).toBe('Copied!');
 
     jest.advanceTimersByTime(1_500);
     expect(label.textContent).toBe('typescript');
+    expect(within(host).getByRole('button', { name: 'Copy typescript code' })).toBe(label);
+    expect(status.textContent).toBe('');
   } finally {
     jest.clearAllTimers();
     jest.useRealTimers();
@@ -98,6 +119,35 @@ it('copies code through its language label and restores the label after feedback
       Reflect.deleteProperty(navigator, 'clipboard');
     }
   }
+});
+
+it.each([
+  { name: 'blockquote', before: '> ```text\n> literal', after: '```dataviewjs\nvoid 0;\n```' },
+  { name: 'list', before: '- ```text\n  literal', after: '```dataviewjs\nvoid 0;\n```' },
+  { name: 'nested blockquote', before: '> > ```text\n> > literal', after: '> ```dataviewjs\n> void 0;' },
+  { name: 'nested list', before: '- - ```text\n    literal', after: '  ```dataviewjs\n  void 0;' },
+  { name: 'quote inside list', before: '- > ```text\n  > literal', after: '  ```dataviewjs\n  void 0;' },
+  { name: 'list inside quote', before: '> - ```text\n>   literal', after: '> ```dataviewjs\n> void 0;' },
+])('neutralizes blocks after an implicitly closed $name fence', async ({ before, after }) => {
+  const processExecutableCode = jest.fn();
+  let forwarded = '';
+  jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, markdown) => {
+    forwarded = markdown;
+    // The host boundary dispatches processors by the actual parsed block language.
+    parser.parse(markdown).iterate({ enter(node) {
+      if (node.name === 'CodeInfo' && markdown.slice(node.from, node.to) === 'dataviewjs') {
+        processExecutableCode();
+      }
+    } });
+  });
+
+  await renderer.renderContent(host, `${before}\n\n${after}\n<iframe src="https://example.invalid/"></iframe>`);
+
+  expect(host.querySelector('.claudian-render-error')).toBeNull();
+  expect(jest.mocked(MarkdownRenderer.render)).toHaveBeenCalled();
+  expect(processExecutableCode).not.toHaveBeenCalled();
+  expect(forwarded).toContain('&lt;iframe');
+  expect(forwarded).not.toContain('<iframe');
 });
 
 it('preserves an existing wrapper without nesting a second wrapper', async () => {
@@ -117,3 +167,31 @@ it('preserves an existing wrapper without nesting a second wrapper', async () =>
   expect(pre.parentElement).toBe(wrapper);
   expect(pre.textContent).toBe('already wrapped');
 });
+
+it.each([
+  ['comment', '<!--'],
+  ['CDATA section', '<![CDATA['],
+  ['processing instruction', '<?target'],
+  ['declaration', '<!DOCTYPE'],
+].flatMap(([name, opener]) => ['\n', '\r\n'].map(newline => ({ name, opener, newline }))))(
+  'neutralizes executable blocks after an indented unterminated $name ($newline)', async ({ opener, newline }) => {
+    const processExecutableCode = jest.fn();
+    let forwarded = '';
+    jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, markdown) => {
+      forwarded = markdown;
+      parser.parse(markdown).iterate({ enter(node) {
+        if (node.name === 'CodeInfo' && markdown.slice(node.from, node.to) === 'dataviewjs') {
+          processExecutableCode();
+        }
+      } });
+    });
+    const source = ['> <div>', `    ${opener}`, '> ~~~dataviewjs', '> void 0;', '> ~~~'].join(newline);
+
+    await renderer.renderContent(host, source);
+
+    expect(host.querySelector('.claudian-render-error')).toBeNull();
+    expect(jest.mocked(MarkdownRenderer.render)).toHaveBeenCalled();
+    expect(processExecutableCode).not.toHaveBeenCalled();
+    expect(forwarded).toContain('claudian-display-only-fence-');
+  },
+);

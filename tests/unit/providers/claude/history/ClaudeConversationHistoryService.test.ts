@@ -885,13 +885,37 @@ describe('ClaudeConversationHistoryService', () => {
       loadSpy.mockRestore();
     });
 
-    it('retries hydration when one session segment has unknown availability', async () => {
+    it.each(['missing', 'unknown'] as const)('preserves cached history and retries when one session segment is %s', async availability => {
       const service = new ClaudeConversationHistoryService();
       const conversation = createConversation({
         providerState: {
           previousProviderSessionIds: ['session-previous'],
           providerSessionId: 'session-1',
         },
+        // Cached messages are the live projection under Claudian-local ids.
+        messages: [
+          {
+            id: 'local-previous-user',
+            role: 'user',
+            content: 'previous question',
+            userMessageId: 'user-previous',
+            timestamp: testDate({ seconds: 1 }).getTime(),
+          },
+          {
+            id: 'local-user',
+            role: 'user',
+            content: 'question',
+            userMessageId: 'user-1',
+            timestamp: testDate({ seconds: 2 }).getTime(),
+          },
+          {
+            id: 'local-assistant',
+            role: 'assistant',
+            content: 'answer',
+            assistantMessageId: 'assistant-1',
+            timestamp: testDate({ seconds: 3 }).getTime(),
+          },
+        ],
       });
       const available = (sessionId: string) => ({
         availability: 'available' as const,
@@ -899,7 +923,7 @@ describe('ClaudeConversationHistoryService', () => {
       });
       const locationSpy = jest.spyOn(historyStore, 'locateSDKSessions')
         .mockResolvedValueOnce(new Map<string, SDKSessionLocation>([
-          ['session-previous', { availability: 'unknown' }],
+          ['session-previous', { availability }],
           ['session-1', available('session-1')],
         ]))
         .mockResolvedValueOnce(new Map<string, SDKSessionLocation>([
@@ -908,27 +932,54 @@ describe('ClaudeConversationHistoryService', () => {
         ]));
       const loadSpy = jest.spyOn(historyStore, 'loadSDKSessionMessages')
         .mockImplementation(async (_vaultPath, sessionId) => ({
-          messages: [{
-            id: `message-${sessionId}`,
-            role: 'user',
-            content: sessionId,
-            timestamp: sessionId === 'session-previous' ? 1 : 2,
-          }],
+          messages: sessionId === 'session-previous'
+            ? [{
+              id: 'native-previous-user',
+              role: 'user',
+              content: 'previous question',
+              userMessageId: 'user-previous',
+              timestamp: testDate({ seconds: 1 }).getTime(),
+            }]
+            : [
+              {
+                id: 'native-user',
+                role: 'user',
+                content: 'question',
+                userMessageId: 'user-1',
+                timestamp: testDate({ seconds: 2 }).getTime(),
+              },
+              {
+                id: 'native-assistant',
+                role: 'assistant',
+                content: 'answer',
+                assistantMessageId: 'assistant-1',
+                timestamp: testDate({ seconds: 3 }).getTime(),
+              },
+            ],
           skippedLines: 0,
         }));
 
-      Object.assign(conversation, await service.hydrateConversationHistory(conversation, '/vault'));
-      Object.assign(conversation, await service.hydrateConversationHistory(conversation, '/vault'));
+      try {
+        Object.assign(conversation, await service.hydrateConversationHistory(conversation, '/vault'));
+        // Native history supersedes the copies it reflects; the unreadable segment's copy stays.
+        expect(conversation.messages.map(message => message.id)).toEqual([
+          'local-previous-user',
+          'native-user',
+          'native-assistant',
+        ]);
+        Object.assign(conversation, await service.hydrateConversationHistory(conversation, '/vault'));
 
-      expect(conversation.messages.map(message => message.content)).toEqual([
-        'session-previous',
-        'session-1',
-      ]);
-      expect(locationSpy).toHaveBeenCalledTimes(2);
-      expect(loadSpy).toHaveBeenCalledTimes(3);
-
-      locationSpy.mockRestore();
-      loadSpy.mockRestore();
+        expect(conversation.messages.map(message => message.id)).toEqual([
+          'native-previous-user',
+          'native-user',
+          'native-assistant',
+        ]);
+        expect(locationSpy).toHaveBeenCalledTimes(2);
+        expect(loadSpy).toHaveBeenCalledTimes(3);
+      } finally {
+        locationSpy.mockRestore();
+        loadSpy.mockRestore();
+      }
     });
   });
 });

@@ -117,6 +117,17 @@ For Codex on macOS, auto-detection also checks ChatGPT.app in `/Applications` an
 
 **Alternative**: Add your Node.js bin directory to PATH in Settings → Claudian → General → Environment → Shared environment.
 
+### A newly released model is missing
+
+Claudian discovers models from each configured provider rather than keeping its own hard-coded model list. A model can therefore be available through a provider API or announced publicly before it appears in the catalog returned for your provider installation, configuration, and account.
+
+1. Update the provider CLI or application, when applicable, and confirm the model appears there.
+2. In Settings → Claudian → Providers, open the provider and confirm its CLI path, environment, and other connection settings use the same installation and account.
+3. Under **Models**, click **Discover** to request the current catalog.
+4. Open **Browse models**, enable the new model, and start a new chat if you want to use it. Existing chats keep their selected model.
+
+If the model is still absent, the active provider runtime or account has not reported it to Claudian. Public or API availability alone does not guarantee catalog availability for every provider integration or account. Avoid editing Claudian's installed bundle to add the model manually; those changes are unsupported and will be overwritten by updates.
+
 ### npm CLI and Node.js not in the same directory
 
 When using an npm-installed provider CLI, make sure its executable and Node.js are available from the same environment. Check their paths:

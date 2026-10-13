@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { DEEPSEEK_PRESETS, type DeepSeekPreset } from '../types';
 import { DEEPSEEK_COMPATIBILITY_SOURCE, DEEPSEEK_EPHEMERAL_SOURCE, DEEPSEEK_LIFECYCLE_SOURCE } from './DeepSeekCompatibility';
@@ -84,7 +85,7 @@ export async function prepareDeepSeekLaunchArtifacts(
         { id: 'claudian-lifecycle', name: lifecyclePath },
         ...DEEPSEEK_PRESETS.map(preset => ({
           id: `preset-${preset}`, name: '@deepseek-ai/dsh-agent-preset',
-          config: { id: preset, name: 'Claudian', plugins: buildDeepSeekPresetPlugins(preset, paths, presetPlugins) },
+          config: { id: preset, name: 'Claudian', plugins: buildDeepSeekPresetPlugins(preset, paths, presetPlugins).map(anchorModuleName) },
         })),
       ] },
       { insert: [{ id: 'claudian-ephemeral', name: ephemeralPath, config: { stateFile: ephemeralStatePath, readyFile: ephemeralReadyPath, spillRoot: ephemeralSpillPath, attachmentRoot: ephemeralAttachmentPath } }] },
@@ -104,6 +105,15 @@ export async function prepareDeepSeekLaunchArtifacts(
     throw error;
   }
   return { patchPath, desktopRunnerPath, writePrompt, writeCodeMode, offerEphemeralFork, readEphemeralReady, dispose: () => removeRoot(root) };
+}
+
+/**
+ * Native converts absolute `insert` row names (and their group children) to file URLs, but imports names nested in a
+ * preset's `plugins` literally, where a Windows drive letter reads as a URL scheme and `#` as a fragment.
+ */
+function anchorModuleName<Row extends { readonly name?: unknown; readonly group?: unknown; readonly config?: unknown }>(row: Row): Row {
+  const name = typeof row.name === 'string' && isAbsolute(row.name) ? pathToFileURL(row.name).href : row.name;
+  return { ...row, name, ...(row.group && Array.isArray(row.config) ? { config: row.config.map(anchorModuleName) } : {}) };
 }
 
 // Windows refuses a replacement or removal while a reader, scanner or exiting Host briefly holds a file.
