@@ -18,6 +18,7 @@ import { resolveStoredTaskSubagent } from '@/features/chat/subagents/storedTaskS
 import { resolveSubagentAdapter } from '@/features/chat/subagents/subagentAdapterResolution';
 import { renderSubagentHistory } from '@/features/chat/subagents/SubagentHistoryRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/subagents/SubagentRenderer';
+import { t } from '@/i18n/i18n';
 import { ImagePreviewModal } from '@/shared/modals/ImagePreviewModal';
 import { registerFileLinkHandler } from '@/utils/fileLink';
 
@@ -53,6 +54,7 @@ export class MessageRenderer {
   private removeFileLinkHandler: () => void;
   private readonly imagePreviewModal = new ImagePreviewModal();
   private readonly contentRemovalObserver?: MutationObserver;
+  #pendingLayoutScroll: ResizeObserver | null = null;
   readonly #markdown: MarkdownContentRenderer;
   readonly #actions: MessageActions;
   readonly #finalizer: ResponseFinalizer;
@@ -90,6 +92,7 @@ export class MessageRenderer {
     }));
     this.#markdown = new MarkdownContentRenderer(
       this.app, component, messagesEl, () => this.plugin.settings.mediaFolder,
+      () => this.plugin.settings.pluginRenderedFenceLanguages,
     );
     this.#actions = new MessageActions(plugin, messagesEl, this.getCapabilities, {
       rewind: rewindCallback,
@@ -133,6 +136,7 @@ export class MessageRenderer {
   dispose(): void {
     if (this.#markdown.isDisposed) return;
     this.contentRemovalObserver?.disconnect();
+    this.#cancelLayoutScroll();
     this.#markdown.dispose();
     this.imagePreviewModal.close();
     this.removeFileLinkHandler();
@@ -225,7 +229,7 @@ export class MessageRenderer {
       this.renderStoredMessage(messages[i], messages, i, live && { options: live, open: openIds?.has(messages[i].id) === true });
     }
 
-    this.scrollToBottom();
+    this.#scrollToBottomOnceLaidOut();
     return newWelcomeEl;
   }
 
@@ -353,11 +357,11 @@ export class MessageRenderer {
 
   appendInterruptIndicator(contentEl: HTMLElement): void {
     const textEl = createResponseTextBlock(contentEl);
-    textEl.createSpan({ cls: 'claudian-interrupted', text: 'Interrupted' });
+    textEl.createSpan({ cls: 'claudian-interrupted', text: t('chat.zen.interrupted') });
     textEl.appendText(' ');
     textEl.createSpan({
       cls: 'claudian-interrupted-hint',
-      text: '\u00B7 What should Claudian do instead?',
+      text: t('chat.interruptedHint'),
     });
   }
 
@@ -630,6 +634,27 @@ export class MessageRenderer {
   /** Scrolls messages container to bottom. */
   scrollToBottom(): void {
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  /** A transcript rendered into a hidden presentation ignores scroll writes until it gets a box. */
+  #scrollToBottomOnceLaidOut(): void {
+    this.#cancelLayoutScroll();
+    this.scrollToBottom();
+    if (this.messagesEl.clientHeight > 0) return;
+    const Observer = this.messagesEl.ownerDocument?.defaultView?.ResizeObserver;
+    if (!Observer) return;
+    const observer = new Observer(() => {
+      if (this.messagesEl.clientHeight === 0) return;
+      this.#cancelLayoutScroll();
+      this.scrollToBottom();
+    });
+    this.#pendingLayoutScroll = observer;
+    observer.observe(this.messagesEl);
+  }
+
+  #cancelLayoutScroll(): void {
+    this.#pendingLayoutScroll?.disconnect();
+    this.#pendingLayoutScroll = null;
   }
 
   /** Scrolls to bottom if already near bottom (within threshold). */

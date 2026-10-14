@@ -4,6 +4,7 @@ import type { ProviderCommandDropdownConfig } from '@/core/providers/commands/Pr
 import type { ProviderCommandDiscoverySource } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
 import type { ProviderCommandEntry, ProviderCommandKind } from '@/core/providers/commands/ProviderCommandEntry';
 import type { ProviderId } from '@/core/providers/types';
+import { t } from '@/i18n/i18n';
 
 import type {
   ComposerDropdownItem,
@@ -94,7 +95,7 @@ export class SlashCommandSource implements ComposerDropdownSource {
     if (result && result.status !== 'ready' && result.status !== 'empty') {
       const label = result.status === 'requires-session' || result.status === 'error'
         ? result.message
-        : 'Loading provider commands…';
+        : t('chat.suggestions.providerLoading');
       const statusItems: ComposerDropdownItem[] = [
         ...items,
         {
@@ -106,11 +107,11 @@ export class SlashCommandSource implements ComposerDropdownSource {
       ];
       if (result.status === 'error' && result.retryable) {
         statusItems.push({
-          detail: 'Try provider command discovery again',
+          detail: t('chat.suggestions.providerRetry'),
           icon: 'refresh-cw',
           id: 'provider-retry',
           kind: 'value',
-          label: 'Retry',
+          label: t('common.retry'),
           replacement: '',
           value: { kind: 'retry' } satisfies SlashValue,
         });

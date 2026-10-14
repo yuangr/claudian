@@ -5,6 +5,7 @@ import {
   scheduleAnimationFrame,
   type ScheduledAnimationFrame,
 } from '@/features/chat/utils/animationFrame';
+import { t } from '@/i18n/i18n';
 
 /** Per-turn context only; Linked content lives in the composer info row. */
 export type ComposerContextSlot =
@@ -115,7 +116,9 @@ export class ComposerContextTray {
     moreButton.removeClass('claudian-hidden');
     if (this.expanded) {
       this.containerEl.addClass('claudian-context-row--expanded');
-      moreButton.textContent = 'Show less';
+      const label = t('chat.composer.showLess');
+      moreButton.textContent = label;
+      moreButton.setAttribute('aria-label', label);
       moreButton.setAttribute('aria-expanded', 'true');
       return;
     }
@@ -137,8 +140,8 @@ export class ComposerContextTray {
     }
 
     const hiddenCount = chips.length - visibleCount;
-    moreButton.textContent = `+${hiddenCount} more`;
-    moreButton.setAttribute('aria-label', `Show ${hiddenCount} more context items`);
+    moreButton.textContent = t('chat.composer.moreItems', { count: hiddenCount });
+    moreButton.setAttribute('aria-label', t('chat.composer.moreContext', { count: hiddenCount }));
   }
 
   destroy(): void {
@@ -223,7 +226,7 @@ export class ComposerContextTray {
         text: '\u00D7',
         attr: {
           type: 'button',
-          'aria-label': `Remove ${item.ariaLabel ?? item.label}`,
+          'aria-label': t('chat.removeItem', { item: item.ariaLabel ?? item.label }),
         },
       });
       removeButton.addEventListener('click', item.onRemove);

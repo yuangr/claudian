@@ -7,15 +7,18 @@ import { type App, type Component, MarkdownRenderer, Platform, TFile } from 'obs
 
 import { createCatalogCommandDiscoveryStore } from '@/core/providers/commands/catalogCommandDiscovery';
 import type { ProviderCommandDiscoveryResult } from '@/core/providers/commands/ProviderCommandDiscoveryResult';
+import type { ProviderCommandDiscoverySnapshot } from '@/core/providers/commands/ProviderCommandDiscoveryStore';
 import type { ProviderCommandEntry } from '@/core/providers/commands/ProviderCommandEntry';
 import { ComposerContextTray } from '@/features/chat/composer/ComposerContextTray';
 import { ComposerEditor } from '@/features/chat/composer/ComposerEditor';
+import { ComposerInfoRow } from '@/features/chat/composer/ComposerInfoRow';
 import { ComposerPromptSuggestion } from '@/features/chat/composer/ComposerPromptSuggestion';
 import { formatComposerSessionMention } from '@/features/chat/composer/composerSessionMentions';
 import { FileContextManager } from '@/features/chat/composer/FileContextManager';
 import { ImageContextManager } from '@/features/chat/composer/ImageContextManager';
 import { MainChatComposerDropdown } from '@/features/chat/composer/MainChatComposerDropdown';
 import { CanvasSelectionController } from '@/features/chat/input/CanvasSelectionController';
+import { LinkedContentChip } from '@/features/chat/linked-content/LinkedContentChip';
 import { sendTabInputMessageFromExplicitEnterShortcut } from '@/features/chat/tabs/TabInputEvents';
 import { setLocale } from '@/i18n/i18n';
 import type { Locale } from '@/i18n/types';
@@ -113,19 +116,19 @@ it.each<[string, Locale, string]>([
     editor.element.selectionStart = editor.element.selectionEnd = 7;
     dropdown.handleInputChange();
     await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
-    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toEqual([editor.element]);
-    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(within(parent).getAllByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' })).toEqual([editor.element]);
+    expect(within(parent).getByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' }).getAttribute('aria-multiline')).toBe('true');
     expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
     editor.element.focus();
-    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toHaveLength(1);
-    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(within(parent).getAllByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' })).toHaveLength(1);
+    expect(within(parent).getByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' }).getAttribute('aria-multiline')).toBe('true');
     expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
     dropdown.hide();
     dropdown.handleInputChange();
     const option = await waitFor(() => within(parent).getByRole('option', { name: 'Notes/A note.md' }));
     const listbox = within(parent).getByRole('listbox');
-    expect(within(parent).getAllByRole('textbox', { name: 'Message' })).toHaveLength(1);
-    expect(within(parent).getByRole('textbox', { name: 'Message' }).getAttribute('aria-multiline')).toBe('true');
+    expect(within(parent).getAllByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' })).toHaveLength(1);
+    expect(within(parent).getByRole('textbox', { name: locale === 'de' ? 'Nachricht' : 'Message' }).getAttribute('aria-multiline')).toBe('true');
     expect(await axe(listbox)).toHaveNoViolations();
     expect(await axe(parent, { runOnly: ['aria-allowed-attr'] })).toHaveNoViolations();
     expect(within(parent).getByRole('listbox', { name: menuName })).toBe(listbox);
@@ -806,4 +809,136 @@ it('leaves Resume picker relationships intact when an inactive completion contro
     expect(textbox.getAttribute('aria-haspopup')).toBeNull();
     expect(textbox.getAttribute('aria-autocomplete')).toBeNull();
   } finally { resume?.destroy(); dropdown.destroy(); files.destroy(); editor.destroy(); parent.remove(); }
+});
+
+
+it('localizes the default composer hint before and after CodeMirror mounts', () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  try {
+    const hint = '请求修改、@提及文件、运行 /命令';
+    expect(editor.element.placeholder).toBe(hint);
+    expect(within(parent).getByRole('textbox', { name: '消息' }).getAttribute('data-placeholder')).toBe(hint);
+    editor.element.focus();
+    expect(within(parent).getByRole('textbox', { name: '消息' })).toBeDefined();
+    expect(within(parent).getByText(hint)).toBeDefined();
+  } finally {
+    editor.destroy();
+    parent.remove();
+    setLocale('en');
+  }
+});
+
+
+it('localizes the linked content removal button through the info row', async () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const row = new ComposerInfoRow(parent);
+  const remove = jest.fn();
+  const chip = new LinkedContentChip(row, jest.fn(), remove);
+  try {
+    chip.render({ path: 'Notes/A.md', kind: 'file', label: 'A', icon: 'file-text', missing: false, target: null }, true);
+    const button = within(parent).getByRole('button', { name: '移除关联内容：Notes/A.md' });
+    expect(await axe(parent)).toHaveNoViolations();
+    fireEvent.click(button);
+    expect(remove).toHaveBeenCalledTimes(1);
+  } finally {
+    chip.destroy();
+    row.destroy();
+    parent.remove();
+    setLocale('en');
+  }
+});
+
+
+it('localizes image attachment labels and removal controls', async () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  const images = new ImageContextManager(parent, editor.element, {});
+  try {
+    images.setImages([{ id: 'image', name: 'photo.png', mediaType: 'image/png', data: 'dGVzdA==', size: 500, source: 'paste' }]);
+    fireEvent.click(within(parent).getByRole('button', { name: '图片附件：photo.png · 500 B' }));
+    const preview = within(document.body).getByRole('dialog', { name: '图片预览：photo.png' });
+    expect(within(preview).getByRole('img', { name: 'photo.png' })).toBeDefined();
+    expect(await axe(preview)).toHaveNoViolations();
+    fireEvent.click(within(preview).getByRole('button', { name: '关闭图片预览' }));
+    expect(within(parent).getByText('图片')).toBeDefined();
+    const remove = within(parent).getByRole('button', { name: '移除图片附件：photo.png · 500 B' });
+    expect(await axe(remove)).toHaveNoViolations();
+    fireEvent.click(remove);
+    expect(images.getAttachedImages()).toEqual([]);
+  } finally {
+    images.destroy();
+    editor.destroy();
+    parent.remove();
+    setLocale('en');
+  }
+});
+
+
+it('localizes image overflow controls and updates their accessible names on expansion', async () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  // jsdom has no layout engine or host stylesheet; supply row metrics and host visibility semantics.
+  const style = parent.createEl('style', { text: '.claudian-hidden, .claudian-context-chip--overflow-hidden { display: none; }' });
+  const editor = createEditor(parent);
+  const trayEl = parent.createDiv();
+  const tray = new ComposerContextTray(trayEl);
+  const images = new ImageContextManager(parent, editor.element, {}, undefined, tray);
+  try {
+    images.setImages(Array.from({ length: 4 }, (_, index) => ({
+      id: `image-${index}`, name: `photo-${index}.png`, mediaType: 'image/png' as const,
+      data: 'dGVzdA==', size: 500, source: 'paste' as const,
+    })));
+    const chips = trayEl.querySelectorAll<HTMLElement>('.claudian-context-chip');
+    [0, 0, 38, 76].forEach((top, index) => Object.defineProperties(chips[index], {
+      offsetParent: { configurable: true, value: trayEl },
+      offsetTop: { configurable: true, value: top }, offsetHeight: { configurable: true, value: 20 },
+    }));
+    tray.refreshLayout();
+    const more = within(trayEl).getByRole('button', { name: '显示另外 2 项上下文' });
+    expect(more.textContent).toBe('+2 项');
+    fireEvent.click(more);
+    const less = within(trayEl).getByRole('button', { name: '收起' });
+    expect(less).toBe(more);
+    expect(less.textContent).toBe('收起');
+    expect(less.getAttribute('aria-expanded')).toBe('true');
+    expect(within(trayEl).getByRole('button', { name: '图片附件：photo-3.png · 500 B' })).toBeDefined();
+    expect(await axe(trayEl)).toHaveNoViolations();
+    fireEvent.click(less);
+    expect(within(trayEl).getByRole('button', { name: '显示另外 2 项上下文' })).toBe(more);
+    expect(more.getAttribute('aria-expanded')).toBe('false');
+    expect(within(trayEl).queryByRole('button', { name: '图片附件：photo-3.png · 500 B' })).toBeNull();
+  } finally {
+    images.destroy(); tray.destroy(); editor.destroy(); style.remove(); parent.remove(); setLocale('en');
+  }
+});
+
+
+it.each(['loading', 'error'] as const)('localizes provider command %s wrappers through the real dropdown', async status => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  const files = new FileContextManager(new VaultMentionDataProvider(createApp()));
+  const snapshot: ProviderCommandDiscoverySnapshot<ProviderCommandEntry> = status === 'loading'
+    ? { status: 'loading' } : { status: 'error', message: 'Native discovery failure', retryable: true };
+  const dropdown = new MainChatComposerDropdown(parent, editor.element, files, {
+    providerId: 'codex', providerDiscovery: {
+      getSnapshot: () => snapshot, load: async () => ({ status: 'empty' }), retry: async () => ({ status: 'empty' }), subscribe: () => () => undefined,
+    },
+  });
+  try {
+    editor.element.value = '/';
+    editor.element.selectionStart = editor.element.selectionEnd = 1;
+    dropdown.handleInputChange();
+    const expectedTexts = status === 'loading'
+      ? ['正在加载提供商命令…'] : ['重新查找提供商命令', 'Native discovery failure'];
+    await waitFor(() => expect(expectedTexts.map(text => within(parent).getByText(text).textContent)).toEqual(expectedTexts));
+    const optionName = status === 'loading' ? '正在加载提供商命令…' : /重试/;
+    expect(within(parent).getByRole('option', { name: optionName })).toBeDefined();
+  } finally {
+    dropdown.destroy(); files.destroy(); editor.destroy(); parent.remove(); setLocale('en');
+  }
 });

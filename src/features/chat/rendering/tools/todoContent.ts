@@ -2,6 +2,7 @@ import { setIcon } from 'obsidian';
 
 import type { TodoItem } from '@/core/tools/todo';
 import { setToolStatus } from '@/features/chat/rendering/tools/toolStatus';
+import { t } from '@/i18n/i18n';
 
 function getTodos(input: Record<string, unknown>): TodoItem[] | undefined {
   const todos = input.todos;
@@ -15,12 +16,12 @@ function countCompleted(todos: TodoItem[]): number {
 
 export function getTodoName(input: Record<string, unknown>): string {
   const todos = getTodos(input);
-  return todos && todos.length > 0 ? `Tasks ${countCompleted(todos)}/${todos.length}` : 'Tasks';
+  return todos && todos.length > 0 ? t('chat.tools.taskProgress', { completed: countCompleted(todos), total: todos.length }) : t('chat.tools.tasks');
 }
 
 export function getTodoLabel(input: Record<string, unknown>): string {
   const todos = getTodos(input);
-  return todos ? `Tasks (${countCompleted(todos)}/${todos.length})` : 'Tasks';
+  return todos ? t('chat.tools.taskProgressLabel', { completed: countCompleted(todos), total: todos.length }) : t('chat.tools.tasks');
 }
 
 /** The in-progress task's active form, shown beside the collapsed header. */
@@ -33,7 +34,7 @@ export function setTodoWriteStatus(statusEl: HTMLElement, input: Record<string, 
   if (isComplete) {
     setToolStatus(statusEl, 'completed', 'claudian-tool-status');
   } else {
-    setToolStatus(statusEl, 'running', 'claudian-tool-status', 'Status: in progress');
+    setToolStatus(statusEl, 'running', 'claudian-tool-status', t('chat.tools.inProgress'));
   }
 }
 
@@ -45,7 +46,7 @@ export function renderTodoWriteContent(container: HTMLElement, input: Record<str
   const todos = getTodos(input);
   if (!todos) {
     const item = container.createSpan({ cls: 'claudian-tool-result-item' });
-    item.setText('Tasks updated');
+    item.setText(t('chat.tools.tasksUpdated'));
     return;
   }
 

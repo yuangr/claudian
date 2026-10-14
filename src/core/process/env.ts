@@ -7,6 +7,13 @@ const isWindows = process.platform === 'win32';
 const PATH_SEPARATOR = isWindows ? ';' : ':';
 const NODE_EXECUTABLE = isWindows ? 'node.exe' : 'node';
 
+let loginShellPathEntries: readonly string[] = [];
+
+/** Written only by `resolveLoginShellPath`, which owns reading the login shell. */
+export function setLoginShellPathEntries(entries: readonly string[]): void {
+  loginShellPathEntries = entries;
+}
+
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || '';
 }
@@ -25,6 +32,74 @@ function getMiseShimsDir(home: string): string | null {
   return home ? path.join(home, '.local', 'share', 'mise', 'shims') : null;
 }
 
+/** fnm's default Node.js alias, reachable without the shell or PowerShell profile hook. */
+function getFnmDefaultBinPaths(home: string): string[] {
+  const fnmDir = process.env.FNM_DIR;
+  const roots = isWindows
+    ? [
+      fnmDir,
+      process.env.APPDATA && path.join(process.env.APPDATA, 'fnm'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'fnm'),
+    ]
+    : [
+      fnmDir,
+      process.env.XDG_DATA_HOME && path.join(process.env.XDG_DATA_HOME, 'fnm'),
+      home && path.join(home, '.local', 'share', 'fnm'),
+      home && process.platform === 'darwin' && path.join(home, 'Library', 'Application Support', 'fnm'),
+      home && path.join(home, '.fnm'),
+    ];
+  // Windows installations keep node.exe at the version root rather than in bin.
+  const aliasSegments = isWindows ? ['aliases', 'default'] : ['aliases', 'default', 'bin'];
+  return roots
+    .filter((root): root is string => typeof root === 'string' && root.length > 0)
+    .map(root => path.join(root, ...aliasSegments));
+}
+
+function joinIfRoot(root: string | undefined, ...segments: string[]): string | null {
+  return root ? path.join(root, ...segments) : null;
+}
+
+function getProtoBinPaths(home: string): Array<string | null> {
+  const root = process.env.PROTO_HOME ?? joinIfRoot(home, '.proto') ?? undefined;
+  return [joinIfRoot(root, 'shims'), joinIfRoot(root, 'bin')];
+}
+
+/** Node.js and CLI managers whose bins are normally added by a shell profile or installer. */
+function getManagerBinPaths(home: string): string[] {
+  const env = process.env;
+  const paths = isWindows
+    ? [
+      env.PNPM_HOME ?? joinIfRoot(env.LOCALAPPDATA, 'pnpm'),
+      ...getProtoBinPaths(home),
+      joinIfRoot(env.NVS_HOME, 'default') ?? joinIfRoot(env.LOCALAPPDATA, 'nvs', 'default'),
+      joinIfRoot(env.LOCALAPPDATA, 'Yarn', 'bin'),
+      joinIfRoot(env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links'),
+    ]
+    : getUnixManagerBinPaths(home);
+  return paths.filter((entry): entry is string => !!entry);
+}
+
+function getUnixManagerBinPaths(home: string): Array<string | null> {
+  const env = process.env;
+  const dataHome = env.XDG_DATA_HOME ?? joinIfRoot(home, '.local', 'share') ?? undefined;
+  return [
+    // Node.js installed by Pi's managed installer.
+    joinIfRoot(dataHome, 'pi-node', 'current', 'bin'),
+    joinIfRoot(env.NODENV_ROOT, 'shims') ?? joinIfRoot(home, '.nodenv', 'shims'),
+    ...getProtoBinPaths(home),
+    env.PNPM_HOME ?? null,
+    process.platform === 'darwin' ? joinIfRoot(home, 'Library', 'pnpm') : null,
+    joinIfRoot(dataHome, 'pnpm'),
+    joinIfRoot(env.N_PREFIX, 'bin'),
+    joinIfRoot(env.NVS_HOME, 'default', 'bin') ?? joinIfRoot(home, '.nvs', 'default', 'bin'),
+    joinIfRoot(home, '.nix-profile', 'bin'),
+    '/nix/var/nix/profiles/default/bin',
+    '/run/current-system/sw/bin',
+    '/opt/local/bin',  // MacPorts
+    '/home/linuxbrew/.linuxbrew/bin',
+  ];
+}
+
 // Windows ships Obsidian.com beside the app. Unix uses registered CLI locations;
 // adding the macOS app directory can select the GUI executable as `obsidian`.
 function getAppProvidedCLIPaths(): string[] {
@@ -35,10 +110,13 @@ function getAppProvidedCLIPaths(): string[] {
   return [];
 }
 
-/** GUI apps like Obsidian have minimal PATH, so we add common binary locations. */
+/**
+ * GUI apps like Obsidian have minimal PATH. The resolved login-shell PATH comes first;
+ * common binary locations cover shells that could not be read.
+ */
 function getExtraBinaryPaths(): string[] {
   const home = getHomeDir();
-  const paths: string[] = [];
+  const paths: string[] = [...loginShellPathEntries];
 
   if (isWindows) {
     const localAppData = process.env.LOCALAPPDATA;
@@ -82,19 +160,7 @@ function getExtraBinaryPaths(): string[] {
       paths.push(path.join(home, '.volta', 'bin'));
     }
 
-    // fnm (Fast Node Manager): %FNM_MULTISHELL_PATH% is the active Node.js bin
-    const fnmMultishell = process.env.FNM_MULTISHELL_PATH;
-    if (fnmMultishell) {
-      paths.push(fnmMultishell);
-    }
-
-    // fnm (Fast Node Manager): %FNM_DIR% or %LOCALAPPDATA%\fnm
-    const fnmDir = process.env.FNM_DIR;
-    if (fnmDir) {
-      paths.push(fnmDir);
-    } else if (localAppData) {
-      paths.push(path.join(localAppData, 'fnm'));
-    }
+    paths.push(...getFnmDefaultBinPaths(home));
 
     // Chocolatey: %ChocolateyInstall%\bin or C:\ProgramData\chocolatey\bin
     const chocolateyInstall = process.env.ChocolateyInstall;
@@ -146,15 +212,7 @@ function getExtraBinaryPaths(): string[] {
       paths.push(path.join(asdfRoot, 'bin'));
     }
 
-    const fnmMultishell = process.env.FNM_MULTISHELL_PATH;
-    if (fnmMultishell) {
-      paths.push(fnmMultishell);
-    }
-
-    const fnmDir = process.env.FNM_DIR;
-    if (fnmDir) {
-      paths.push(fnmDir);
-    }
+    paths.push(...getFnmDefaultBinPaths(home));
 
     if (home) {
       paths.push(path.join(home, 'bin'));
@@ -166,7 +224,6 @@ function getExtraBinaryPaths(): string[] {
       paths.push(path.join(home, '.volta', 'bin'));
       paths.push(path.join(home, '.asdf', 'shims'));
       paths.push(path.join(home, '.asdf', 'bin'));
-      paths.push(path.join(home, '.fnm'));
 
       // NVM: use NVM_BIN if set, otherwise resolve default version from filesystem
       const nvmBin = process.env.NVM_BIN;
@@ -180,6 +237,8 @@ function getExtraBinaryPaths(): string[] {
       }
     }
   }
+
+  paths.push(...getManagerBinPaths(home));
 
   const npmPrefix = process.env.npm_config_prefix;
   if (npmPrefix) {

@@ -2,12 +2,14 @@ import type { App, Component } from 'obsidian';
 import { MarkdownRenderer } from 'obsidian';
 
 import {
+  getPluginFenceLanguageSet,
   prepareDisplayOnlyCodeFences,
   restoreDisplayOnlyCodeFences,
 } from '@/features/chat/rendering/markdown/DisplayOnlyCodeFences';
 import { escapeRawHTMLTags } from '@/features/chat/rendering/markdown/markdownHTML';
 import { MarkdownRenderScope } from '@/features/chat/rendering/markdown/MarkdownRenderScope';
 import { renderMermaidDiagrams } from '@/features/chat/rendering/markdown/MermaidRenderer';
+import { t } from '@/i18n/i18n';
 import { enhanceRenderedCodeFence } from '@/shared/components/CopyableCodeFence';
 import { processFileLinks } from '@/utils/fileLink';
 import { replaceImageEmbedsWithHTML } from '@/utils/imageEmbed';
@@ -34,6 +36,7 @@ export class MarkdownContentRenderer {
     private readonly component: Component,
     private readonly rootEl: HTMLElement,
     private readonly getMediaFolder: () => string,
+    private readonly getPluginFenceLanguages: () => readonly string[] | undefined,
   ) {}
 
   get isDisposed(): boolean {
@@ -68,7 +71,11 @@ export class MarkdownContentRenderer {
       // as plain text. Trusted plugin markup (image embeds) is injected only
       // after this step, otherwise it would be escaped too.
       const safeMarkdown = escapeRawHTMLTags(renderMarkdown);
-      const displayOnlyCodeFences = prepareDisplayOnlyCodeFences(safeMarkdown);
+      // Plugin-rendered fences stay inert until the message is final, like Mermaid.
+      const displayOnlyCodeFences = prepareDisplayOnlyCodeFences(
+        safeMarkdown,
+        options?.deferDiagrams ? undefined : getPluginFenceLanguageSet(this.getPluginFenceLanguages()),
+      );
       const processedMarkdown = replaceImageEmbedsWithHTML(
         displayOnlyCodeFences.markdown,
         this.app,
@@ -100,7 +107,7 @@ export class MarkdownContentRenderer {
       this.#releaseOne(el);
       el.createDiv({
         cls: 'claudian-render-error',
-        text: 'Failed to render message content.',
+        text: t('chat.renderFailed'),
       });
     }
   }
