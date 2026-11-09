@@ -5,6 +5,10 @@ import type {
   SDKUserMessage,
   SlashCommand,
 } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+import { createSessionToolMCPServer, SESSION_TOOL_MCP_SERVER_NAME } from '@/core/session-tools/sessionToolMCP';
+import type { SessionToolCallHandler } from '@/core/session-tools/sessionToolSpecs';
 
 import { loadClaudeAgentQuery } from '../loadClaudeAgentSDK';
 import { MessageChannel } from '../runtime/ClaudeMessageChannel';
@@ -13,7 +17,7 @@ import {
   type ClaudeSDKUserMessage,
 } from '../runtime/ClaudeUserMessageFactory';
 import type { ClaudeEncodedExecutionRequest } from './ClaudeExecutionRequestEncoder';
-import { ClaudeTurnInputs } from './ClaudeTurnInputs';
+import { type ClaudeSteerDelivery, ClaudeTurnInputs } from './ClaudeTurnInputs';
 
 export interface ClaudeCommandUpdate {
   readonly commands?: SlashCommand[];
@@ -22,6 +26,7 @@ export interface ClaudeCommandUpdate {
 
 export interface ClaudeExecutionStrategySink {
   readonly sessionInstanceId: string;
+  getSessionToolHandler(signal: AbortSignal): SessionToolCallHandler | undefined;
   getProviderSessionId(): string | null;
   assertModelAvailable(model: string): void;
   bindNativeTurnInputs(inputs: ClaudeTurnInputs, queryToken: number): void;
@@ -43,10 +48,10 @@ export interface ClaudeExecutionStrategy {
     queryToken: number,
   ): Promise<void>;
   /**
-   * Hands a steer to the live native turn for `queryToken`. Returns false only
-   * when nothing was handed off.
+   * Hands a steer to the live native turn for `queryToken`; its turn inputs
+   * settle `delivery`. Returns false only when nothing was handed off.
    */
-  steerTurn(message: ClaudeSDKUserMessage, queryToken: number): boolean;
+  steerTurn(message: ClaudeSDKUserMessage, queryToken: number, delivery: ClaudeSteerDelivery): boolean;
   cancel(queryToken: number | null, nativeTurnHandedOff: boolean): void;
   getRewindQuery(): Query | null;
   ensureReadyForRewind(
@@ -68,19 +73,30 @@ interface PersistentNativeTurn {
   settle(outcome: PersistentNativeTurnOutcome): void;
 }
 
+/** The open persistent query and what was opened with it; replaced or cleared as one. */
+interface LiveQuery {
+  readonly query: Query;
+  readonly channel: MessageChannel;
+  readonly abortController: AbortController;
+  /** The configuration the process runs with, updated as dynamic settings apply. */
+  config: ClaudeEncodedExecutionRequest;
+}
+
 export class ClaudePersistentExecutionStrategy
 implements ClaudeExecutionStrategy {
-  private query: Query | null = null;
-  private messageChannel: MessageChannel | null = null;
-  private abortController: AbortController | null = null;
+  #live: LiveQuery | null = null;
+  /** Outlives its query: disposal waits for the consumer to unwind. */
   private consumerPromise: Promise<void> | null = null;
-  private currentConfig: ClaudeEncodedExecutionRequest | null = null;
   private activeNativeTurn: PersistentNativeTurn | null = null;
   private preparingTurnToken: number | null = null;
   private hasNonPersistentContext = false;
   private disposed = false;
 
   constructor(private readonly sink: ClaudeExecutionStrategySink) {}
+
+  private get query(): Query | null {
+    return this.#live?.query ?? null;
+  }
 
   async startTurn(
     request: ClaudeEncodedExecutionRequest,
@@ -90,7 +106,6 @@ implements ClaudeExecutionStrategy {
     const priorTurn = this.activeNativeTurn;
     if (priorTurn) {
       const outcome = await priorTurn.completion;
-      requestSignal?.throwIfAborted();
       if (outcome.type === 'failed') {
         throw outcome.error;
       }
@@ -101,12 +116,16 @@ implements ClaudeExecutionStrategy {
     try {
       await this.#ensureQuery(request, queryToken);
       requestSignal?.throwIfAborted();
-      if (!this.query || !this.messageChannel) {
+      if (!this.#live) {
         throw new Error('Claude Code persistent query is unavailable');
       }
 
       await this.#applyDynamicUpdates(request);
       requestSignal?.throwIfAborted();
+      const live = this.#live;
+      if (!live) {
+        throw new Error('Claude Code persistent query is unavailable');
+      }
       const message = buildClaudeSDKUserMessage(
         request.prompt,
         this.sink.getProviderSessionId() ?? '',
@@ -114,11 +133,9 @@ implements ClaudeExecutionStrategy {
       );
       const inputs = new ClaudeTurnInputs(message.uuid);
       this.sink.bindNativeTurnInputs(inputs, queryToken);
-      requestSignal?.throwIfAborted();
-      const query = this.query;
       this.sink.assertModelAvailable(request.model);
-      this.messageChannel.enqueue(message);
-      this.activeNativeTurn = createPersistentNativeTurn(query, queryToken, inputs);
+      live.channel.enqueue(message);
+      this.activeNativeTurn = createPersistentNativeTurn(live.query, queryToken, inputs);
       this.hasNonPersistentContext ||= request.options.persistSession === false;
       this.sink.markNativeTurnHandedOff(queryToken);
     } finally {
@@ -128,23 +145,24 @@ implements ClaudeExecutionStrategy {
     }
   }
 
-  steerTurn(message: ClaudeSDKUserMessage, queryToken: number): boolean {
+  steerTurn(message: ClaudeSDKUserMessage, queryToken: number, delivery: ClaudeSteerDelivery): boolean {
     const nativeTurn = this.activeNativeTurn;
+    const live = this.#live;
     if (
       this.disposed
       || !nativeTurn
+      || !live
       || nativeTurn.queryToken !== queryToken
-      || nativeTurn.query !== this.query
+      || nativeTurn.query !== live.query
       || nativeTurn.inputs.settled
-      || !this.messageChannel
       // Recalling a queued steer restarts the process, which non-persistent context cannot survive.
       || this.hasNonPersistentContext
     ) {
       return false;
     }
-    nativeTurn.inputs.addSteer(message.uuid);
+    nativeTurn.inputs.addSteer(message.uuid, delivery);
     // 'next' folds at the next native boundary; 'now' would abort the running tool.
-    this.messageChannel.enqueue({ ...message, priority: 'next' });
+    live.channel.enqueue({ ...message, priority: 'next' });
     return true;
   }
 
@@ -192,12 +210,11 @@ implements ClaudeExecutionStrategy {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    const query = this.query;
-    this.messageChannel?.close();
-    this.abortController?.abort();
-    this.query = null;
-    this.messageChannel = null;
-    this.abortController = null;
+    const live = this.#live;
+    this.#live = null;
+    live?.channel.close();
+    live?.abortController.abort();
+    const query = live?.query;
     if (query) {
       this.sink.handleNativeQueryClosed(query);
       this.#finishNativeTurn(query, {
@@ -208,7 +225,6 @@ implements ClaudeExecutionStrategy {
     }
     await this.consumerPromise?.catch(() => undefined);
     this.consumerPromise = null;
-    this.currentConfig = null;
   }
 
   async #ensureQuery(
@@ -216,26 +232,18 @@ implements ClaudeExecutionStrategy {
     queryToken: number,
   ): Promise<void> {
     const requestSignal = request.options.abortController?.signal;
-    requestSignal?.throwIfAborted();
     if (this.disposed) {
       throw new Error('Claude Code persistent strategy is disposed');
     }
     if (
       this.hasNonPersistentContext
-      && (
-        !this.query
-        || this.currentConfig?.restartKey !== request.restartKey
-      )
+      && this.#live?.config.restartKey !== request.restartKey
     ) {
       throw new Error(
         'This non-persistent Claude Code session cannot be restored after its configuration or process changes. Start a new request.',
       );
     }
-    if (
-      this.query
-      && this.currentConfig
-      && this.currentConfig.restartKey !== request.restartKey
-    ) {
+    if (this.#live && this.#live.config.restartKey !== request.restartKey) {
       await this.#closeCurrentQuery();
       requestSignal?.throwIfAborted();
     }
@@ -257,14 +265,12 @@ implements ClaudeExecutionStrategy {
       ...request.options,
       abortController,
     };
+    attachSessionTools(options, this.sink, abortController.signal);
     const query = agentQuery({
       prompt: messageChannel,
       options,
     });
-    this.abortController = abortController;
-    this.messageChannel = messageChannel;
-    this.query = query;
-    this.currentConfig = request;
+    this.#live = { abortController, channel: messageChannel, config: request, query };
     this.sink.handleNativeQueryOpened(query);
     this.consumerPromise = this.#consume(query, queryToken);
   }
@@ -272,13 +278,15 @@ implements ClaudeExecutionStrategy {
   async #applyDynamicUpdates(
     request: ClaudeEncodedExecutionRequest,
   ): Promise<void> {
-    const query = this.query;
-    const current = this.currentConfig;
-    if (!query || !current) return;
+    const live = this.#live;
+    if (!live) return;
+    const { query } = live;
+    let current = live.config;
 
     if (request.model !== current.model) {
       await query.setModel(request.model);
-      if (this.query !== query || this.disposed) return;
+      if (this.#live !== live || this.disposed) return;
+      live.config = current = { ...current, model: request.model };
     }
     const flagSettings: Parameters<Query['applyFlagSettings']>[0] = {
       ...(request.effort !== current.effort
@@ -291,13 +299,14 @@ implements ClaudeExecutionStrategy {
     };
     if (Object.keys(flagSettings).length > 0) {
       await query.applyFlagSettings(flagSettings);
-      if (this.query !== query || this.disposed) return;
+      if (this.#live !== live || this.disposed) return;
+      live.config = current = { ...current, effort: request.effort, outputStyle: request.outputStyle };
     }
     if (request.sdkPermissionMode !== current.sdkPermissionMode) {
       await query.setPermissionMode(request.sdkPermissionMode);
-      if (this.query !== query || this.disposed) return;
+      if (this.#live !== live || this.disposed) return;
     }
-    this.currentConfig = request;
+    live.config = request;
   }
 
   async #consume(query: Query, queryToken: number): Promise<void> {
@@ -319,7 +328,7 @@ implements ClaudeExecutionStrategy {
           message,
           nativeTurn?.queryToken ?? queryToken,
         );
-        if (message.type === 'result' && nativeTurn?.inputs.settled) {
+        if (nativeTurn?.inputs.settled) {
           this.#finishNativeTurn(query, { type: 'completed' });
         }
       }
@@ -373,13 +382,11 @@ implements ClaudeExecutionStrategy {
   }
 
   #detachCurrentQuery(query: Query): void {
-    if (this.query !== query) return;
-    this.messageChannel?.close();
-    this.abortController?.abort();
-    this.query = null;
-    this.messageChannel = null;
-    this.abortController = null;
-    this.currentConfig = null;
+    const live = this.#live;
+    if (live?.query !== query) return;
+    this.#live = null;
+    live.channel.close();
+    live.abortController.abort();
     this.sink.handleNativeQueryClosed(query);
   }
 }
@@ -431,6 +438,7 @@ implements ClaudeExecutionStrategy {
       const agentQuery = await loadClaudeAgentQuery();
       abortController.signal.throwIfAborted();
       this.sink.assertModelAvailable(request.model);
+      attachSessionTools(options, this.sink, abortController.signal);
       query = agentQuery({ options, prompt });
       this.activeQuery = query;
       this.sink.handleNativeQueryOpened(query);
@@ -520,16 +528,28 @@ function createPersistentNativeTurn(
       resolve = innerResolve;
     },
   );
-  let settled = false;
   return {
     query,
     queryToken,
     inputs,
     completion,
-    settle: (outcome) => {
-      if (settled) return;
-      settled = true;
-      resolve(outcome);
-    },
+    settle: resolve,
+  };
+}
+
+/** Construct at query launch: an SDK server instance belongs to one transport. */
+function attachSessionTools(options: Options, sink: ClaudeExecutionStrategySink, signal: AbortSignal): void {
+  const handler = sink.getSessionToolHandler(signal);
+  if (!handler) return;
+  options.mcpServers = {
+    ...options.mcpServers,
+    [SESSION_TOOL_MCP_SERVER_NAME]: {
+      type: 'sdk',
+      name: SESSION_TOOL_MCP_SERVER_NAME,
+      instance: createSessionToolMCPServer(handler) as unknown as McpServer,
+      timeout: 60_000,
+      // Supported by the pinned SDK runtime, but not yet by its public type.
+      disableAutoBackground: true,
+    } as NonNullable<Options['mcpServers']>[string],
   };
 }

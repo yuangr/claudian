@@ -1,6 +1,11 @@
 import * as path from 'node:path';
 
+import { normalizeImageMediaType } from '@/core/execution/imageAttachment';
+import type { ExecutionPathMapper } from '@/core/process/execution-target/types';
+import { decodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import { resolveToolDiffData } from '@/core/tools/toolDiff';
+import { extractACPDiffResultDetails } from '@/providers/acp/ACPToolResultNormalization';
+import { readFileRevision } from '@/utils/fileRevision';
 import { forEachJSONLLine } from '@/utils/jsonlFile';
 
 import { isWriteEditTool, TOOL_ASK_USER_QUESTION } from '../../../core/tools/toolNames';
@@ -9,11 +14,10 @@ import type {
   ChatMessage,
   ContentBlock,
   ImageAttachment,
-  ImageMediaType,
   ToolCallInfo,
   ToolResultDetails,
 } from '../../../core/types';
-import { extractACPDiffResultDetails } from '../../acp/ACPToolResultNormalization';
+import { mapGrokNativePaths } from '../normalization/grokNativePaths';
 import {
   buildGrokToolProviderPayload,
   type GrokRawToolNameResolution,
@@ -64,6 +68,8 @@ interface StoredTool {
 
 interface PendingTurn {
   assistantContent: string;
+  /** Native `stop_reason: cancelled`: the user stopped the turn. */
+  interrupted?: boolean;
   durationSeconds?: number;
   completedAt?: number;
   assistantId?: string;
@@ -96,6 +102,7 @@ export interface GrokHistoryLineConsumer<T> {
 export function createGrokHistoryParser(
   sessionId: string,
   resumeAt?: string,
+  pathMapper?: ExecutionPathMapper,
 ): GrokHistoryLineConsumer<ParsedGrokHistory> {
   let completedTurns: CompletedTurn[] = [];
   let pending: PendingTurn | null = null;
@@ -116,6 +123,16 @@ export function createGrokHistoryParser(
       promptIndex: turn.timelinePromptIndex,
       ...(usage ? { usage } : {}),
     });
+    if (turn.interrupted) {
+      // Steers split one native prompt into several displayed replies.
+      for (const segment of completedTurns.filter(item => item.promptIndex === turn.timelinePromptIndex)) {
+        for (const message of segment.messages) {
+          for (const tool of message.toolCalls ?? []) {
+            if (tool.status === 'running') tool.status = 'error';
+          }
+        }
+      }
+    }
     turnIndex += 1;
     return true;
   };
@@ -128,7 +145,7 @@ export function createGrokHistoryParser(
     if (readString(record.params.sessionId) !== sessionId) {
       return;
     }
-    const update = readRecord(record.params.update);
+    const update = mapGrokNativePaths(readRecord(record.params.update), pathMapper);
     if (!update) {
       return;
     }
@@ -272,6 +289,7 @@ export function createGrokHistoryParser(
     if (updateType === 'turn_completed') {
       const completedAt = normalizeTimestamp(record.timestamp);
       const stopReason = readString(update.stop_reason) ?? readString(update.stopReason);
+      pending.interrupted = stopReason === 'cancelled';
       if (stopReason !== 'cancelled' && stopReason !== 'error'
         && Number.isFinite(pending.startedAt) && pending.startedAt > 0
         && Number.isFinite(completedAt) && completedAt >= pending.startedAt) {
@@ -377,8 +395,9 @@ export async function loadGrokHistory(
   sessionDirectory: string,
   sessionId: string,
   resumeAt?: string,
+  pathMapper?: ExecutionPathMapper,
 ): Promise<ParsedGrokHistory> {
-  return await readGrokUpdates(sessionDirectory, createGrokHistoryParser(sessionId, resumeAt))
+  return await readGrokUpdates(sessionDirectory, createGrokHistoryParser(sessionId, resumeAt, pathMapper))
     ?? { messages: [] };
 }
 
@@ -398,6 +417,15 @@ export async function loadGrokPromptIndexAfterAssistant(
   }
 }
 
+/** Cheap change token for the updates file hydration reads; null when it cannot be observed. */
+export function readGrokHistoryRevision(sessionDirectory: string): Promise<string | null> {
+  return readFileRevision(getGrokUpdatesPath(sessionDirectory));
+}
+
+function getGrokUpdatesPath(sessionDirectory: string): string {
+  return path.join(sessionDirectory, 'updates.jsonl');
+}
+
 /** Streams native updates; resolves null only when the session has no updates file. */
 async function readGrokUpdates<T>(
   sessionDirectory: string,
@@ -405,7 +433,7 @@ async function readGrokUpdates<T>(
 ): Promise<T | null> {
   try {
     await forEachJSONLLine(
-      path.join(sessionDirectory, 'updates.jsonl'),
+      getGrokUpdatesPath(sessionDirectory),
       line => consumer.pushLine(line),
     );
   } catch (error) {
@@ -456,9 +484,11 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
     title: readString(update.title),
   });
   const rawName = rawNameResolution.rawName;
-  const rawInput = update.rawInput !== undefined ? update.rawInput : current?.rawInput;
+  // ACP v1 treats null raw fields like omitted updates; an initial null remains native payload.
+  const rawInput = update.rawInput !== undefined && (update.rawInput !== null || !current)
+    ? update.rawInput : current?.rawInput;
   const renderedContent = renderToolContent(update.content);
-  const rawOutput = update.rawOutput !== undefined
+  const rawOutput = update.rawOutput !== undefined && (update.rawOutput !== null || !current)
     ? update.rawOutput
     : current?.rawOutput;
   const normalized = normalizeGrokToolCall({
@@ -471,7 +501,7 @@ function reconcileToolUpdate(turn: PendingTurn, update: Record<string, unknown>)
   const acpResultDetails = extractACPDiffResultDetails(update.content)
     ?? current?.acpResultDetails;
   // Explicit text content is the presentation, even when empty (e.g. an image-only MCP result).
-  const output = hasTextContent(update.content) ? renderedContent : renderedContent || (update.rawOutput === undefined
+  const output = hasTextContent(update.content) ? renderedContent : renderedContent || (update.rawOutput == null
     ? current?.output || normalized.output
     : normalized.output || current?.output) || '';
 
@@ -506,7 +536,9 @@ function finalizeTurn(
   const assistantId = turn.assistantId
     ?? promptId
     ?? `grok-${scope}-turn-${turn.turnIndex}-assistant`;
+  const sessionMessage = decodeSessionMessage(turn.userContent);
   const user: ChatMessage = {
+    ...(sessionMessage ? { sessionMessage: { from: sessionMessage.from, sessionId: sessionMessage.sessionId } } : {}),
     content: turn.userContent,
     id: userId,
     role: 'user',
@@ -516,7 +548,10 @@ function finalizeTurn(
   };
 
   if (!turn.assistantContent && turn.blocks.length === 0 && turn.tools.size === 0) {
-    return [user];
+    // A turn stopped before any output keeps a bare marker, as the live Stop renders it.
+    return turn.interrupted
+      ? [user, { id: assistantId, role: 'assistant', content: '', timestamp: turn.startedAt, isInterrupt: true, turnId: promptId ?? assistantId }]
+      : [user];
   }
   const toolCalls = turn.toolOrder.flatMap((id) => {
     const tool = turn.tools.get(id);
@@ -554,9 +589,12 @@ function finalizeTurn(
   });
   const assistant: ChatMessage = {
     assistantMessageId: assistantId,
+    // The native prompt ID its `turn_completed` reports.
+    turnId: promptId ?? assistantId,
     content: turn.assistantContent,
     completedAt: turn.completedAt,
     ...(turn.durationSeconds !== undefined ? { durationSeconds: turn.durationSeconds } : {}),
+    ...(turn.interrupted ? { isInterrupt: true } : {}),
     ...(turn.blocks.length > 0 ? { contentBlocks: turn.blocks } : {}),
     id: assistantId,
     role: 'assistant',
@@ -617,7 +655,7 @@ function extractImageAttachment(
   const content = readRecord(value);
   if (!content || content.type !== 'image') return null;
   const data = readString(content.data);
-  const mediaType = readImageMediaType(content.mimeType);
+  const mediaType = normalizeImageMediaType(content.mimeType);
   if (!data || !mediaType) return null;
   const extension = mediaType === 'image/jpeg' ? 'jpg' : mediaType.slice('image/'.length);
   return {
@@ -628,18 +666,6 @@ function extractImageAttachment(
     size: Buffer.from(data, 'base64').byteLength,
     source: 'file',
   };
-}
-
-function readImageMediaType(value: unknown): ImageMediaType | null {
-  switch (value) {
-    case 'image/gif':
-    case 'image/jpeg':
-    case 'image/png':
-    case 'image/webp':
-      return value;
-    default:
-      return null;
-  }
 }
 
 function hasTextContent(value: unknown): boolean {

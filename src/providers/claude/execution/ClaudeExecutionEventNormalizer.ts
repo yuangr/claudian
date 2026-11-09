@@ -1,5 +1,7 @@
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+
 import type {
   ProviderAssistantMessageStartedEvent,
   ProviderCitationsEvent,
@@ -16,6 +18,8 @@ import type {
 } from '../../../core/execution';
 import type { TurnStats, UsageInfo } from '../../../core/types';
 import { createTurnStats } from '../../../core/types';
+import { mapClaudeToolInputPaths, mapClaudeToolResultPaths } from '../normalization/claudePaths';
+import { normalizeClaudeSessionToolName } from '../normalization/claudeSessionToolNames';
 import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
 import { normalizeClaudeToolResultDetails } from '../normalization/claudeToolResultDetails';
 import type {
@@ -95,7 +99,6 @@ interface ToolIdentity {
 
 interface NormalizationState {
   readonly streamState: ReturnType<typeof createTransformStreamState>;
-  readonly taskToolNormalizer: ClaudeTaskToolNormalizer;
   readonly usageState: ReturnType<typeof createTransformUsageState>;
   readonly toolScopes: Map<string, ToolIdentity>;
   /** Shared tool name of each started tool call. */
@@ -108,6 +111,7 @@ interface NormalizationState {
 }
 
 export class ClaudeExecutionEventNormalizer {
+  private readonly taskToolNormalizer = new ClaudeTaskToolNormalizer();
   private readonly states: Record<
     ClaudeExecutionEventChannel,
     NormalizationState
@@ -120,6 +124,7 @@ export class ClaudeExecutionEventNormalizer {
     message: SDKMessage,
     channel: ClaudeExecutionEventChannel,
     options: {
+      readonly executionTarget?: ExecutionTarget;
       readonly intendedModel?: string;
       readonly reportedContextWindow?: number;
     } = {},
@@ -133,6 +138,7 @@ export class ClaudeExecutionEventNormalizer {
     })) {
       switch (event.type) {
         case 'session_init':
+          this.taskToolNormalizer.bindSession(event.sessionId);
           normalized.push({ type: 'session_init', event });
           break;
         case 'async_subagent_completion':
@@ -148,7 +154,7 @@ export class ClaudeExecutionEventNormalizer {
           normalized.push({ type: 'native_error', message: event.content });
           break;
         default:
-          for (const chunk of normalizeTaskToolChunk(event, state.taskToolNormalizer)) {
+          for (const chunk of normalizeTaskToolChunk(event, this.taskToolNormalizer)) {
             this.#normalizeOutputChunk(message, chunk, state, normalized);
           }
       }
@@ -164,7 +170,17 @@ export class ClaudeExecutionEventNormalizer {
       normalized.push({ type: 'result', turnStats: message.subtype === 'success' && !message.is_error
         ? createTurnStats(message.usage?.output_tokens, message.duration_ms) : undefined });
     }
-    return normalized;
+    return normalized.map(item => {
+      if (item.type !== 'output') return item;
+      const event = item.event;
+      if (event.type === 'tool_started') return { ...item, event: {
+        ...event, input: mapClaudeToolInputPaths(event.name, event.input, options.executionTarget),
+      } };
+      if (event.type === 'tool_completed' && event.resultDetails) return { ...item, event: {
+        ...event, resultDetails: mapClaudeToolResultPaths(event.resultDetails, options.executionTarget),
+      } };
+      return item;
+    });
   }
 
   updateContextWindow(
@@ -203,7 +219,7 @@ export class ClaudeExecutionEventNormalizer {
   reset(channel: ClaudeExecutionEventChannel): void {
     const state = this.states[channel];
     state.streamState.clearAll();
-    state.taskToolNormalizer.reset();
+    this.taskToolNormalizer.finishCalls(state.toolNames.keys());
     state.usageState.clear();
     state.toolScopes.clear();
     state.toolNames.clear();
@@ -279,7 +295,6 @@ export class ClaudeExecutionEventNormalizer {
 function createNormalizationState(): NormalizationState {
   return {
     streamState: createTransformStreamState(),
-    taskToolNormalizer: new ClaudeTaskToolNormalizer(),
     usageState: createTransformUsageState(),
     toolScopes: new Map(),
     toolNames: new Map(),
@@ -395,8 +410,10 @@ function normalizeToolStarted(
     type: 'tool_started',
     toolCallId: chunk.id,
     ...identity,
-    name: chunk.name,
+    name: normalizeClaudeSessionToolName(chunk.name),
     input: chunk.input,
+    ...(normalizeClaudeSessionToolName(chunk.name) !== chunk.name
+      ? { providerPayload: { rawName: chunk.name } } : {}),
     ...('providerPayload' in chunk && chunk.providerPayload
       ? { providerPayload: chunk.providerPayload }
       : {}),

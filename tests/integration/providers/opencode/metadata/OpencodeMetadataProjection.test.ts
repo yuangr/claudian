@@ -1,81 +1,66 @@
-import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
-import type { ACPSessionConfigOption } from '@/providers/acp';
-import { projectOpencodeMetadata } from '@/providers/opencode/metadata/OpencodeMetadataProjection';
-import { getOpencodeProviderSettings } from '@/providers/opencode/settings';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
 
-function createHost(): ProviderHost {
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
+import { decodeOpencodeConfig } from '@/providers/opencode/config';
+import type { OpencodeNativeModel } from '@/providers/opencode/http/OpencodeNativeModelCatalog';
+import { projectOpencodeMetadata } from '@/providers/opencode/metadata/OpencodeMetadataProjection';
+
+async function createHost(): Promise<ProviderRuntimeHost> {
   const settings = { providerConfigs: { opencode: { enabled: true, visibleModels: ['provider/alpha', 'provider/beta'] } } };
-  const coordinator = new SettingsCoordinator(settings, async () => undefined);
-  return {
-    settings,
-    mutateSettings: coordinator.mutate.bind(coordinator),
-    mutateSettingsConditionally: coordinator.mutateConditionally.bind(coordinator),
-    notifyProviderChatOptionsChanged() {},
-  } as unknown as ProviderHost;
+  return (await createProviderHostFixture({ settings })).host.getRuntimeHost('opencode');
 }
 
-function effort(values: string[]): ACPSessionConfigOption[] {
-  return [{
-    id: 'effort', category: 'thought_level', name: 'Effort', type: 'select',
-    currentValue: values[0] ?? '', options: values.map(value => ({ name: value, value })),
-  }];
+function nativeModel(rawId: string, label: string): OpencodeNativeModel {
+  const [providerID, id] = rawId.split('/');
+  return { rawId, providerID, id, label, variants: [], contextWindow: 0 };
 }
 
 it('retains independent model warmups published through serialized settings mutations', async () => {
-  const host = createHost();
+  const host = await createHost();
   await Promise.all([
-    projectOpencodeMetadata(host, { selectedRawModelId: 'provider/alpha', configOptions: effort(['high']) }),
-    projectOpencodeMetadata(host, { selectedRawModelId: 'provider/beta', configOptions: effort(['low']) }),
+    projectOpencodeMetadata(host, { selectedRawModelId: 'provider/alpha', thinkingLevels: ['high'] }),
+    projectOpencodeMetadata(host, { selectedRawModelId: 'provider/beta', thinkingLevels: ['low'] }),
   ]);
-  expect(getOpencodeProviderSettings(host.settings).thinkingOptionsByModel).toEqual({
-    'provider/alpha': [{ label: 'high', value: 'high' }],
-    'provider/beta': [{ label: 'low', value: 'low' }],
+  expect(decodeOpencodeConfig(host.config).thinkingOptionsByModel).toEqual({
+    'provider/alpha': [{ label: 'High', value: 'high' }],
+    'provider/beta': [{ label: 'Low', value: 'low' }],
   });
 });
 
 it('replaces an explicitly empty catalog without changing enabled model choices', async () => {
-  const host = createHost();
-  await projectOpencodeMetadata(host, {
-    models: { currentModelId: '', availableModels: [{ modelId: 'provider/alpha', name: 'Alpha' }] },
-  });
-  await projectOpencodeMetadata(host, { models: { currentModelId: '', availableModels: [] } });
-  expect(getOpencodeProviderSettings(host.settings)).toMatchObject({
+  const host = await createHost();
+  await projectOpencodeMetadata(host, { models: [nativeModel('provider/alpha', 'Alpha')] });
+  await projectOpencodeMetadata(host, { models: [] });
+  expect(decodeOpencodeConfig(host.config)).toMatchObject({
     discoveredModels: [], visibleModels: ['provider/alpha', 'provider/beta'],
   });
 });
 
-it('clears catalogs supplied as empty ACP selectors while preserving omitted catalogs', async () => {
-  const host = createHost();
-  await projectOpencodeMetadata(host, {
-    models: { currentModelId: 'provider/alpha', availableModels: [{ modelId: 'provider/alpha', name: 'Alpha' }] },
-  });
-  await projectOpencodeMetadata(host, {
-    configOptions: [{ id: 'model', category: 'model', name: 'Model', type: 'select', currentValue: '', options: [] }],
-  });
-  expect(getOpencodeProviderSettings(host.settings)).toMatchObject({
-    discoveredModels: [],
-    visibleModels: ['provider/alpha', 'provider/beta'],
-  });
-});
-
 it('clears explicitly empty reasoning options while retaining metadata absent from the update', async () => {
-  const host = createHost();
+  const host = await createHost();
   await projectOpencodeMetadata(host, {
-    models: { currentModelId: 'provider/alpha', availableModels: [{ modelId: 'provider/alpha', name: 'Alpha' }] },
-    configOptions: effort(['high']),
+    models: [nativeModel('provider/alpha', 'Alpha')],
+    selectedRawModelId: 'provider/alpha',
+    thinkingLevels: ['high'],
   });
   await projectOpencodeMetadata(host, {
-    selectedRawModelId: 'provider/beta', configOptions: effort(['low']),
+    selectedRawModelId: 'provider/beta', thinkingLevels: ['low'],
   });
   await projectOpencodeMetadata(host, { selectedRawModelId: 'provider/alpha' });
-  expect(getOpencodeProviderSettings(host.settings).thinkingOptionsByModel['provider/alpha'])
-    .toEqual([{ label: 'high', value: 'high' }]);
+  expect(decodeOpencodeConfig(host.config).thinkingOptionsByModel['provider/alpha'])
+    .toEqual([{ label: 'High', value: 'high' }]);
 
-  await projectOpencodeMetadata(host, { selectedRawModelId: 'provider/alpha', configOptions: effort([]) });
-  expect(getOpencodeProviderSettings(host.settings)).toMatchObject({
+  await projectOpencodeMetadata(host, { selectedRawModelId: 'provider/alpha', thinkingLevels: [] });
+  expect(decodeOpencodeConfig(host.config)).toMatchObject({
     discoveredModels: [{ rawId: 'provider/alpha', label: 'Alpha' }],
-    thinkingOptionsByModel: { 'provider/beta': [{ label: 'low', value: 'low' }] },
+    thinkingOptionsByModel: { 'provider/beta': [{ label: 'Low', value: 'low' }] },
   });
-  expect(getOpencodeProviderSettings(host.settings).thinkingOptionsByModel['provider/alpha']).toEqual([]);
+  expect(decodeOpencodeConfig(host.config).thinkingOptionsByModel['provider/alpha']).toEqual([]);
+});
+
+it('publishes reasoning metadata for an accepted prototype-named model', async () => {
+  const host = (await createProviderHostFixture({ settings: { providerConfigs: { opencode: { enabled: true, visibleModels: ['__proto__'] } } } })).host.getRuntimeHost('opencode');
+  await projectOpencodeMetadata(host, { selectedRawModelId: '__proto__', thinkingLevels: ['high'] });
+  expect(Object.entries(decodeOpencodeConfig(JSON.parse(JSON.stringify(host.config))).thinkingOptionsByModel))
+    .toEqual([['__proto__', [{ label: 'High', value: 'high' }]]]);
 });

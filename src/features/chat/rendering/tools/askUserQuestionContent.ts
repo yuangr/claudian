@@ -29,21 +29,25 @@ function renderAskUserQuestionResult(container: HTMLElement, toolCall: ToolCallI
   const questions = toolCall.input.questions as AskUserQuestionItem[] | undefined;
   const answers = resolveAskUserAnswers(toolCall);
   if (!questions || !Array.isArray(questions) || !answers) return false;
-  if (!questions.some(question => (question.id && question.id in answers) || question.question in answers)) return false;
-  if (toolCall.input.replyMode === 'user-message' && !questions.every(question => (question.id && question.id in answers) || question.question in answers)) return false;
+  const answered = (question: AskUserQuestionItem): boolean =>
+    Boolean(question.id && Object.hasOwn(answers, question.id)) || Object.hasOwn(answers, question.question);
+  if (!questions.some(answered)) return false;
+  if (toolCall.input.replyMode === 'user-message' && !questions.every(answered)) return false;
   container.empty();
 
   const reviewEl = container.createDiv({ cls: 'claudian-ask-review' });
   for (let i = 0; i < questions.length; i++) {
     const q = questions[i];
     const answer = formatAnswer(
-      (q.id ? answers[q.id] : undefined) ?? answers[q.question]
+      (q.id && Object.hasOwn(answers, q.id) ? answers[q.id] : undefined)
+        ?? (Object.hasOwn(answers, q.question) ? answers[q.question] : undefined)
     );
+    const displayAnswer = q.isSecret === true && answer ? '••••••••' : answer;
     const pairEl = reviewEl.createDiv({ cls: 'claudian-ask-review-pair' });
     const bodyEl = pairEl.createDiv({ cls: 'claudian-ask-review-body' });
     bodyEl.createDiv({ text: q.question, cls: 'claudian-ask-review-q-text' });
     bodyEl.createDiv({
-      text: answer || t('chat.questions.notAnswered'),
+      text: displayAnswer || t('chat.questions.notAnswered'),
       cls: answer ? 'claudian-ask-review-a-text' : 'claudian-ask-review-empty',
     });
   }

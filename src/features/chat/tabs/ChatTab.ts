@@ -55,6 +55,7 @@ export type TabHydrationState = 'idle' | 'loading' | 'ready' | 'failed';
 /** Linked content operations a host view forwards to a tab. */
 export interface TabLinkedContentPort {
   selectExplicit(path: string | null): void;
+  reopenAutoDraft(): void;
   handleActiveFileChanged(file: TFile | null, isActiveOwner: boolean): void;
   handleActiveFileMetadataChanged(file: TFile | null): void;
   handleRenamed(oldPath: string, newPath: string, includeDescendants?: boolean): void;
@@ -79,6 +80,8 @@ export interface TabComposerPort {
   setHiddenCommands(commands: ReadonlySet<string>): void;
   /** Invalidates session mentions after the conversation list changes. */
   invalidateSessionMentions(): void;
+  /** Re-reads the project chip after membership, the project records, or the draft seed change. */
+  refreshProject(): void;
 }
 
 /** Restores a transcript moved by `TabPlacementPort.placeTranscript`. */

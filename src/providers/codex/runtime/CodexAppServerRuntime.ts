@@ -1,13 +1,11 @@
-import { Notice } from 'obsidian';
-
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { TargetLaunchSpec } from '@/core/process/execution-target/types';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 import type { ProviderTransitionOwnerContext } from '@/core/providers/types';
 
+import { decodeCodexConfig } from '../config';
 import { CodexMetadataTransitionGate } from '../metadata/CodexMetadataTransitionGate';
-import { getCodexProviderSettings } from '../settings';
 import { CodexAppServerProcess } from './CodexAppServerProcess';
 import { initializeCodexAppServerTransport, resolveCodexAppServerLaunchSpec } from './codexAppServerSupport';
-import type { CodexLaunchSpec } from './codexLaunchTypes';
 import { CodexRPCTransport } from './CodexRPCTransport';
 import { type CodexRuntimeContext, createCodexRuntimeContext } from './CodexRuntimeContext';
 import { CodexThreadRouter } from './CodexThreadRouter';
@@ -36,7 +34,7 @@ export class CodexAppServerConnection {
   private readonly exitListeners = new Set<() => void>();
 
   constructor(
-    readonly launchSpec: CodexLaunchSpec,
+    readonly launchSpec: TargetLaunchSpec,
     readonly fingerprint: string,
     private readonly invalidate: () => void,
     private readonly stopped: () => void,
@@ -177,8 +175,8 @@ export class CodexAppServerRuntime {
   private disposePromise: Promise<void> | null = null;
 
   constructor(
-    private readonly plugin: ProviderHost,
-    private readonly warn: (message: string) => void = message => { new Notice(message); },
+    private readonly host: ProviderRuntimeHost,
+    private readonly warn: (message: string) => void,
   ) {}
 
   onSkillsChanged(listener: () => void): () => void {
@@ -199,7 +197,7 @@ export class CodexAppServerRuntime {
     this.#assertAvailable();
     const generation = this.generation;
     const launchSpec = await waitForCodexOperation(
-      resolveCodexAppServerLaunchSpec(this.plugin, 'codex', context), signal,
+      resolveCodexAppServerLaunchSpec(this.host, context), signal,
     );
     this.#assertAvailable();
     if (generation !== this.generation) return this.acquire(options);
@@ -222,6 +220,8 @@ export class CodexAppServerRuntime {
       this.connections.add(connection);
       this.current = connection;
     }
+    // A synchronous start failure lives on initialized; retain would mask it as a closed connection.
+    if (!connection.isAlive()) await waitForCodexOperation(connection.initialized, signal);
     const lease = connection.retain();
     try {
       await waitForCodexOperation<unknown>(options.readiness === 'initialized' ? connection.initialized : connection.ready, signal);
@@ -251,10 +251,10 @@ export class CodexAppServerRuntime {
 
   async endEnvironmentTransition(): Promise<void> {
     try {
-      if (!getCodexProviderSettings(this.plugin.settings).enabled) {
+      if (!decodeCodexConfig(this.host.config).enabled) {
         await this.stop();
       } else if (this.current) {
-        const spec = await resolveCodexAppServerLaunchSpec(this.plugin, 'codex', { providerTransitionOwner: true });
+        const spec = await resolveCodexAppServerLaunchSpec(this.host, { providerTransitionOwner: true });
         if (this.current?.fingerprint !== fingerprintLaunchSpec(spec)) this.#retireCurrent();
       }
     } finally {
@@ -282,7 +282,7 @@ export class CodexAppServerRuntime {
 
   #assertAvailable(): void {
     if (this.disposed) throw new Error('Codex runtime is disposed.');
-    if (!getCodexProviderSettings(this.plugin.settings).enabled) throw new Error('Codex is disabled.');
+    if (!decodeCodexConfig(this.host.config).enabled) throw new Error('Codex is disabled.');
   }
 
   #retireCurrent(): void {
@@ -298,7 +298,7 @@ export class CodexAppServerRuntime {
   }
 }
 
-function fingerprintLaunchSpec(spec: CodexLaunchSpec): string {
+function fingerprintLaunchSpec(spec: TargetLaunchSpec): string {
   return JSON.stringify([
     spec.command, spec.args, spec.spawnCwd, spec.targetCwd, spec.target,
     Object.entries(spec.env).sort(([left], [right]) => left.localeCompare(right)),

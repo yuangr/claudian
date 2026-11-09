@@ -17,6 +17,9 @@ function structuredPatchToDiffLines(hunks: readonly StructuredPatchHunk[]): Diff
       const prefix = line[0];
       const text = line.slice(1);
 
+      // Unified-diff EOF metadata is not a source line on either side.
+      if (prefix === '\\') continue;
+
       if (prefix === '+') {
         result.push({ type: 'insert', text, newLineNum: newLineNum++ });
       } else if (prefix === '-') {
@@ -182,7 +185,7 @@ function diffFromToolInput(toolCall: ToolCallInfo, filePath: string): ToolDiffDa
   if (toolCall.name === 'Write') {
     const content = toolCall.input.content;
     if (typeof content === 'string') {
-      const newLines = content.split('\n');
+      const newLines = splitReplacementLines(content);
       const diffLines: DiffLine[] = newLines.map((text, i) => ({
         type: 'insert',
         text,
@@ -253,7 +256,12 @@ function buildReplacementDiffLines(pairs: readonly ReplacementPair[]): DiffLine[
 }
 
 function splitReplacementLines(text: string): string[] {
-  return text === '' ? [] : text.split('\n');
+  if (text === '') return [];
+  const lines = text.split('\n');
+  // Only the trailing empty element produced by a final LF separator is dropped;
+  // unterminated content keeps its last line and interior blanks survive.
+  if (text.endsWith('\n')) lines.pop();
+  return lines;
 }
 
 function buildApplyPatchFileDiff(current: {

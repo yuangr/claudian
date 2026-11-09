@@ -100,7 +100,7 @@ export class BuiltInCommandController {
     // Clean up any existing dropdown
     this.destroyResumeDropdown();
 
-    const conversations = this.deps.plugin.getConversationList();
+    const conversations = this.deps.plugin.getConversationList().filter(conversation => !conversation.isArchived);
     if (conversations.length === 0) {
       new Notice(t('chat.sessions.empty'));
       return;

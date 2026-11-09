@@ -1,10 +1,22 @@
 const LIST_SELECTOR = '.claudian-history-list';
 const ITEM_SELECTOR = '.claudian-history-item';
+/**
+ * Rows a rerender keeps in place: sessions, and project headers, so expanding a project in a list that scrolls as
+ * one keeps its header still instead of a session below it.
+ */
+const ANCHOR_SELECTOR = '.claudian-history-item[data-conversation-id], .claudian-session-group-header[data-project-id]';
 
 type ScrollAnchor = {
-  conversationId: string;
+  key: string;
   viewportOffset: number;
 };
+
+function anchorKey(element: HTMLElement): string | null {
+  const conversationId = element.getAttribute('data-conversation-id');
+  if (conversationId) return `conversation:${conversationId}`;
+  const projectId = element.getAttribute('data-project-id');
+  return projectId ? `project:${projectId}` : null;
+}
 
 /**
  * Scroll and pagination state of a rendered session list, carried across a rerender so the
@@ -15,6 +27,7 @@ export interface SessionListPosition {
   readonly visibleCount: number;
   readonly sessionScrollTop: number;
   readonly pinnedScrollTop: number;
+  readonly projectsScrollTop: number;
   readonly anchors: readonly ScrollAnchor[];
 }
 
@@ -22,40 +35,51 @@ export const INITIAL_SESSION_LIST_POSITION: SessionListPosition = {
   visibleCount: 0,
   sessionScrollTop: 0,
   pinnedScrollTop: 0,
+  projectsScrollTop: 0,
   anchors: [],
 };
 
 function captureScrollAnchors(list: HTMLElement): ScrollAnchor[] {
+  // A list at its top stays there, so rows that load above the first one, such as after startup, show.
+  if (list.scrollTop <= 0) return [];
   const listRect = list.getBoundingClientRect();
   if (listRect.height <= 0) return [];
 
-  return Array.from(list.querySelectorAll<HTMLElement>(ITEM_SELECTOR))
+  return Array.from(list.querySelectorAll<HTMLElement>(ANCHOR_SELECTOR))
     .map((item): ScrollAnchor | null => {
-      const conversationId = item.getAttribute('data-conversation-id');
+      const key = anchorKey(item);
       const itemRect = item.getBoundingClientRect();
       if (
-        !conversationId
+        !key
         || itemRect.height <= 0
         || itemRect.bottom <= listRect.top
         || itemRect.top >= listRect.bottom
       ) return null;
       return {
-        conversationId,
+        key,
         viewportOffset: itemRect.top - listRect.top,
       };
     })
     .filter((anchor): anchor is ScrollAnchor => anchor !== null);
 }
 
-/** Reads the position of the list currently rendered in `container`, before it is replaced. */
-export function captureSessionListPosition(container: HTMLElement): SessionListPosition {
+/**
+ * Reads the position of the list currently rendered in `container`, before it is replaced. `sectionScrolling` says
+ * whether its sections scroll on their own (the persistent sidebar) rather than the whole list (the compact menu).
+ */
+export function captureSessionListPosition(container: HTMLElement, sectionScrolling: boolean): SessionListPosition {
   const list = container.querySelector<HTMLElement>(LIST_SELECTOR);
   if (!list) return INITIAL_SESSION_LIST_POSITION;
 
-  const sessionList = list.querySelector<HTMLElement>('.claudian-session-list-items') ?? list;
+  const sessionList = sectionScrolling
+    ? list.querySelector<HTMLElement>('.claudian-session-list-items') ?? list
+    : list;
   const pinnedList = list
     .querySelector<HTMLElement>('.claudian-history-section--pinned')
     ?.querySelector<HTMLElement>('.claudian-history-section-items');
+  const projectsList = sectionScrolling
+    ? list.querySelector<HTMLElement>('.claudian-session-project-items')
+    : null;
   const recordedVisibleCount = Number(list.dataset.visibleCount);
   return {
     visibleCount: Number.isFinite(recordedVisibleCount) && recordedVisibleCount > 0
@@ -63,6 +87,7 @@ export function captureSessionListPosition(container: HTMLElement): SessionListP
       : list.querySelectorAll(ITEM_SELECTOR).length,
     sessionScrollTop: sessionList.scrollTop,
     pinnedScrollTop: pinnedList?.scrollTop ?? 0,
+    projectsScrollTop: projectsList?.scrollTop ?? 0,
     anchors: captureScrollAnchors(sessionList),
   };
 }
@@ -76,17 +101,17 @@ export function restoreSessionListPosition(
   position: SessionListPosition,
   sessionList: HTMLElement,
   pinnedList: HTMLElement | null,
+  projectsList: HTMLElement | null,
 ): void {
+  if (projectsList) projectsList.scrollTop = position.projectsScrollTop;
   if (pinnedList) pinnedList.scrollTop = position.pinnedScrollTop;
   sessionList.scrollTop = position.sessionScrollTop;
   if (position.anchors.length === 0) return;
 
-  const items = Array.from(sessionList.querySelectorAll<HTMLElement>(ITEM_SELECTOR));
+  const items = Array.from(sessionList.querySelectorAll<HTMLElement>(ANCHOR_SELECTOR));
   const listTop = sessionList.getBoundingClientRect().top;
   for (const anchor of position.anchors) {
-    const item = items.find(candidate => (
-      candidate.getAttribute('data-conversation-id') === anchor.conversationId
-    ));
+    const item = items.find(candidate => anchorKey(candidate) === anchor.key);
     if (!item) continue;
 
     const itemRect = item.getBoundingClientRect();

@@ -1,20 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { Mock } from 'vitest';
 
+import { getInstallationKey } from '@/core/device/InstallationKey';
 import { OpencodeCLIResolver } from '@/providers/opencode/runtime/OpencodeCLIResolver';
 
-jest.mock('fs');
-const mockedStat = fs.statSync as jest.Mock;
-
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => 'current-host',
-}));
+vi.mock('fs');
+const mockedStat = fs.statSync as Mock;
 
 describe('OpencodeCLIResolver', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    vi.clearAllMocks();
+    (fs.existsSync as Mock).mockReturnValue(false);
   });
 
   it('uses the current host path instead of another synced host path', () => {
@@ -30,7 +27,7 @@ describe('OpencodeCLIResolver', () => {
       providerConfigs: { opencode: {
         cliPathsByHost: {
           'other-host': '/other/opencode',
-          'current-host': '/current/opencode',
+          [getInstallationKey()]: '/current/opencode',
         },
         cliPath: '/legacy/opencode',
       } },
@@ -109,4 +106,21 @@ describe('OpencodeCLIResolver', () => {
     expect(resolver.resolveFromSettings(settings)).toBeNull();
     expect(mockedStat.mock.calls.length).toBeGreaterThan(firstCallCount);
   });
+});
+
+it('uses Linux command references without touching host files for a Windows WSL installation', () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  try {
+    mockedStat.mockClear();
+    const resolver = new OpencodeCLIResolver();
+    const key = getInstallationKey();
+    const config = { installationMethodsByHost: { [key]: 'wsl' }, cliPathsByHost: { [key]: '/home/alice/bin/open code' } };
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: config } })).toBe('/home/alice/bin/open code');
+    // A stored legacy path keeps pasted whitespace and quotes; neither reaches the Linux command.
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: { installationMethodsByHost: { [key]: 'wsl' }, cliPath: '  "/home/alice/bin/legacy"  ' } } })).toBe('/home/alice/bin/legacy');
+    config.cliPathsByHost[key] = 'C:\\Tools\\opencode.cmd';
+    expect(resolver.resolveFromSettings({ providerConfigs: { opencode: config } })).toBe('opencode');
+    expect(mockedStat).not.toHaveBeenCalled();
+  } finally { Object.defineProperty(process, 'platform', platform); }
 });

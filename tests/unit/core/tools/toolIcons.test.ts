@@ -4,6 +4,8 @@ TOOL_AGENT_OUTPUT,
 TOOL_ASK_USER_QUESTION,
 TOOL_BASH,
 TOOL_BASH_OUTPUT,
+TOOL_CLAUDIAN_LIST_DESTINATIONS,
+TOOL_CLAUDIAN_SEND_MESSAGE,
 TOOL_EDIT,
 TOOL_EXEC,
 TOOL_GLOB,
@@ -20,6 +22,7 @@ TOOL_SUBAGENT,
 TOOL_TODO_WRITE,
 TOOL_WEB_FETCH,
 TOOL_WEB_SEARCH,
+TOOL_WORKFLOW,
 TOOL_WRITE,
 } from '@/core/tools/toolNames';
 
@@ -33,6 +36,7 @@ describe('getToolIcon', () => {
     [TOOL_EXEC, 'code'],
     ['js', 'code'],
     ['mcp__cua_repl__js', 'code'],
+    [TOOL_WORKFLOW, 'workflow'],
     [TOOL_BASH_OUTPUT, 'terminal'],
     [TOOL_KILL_SHELL, 'terminal'],
     [TOOL_GLOB, 'folder-search'],
@@ -48,6 +52,8 @@ describe('getToolIcon', () => {
     [TOOL_AGENT_OUTPUT, 'bot'],
     [TOOL_ASK_USER_QUESTION, 'help-circle'],
     [TOOL_SKILL, 'zap'],
+    [TOOL_CLAUDIAN_LIST_DESTINATIONS, 'messages-square'],
+    [TOOL_CLAUDIAN_SEND_MESSAGE, 'send'],
   ])('should return "%s" icon for %s tool', (tool, expectedIcon) => {
     expect(getToolIcon(tool)).toBe(expectedIcon);
   });
@@ -64,6 +70,14 @@ describe('getToolIcon', () => {
     expect(getToolIcon('')).toBe('wrench');
     expect(getToolIcon('SomeCustomTool')).toBe('wrench');
   });
+
+  it.each(['constructor', '__proto__', 'toString', ' Constructor '])(
+    'should return the literal fallback wrench string for prototype-key tool name %j',
+    (tool) => {
+      expect(typeof getToolIcon(tool)).toBe('string');
+      expect(getToolIcon(tool)).toBe('wrench');
+    },
+  );
 
   it('should not match partial mcp prefix', () => {
     expect(getToolIcon('mcpTool')).toBe('wrench');

@@ -1,12 +1,14 @@
 import type { App } from 'obsidian';
 
+import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
 import type { DraftSessionHold } from '@/features/chat/sessions/SessionRuntimePool';
 import type { TabId } from '@/features/chat/tabs/ChatTab';
+import { sessionProjectId } from '@/features/chat/tabs/draftSeed';
 import type { ParkedDrafts } from '@/features/chat/tabs/ParkedDrafts';
 import type { NavigationRequestCheck, TabConversationNavigation } from '@/features/chat/tabs/TabConversationNavigation';
 import type { TabIdentity } from '@/features/chat/tabs/TabIdentity';
 import { commitProvisionalTab } from '@/features/chat/tabs/TabLifecycle';
-import type { AssembledTabRuntime, TabMembershipView } from '@/features/chat/tabs/types';
+import type { AssembledTabRuntime, DraftSeed, TabMembershipView } from '@/features/chat/tabs/types';
 
 /** Whether Linked content still exists; vaults without path lookup accept every path. */
 export function linkedContentExists(app: Pick<App, 'vault'>, contentPath: string): boolean {
@@ -27,7 +29,8 @@ export interface ViewerSlotHost {
    * Creates and activates a provisional tab: reattaching a held draft session by key, or
    * seeding a new draft with a saved selection.
    */
-  createPreview(conversationId: string | null, draft?: DraftSource): Promise<AssembledTabRuntime | null>;
+  /** A seed is applied before the preview is published, so no first input can be admitted without it. */
+  createPreview(conversationId: string | null, draft?: DraftSource, seed?: DraftSeed): Promise<AssembledTabRuntime | null>;
   /** Keeps a draft session alive while nothing shows it. */
   holdDraft(tab: AssembledTabRuntime): DraftSessionHold;
   /** The key of the draft session an unloaded blank tab holds, if any. */
@@ -75,14 +78,17 @@ export class ViewerSlot {
     });
   }
 
-  /** Replaces the preview with a blank draft, optionally linked to `linkedContentPath`. */
-  async startDraft(options: ViewerSlotRequest & { linkedContentPath?: string } = {}): Promise<void> {
-    const { linkedContentPath, sourceTab = null } = options;
+  /**
+   * Replaces the preview with a blank draft, optionally linked to `linkedContentPath` and seeded with
+   * `projectId`. The project is validated when the draft creates its Conversation; an unknown one joins nothing.
+   */
+  async startDraft(options: ViewerSlotRequest & DraftSeed = {}): Promise<void> {
+    const { linkedContentPath, projectId, sourceTab = null } = options;
     if (sourceTab && !this.host.membership.isTabAlive(sourceTab)) return;
     this.#assertLinkedContentExists(linkedContentPath);
 
     await this.host.navigation.enqueue(null, async (isCurrent) => {
-      await this.#startDraft(isCurrent, linkedContentPath);
+      await this.#startDraft(isCurrent, { linkedContentPath, projectId });
     });
   }
 
@@ -112,7 +118,7 @@ export class ViewerSlot {
       const saved = selection ? membership.getIdentity(selection.id) : null;
       const heldKey = saved ? this.host.heldDraftKey(saved.id) : null;
       const draft = await this.#startDraft(
-        isCurrent, undefined, saved ? { ...saved, ...(heldKey ? { draftSessionKey: heldKey } : {}) } : undefined,
+        isCurrent, {}, saved ? { ...saved, ...(heldKey ? { draftSessionKey: heldKey } : {}) } : undefined,
       );
       // A blank tab that never had a session continues as the draft the viewer now shows.
       if (saved && draft && !heldKey) this.host.adoptDraft(saved.id, draft);
@@ -176,29 +182,37 @@ export class ViewerSlot {
   }
 
   /**
-   * Shows a blank draft: the given held draft session, else the wide layout's last new session
-   * unless Linked content asks for a fresh one, else a new draft. Resolves to the shown draft.
+   * Shows a blank draft: the given held draft session, else the shown blank draft or the wide layout's last new
+   * session when it already matches the seed's project (a Linked content seed always starts fresh), else a new
+   * draft. Resolves to the shown draft.
    */
   async #startDraft(
     isCurrent: NavigationRequestCheck,
-    linkedContentPath?: string,
+    seed: DraftSeed,
     source?: DraftSource,
   ): Promise<AssembledTabRuntime | null> {
     const { membership, parkedDrafts } = this.host;
+    const { linkedContentPath, projectId } = seed;
     this.#assertLinkedContentExists(linkedContentPath);
+    const matchesSeed = (runtime: ChatSessionRuntime): boolean => (
+      linkedContentPath === undefined && sessionProjectId(runtime) === projectId
+    );
     const active = this.#activePreview();
     // The shown blank draft already is the new session.
-    if (active && !active.conversationId && linkedContentPath === undefined && source === undefined) {
+    if (active && !active.conversationId && source === undefined && matchesSeed(active.session.runtime)) {
+      active.linkedContent.reopenAutoDraft();
       active.composer.focus();
       return active;
     }
-    const newSession = linkedContentPath === undefined ? this.#currentNewSession() : null;
+    const held = this.#currentNewSession();
+    const newSession = held && matchesSeed(held.runtime) ? held : null;
     const draft = source ?? (newSession ? { draftSessionKey: newSession.key } : undefined);
     for (const preview of this.#livePreviews()) {
-      if (!preview.conversationId && linkedContentPath !== undefined) this.#rememberNewSession(preview);
+      // A blank draft this one replaces becomes the new session New can return to, unless one is being reused.
+      if (!preview.conversationId && !newSession && source === undefined) this.#rememberNewSession(preview);
       parkedDrafts.park(preview);
     }
-    const tab = await this.host.createPreview(null, draft);
+    const tab = await this.host.createPreview(null, draft, seed);
     if (!tab) throw new Error('Failed to create a provisional chat tab');
     // Attached again, the new session no longer needs the slot's hold.
     if (this.#newSession?.key === tab.session.runtime.sessionKey) {
@@ -210,10 +224,8 @@ export class ViewerSlot {
       return null;
     }
     try {
-      if (linkedContentPath !== undefined) {
-        this.#assertLinkedContentExists(linkedContentPath);
-        tab.linkedContent.selectExplicit(linkedContentPath);
-      }
+      if (newSession) tab.linkedContent.reopenAutoDraft();
+      // Assembly applied the seed before publishing the draft.
       if (membership.getActiveTabId() === tab.id) tab.composer.focus();
     } catch (error) {
       await this.host.closeTab(tab.id).catch(() => false);

@@ -1,22 +1,20 @@
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 
+import { decodeOpencodeConfig } from '../config';
 import type { OpencodeServerService } from '../http/OpencodeServerService';
-import { getOpencodeProviderSettings } from '../settings';
-import { buildOpencodeRuntimeEnv } from './OpencodeRuntimeEnvironment';
-import { detectOpencodeNativeVersion, type OpencodeNativeVersion } from './OpencodeVersion';
+import { resolveOpencodeTarget } from './OpencodeExecutionTarget';
+import { OpencodeCLINotInstalledError } from './OpencodeVersion';
 
-/** Provider-owned prewarm and launch transitions for the shared v2 server. */
+/** Provider-owned prewarm and launch transitions for the shared server. */
 export class OpencodeSharedRuntime {
   private requested = false;
   private disposed = false;
-  private generation = 0;
   private controller = new AbortController();
   private startup: Promise<void> | null = null;
 
   constructor(
-    private readonly plugin: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly serverService: OpencodeServerService,
-    private readonly onNativeVersion: (version: OpencodeNativeVersion | undefined) => void,
   ) {}
 
   /** Prewarms the committed launch without creating a native session. */
@@ -31,7 +29,6 @@ export class OpencodeSharedRuntime {
   }
 
   beginTransition(): void {
-    this.generation += 1;
     this.controller.abort();
     this.controller = new AbortController();
     this.serverService.beginTransition();
@@ -39,10 +36,10 @@ export class OpencodeSharedRuntime {
 
   async endTransition(): Promise<void> {
     try {
-      if (!getOpencodeProviderSettings(this.plugin.settings).enabled) await this.serverService.invalidate();
+      if (!decodeOpencodeConfig(this.host.config).enabled) await this.serverService.invalidate();
       else {
         const launch = await this.#resolveLaunch();
-        this.serverService.reconcileLaunch(launch.cliPath, launch.cwd, launch.environment);
+        this.serverService.reconcileLaunch(launch.cliPath, launch.cwd, launch.environment, launch.target);
       }
     } finally { this.serverService.endTransition(); }
     if (this.requested) await this.start().catch(() => undefined);
@@ -50,7 +47,6 @@ export class OpencodeSharedRuntime {
 
   dispose(): void {
     this.disposed = true;
-    this.generation += 1;
     this.controller.abort();
   }
 
@@ -58,31 +54,30 @@ export class OpencodeSharedRuntime {
     for (;;) {
       // Read settings only once admission is open, so a transition cannot leak a stale launch.
       await this.serverService.waitUntilAvailable();
-      if (this.disposed || !getOpencodeProviderSettings(this.plugin.settings).enabled) return;
-      const generation = this.generation;
+      if (this.disposed || !decodeOpencodeConfig(this.host.config).enabled) return;
       const signal = this.controller.signal;
       try {
         const launch = await this.#resolveLaunch();
         signal.throwIfAborted();
-        const version = await detectOpencodeNativeVersion(launch.cliPath, launch.environment);
-        signal.throwIfAborted();
-        this.onNativeVersion(version);
-        if (version !== 2) return;
-        this.serverService.reconcileLaunch(launch.cliPath, launch.cwd, launch.environment);
-        const lease = await this.serverService.acquire(launch.cliPath, launch.cwd, launch.environment, signal);
+        this.serverService.reconcileLaunch(launch.cliPath, launch.cwd, launch.environment, launch.target);
+        const lease = await this.serverService.acquire(launch.cliPath, launch.cwd, launch.environment, signal, launch.target);
         try { await lease.request('/api/info', { signal }); }
         finally { await lease.dispose(); }
         return;
       } catch (error) {
+        // A missing CLI has nothing to prewarm; an unsupported one rejects.
+        if (error instanceof OpencodeCLINotInstalledError) return;
         // A transition overtook this attempt; retry against its committed settings.
-        if (this.disposed || generation === this.generation) throw error;
+        if (this.disposed || !signal.aborted) throw error;
       }
     }
   }
 
   async #resolveLaunch() {
-    const cliPath = await this.plugin.getResolvedProviderCliPath('opencode') ?? 'opencode';
-    const adapter = this.plugin.app.vault.adapter as { basePath?: string };
-    return { cliPath, cwd: adapter.basePath || process.cwd(), environment: buildOpencodeRuntimeEnv(this.plugin.settings, cliPath) };
+    const cliPath = await this.host.resolveCliPath() ?? 'opencode';
+    const cwd = this.host.workingDirectory || process.cwd();
+    const target = await resolveOpencodeTarget(this.host.config, cwd);
+    const environment = await this.serverService.targetEnvironment.resolve(target, cwd, this.host.environmentText, cliPath);
+    return { cliPath, cwd, target, environment };
   }
 }

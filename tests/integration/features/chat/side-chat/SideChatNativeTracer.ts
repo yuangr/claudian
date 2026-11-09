@@ -1,3 +1,5 @@
+import '@/providers';
+
 import type { ForkTestEnvironment } from '@test/helpers/features/chat/ProviderForkTestHarness';
 
 import type {
@@ -9,7 +11,6 @@ import type {
 import type { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ChatMessage, ImageAttachment, ProviderId } from '@/core/types';
-import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import { handleForkRequest } from '@/features/chat/sessions/SessionForkSource';
 import { SideChatSession } from '@/features/chat/side-chat/SideChatSession';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
@@ -75,7 +76,7 @@ export async function traceSideChild(
     resolveBackend: () => backend,
     lifecycleRegistry: registry,
     interactionPort: options.interactionPort ?? rejectingInteractionPort(),
-    vaultWorkingDirectory: env.root,
+    workingDirectory: env.root,
     onRequestedEvent: event => { if (event.type === 'text_delta') responseText += event.text; },
   });
 
@@ -89,7 +90,7 @@ export async function traceSideChild(
         configuration: {
           model: options.model ?? captured.sourceSelectedModel,
           permissionMode: options.permissionMode ?? 'normal',
-          systemInstructions: { instructions: 'Answer the user.', kind: 'explicit' },
+          systemInstructions: { instructions: 'Answer the user.', kind: 'explicit', purpose: 'title' },
         },
         conversationHistory: history,
         text,
@@ -135,12 +136,7 @@ export async function captureSideSource(
   chat: Awaited<ReturnType<ForkTestEnvironment['open']>>,
   checkpointMessage: ChatMessage,
 ): Promise<CapturedSideSource | null> {
-  const plugin = {
-    app: env.app,
-    settings: (env.host as unknown as { settings: unknown }).settings,
-    getConversationSummary(id: string) { return (this as unknown as { getConversationSync: (id: string) => any }).getConversationSync(id); },
-    getConversationSync: (id: string) => env.repository.getSync(id),
-  } as unknown as ChatFeatureHost;
+  const plugin = env.plugin;
   const tab = {
     conversationId: chat.conversation.id,
     executionCoordinator: chat.coordinator,

@@ -3,14 +3,15 @@ import { getProviderConfig } from '../../core/providers/providerConfig';
 import { hasStoredConfigNormalization } from '../../core/providers/settings/storedSettings';
 import type { ProviderModule } from '../../core/providers/types';
 import {
-  getPiWorkspaceServices,
   piWorkspaceRegistration,
 } from './app/PiWorkspaceServices';
 import { PI_PROVIDER_CAPABILITIES } from './capabilities';
 import { piSettingsReconciler } from './env/PiSettingsReconciler';
 import { PiExecutionBackend } from './execution/PiExecutionBackend';
 import { PiConversationHistoryService } from './history/PiConversationHistoryService';
+import { piPeepsSubagentAdapter } from './normalization/PiPeepsSubagents';
 import { piModelPolicy } from './PiModelPolicy';
+import { resolvePiExecutionWorkingDirectory } from './runtime/piTargetPaths';
 import { getPiProviderSettings, projectPiModelSettings, updatePiProviderSettings } from './settings';
 import { ObsidianPiExtensionUIRenderer } from './ui/ObsidianPiExtensionUIRenderer';
 import { piChatUIConfig } from './ui/PiChatUIConfig';
@@ -21,9 +22,9 @@ export const piProviderRegistration: ProviderModule = {
   capabilities: PI_PROVIDER_CAPABILITIES,
   modelPolicy: piModelPolicy,
   chatUIConfig: piChatUIConfig,
+  resolveExecutionWorkingDirectory: (plugin, workingDirectory) => resolvePiExecutionWorkingDirectory(plugin.getRuntimeHost('pi'), workingDirectory),
   createExecutionBackend: (plugin) => new PiExecutionBackend(
-    plugin,
-    getPiWorkspaceServices(),
+    plugin.getRuntimeHost('pi'),
     { extensionUiRenderer: new ObsidianPiExtensionUIRenderer(plugin.app) },
   ),
 
@@ -42,7 +43,7 @@ export const piProviderRegistration: ProviderModule = {
         return !model || model.reasoningMetadataResolved === false;
       });
     },
-    hostScopedFields: ['cliPathsByHost'],
+    hostScopedFields: ['cliPathsByHost', 'installationMethodsByHost', 'wslDistroOverridesByHost'],
     normalizeStored(target, stored) {
       const storedConfig = getProviderConfig(stored, 'pi');
       updatePiProviderSettings(target, getPiProviderSettings(stored));
@@ -52,6 +53,7 @@ export const piProviderRegistration: ProviderModule = {
       );
     },
   },
+  subagentAdapter: piPeepsSubagentAdapter,
   taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
   workspace: piWorkspaceRegistration,
 };

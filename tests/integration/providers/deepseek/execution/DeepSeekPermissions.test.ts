@@ -1,4 +1,5 @@
 import { NativePeer } from '@test/helpers/deepseek/NativePeer';
+import { nativeRequest } from '@test/helpers/deepseek/NativeRequest';
 import { testDate } from '@test/helpers/testClock';
 
 import { applyDeepSeekPermission, readDeepSeekPermission } from '@/providers/deepseek/execution/DeepSeekPermissions';
@@ -10,20 +11,18 @@ afterEach(async () => { await peer.close(); });
 
 it('validates effective permission facts across a pinned paginated log before admission', async () => {
   peer.onCall = (method, args) => {
-    if (method === 'permissionPresets/catalog') return { options: [{ value: 'workspace-write' }] };
-    if (method === 'commands/list') return [{ name: 'permission' }];
     if (method === 'commands/execute') return { result: { kind: 'success' } };
     if (method === 'session/projections') return { asOfSeq: 60, values: { permissions: { currentValue: 'workspace-write' } } };
     if (method === 'session/page') {
-      return args.request.beforeSeq ? { hasMore: false, records: [
+      return nativeRequest(args).beforeSeq ? { hasMore: false, records: [
         { type: 'event', event: { type: 'sandbox/mode', seq: 2, time, data: { mode: 'workspace-write' } } },
         { type: 'event', event: { type: 'approval/policy', seq: 3, time, data: { policy: 'ask' } } },
       ] } : { hasMore: true, records: [{ type: 'event', event: { type: 'turn/end', seq: 60, time, data: {} } }] };
     }
     throw new Error(`Unexpected ${method}`);
   };
-  await expect(applyDeepSeekPermission(peer.client, 'root', 'normal', () => {})).resolves.toBe('normal');
-  expect(peer.calls.filter(c => c.method === 'session/page').map(c => c.args.request)).toEqual([
+  await expect(applyDeepSeekPermission(peer.client, 'root', 'normal')).resolves.toBe('normal');
+  expect(peer.calls.filter(c => c.method === 'session/page').map(c => nativeRequest(c.args))).toEqual([
     { address: { kind: 'session', sessionId: 'root' }, throughSeq: 60, maxMessages: 100 },
     { address: { kind: 'session', sessionId: 'root' }, throughSeq: 60, beforeSeq: 60, maxMessages: 100 },
   ]);
@@ -44,14 +43,12 @@ it.each([
   { name: 'missing facts', outcome: 'success', records: [], message: incompatible },
 ])('rejects $name instead of trusting preset labels or RPC success', async ({ outcome, records, message }) => {
   peer.onCall = method => {
-    if (method === 'permissionPresets/catalog') return { options: [{ value: 'workspace-write' }] };
-    if (method === 'commands/list') return [{ name: 'permission' }];
     if (method === 'commands/execute') return { result: { kind: outcome } };
     if (method === 'session/projections') return { asOfSeq: 5, values: { permissions: { currentValue: 'workspace-write' } } };
     if (method === 'session/page') return { hasMore: false, records };
     throw new Error(`Unexpected ${method}`);
   };
-  await expect(applyDeepSeekPermission(peer.client, 'root', 'normal', () => {})).rejects.toThrow(message);
+  await expect(applyDeepSeekPermission(peer.client, 'root', 'normal')).rejects.toThrow(message);
 });
 
 it('reports unavailable native sessions without using activating follow', async () => {

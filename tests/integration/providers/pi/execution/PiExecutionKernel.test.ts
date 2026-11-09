@@ -1,19 +1,29 @@
+// @test-ci {"native":true,"inputs":["tests/fixtures/providers/pi/**"]}
+import type { ChildProcess } from 'node:child_process';
+import { subscribe, unsubscribe } from 'node:diagnostics_channel';
 import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
+
+import type { ProviderExecutionSession, ProviderSessionToolPort, ProviderToolPolicy } from '@/core/execution';
+import { PiExecutionBackend } from '@/providers/pi/execution/PiExecutionBackend';
 import { PiRPCSessionKernel } from '@/providers/pi/execution/PiExecutionKernel';
 import type { PiRPCRecord } from '@/providers/pi/runtime/PiRPCTransport';
 
-jest.setTimeout(10_000);
+vi.setConfig({ testTimeout: 10_000 });
 
 describe('Pi execution kernel with an external protocol process', () => {
   let root: string;
   let kernel: PiRPCSessionKernel;
   let events: PiRPCRecord[];
   let closed: Promise<Error | undefined>;
+  let nativeClosed: Promise<void>;
+  let removeNativeCloseListener: () => void = () => undefined;
 
   beforeEach(async () => {
+    removeNativeCloseListener = () => undefined;
     root = await fs.mkdtemp(path.join(tmpdir(), 'claudian-pi-kernel-'));
     await fs.writeFile(path.join(root, 'source.jsonl'), JSON.stringify({ type: 'session', version: 3, id: 'pi-source', cwd: root }) + '\n');
     events = [];
@@ -31,12 +41,37 @@ describe('Pi execution kernel with an external protocol process', () => {
       onExtensionChunk: () => undefined,
       onExtensionRequest: () => true,
     }, null);
-    kernel.start();
+    const children: ChildProcess[] = [];
+    const captureChild = (message: unknown) => {
+      children.push((message as { process: ChildProcess }).process);
+    };
+    subscribe('child_process', captureChild);
+    try {
+      kernel.start();
+    } finally {
+      unsubscribe('child_process', captureChild);
+    }
+    if (children.length !== 1) throw new Error('Expected kernel.start to spawn exactly one native child');
+    const child = children[0];
+    if (child.spawnfile !== process.execPath) throw new Error('Expected the kernel child to use the fixture Node executable');
+    if (child.spawnargs.length !== 2 || child.spawnargs[0] !== process.execPath
+      || child.spawnargs[1] !== path.resolve('tests/fixtures/providers/pi/PiSessionProcess.mjs')) {
+      throw new Error('Expected the kernel child to run the absolute PiSessionProcess fixture');
+    }
+    nativeClosed = new Promise(resolve => {
+      const onNativeClose = () => resolve();
+      child.once('close', onNativeClose);
+      removeNativeCloseListener = () => { child.off('close', onNativeClose); };
+    });
   });
 
   afterEach(async () => {
-    await kernel.shutdown();
-    await fs.rm(root, { recursive: true, force: true });
+    try {
+      await kernel.shutdown();
+    } finally {
+      removeNativeCloseListener();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it('routes response payloads and streamed events through the real transport', async () => {
@@ -76,6 +111,169 @@ describe('Pi execution kernel with an external protocol process', () => {
   it('surfaces unexpected process exit to both pending work and the lifecycle observer', async () => {
     await expect(kernel.request('fixture_exit', {}, 3_000)).rejects.toThrow(/17|closed/i);
     await expect(closed).resolves.toEqual(expect.objectContaining({ message: expect.stringMatching(/17|closed/i) }));
+    // Process exit settles work before the independent stderr stream necessarily drains.
+    await nativeClosed;
     expect(kernel.getStderrSnapshot()).toContain('fixture requested exit');
+  });
+});
+
+describe('Pi session tools through the generated extension', () => {
+  let root: string;
+  let sessionFile: string;
+  let kernel: PiRPCSessionKernel;
+  let session: ProviderExecutionSession;
+  let port: ProviderSessionToolPort;
+  const configuration = { model: 'pi:anthropic/claude-sonnet-4', reasoning: null, systemInstructions: { kind: 'main-agent' as const, instructions: 'Main Agent prompt.' } };
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(tmpdir(), 'claudian-pi-session-tools-'));
+    sessionFile = path.join(root, '.pi', 'agent', 'sessions', 'source.jsonl');
+    await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+    await fs.writeFile(sessionFile, JSON.stringify({ type: 'session', version: 3, id: 'pi-source', cwd: root }) + '\n');
+    port = { list: vi.fn().mockResolvedValue({ sessions: [] }), send: vi.fn().mockResolvedValue({ sessionId: 'recipient', title: 'Review', provider: 'codex', status: 'queued' }), read: vi.fn() };
+  });
+
+  afterEach(async () => {
+    await session?.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  async function createSession(bound = true, mismatch = false, persistent = true, startupTool = false) {
+    const host = (await createProviderHostFixture({ settings: { model: configuration.model, effortLevel: 'off', systemPrompt: '', userName: '',
+        providerConfigs: { pi: { enabled: true, visibleModels: [configuration.model],
+          discoveredModels: [{ encodedId: configuration.model, id: 'claude-sonnet-4', provider: 'anthropic', label: 'Sonnet', input: ['text'], reasoning: true, thinkingLevels: ['off'] }] } } }, overrides: { getResolvedProviderCliPath: async () => process.execPath } })).host;
+    const backend = new PiExecutionBackend(host.getRuntimeHost('pi'), {
+      createKernel: (spec, callbacks) => {
+        kernel = new PiRPCSessionKernel({ ...spec, command: process.execPath,
+          args: [path.resolve('tests/fixtures/providers/pi/PiSessionProcess.mjs'), ...spec.args],
+          env: { ...spec.env, CLAUDIAN_TEST_PI_ROOT: root, ...(startupTool ? { CLAUDIAN_TEST_PI_STARTUP_TOOL: '1' } : {}), ...(mismatch ? { CLAUDIAN_TEST_PI_MISMATCH: '1' } : {}) },
+        }, callbacks, null);
+        return kernel;
+      },
+    });
+    session = backend.createSession({ interactionPort: { askUserQuestion: vi.fn(), requestApproval: vi.fn(), dismissInteraction: vi.fn() }, lifecycle: persistent ? 'persistent' : 'ephemeral', nativePersistence: persistent ? 'enabled' : 'disabled-if-supported', workingDirectory: root,
+      ...(bound ? { sessionTools: port } : {}),
+      resumeSeed: { providerSessionId: 'pi-source', providerState: { sessionId: 'pi-source', sessionFile } },
+    });
+    const events = [];
+    for await (const event of session.execute({ configuration, toolPolicy: { kind: 'provider-default' },
+      input: [{ type: 'text', text: 'Warmup' }], signal: new AbortController().signal }).events) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: mismatch ? 'execution_error' : 'turn_completed' });
+    return events;
+  }
+
+  async function openRun(toolPolicy: ProviderToolPolicy = { kind: 'provider-default' }) {
+    let ready!: () => void;
+    const started = new Promise<void>(resolve => { ready = resolve; });
+    const run = session.execute({ configuration, toolPolicy, input: [{ type: 'text', text: 'fixture:hold' }], signal: new AbortController().signal });
+    const drained = (async () => {
+      for await (const event of run.events) if (event.type === 'text_delta') ready();
+    })();
+    await started;
+    return { run, drained };
+  }
+
+  it('registers only in bound execution sessions and round-trips both tools without dialogs', async () => {
+    await createSession(false);
+    expect(await kernel.request('fixture_tools')).toEqual({ tools: [] });
+    const unbound = await openRun();
+    await kernel.request('fixture_emit', { event: { type: 'tool_execution_start', toolCallId: 'unbound', toolName: 'claudian_send_message' } });
+    const denied = await kernel.request<{ value: string }>('fixture_private_input', { dialogId: 'unbound-dialog', payload: { name: 'claudian_send_message', toolCallId: 'unbound', args: { text: 'No' } } });
+    expect(JSON.parse(denied.value)).toMatchObject({ isError: true, text: expect.stringMatching(/main chat/) });
+    expect(port.send).not.toHaveBeenCalled();
+    unbound.run.cancel();
+    await unbound.drained;
+    await session.dispose();
+    await createSession();
+    expect(await kernel.request('fixture_tools')).toMatchObject({ tools: [
+      { name: 'claudian_list_destinations', parameters: { type: 'object', properties: {} } },
+      { name: 'claudian_send_message', parameters: { properties: expect.objectContaining({ text: expect.anything(), mode: expect.anything() }) } },
+      { name: 'claudian_read_session', parameters: { required: ['sessionId'] } },
+    ] });
+    const { drained } = await openRun();
+    expect(await kernel.request('fixture_tool', { name: 'claudian_list_destinations', toolCallId: 'list', args: {} }))
+      .toMatchObject({ isError: false, content: [{ text: '{"sessions":[]}' }] });
+    expect(await kernel.request('fixture_tool', { name: 'claudian_send_message', toolCallId: 'send', args: { text: 'Hello', sessionId: 'recipient' } }))
+      .toMatchObject({ isError: false, content: [{ text: JSON.stringify({ sessionId: 'recipient', title: 'Review', provider: 'codex', status: 'queued' }) }] });
+    expect(port.send).toHaveBeenCalledWith({ text: 'Hello', sessionId: 'recipient' }, expect.any(AbortSignal));
+    await kernel.request('fixture_emit', { event: { type: 'agent_settled' } });
+    await drained;
+  });
+
+  it('exposes session tools independently of the persistence-only tree bridge', async () => {
+    await createSession(true, false, false);
+    expect(kernel.launchSpec.enableTreeBridge).toBeUndefined();
+    const { run, drained } = await openRun();
+    expect(await kernel.request('fixture_tool', { name: 'claudian_list_destinations', toolCallId: 'ephemeral', args: {} }))
+      .toMatchObject({ isError: false, content: [{ text: '{"sessions":[]}' }] });
+    run.cancel();
+    await drained;
+  });
+
+  it.each<ProviderToolPolicy>([{ kind: 'read-only' }, { kind: 'passive' }, { kind: 'allow-list', names: ['claudian_send_message'] }])('denies calls under $kind even when the tool is named', async toolPolicy => {
+    await createSession();
+    // The fixture can call registered tools despite native filtering, exercising the call-time guard.
+    const { run, drained } = await openRun(toolPolicy);
+    const result = await kernel.request('fixture_tool', { name: 'claudian_send_message', toolCallId: 'denied', args: { text: 'No' } });
+    expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/default tool policy/) }] });
+    expect(port.send).not.toHaveBeenCalled();
+    const index = kernel.launchSpec.args.indexOf('--tools');
+    const namedTools = index < 0 ? [] : kernel.launchSpec.args[index + 1].split(',');
+    expect(namedTools).toEqual(expect.arrayContaining(toolPolicy.kind === 'passive' ? [] : ['claudian_list_destinations', 'claudian_send_message']));
+    run.cancel();
+    await drained;
+  });
+
+  it.each(['tool end', 'cancel', 'settlement', 'close'] as const)('revokes a pending call on %s', async action => {
+    let entered!: () => void;
+    const called = new Promise<void>(resolve => { entered = resolve; });
+    let callSignal!: AbortSignal;
+    let finish!: () => void;
+    port.send = vi.fn<typeof port.send>((_args, signal) => {
+      callSignal = signal;
+      entered();
+      return new Promise(resolve => { finish = () => resolve({ sessionId: 'recipient', title: 'Review', provider: 'codex', status: 'queued' }); });
+    });
+    await createSession();
+    const { run, drained } = await openRun();
+    const result = kernel.request('fixture_tool', { name: 'claudian_send_message', toolCallId: 'pending', args: { text: 'Wait' } }).catch(() => undefined);
+    await called;
+    expect(callSignal.aborted).toBe(false);
+    if (action === 'tool end') await kernel.request('fixture_tool_end', { toolCallId: 'pending' });
+    else if (action === 'cancel') run.cancel();
+    else if (action === 'settlement') await kernel.request('fixture_emit', { event: { type: 'agent_settled' } });
+    else await kernel.request('fixture_exit').catch(() => undefined);
+    if (action === 'tool end') await result;
+    else await drained;
+    expect(callSignal.aborted).toBe(true);
+    finish();
+    await result;
+  });
+
+  it('cannot attach a delayed callback from a settled run to the next run', async () => {
+    await createSession();
+    const first = await openRun();
+    await kernel.request('fixture_emit', { event: { type: 'tool_execution_start', toolCallId: 'old', toolName: 'claudian_send_message' } });
+    await kernel.request('fixture_emit', { event: { type: 'agent_settled' } });
+    await first.drained;
+    const next = await openRun();
+    const late = await kernel.request('fixture_private_input', { dialogId: 'late', payload: { name: 'claudian_send_message', toolCallId: 'old', args: { text: 'Late' } } });
+    expect(late).toMatchObject({ cancelled: true });
+    expect(port.send).not.toHaveBeenCalled();
+    next.run.cancel();
+    await next.drained;
+  });
+
+  it('cancels startup extension input before resume identity is proved', async () => {
+    await createSession(true, false, true, true);
+    expect(JSON.parse(await fs.readFile(path.join(root, 'startup-tool.json'), 'utf8')))
+      .toMatchObject({ isError: true, content: [{ text: expect.stringMatching(/cancelled/) }] });
+    expect(port.send).not.toHaveBeenCalled();
+  });
+
+  it('does not accept a mismatched resume identity', async () => {
+    const events = await createSession(true, true);
+    expect(events.at(-1)).toMatchObject({ type: 'execution_error' });
+    expect(port.send).not.toHaveBeenCalled();
   });
 });

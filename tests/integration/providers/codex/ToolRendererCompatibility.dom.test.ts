@@ -1,11 +1,13 @@
-/** @jest-environment jsdom */
-import '@/providers';
+/** @vitest-environment jsdom */
 
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { parseCodexSessionContent } from '@test/helpers/providers/codex/parseCodexSessionContent';
 import { testDate, testTime } from '@test/helpers/testClock';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
 import { Component, MarkdownRenderer } from 'obsidian';
 
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import { applyToolResultPresentation } from '@/core/tools/toolResultDetails';
 import type { ChatMessage, StreamChunk, ToolCallInfo } from '@/core/types';
@@ -16,9 +18,13 @@ import { renderStoredToolCall, renderToolCall, updateToolCallResult } from '@/fe
 import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { StreamController } from '@/features/chat/turns/StreamController';
-import { parseCodexSessionContent } from '@/providers/codex/history/CodexHistoryStore';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
+import { CODEX_PROVIDER_CAPABILITIES } from '@/providers/codex/capabilities';
 import { formatCodexQuestionReply } from '@/providers/codex/normalization/codexQuestionNormalization';
+import { codexProviderRegistration } from '@/providers/codex/registration';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
+
+registerProviderModules([claudeProviderRegistration, codexProviderRegistration]);
 
 HTMLElement.prototype.empty = function () { this.replaceChildren(); };
 HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
@@ -108,14 +114,9 @@ interface NativeToolCall {
   error?: string;
 }
 
-/** Restores a native MCP call from its live app-server item or its persisted rollout record. */
-function restoreNativeMcpTool(mode: 'live' | 'history', call: NativeToolCall): ToolCallInfo[] {
+/** Restores a native MCP call from its live app-server item. */
+function restoreNativeMcpTool(call: NativeToolCall): ToolCallInfo[] {
   const native = { server: 'docs', tool: 'search', ...call };
-  if (mode === 'history') {
-    return parseCodexSessionContent(JSON.stringify({
-      type: 'response_item', timestamp: testTime(), payload: { ...native, type: 'mcp_tool_call', call_id: call.id },
-    })).flatMap(message => message.toolCalls ?? []);
-  }
   const chunks: StreamChunk[] = [];
   const router = new CodexNotificationRouter(chunk => chunks.push(chunk), '/workspace');
   router.beginTurn();
@@ -129,7 +130,7 @@ function restoreNativeMcpTool(mode: 'live' | 'history', call: NativeToolCall): T
 function restoreNativeWebSearch(mode: 'live' | 'history', call: NativeToolCall & { action: Record<string, unknown> }): ToolCallInfo[] {
   if (mode === 'history') {
     return parseCodexSessionContent(JSON.stringify({
-      type: 'response_item', timestamp: testTime(), payload: { type: 'web_search_call', call_id: call.id, status: call.status, action: call.action },
+      type: 'response_item', timestamp: testTime(), payload: { type: 'web_search_call', id: call.id, status: call.status, action: call.action },
     })).flatMap(message => message.toolCalls ?? []);
   }
   const chunks: StreamChunk[] = [];
@@ -296,17 +297,21 @@ describe.each(['live', 'history'] as const)('%s Codex tool presentation', mode =
     expect(block.textContent).toContain('turn1view0');
   });
 
-  it.each([
-    ['string arguments', { id: 'mcp-args', status: 'completed', arguments: '{"query":"vault notes"}', result: { content: [{ type: 'text', text: 'hit' }] } },
-      { input: { query: 'vault notes' }, status: 'completed', result: 'hit' }],
-    ['cancellation', { id: 'mcp-cancelled', status: 'cancelled', arguments: { query: 'vault notes' } },
-      { input: { query: 'vault notes' }, status: 'error', result: 'Failed' }],
-    ['error text', { id: 'mcp-error', status: 'completed', arguments: {}, error: 'Server disconnected' },
-      { input: {}, status: 'error', result: 'Server disconnected' }],
-  ] as const)('restores native MCP calls with %s', (_label, call, expected) => {
-    const tools = restoreNativeMcpTool(mode, call);
-    expect(tools).toEqual([expect.objectContaining({ id: call.id, name: 'mcp__docs__search', ...expected })]);
-  });
+  if (mode === 'live') {
+    it.each([
+      ['string arguments', { id: 'mcp-args', status: 'completed', arguments: '{"query":"vault notes"}', result: { content: [{ type: 'text', text: 'hit' }] } },
+        { input: { query: 'vault notes' }, status: 'completed', result: 'hit' }],
+      ['structured-only content', { id: 'mcp-structured', status: 'completed', arguments: {}, result: { content: [], structuredContent: { matches: ['vault note'], count: 1 } } },
+        { input: {}, status: 'completed', result: '{\n  "matches": [\n    "vault note"\n  ],\n  "count": 1\n}' }],
+      ['cancellation', { id: 'mcp-cancelled', status: 'cancelled', arguments: { query: 'vault notes' } },
+        { input: { query: 'vault notes' }, status: 'error', result: 'Failed' }],
+      ['error text', { id: 'mcp-error', status: 'completed', arguments: {}, error: 'Server disconnected' },
+        { input: {}, status: 'error', result: 'Server disconnected' }],
+    ] as const)('restores native MCP calls with %s', (_label, call, expected) => {
+      const tools = restoreNativeMcpTool(call);
+      expect(tools).toEqual([expect.objectContaining({ id: call.id, name: 'mcp__docs__search', ...expected })]);
+    });
+  }
 
   it.each([
     ['completed', 'completed'],
@@ -315,8 +320,30 @@ describe.each(['live', 'history'] as const)('%s Codex tool presentation', mode =
   ])('restores a %s native web search', (status, expectedStatus) => {
     const tools = restoreNativeWebSearch(mode, { id: `search-${status}`, status, action: { type: 'search', query: 'vault sync' } });
     expect(tools).toEqual([expect.objectContaining({
-      id: `search-${status}`, name: 'WebSearch', input: { actionType: 'search', query: 'vault sync' }, status: expectedStatus, result: 'Search complete',
+      id: mode === 'history' ? 'tail-ws-0' : `search-${status}`, name: 'WebSearch', input: { actionType: 'search', query: 'vault sync' }, status: expectedStatus, result: 'Search complete',
     })]);
+  });
+
+  it('keeps native secret question answers masked in completed cards', async () => {
+    const answer = 'sample-sensitive-token-123';
+    const output = JSON.stringify({ answers: { token: { answers: [answer] } } });
+    const tool = restoreTool(mode, 'request_user_input', {
+      questions: [{ id: 'token', header: 'Token', question: 'Enter API token',
+        isSecret: true, isOther: true, options: [{ label: 'Use a token', description: 'Authenticate' }] }],
+    }, output);
+    const parent = document.body.createDiv();
+    try {
+      const card = mode === 'live'
+        ? renderToolCall(parent, { ...tool, status: 'running', result: undefined }, { initiallyExpanded: true })
+        : renderStoredToolCall(parent, tool, { initiallyExpanded: true });
+      if (mode === 'live') updateToolCallResult(card, tool);
+      expect(within(card).getByText('Enter API token')).toBeDefined();
+      expect(within(card).getByText('••••••••')).toBeDefined();
+      expect(card.textContent).not.toContain(answer);
+      expect(tool.result).toBe(output);
+      expect(tool.resolvedAnswers?.token).toBe(answer);
+      expect(await axe(parent)).toHaveNoViolations();
+    } finally { parent.remove(); }
   });
 
   it('renders async question acknowledgement with the original question and options', async () => {
@@ -368,7 +395,7 @@ it('submits a selected option and a free-text answer once, then restores both an
   const tool = restoreTool('history', 'request_user_input_async', input, '{"accepted":true}');
   let reply = '';
   let finish!: () => void;
-  const onAnswer = jest.fn(async answers => {
+  const onAnswer = vi.fn(async answers => {
     reply = formatCodexQuestionReply(tool, answers)!.content;
     await new Promise<void>(resolve => { finish = resolve; });
   });
@@ -409,10 +436,10 @@ it('submits a selected option and a free-text answer once, then restores both an
   expect(messages.find(message => message.role === 'user')?.displayContent).toBe('');
   const transcript = document.body.createDiv();
   const renderer = new MessageRenderer(
-    { app: {}, settings: {} } as any,
+    await createChatFeatureHost(),
     new Component(),
     transcript, undefined, undefined,
-    () => ({ providerId: 'codex', supportsConversationBranches: true }) as any,
+    () => CODEX_PROVIDER_CAPABILITIES,
     { navigate: async () => undefined, isBusy: () => false },
   );
   renderer.addMessage(messages.find(message => message.role === 'user')!);
@@ -430,7 +457,7 @@ it('submits a selected option and a free-text answer once, then restores both an
 
 it('keeps answer controls usable after rejected submission and disables controls on a failed tool', async () => {
   const tool = restoreTool('history', 'request_user_input_async', { questions: [{ title: 'Which check?', options: ['History'] }] }, '{"accepted":true}');
-  const onAnswer = jest.fn().mockRejectedValue(new Error('Conversation changed.'));
+  const onAnswer = vi.fn().mockRejectedValue(new Error('Conversation changed.'));
   const { block, panelHost, composer, prompts } = showQuestion(tool, onAnswer);
   fireEvent.click(within(panelHost).getByRole('button', { name: 'History' }));
   fireEvent.click(within(panelHost).getByRole('button', { name: 'Submit answers' }));
@@ -473,7 +500,7 @@ it('shows js source before output arrives and preserves it after a live failure'
 
 it('expires dismissed questions and keeps history replay read-only', async () => {
   const tool = restoreTool('history', 'request_user_input_async', { questions: [{ title: 'Which check?', options: ['History'] }] }, '{"accepted":true}');
-  const onAnswer = jest.fn();
+  const onAnswer = vi.fn();
   const { panelHost, composer, block, prompts } = showQuestion(tool, onAnswer);
   const panel = within(panelHost).getByRole('region', { name: 'Question' });
   expect((await axe(panel)).violations).toEqual([]);
@@ -542,15 +569,15 @@ it.each(['add', 'delete', 'update'] as const)('renders native %s file contents l
 
 it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary => ({ lateNative, boundary }))))(
   'keeps streamed raw-only patches before $boundary (late native item: $lateNative)', async ({ lateNative, boundary }) => {
-  jest.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
+  vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
     (el as HTMLElement).createEl('p', { text: markdown });
   });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const messagesEl = document.body.createDiv();
-  const vault = {
-    getAbstractFileByPath: jest.fn(() => null),
-    adapter: { list: jest.fn(async () => ({ files: [], folders: [] })) },
-  };
-  const plugin = { app: { vault }, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  const vault = plugin.app.vault;
+  vi.spyOn(vault, 'getAbstractFileByPath').mockReturnValue(null);
+  vi.spyOn(vault.adapter, 'list').mockResolvedValue({ files: [], folders: [] });
   const renderer = new MessageRenderer(plugin, new Component(), messagesEl);
   const state = new ChatState();
   const subagents = new SubagentManager(() => undefined);
@@ -562,24 +589,22 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
     pending = pending.then(() => stream.handleStreamChunk(chunk, response));
   }, '/workspace');
   const notify = async (method: string, params: unknown) => { router.handleNotification(method, params); await pending; };
-  const timerWindow: Window = window;
-  const realSetTimeout = timerWindow.setTimeout.bind(timerWindow);
-  const vaultNotifications: Promise<void>[] = [];
-  // Keep real notification timing, but join this case's callbacks before releasing its fixture.
-  const timeoutSpy = jest.spyOn(timerWindow, 'setTimeout').mockImplementation((handler, delay, ...args) => {
-    if (delay !== 200 || typeof handler !== 'function') return realSetTimeout(handler, delay, ...args);
-    let complete!: () => void;
-    vaultNotifications.push(new Promise<void>(resolve => { complete = resolve; }));
-    return realSetTimeout(function (this: Window, ...callbackArgs: unknown[]) {
-      try {
-        return handler.apply(this, callbackArgs);
-      } finally {
-        complete();
-      }
-    }, delay, ...args);
-  });
-  const joinVaultNotifications = async () => {
-    for (const notification of vaultNotifications) await notification;
+  const retainedHeaders: HTMLElement[] = [];
+  const expectPatchCard = (header: HTMLElement, index: number, patch: string, result: string) => {
+    const card = state.toolCallElements.get(`patch-${index}`)!;
+    expect(header.parentElement).toBe(card);
+    expect(card.dataset.toolId).toBe(`patch-${index}`);
+    expect(response.toolCalls?.find(tool => tool.id === `patch-${index}`)).toMatchObject({
+      id: `patch-${index}`, name: 'apply_patch', input: { patch }, status: 'completed', result,
+    });
+    expect(within(card).getByLabelText('Changes: +1 -0')).toBeDefined();
+    expect(header.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(header);
+    expect(header.getAttribute('aria-expanded')).toBe('true');
+    const content = card.querySelector<HTMLElement>('.claudian-tool-content')!;
+    expect(within(content).getAllByText(`hello-${index}`)).toHaveLength(1);
+    fireEvent.click(header);
+    expect(header.getAttribute('aria-expanded')).toBe('false');
   };
   try {
     state.addMessage(response);
@@ -587,43 +612,82 @@ it.each([false, true].flatMap(lateNative => ['text', 'thinking'].map(boundary =>
     router.beginTurn();
     await notify('item/agentMessage/delta', { itemId: 'intro', delta: 'Creating the note.' });
     for (const [index, wrapped] of [false, true].entries()) {
-      const patch = `*** Begin Patch\n*** Add File: note-${index}.md\n+hello\n*** End Patch`;
+      const patch = `*** Begin Patch\n*** Add File: note-${index}.md\n+hello-${index}\n*** End Patch`;
       await notify('rawResponseItem/completed', { item: { type: 'custom_tool_call', name: wrapped ? 'exec' : 'apply_patch', call_id: `patch-${index}`,
         input: wrapped ? `text(await tools.apply_patch(${JSON.stringify(patch)}));` : patch } });
       await notify('rawResponseItem/completed', { item: { type: 'custom_tool_call_output', call_id: `patch-${index}`, output: 'Success.' } });
       await notify(boundary === 'text' ? 'item/agentMessage/delta' : 'item/reasoning/summaryTextDelta', { itemId: `check-${index}`, delta: `Checking note ${index}.` });
       await stream.finalizeCurrentThinkingBlock(response);
       await stream.finalizeCurrentTextBlock(response);
-      expect(within(messagesEl).getAllByRole('button', { name: /^apply_patch: note-/ })).toHaveLength(index + 1);
+      const currentHeaders = within(messagesEl).getAllByRole('button', { name: /^apply_patch:/ });
+      expect(currentHeaders).toHaveLength(index + 1);
+      const header = currentHeaders[index];
+      retainedHeaders.push(header);
+      expectPatchCard(header, index, patch, 'Success.');
       if (lateNative) {
         await notify('item/completed', { item: { type: 'fileChange', id: `native-${index}`, status: 'completed',
-          changes: [{ path: `/workspace/note-${index}.md`, kind: { type: 'add' }, diff: 'hello\n' }] } });
+          changes: [{ path: `/workspace/note-${index}.md`, kind: { type: 'add' }, diff: `hello-${index}\n` }] } });
       }
+      const updatedHeaders = within(messagesEl).getAllByRole('button', { name: /^apply_patch:/ });
+      expect(updatedHeaders).toHaveLength(index + 1);
+      for (const [position, retained] of retainedHeaders.entries()) {
+        expect(updatedHeaders[position]).toBe(retained);
+      }
+      expectPatchCard(updatedHeaders[index], index, patch, lateNative ? `add: /workspace/note-${index}.md` : 'Success.');
       if (boundary === 'text') {
         await notify('rawResponseItem/completed', { item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `Checking note ${index}.` }] } });
         await stream.finalizeCurrentTextBlock(response);
       }
+      if (boundary === 'thinking') {
+        const thinkingHeaders = within(messagesEl).getAllByRole('button', { name: /^Thought/ });
+        fireEvent.click(thinkingHeaders[index]);
+        await Promise.resolve();
+      }
       expect(within(messagesEl).getAllByText(`Checking note ${index}.`)).toHaveLength(1);
+      const boundaryText = within(messagesEl).getByText(`Checking note ${index}.`);
+      expect(header.compareDocumentPosition(boundaryText) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     }
     await notify('item/agentMessage/delta', { itemId: 'final', delta: 'Notes are ready.' });
     await notify('rawResponseItem/completed', { item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Notes are ready.' }] } });
     await notify('turn/completed', { turn: { id: 'turn', status: 'completed' } });
     await stream.finalizeCurrentTextBlock(response);
-    const cards = within(messagesEl).getAllByRole('button', { name: /^apply_patch: note-/ });
+    const cards = within(messagesEl).getAllByRole('button', { name: /^apply_patch:/ });
     expect(cards).toHaveLength(2);
+    for (const [index, header] of cards.entries()) {
+      expect(header).toBe(retainedHeaders[index]);
+      expectPatchCard(header, index, `*** Begin Patch\n*** Add File: note-${index}.md\n+hello-${index}\n*** End Patch`, lateNative ? `add: /workspace/note-${index}.md` : 'Success.');
+    }
     const intro = within(messagesEl).getByText('Creating the note.');
     const answer = within(messagesEl).getByText('Notes are ready.');
     expect(intro.compareDocumentPosition(cards[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(cards[0].compareDocumentPosition(cards[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(cards[1].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    await joinVaultNotifications();
+    await vi.advanceTimersByTimeAsync(200);
     expect(vault.getAbstractFileByPath).toHaveBeenCalledWith('note-0.md');
     expect(vault.getAbstractFileByPath).toHaveBeenCalledWith('note-1.md');
     expect(vault.adapter.list).toHaveBeenCalledWith('');
+    vi.useRealTimers();
     expect((await axe(messagesEl)).violations).toEqual([]);
   } finally {
-    await joinVaultNotifications();
     stream.dispose(); subagents.clear(); renderer.dispose();
-    timeoutSpy.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
+
+it('shows structured-only native MCP output and preserves text/error precedence', async () => {
+  const data = { matches: ['vault note'], count: 1 };
+  const structured = restoreNativeMcpTool({ id: 'structured', status: 'completed', result: { content: [], structuredContent: data } })[0];
+  const block = renderStoredToolCall(document.body.createDiv(), structured, { initiallyExpanded: true });
+  expect(within(block).getByText(/vault note/).textContent).toContain('vault note');
+  expect((await axe(block)).violations).toEqual([]);
+  for (const [content, error, expected] of [
+    [[{ type: 'text', text: 'Human-readable result' }], undefined, 'Human-readable result'],
+    [[], 'Server disconnected', 'Server disconnected'],
+  ] as const) {
+    const tool = restoreNativeMcpTool({ id: 'precedence', status: 'completed', error,
+      result: { content, structuredContent: data } })[0];
+    expect(tool.result).toBe(expected);
+    expect(tool.status).toBe(error ? 'error' : 'completed');
   }
 });

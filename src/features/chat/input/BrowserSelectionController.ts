@@ -40,8 +40,19 @@ export class BrowserSelectionController {
         return;
       }
 
+      const url = this.#extractViewUrl(browserView.view, browserView.containerEl);
       const selectedText = await this.extractSelectedText(browserView.containerEl);
       if (generation !== this.pollGeneration) return;
+      const active = this.#getActiveBrowserView();
+      const sourceIsActive = active?.view === browserView.view && active.containerEl === browserView.containerEl;
+      const currentView = this.app.workspace.getMostRecentLeaf?.()?.view as ItemView | undefined;
+      const ownInputHandoff = !sourceIsActive
+        && this.inputEl.contains(this.inputEl.ownerDocument.activeElement)
+        && currentView?.containerEl?.contains(this.inputEl)
+        && this.app.workspace.getLeavesOfType(browserView.viewType).some(leaf => leaf.view === browserView.view);
+      if ((!sourceIsActive && !ownInputHandoff)
+        || browserView.view.containerEl !== browserView.containerEl
+        || this.#extractViewUrl(browserView.view, browserView.containerEl) !== url) return;
       if (selectedText) {
         const nextContext = this.#buildContext(browserView.view, browserView.viewType, browserView.containerEl, selectedText);
         if (!this.#isSameSelection(nextContext, this.storedSelection)) {

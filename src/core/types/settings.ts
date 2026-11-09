@@ -79,24 +79,6 @@ export type SessionManagerOrganization = 'list' | 'linked-content';
 export type SessionManagerSort = 'last-updated' | 'created';
 export type SessionAutoArchiveAfter = 'off' | '7d' | '14d' | '30d';
 
-export interface LegacyLinkedContentSettingsInput {
-  sessionManagerOrganization?: SessionManagerOrganization | 'linked-note';
-  pinnedLinkedNotePaths?: unknown;
-}
-
-/** Forced provider transition invalidated a parked auxiliary continuation. */
-export interface AuxiliaryContinuityReset {
-  success: false;
-  resetRequired: true;
-  error: string;
-  editedText?: never;
-  insertedText?: never;
-  clarification?: never;
-}
-
-/** Safe/YOLO permission values shared by providers with a two-mode control. */
-export type PermissionMode = 'yolo' | 'normal';
-
 /** Scope for environment variable storage and snippets. */
 export type EnvironmentScope = 'shared' | `provider:${string}`;
 
@@ -110,6 +92,11 @@ export type ProviderConfigMap = Partial<Record<string, Record<string, unknown>>>
 export interface StoredChatModelSelection {
   providerId: string;
   model: string;
+}
+
+/** Inline edit's own model; reasoning is omitted to follow the provider's saved effort. */
+export interface StoredInlineEditModelSelection extends StoredChatModelSelection {
+  reasoning?: string;
 }
 
 /**
@@ -157,6 +144,8 @@ export interface ClaudianSettings {
   // Provider selection
   settingsProvider: string;  // ProviderId — which provider's model/effort is projected to top-level fields
   lastSelectedChatModel: StoredChatModelSelection | null;
+  /** Null starts inline edits from the active chat selection. */
+  inlineEditModel: StoredInlineEditModelSelection | null;
   savedProviderModel: Partial<Record<string, string>>;
   savedProviderEffort: Partial<Record<string, string>>;
   savedProviderServiceTier: Partial<Record<string, string>>;
@@ -186,6 +175,13 @@ export interface ClaudianSettings {
   skillsSynced: boolean;
   sessionManagerOrganization?: SessionManagerOrganization;
   sessionManagerSort?: SessionManagerSort;
+  /**
+   * Project ids in the user's dragged order; pinned projects still come first. Projects missing from it lead,
+   * newest first.
+   */
+  projectOrder?: string[];
+  /** Project folders expanded in the session sidebar and compact history. */
+  expandedProjectIds?: string[];
   pinnedLinkedContentPaths?: string[];
   sessionAutoArchiveAfter?: SessionAutoArchiveAfter;
 

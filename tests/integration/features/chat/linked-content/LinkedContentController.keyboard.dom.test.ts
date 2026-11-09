@@ -1,21 +1,18 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 
+import { axe } from '@test/helpers/accessibility';
+import { testDate } from '@test/helpers/testClock';
 import { fireEvent, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
-import { TFolder } from 'obsidian';
+import { setIcon, TFolder } from 'obsidian';
 
+import { ComposerInfoRow } from '@/features/chat/composer/ComposerInfoRow';
 import { LinkedContentController } from '@/features/chat/linked-content/LinkedContentController';
+import { ProjectChip } from '@/features/chat/projects/ProjectChip';
 import { createWelcomeElement } from '@/features/chat/rendering/WelcomeRenderer';
 import { setLocale } from '@/i18n/i18n';
 
 beforeAll(() => {
-  Object.assign(HTMLElement.prototype, {
-    empty(this: HTMLElement) { this.replaceChildren(); },
-    addClass(this: HTMLElement, ...names: string[]) { this.classList.add(...names); },
-    removeClass(this: HTMLElement, ...names: string[]) { this.classList.remove(...names); },
-    toggleClass(this: HTMLElement, name: string, force: boolean) { this.classList.toggle(name, force); },
-    scrollIntoView() {},
-  });
+
 });
 
 it('navigates linked-content choices with arrows, selects, and returns focus on Escape', async () => {
@@ -99,4 +96,88 @@ it('localizes the controller-generated missing-content selector label', () => {
     container.remove();
     setLocale('en');
   }
+});
+
+it.each(['Enter', 'Escape', 'ArrowDown', 'ArrowUp'])('leaves %s to an active IME composition in the linked-content search', async key => {
+  const folders = ['Plans', 'Projects'].map(path => Object.assign(new TFolder(), { name: path, path }));
+  const controller = new LinkedContentController({
+    app: {
+      vault: { getAbstractFileByPath: (path: string) => folders.find(folder => folder.path === path) ?? null },
+      workspace: { getActiveFile: () => null },
+    } as never,
+    getExcludedTags: () => [], getCachedVaultFiles: () => [], getCachedVaultFolders: () => folders,
+  });
+  const container = document.body.createDiv();
+  try {
+    const welcome = createWelcomeElement(container, 'Hello');
+    controller.mountWelcome(welcome);
+    const view = within(welcome);
+    fireEvent.click(view.getByRole('button', { name: 'None' }));
+    const search = view.getByRole('textbox', { name: 'Linked content:' });
+    fireEvent.input(search, { target: { value: 'p' } });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    expect(view.getByRole('option', { name: 'Projects. Projects' }).getAttribute('aria-selected')).toBe('true');
+    expect(fireEvent.keyDown(search, { key, isComposing: true })).toBe(true);
+    expect(view.getByRole('textbox', { name: 'Linked content:' })).toBe(search);
+    expect(view.getByRole('option', { name: 'Projects. Projects' }).getAttribute('aria-selected')).toBe('true');
+    expect(controller.getSnapshot()).toEqual({ mode: 'auto-draft', path: null });
+    expect(document.activeElement).toBe(search);
+    expect(await axe(welcome, {
+      runOnly: ['label', 'aria-valid-attr-value', 'aria-roles', 'aria-required-parent', 'aria-required-children'],
+    })).toHaveNoViolations();
+    fireEvent.keyDown(search, { key: 'Enter' });
+    expect(controller.getSnapshot()).toEqual({ mode: 'explicit-draft', path: 'Projects' });
+  } finally { controller.destroy(); container.remove(); }
+});
+
+
+it.each(['main', 'remove'] as const)('keeps the linked-content %s button focused after the linked folder is renamed', async control => {
+  const folder = Object.assign(new TFolder(), { name: 'Plans', path: 'Plans' });
+  const controller = new LinkedContentController({
+    app: { vault: { getAbstractFileByPath: (path: string) => path === folder.path ? folder : null },
+      workspace: { getActiveFile: () => null } } as never,
+    getExcludedTags: () => [], getCachedVaultFiles: () => [], getCachedVaultFolders: () => [folder],
+  });
+  const container = document.body.createDiv();
+  const row = new ComposerInfoRow(container);
+  const outside = document.body.createEl('button', { text: 'Outside', attr: { type: 'button' } });
+  try {
+    controller.selectExplicit('Plans');
+    controller.mountInfoRow(row);
+    const buttonName = (name: string) => control === 'main' ? `Linked content: ${name}` : `Remove Linked content: ${name}`;
+    within(container).getByRole('button', { name: buttonName('Plans') }).focus();
+    Object.assign(folder, { name: 'Roadmap', path: 'Roadmap' });
+    controller.handleRenamed('Plans', 'Roadmap');
+    expect(document.activeElement).toBe(within(container).getByRole('button', { name: buttonName('Roadmap') }));
+    expect(controller.getSnapshot().path).toBe('Roadmap');
+    expect(await axe(container)).toHaveNoViolations();
+    outside.focus();
+    controller.handleCreated('Roadmap');
+    expect(document.activeElement).toBe(outside);
+  } finally { controller.destroy(); row.destroy(); container.remove(); outside.remove(); }
+});
+
+it('keeps a draft project chip focused, with its project icon, after its project record is refreshed', async () => {
+  const container = document.body.createDiv();
+  const row = new ComposerInfoRow(container);
+  let name = 'Launch';
+  let icon: string | undefined;
+  const project = () => ({ id: 'project', name, ...(icon ? { icon } : {}), instructions: '', memoryPath: 'Memory.md', createdAt: testDate().getTime(), isPinned: false, isArchived: false });
+  const chipIcon = () => vi.mocked(setIcon).mock.calls
+    .filter(([element]) => within(container).getByRole('button', { name: `Project: ${name}` }).contains(element)).at(-1)?.[1];
+  const chip = new ProjectChip(row, {
+    projects: { get: project, list: () => [project()] },
+    conversation: { project: { projectId: 'project', isDraft: true, changeable: true }, selectProject: async () => {} },
+  });
+  try {
+    chip.refresh();
+    expect(chipIcon()).toBe('lucide-folder');
+    within(container).getByRole('button', { name: 'Project: Launch' }).focus();
+    name = 'Launch revised';
+    icon = 'lucide-rocket';
+    chip.refresh();
+    expect(document.activeElement).toBe(within(container).getByRole('button', { name: 'Project: Launch revised' }));
+    expect(chipIcon()).toBe('lucide-rocket');
+    expect(await axe(container)).toHaveNoViolations();
+  } finally { chip.destroy(); row.destroy(); container.remove(); }
 });

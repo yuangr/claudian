@@ -1,12 +1,13 @@
-import type { ProviderToolPolicy } from '@/core/execution';
+import { isSessionToolPolicyAllowed, type ProviderToolPolicy } from '@/core/execution';
 import type {
   Thread,
   ThreadForkResult,
   ThreadResumeResult,
-  ThreadRollbackResult,
+  ThreadRevertResult,
   ThreadStartResult,
 } from '@/providers/codex/runtime/codexAppServerTypes';
 import type { CodexRPCTransport } from '@/providers/codex/runtime/CodexRPCTransport';
+import { CODEX_SESSION_TOOL_VERSION, isCodexSessionTool } from '@/providers/codex/runtime/CodexSessionTools';
 import type { CodexThreadScope } from '@/providers/codex/runtime/CodexThreadScope';
 import {
   CODEX_WORKSPACE_DEPENDENCY_TOOL_NAME,
@@ -51,7 +52,7 @@ export interface CodexThreadBinderHost {
   /** An existing thread was resumed into the current process. */
   threadResumed(thread: Thread): void;
   /** thread/start created the session's native thread. */
-  threadStarted(run: CodexActiveRun, identity: CodexThreadIdentity & { threadId: string }): void;
+  threadStarted(run: CodexActiveRun, identity: CodexThreadIdentity & { threadId: string; sessionToolVersion: number | null }): void;
   /** A fork child exists; its identity is durable before the child is resumed. */
   forkTargetAdopted(run: CodexActiveRun, target: CodexPendingForkTarget): void;
   /** The pending fork was materialized at its checkpoint. */
@@ -67,11 +68,11 @@ export class CodexThreadBinder {
   #pendingForkTarget: CodexPendingForkTarget | undefined;
   #forkIdentityPromise: Promise<CodexPendingForkTarget> | null = null;
   #forkSetupPromise: Promise<CodexEnsuredThread> | null = null;
-  #loadedThreadId: string | null = null;
+  /** The thread this generation loaded and the base instructions it was loaded with. */
+  #loadedThread: { readonly threadId: string; readonly baseInstructions: string } | null = null;
   /** Sandbox mode in effect on the loaded thread; turn/start overrides persist across turns. */
   #loadedThreadSandbox: string | null = null;
   #loadedThreadSandboxRevision = 0;
-  #loadedThreadBaseInstructions: string | null = null;
   #supportsApprovalReviewer = false;
 
   constructor(
@@ -121,9 +122,8 @@ export class CodexThreadBinder {
 
   /** The generation that loaded threads is no longer attached. */
   unload(): void {
-    this.#loadedThreadId = null;
+    this.#loadedThread = null;
     this.#setLoadedThreadSandbox(null);
-    this.#loadedThreadBaseInstructions = null;
     this.#supportsApprovalReviewer = false;
   }
 
@@ -145,8 +145,8 @@ export class CodexThreadBinder {
     if (
       identity.threadId
       && (
-        this.#loadedThreadId !== identity.threadId
-        || this.#loadedThreadBaseInstructions !== request.baseInstructions
+        this.#loadedThread?.threadId !== identity.threadId
+        || this.#loadedThread.baseInstructions !== request.baseInstructions
       )
     ) {
       if (request.persistExtendedHistory === false) {
@@ -195,6 +195,8 @@ export class CodexThreadBinder {
     this.host.threadStarted(run, {
       threadId: result.thread.id,
       sessionFilePath,
+      sessionToolVersion: dynamicTools.some(spec => isCodexSessionTool(spec.namespace, spec.name))
+        ? CODEX_SESSION_TOOL_VERSION : null,
       workspaceDependencyToolVersion: dynamicTools.some(spec =>
         spec.namespace === CODEX_WORKSPACE_DEPENDENCY_TOOL_NAMESPACE
         && spec.name === CODEX_WORKSPACE_DEPENDENCY_TOOL_NAME
@@ -268,7 +270,7 @@ export class CodexThreadBinder {
         lastTurnId: fork.resumeAt,
         ...this.#threadConfig(request, withLegacyToolInstructions(request.baseInstructions)),
         persistExtendedHistory: false,
-      } : {});
+      } : { lastTurnId: fork.resumeAt });
     }
 
     if (!isCurrent()) {
@@ -277,8 +279,7 @@ export class CodexThreadBinder {
 
     if (request.persistExtendedHistory === false) {
       // thread/fork already loaded the ephemeral child at the captured checkpoint.
-      this.#loadedThreadId = target.threadId;
-      this.#loadedThreadBaseInstructions = request.baseInstructions;
+      this.#loadedThread = { threadId: target.threadId, baseInstructions: request.baseInstructions };
       this.#consumePendingFork(run);
       return { threadId: target.threadId, sessionFilePath: null };
     }
@@ -302,20 +303,21 @@ export class CodexThreadBinder {
     if (checkpointIndex < 0) {
       throw new Error(`Fork checkpoint not found: ${fork.resumeAt}`);
     }
-    const rollbackCount = resumeResult.thread.turns.length - checkpointIndex - 1;
-    if (rollbackCount > 0) {
-      const rollbackResult = await transport.request<ThreadRollbackResult>(
-        'thread/rollback',
+    // Children adopted before thread/fork received lastTurnId still carry later turns.
+    const firstLaterTurn = resumeResult.thread.turns[checkpointIndex + 1];
+    if (firstLaterTurn) {
+      const revertResult = await transport.request<ThreadRevertResult>(
+        'thread/revert',
         {
           threadId: target.threadId,
-          numTurns: rollbackCount,
+          beforeTurnId: firstLaterTurn.id,
         },
       );
       if (!isCurrent()) {
-        throw new Error('Codex fork setup was interrupted while rolling back the child.');
+        throw new Error('Codex fork setup was interrupted while reverting the child.');
       }
-      if (rollbackResult.thread.id !== target.threadId) {
-        throw new Error('Codex rolled back a different thread than the owned fork target.');
+      if (revertResult.thread.id !== target.threadId) {
+        throw new Error('Codex reverted a different thread than the owned fork target.');
       }
     }
 
@@ -409,9 +411,8 @@ export class CodexThreadBinder {
     result: ThreadStartResult,
     baseInstructions: string,
   ): void {
-    this.#loadedThreadId = threadId;
+    this.#loadedThread = { threadId, baseInstructions };
     this.#setLoadedThreadSandbox(sandboxModeOf(result.sandbox));
-    this.#loadedThreadBaseInstructions = baseInstructions;
   }
 
   #recordApprovalReviewer(result: ThreadStartResult, requested: unknown): void {
@@ -449,6 +450,7 @@ function isThreadStartToolAllowed(
   namespace: string | null | undefined,
   name: string,
 ): boolean {
+  if (isCodexSessionTool(namespace, name)) return isSessionToolPolicyAllowed(policy);
   if (policy.kind === 'provider-default' || policy.kind === 'unrestricted') {
     return true;
   }

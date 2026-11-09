@@ -1,3 +1,5 @@
+import '@/providers';
+
 import { deferred } from '@test/helpers/ChatInputHarness';
 import { FakeSideBackend, waitFor } from '@test/helpers/features/chat/SideChatSessionHarness';
 
@@ -7,7 +9,7 @@ import { SideChatSession } from '@/features/chat/side-chat/SideChatSession';
 function createSession(overrides: Partial<ConstructorParameters<typeof SideChatSession>[0]> = {}) {
   const backend = new FakeSideBackend();
   const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
-  const buildChildResumeState = jest.fn(async () => ({ forkSource: { resumeAt: 'checkpoint-1', sessionId: 'main-session' } }));
+  const buildChildResumeState = vi.fn(async () => ({ forkSource: { resumeAt: 'checkpoint-1', sessionId: 'main-session' } }));
   const requestedEvents: string[] = [];
   const sessionEvents: string[] = [];
   const session = new SideChatSession({
@@ -23,7 +25,7 @@ function createSession(overrides: Partial<ConstructorParameters<typeof SideChatS
     providerId: 'claude',
     ephemeral: false,
     resolveBackend: () => backend,
-    vaultWorkingDirectory: '/vault',
+    workingDirectory: '/vault',
     ...overrides,
   });
   return { backend, buildChildResumeState, lifecycleRegistry, requestedEvents, session, sessionEvents };
@@ -31,7 +33,7 @@ function createSession(overrides: Partial<ConstructorParameters<typeof SideChatS
 
 function turn(text: string) {
   return {
-    configuration: { systemInstructions: { kind: 'provider-default' as const } },
+    configuration: { systemInstructions: { kind: 'main-agent' as const, instructions: 'Main Agent prompt.' } },
     images: [],
     text,
   };
@@ -82,9 +84,9 @@ describe('SideChatSession', () => {
   it('keeps a replacement interaction pending when a dismissed request with the same id settles late', async () => {
     const firstReply = deferred<{ interactionId: string; decision: 'allow' }>();
     const nextReply = deferred<{ interactionId: string; decision: 'allow' }>();
-    const requestApproval = jest.fn().mockReturnValueOnce(firstReply.promise).mockReturnValueOnce(nextReply.promise);
+    const requestApproval = vi.fn().mockReturnValueOnce(firstReply.promise).mockReturnValueOnce(nextReply.promise);
     const harness = createSession({ interactionPort: {
-      askUserQuestion: async () => { throw new Error('unexpected'); }, dismissInteraction: jest.fn(), requestApproval,
+      askUserQuestion: async () => { throw new Error('unexpected'); }, dismissInteraction: vi.fn(), requestApproval,
     } });
     const running = harness.session.execute(turn('Explore'));
     await waitFor(() => harness.backend.sessions.length === 1);
@@ -97,10 +99,8 @@ describe('SideChatSession', () => {
     const next = port.requestApproval(request, new AbortController().signal);
     firstReply.resolve({ interactionId: 'reused', decision: 'allow' });
     await expect(first).rejects.toThrow(/stale/i);
-    expect(harness.session.hasPendingInteractions).toBe(true);
     nextReply.resolve({ interactionId: 'reused', decision: 'allow' });
     await expect(next).resolves.toMatchObject({ decision: 'allow' });
-    expect(harness.session.hasPendingInteractions).toBe(false);
     native.complete();
     await running;
     await harness.session.dispose();
@@ -114,7 +114,7 @@ describe('SideChatSession', () => {
     const running = harness.session.execute(request);
     await waitFor(() => harness.backend.sessions.length === 1);
     const native = harness.backend.latest;
-    const steer = jest.fn(async (_request: ProviderExecutionRequest) => true);
+    const steer = vi.fn(async (_request: ProviderExecutionRequest) => true);
     Object.assign(native, { steer });
     expect(await harness.session.steer('Answer')).toBe(true);
     const submitted = steer.mock.calls[0][0];
@@ -268,7 +268,7 @@ describe('SideChatSession', () => {
 
   it('withdraws a request whose handoff guard fails while fork preparation is pending', async () => {
     const preparation = deferred<Record<string, unknown>>();
-    const preparing = jest.fn(() => preparation.promise);
+    const preparing = vi.fn(() => preparation.promise);
     const harness = createSession({ buildChildResumeState: preparing });
     let expired = false;
     const running = harness.session.execute({
@@ -319,7 +319,7 @@ describe('SideChatSession', () => {
 
   it('keeps the side prompt recoverable when native startup fails before acceptance', async () => {
     const harness = createSession({
-      buildChildResumeState: jest.fn(async () => { throw new Error('Fork checkpoint not found'); }),
+      buildChildResumeState: vi.fn(async () => { throw new Error('Fork checkpoint not found'); }),
     });
     await expect(harness.session.execute(turn('Explore B'))).rejects.toThrow(/checkpoint not found/i);
     expect(harness.backend.sessions).toHaveLength(0);
@@ -349,16 +349,16 @@ describe('SideChatSession', () => {
       toolName: 'Write', turnId: native.activeTurnId,
     }, new AbortController().signal);
     await waitFor(() => resolveApproval !== null);
-    expect(harness.session.hasPendingInteractions).toBe(true);
     resolveApproval!({ decision: 'allow', interactionId: 'side-approval-1' });
     await expect(approval).resolves.toMatchObject({ decision: 'allow' });
 
+    resolveApproval = null;
     const pending = port.requestApproval({
       description: 'Write another note', input: {}, interactionId: 'side-approval-2',
       kind: 'approval', sessionInstanceId: native.sessionInstanceId, toolName: 'Write',
       turnId: native.activeTurnId,
     }, new AbortController().signal);
-    await waitFor(() => harness.session.hasPendingInteractions);
+    await waitFor(() => resolveApproval !== null);
     harness.session.cancel();
     await running;
     expect(dismissals).toEqual([{ interactionId: 'side-approval-2', reason: 'cancelled' }]);

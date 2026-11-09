@@ -4,7 +4,8 @@ import {
   type ACPSessionConfigOption,
   type ACPSessionModelState,
   extractACPSessionModelState,
-} from '../../acp';
+} from '@/providers/acp';
+
 import {
   type GrokDiscoveredModel,
   normalizeGrokDiscoveredModels,
@@ -62,13 +63,6 @@ export function normalizeGrokSetModelMetadata(
     rawId: readModelId(metadata.model) ?? rawModelId,
     ...(hasReasoningOptions(metadata.model) ? { reasoningMetadataResolved: true } : {}),
   }])[0] ?? null;
-}
-
-export function normalizeGrokModelUpdateMetadata(
-  value: unknown,
-): NormalizedGrokSessionModels | null {
-  const state = parseGrokModelUpdateState(value);
-  return state ? normalizeGrokSessionModelMetadata({ models: state }) : null;
 }
 
 export function parseGrokModelUpdateState(

@@ -1,248 +1,36 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
-import { deserialize, serialize } from 'node:v8';
+import { axe } from '@test/helpers/accessibility';
+import { ControlledResizeObserver, triggerResize } from '@test/helpers/dom/ResizeObserver';
+import {
+  cleanups,
+  createChatWorkspaceFixture,
+  installChatWorkspaceHooks,
+  type Leaf,
+  waitFor,
+  zenPanel,
+} from '@test/helpers/features/chat/ChatWorkspaceFixture';
+import type { FakeSideSession } from '@test/helpers/features/chat/SideChatSessionHarness';
+import { testDate } from '@test/helpers/testClock';
+import { fireEvent, screen, within } from '@testing-library/dom';
+import { Scope, setIcon } from 'obsidian';
 
-import { createClaudianView } from '@test/helpers/features/chat/ClaudianViewHarness';
-import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
-import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
-import { FakeSideSession } from '@test/helpers/features/chat/SideChatSessionHarness';
-import { modelCatalogCases } from '@test/helpers/providerModelCatalogs';
-import { fireEvent, screen, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
-import { App, Component, Scope, setIcon } from 'obsidian';
-
-import { ChatModelSelectionCoordinator } from '@/app/settings/ChatModelSelectionCoordinator';
-import { DEFAULT_CLAUDIAN_SETTINGS } from '@/app/settings/defaultSettings';
-import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
-import { ClaudianViews } from '@/composition/ClaudianViews';
-import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { BUILT_IN_COMMANDS } from '@/core/commands/builtInCommands';
+import type { ProviderCapabilities } from '@/core/providers/types';
 import { getToolIcon } from '@/core/tools/toolIcons';
-import type { ClaudianSettings, Conversation, StreamChunk } from '@/core/types';
-import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
-import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
-import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
+import type { StreamChunk } from '@/core/types';
+import { ChatState } from '@/features/chat/state/ChatState';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 import { FLAVOR_TEXTS } from '@/features/chat/turns/flavorTexts';
-import { createChatFocusCommand } from '@/features/chat/workspace/ChatFocusCommand';
-import { ZenModeController } from '@/features/chat/zen/ZenModeController';
+import type { ZenPresentationPort } from '@/features/chat/zen/types';
+import { ZenModePanel } from '@/features/chat/zen/ZenModePanel';
 import { adaptCodexStreamChunk } from '@/providers/codex/execution/CodexExecutionEventNormalizer';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
-import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
-const originalResizeObserver = globalThis.ResizeObserver;
-const originalStructuredClone = globalThis.structuredClone;
-const cleanups: Array<() => Promise<void> | void> = [];
+const { Scope: HostScope } = await vi.importActual<typeof import('@test/__mocks__/obsidian')>('obsidian');
 
-beforeEach(() => {
-  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
-  globalThis.structuredClone = value => deserialize(serialize(value));
-});
-
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-  globalThis.ResizeObserver = originalResizeObserver;
-  globalThis.structuredClone = originalStructuredClone;
-  ProviderWorkspaceRegistry.clear();
-  jest.restoreAllMocks();
-  await releaseSideChatHarnesses();
-});
-
-type Split = { collapsed: boolean; containerEl: HTMLElement };
-type Leaf = { view: unknown; getRoot: () => unknown; isDeferred?: boolean; loadIfDeferred?: () => Promise<void> };
-
-/** Narrow stand-in for Obsidian's desktop workspace layout, events and keymap. */
-function createWorkspace() {
-  const containerEl = document.body.createDiv({ cls: 'workspace' });
-  const leftSplit: Split = { collapsed: false, containerEl: containerEl.createDiv({ cls: 'workspace-split mod-left-split' }) };
-  const rootEl = containerEl.createDiv({ cls: 'workspace-split mod-vertical mod-root' });
-  const rightSplit: Split = { collapsed: false, containerEl: containerEl.createDiv({ cls: 'workspace-split mod-right-split' }) };
-  const rootSplit = {};
-  const noteEditor = rootEl.createDiv({ cls: 'workspace-leaf' }).createEl('textarea', {
-    attr: { 'aria-label': 'Note editor' },
-  }) as HTMLTextAreaElement;
-  const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
-  const leaves: Leaf[] = [];
-  const workspace = {
-    containerEl,
-    leftSplit,
-    rightSplit,
-    rootSplit,
-    layoutReady: true,
-    onLayoutReady: (callback: () => void) => callback(),
-    on(name: string, callback: (...args: unknown[]) => void) {
-      if (!listeners.has(name)) listeners.set(name, new Set());
-      listeners.get(name)!.add(callback);
-      return { name, callback };
-    },
-    offref(ref: { name: string; callback: (...args: unknown[]) => void }) {
-      listeners.get(ref.name)?.delete(ref.callback);
-    },
-    trigger(name: string, ...args: unknown[]) {
-      for (const listener of [...(listeners.get(name) ?? [])]) listener(...args);
-    },
-    listenerCount: () => [...listeners.values()].reduce((total, set) => total + set.size, 0),
-    getLeavesOfType: () => leaves,
-    getActiveViewOfType: jest.fn(),
-    getActiveFile: () => null,
-    revealLeaf: jest.fn(async (leaf: Leaf) => {
-      const root = leaf.getRoot() as Split;
-      root.collapsed = false;
-      workspace.trigger('resize');
-    }),
-  };
-  const scopes: unknown[] = [];
-  const keymap = {
-    pushScope: (scope: unknown) => { scopes.push(scope); },
-    popScope: (scope: unknown) => { scopes.splice(scopes.indexOf(scope), 1); },
-  };
-  const setCollapsed = (split: Split, collapsed: boolean) => {
-    split.collapsed = collapsed;
-    split.containerEl.hidden = collapsed;
-    workspace.trigger('resize');
-  };
-  return { workspace, keymap, scopes, rootEl, rootSplit, leftSplit, rightSplit, noteEditor, leaves, setCollapsed };
-}
-
-function createSettings(enabled: boolean): ClaudianSettings {
-  const entry = modelCatalogCases.find(candidate => candidate.id === 'claude')!;
-  const settings = JSON.parse(JSON.stringify(DEFAULT_CLAUDIAN_SETTINGS)) as ClaudianSettings;
-  entry.populate(settings);
-  settings.enableZenMode = enabled;
-  return settings;
-}
-
-async function createZenFixture(options: { enabled?: boolean; ready?: boolean } = {}) {
-  const settings = createSettings(options.enabled ?? true);
-  const harness = createHarness({ settings: settings as unknown as Record<string, unknown> });
-  ProviderWorkspaceRegistry.setServices('claude', {});
-  const app = new App();
-  Object.assign(app.vault.adapter, { basePath: '/vault' });
-  Object.assign(app.vault, { on: () => ({}), offref: () => undefined });
-  const layout = createWorkspace();
-  Object.assign(app, { workspace: layout.workspace, keymap: layout.keymap, scope: new Scope() });
-  const sessions: FakeSideSession[] = [];
-  jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockImplementation((_host, providerId = 'claude') => ({
-    providerId,
-    createSession: config => {
-      const session = new FakeSideSession(config);
-      sessions.push(session);
-      return session;
-    },
-  }));
-  const conversations: Conversation[] = [];
-  const zen = new ZenModeController({
-    app,
-    isEnabled: (): boolean => settingsCoordinator.getCommittedSettings().enableZenMode,
-    getPosition: () => settingsCoordinator.getCommittedSettings().zenModePosition,
-    savePosition: (position) => {
-      void settingsCoordinator.mutate((draft) => { draft.zenModePosition = position; });
-    },
-  });
-  const settingsCoordinator: SettingsCoordinator<ClaudianSettings> = new SettingsCoordinator(
-    settings,
-    async () => undefined,
-    () => zen.reconcile(),
-  );
-  const find = (id: string) => conversations.find(entry => entry.id === id) ?? null;
-  const plugin = {
-    ...(harness.plugin as ChatFeatureHost), app, settings,
-    chatModelSelection: new ChatModelSelectionCoordinator(settingsCoordinator),
-    executionPersistence: {
-      registerExecutionBinding: () => undefined,
-      releaseExecutionBinding: () => undefined,
-      persistExecutionSnapshot: async () => true,
-      assertConversationExecutionAuthority: async () => undefined,
-      recordConversationActivity: async () => undefined,
-    },
-    getActiveEnvironmentVariables: () => '',
-    getConversationSummary: find,
-    getConversationSync: find,
-    getConversationById: async (id: string) => find(id),
-    getConversationList: () => conversations,
-    updateConversation: async () => undefined,
-    renameConversation: async () => undefined,
-    mutateSettings: settingsCoordinator.mutate.bind(settingsCoordinator),
-    getCommittedSettings: settingsCoordinator.getCommittedSettings.bind(settingsCoordinator),
-    registerZenModeSource: (source: Parameters<ZenModeController['register']>[0]) => zen.register(source),
-  } as unknown as ChatFeatureHost;
-
-  installSessionRuntimePool(plugin);
-
-  const addView = async (placement: 'left' | 'right' | 'main', ready = true) => {
-    const conversation = {
-      id: `conversation-${conversations.length + 1}`,
-      providerId: 'claude',
-      selectedModel: modelCatalogCases.find(candidate => candidate.id === 'claude')!.selected,
-      messages: [],
-      sessionId: `session-${conversations.length + 1}`,
-    } as unknown as Conversation;
-    conversations.push(conversation);
-    const split = placement === 'left' ? layout.leftSplit : placement === 'right' ? layout.rightSplit : null;
-    const viewContainerEl = (split?.containerEl ?? layout.rootEl).createDiv({ cls: 'claudian-container' });
-    const leaf: Leaf = { getRoot: () => split ?? layout.rootSplit, view: null };
-    const view = createClaudianView({
-      host: plugin,
-      app,
-      leaf,
-      containerEl: viewContainerEl,
-      contentEl: viewContainerEl,
-    });
-    // The view-owned footer and tab container that onOpen builds.
-    view.viewContainerEl = viewContainerEl;
-    view.buildViewLayout(viewContainerEl);
-    const activeInputSlotEl = viewContainerEl.querySelector<HTMLElement>('.claudian-active-input-slot')!;
-    const sideChatChipHostEl = viewContainerEl.querySelector<HTMLElement>('.claudian-side-chat-chip-slot')!;
-    const tab: AssembledTabRuntime = await createTabRuntime({
-      plugin,
-      component: Object.assign(new Component(), { registerDomEvent: () => undefined, registerEvent: () => undefined }) as never,
-      containerEl: view.tabContentEl,
-      mentionDataProvider: new VaultMentionDataProvider(plugin.app),
-      conversation, getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
-    openConversation: async () => {}, startNewConversation: async () => {},
-    });
-    await tab.session.runtime.model.hydrate();
-    // jsdom has no layout engine; model the native visibility query at the browser boundary.
-    tab.dom.inputEl.checkVisibility = () => {
-      if (!tab.dom.inputEl.isConnected) return false;
-      for (let el: HTMLElement | null = tab.dom.inputEl; el; el = el.parentElement) {
-        const style = el.ownerDocument.defaultView!.getComputedStyle(el);
-        if (el.hidden || style.display === 'none' || style.visibility === 'hidden'
-          || style.visibility === 'collapse' || style.opacity === '0') return false;
-      }
-      return true;
-    };
-    tab.dom.contentEl.removeClass('claudian-hidden');
-    cleanups.push(() => destroyTab(tab));
-    view.tabManager = {
-      getActiveTab: () => tab,
-      getTab: (id: string) => id === tab.id ? tab : null,
-      getTabCount: () => 1,
-    };
-
-    Object.assign(view.tabWorkspace, { lifecycleRevision: 1, initializedRevision: ready ? 1 : -1 });
-    leaf.view = view;
-    layout.leaves.push(leaf);
-    view.presentation.update();
-    view.startZenModeSource();
-    cleanups.push(() => view.stopZenModeSource());
-    return { view, tab, leaf, activeInputSlotEl, sideChatChipHostEl };
-  };
-
-  zen.start();
-  cleanups.push(() => zen.dispose());
-  const primary = await addView('right', options.ready ?? true);
-  const views = new ClaudianViews(app.workspace, () => 'right-sidebar');
-  const focusCommand = createChatFocusCommand(
-    () => views.getInputFocusView(zen.getActiveLeaf())?.getActiveTab()?.composer ?? null,
-  );
-  return { ...layout, ...primary, app, zen, focusCommand, sessions, settingsCoordinator, addView };
-}
-
-function zenPanel(): HTMLElement | null {
-  return document.querySelector<HTMLElement>('.claudian-zen');
-}
+installChatWorkspaceHooks();
 
 function preview(): string {
   return zenPanel()?.querySelector('.claudian-zen-preview')?.textContent ?? '';
@@ -263,7 +51,7 @@ async function sendFromZen(tab: AssembledTabRuntime, sessions: FakeSideSession[]
 }
 
 it('moves the existing composer and transcript into the central workspace while the sidebar is collapsed', async () => {
-  const { tab, rootEl, rightSplit, setCollapsed, activeInputSlotEl } = await createZenFixture();
+  const { tab, rootEl, rightSplit, setCollapsed, activeInputSlotEl } = await createChatWorkspaceFixture();
   const composer = tab.dom.inputComposerEl;
   const transcript = tab.dom.messagesWrapperEl;
   expect(zenPanel()).toBeNull();
@@ -286,16 +74,18 @@ it('moves the existing composer and transcript into the central workspace while 
 });
 
 it('follows the view brand provider after it changes while zen is open', async () => {
-  const { view, tab, rightSplit, setCollapsed } = await createZenFixture();
+  const { view, tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
-  view.syncProviderBrandColor();
+  view['syncProviderBrandColor']();
   expect(zenPanel()!.dataset.provider).toBe('claude');
 
   // The tab switches to another provider's model from the zen composer.
-  view.plugin.getConversationSummary(tab.conversationId).providerId = 'codex';
-  view.syncProviderBrandColor();
+  const conversation = view['plugin'].getConversationSync(tab.conversationId!);
+  assert(conversation);
+  conversation.providerId = 'codex';
+  view['syncProviderBrandColor']();
 
-  expect(view.viewContainerEl.dataset.provider).toBe('codex');
+  expect(view['viewContainerEl']!.dataset.provider).toBe('codex');
   expect(zenPanel()!.dataset.provider).toBe('codex');
 });
 
@@ -303,14 +93,14 @@ it.each([
   ['the setting is off', { enabled: false }, 'right'],
   ['only the other sidebar collapses', {}, 'left'],
 ])('does not activate when %s', async (_label, options, collapse) => {
-  const fixture = await createZenFixture(options);
+  const fixture = await createChatWorkspaceFixture(options);
   fixture.setCollapsed(collapse === 'left' ? fixture.leftSplit : fixture.rightSplit, true);
   expect(zenPanel()).toBeNull();
   expect(fixture.tab.dom.inputComposerEl.parentElement).toBe(fixture.activeInputSlotEl);
 });
 
 it('ignores a chat in the central workspace', async () => {
-  const fixture = await createZenFixture({ ready: false });
+  const fixture = await createChatWorkspaceFixture({ ready: false });
   const central = await fixture.addView('main');
   fixture.setCollapsed(fixture.rightSplit, true);
   fixture.setCollapsed(fixture.leftSplit, true);
@@ -319,26 +109,26 @@ it('ignores a chat in the central workspace', async () => {
 });
 
 it('waits for ordinary restoration before presenting an already collapsed sidebar', async () => {
-  const fixture = await createZenFixture({ ready: false });
+  const fixture = await createChatWorkspaceFixture({ ready: false });
   fixture.setCollapsed(fixture.rightSplit, true);
   expect(zenPanel()).toBeNull();
   expect(fixture.sessions).toHaveLength(0);
 
-  fixture.view.tabWorkspace.initializedRevision = 1;
-  fixture.view.notifyZenPresentationChanged();
+  fixture.view['tabWorkspace']['initializedRevision'] = 1;
+  fixture.view['notifyZenPresentationChanged']();
 
   expect(zenPanel()!.contains(fixture.tab.dom.inputComposerEl)).toBe(true);
   expect(fixture.sessions).toHaveLength(0);
 });
 
 it('loads a chat that Obsidian deferred in an already collapsed sidebar', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   let loaded: Awaited<ReturnType<typeof fixture.addView>> | null = null;
   const deferred: Leaf = {
     view: {},
     getRoot: () => fixture.leftSplit,
     isDeferred: true,
-    loadIfDeferred: jest.fn(async () => {
+    loadIfDeferred: vi.fn(async () => {
       fixture.leaves.splice(fixture.leaves.indexOf(deferred), 1);
       loaded = await fixture.addView('left');
     }),
@@ -361,12 +151,12 @@ it('loads a chat that Obsidian deferred in an already collapsed sidebar', async 
 });
 
 it('prefers a loaded chat over loading a deferred one', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   const deferred: Leaf = {
     view: {},
     getRoot: () => fixture.leftSplit,
     isDeferred: true,
-    loadIfDeferred: jest.fn(async () => undefined),
+    loadIfDeferred: vi.fn(async () => undefined),
   };
   fixture.leaves.push(deferred);
   fixture.setCollapsed(fixture.rightSplit, true);
@@ -377,7 +167,7 @@ it('prefers a loaded chat over loading a deferred one', async () => {
 });
 
 it('applies committed setting changes without reopening the sidebar or touching execution', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   const { tab, sessions, settingsCoordinator } = fixture;
   fixture.setCollapsed(fixture.rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Keep working');
@@ -397,8 +187,27 @@ it('applies committed setting changes without reopening the sidebar or touching 
   session.complete();
 });
 
+it.each([
+  ['display crossing pair', 'A'.repeat(238) + '\uD83D\uDE00X', 'A'.repeat(238) + '…'],
+  ['display fitting pair', 'A'.repeat(237) + '\uD83D\uDE00XX', 'A'.repeat(237) + '\uD83D\uDE00…'],
+  ['display exact limit', 'A'.repeat(238) + '\uD83D\uDE00', 'A'.repeat(238) + '\uD83D\uDE00'],
+  ['scan crossing pair', ' '.repeat(3761) + 'A'.repeat(238) + '\uD83D\uDE00X', 'A'.repeat(238)],
+])('renders %s in the live preview and its accessible description', async (_name, input, expected) => {
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
+  setCollapsed(rightSplit, true);
+  const session = await sendFromZen(tab, sessions, 'Summarize the note');
+  await waitFor(() => expect(preview()).toBe('Summarize the note'));
+  session.emitText(input);
+  await waitFor(() => expect(preview()).toBe(expected));
+
+  const panel = screen.getByRole('region', { name: 'Claudian chat' });
+  const show = within(panel).getByRole('button', { name: 'Show conversation', description: expected });
+  expect(document.getElementById(show.getAttribute('aria-describedby')!)?.textContent).toBe(expected);
+  expect(await axe(panel.querySelector<HTMLElement>('.claudian-zen-bar')!)).toHaveNoViolations();
+});
+
 it('keeps one live turn, draft and node identity across repeated presentation changes', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   const { tab, sessions, rightSplit, setCollapsed } = fixture;
   const composer = tab.dom.inputComposerEl;
   const transcript = tab.dom.messagesWrapperEl;
@@ -451,7 +260,8 @@ it.each([
   'item/reasoning/summaryTextDelta',
   'item/reasoning/textDelta',
 ])('retains waiting flavor in the transcript and Zen across empty Codex %s after a notification', async method => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Explain this note');
   const flavor = await waitForFlavor(tab);
@@ -466,7 +276,7 @@ it.each([
   const events = chunks.flatMap(chunk => adaptCodexStreamChunk(chunk) ?? []);
   expect(events).not.toHaveLength(0);
   for (const event of events) session.emitOutput(event);
-  await new Promise(resolve => setTimeout(resolve, 600));
+  await vi.advanceTimersByTimeAsync(600);
 
   // Empty provider output must not replace the visible waiting surface or create empty reasoning.
   expect(waitingIndicatorText(tab)).toBe(flavor);
@@ -477,7 +287,8 @@ it.each([
 });
 
 it('shares one status across waiting, thinking, tools, text and silent pauses, then clears it', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const transcript = within(tab.dom.messagesEl);
   const session = await sendFromZen(tab, sessions, 'Explain this note');
@@ -511,12 +322,15 @@ it('shares one status across waiting, thinking, tools, text and silent pauses, t
   await waitFor(() => expect(tab.state.isStreaming).toBe(false));
   await waitFor(() => expect(preview()).toMatch(/^Worked for \d{2}:\d{2} · Here is the answer\.$/));
   expect(waitingIndicatorText(tab)).toBeNull();
+  // The accessibility engine runs on real timers after the clock-dependent assertions.
+  vi.useRealTimers();
   // The drawer holds the moved transcript, its navigation and the preview line.
   expect(await axe(zenPanel()!.querySelector<HTMLElement>('.claudian-zen-drawer')!)).toHaveNoViolations();
 });
 
 it('gives a pending approval priority over the waiting status and resumes it afterwards', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Write a note');
   await waitForFlavor(tab);
@@ -533,7 +347,7 @@ it('gives a pending approval priority over the waiting status and resumes it aft
     type: 'tool_started', toolCallId: 'tool-1', name: 'Write', input: { file_path: 'note.md' },
     toolScope: { kind: 'main' },
   } as never);
-  await new Promise(resolve => setTimeout(resolve, 600));
+  await vi.advanceTimersByTimeAsync(600);
   expect(waitingIndicatorText(tab)).toBeNull();
   expect(preview()).toBe('Needs your input');
 
@@ -548,7 +362,8 @@ it('gives a pending approval priority over the waiting status and resumes it aft
 });
 
 it('keeps explicit compaction status across a prompt', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, '/compact');
   await waitFor(() => expect(waitingIndicatorText(tab)).toBe('Compacting...'));
@@ -569,23 +384,25 @@ it('keeps explicit compaction status across a prompt', async () => {
 });
 
 it('clears a pending waiting status when provider invalidation ends the turn', async () => {
-  const { tab, view, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, view, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Invalidate during text');
   session.emitText('Partial response');
   await waitFor(() => expect(preview()).toBe('Partial response'));
-  await view.plugin.providerHost.executionLifecycleRegistry.runTransition(['claude'], async () => undefined);
+  await view['plugin'].providerHost.executionLifecycleRegistry.runTransition(['claude'], async () => undefined);
   await tab.session.turns.drain();
   expect(session.cancelCalls).toBeGreaterThan(0);
 
   // Past the text-pause delay, the ended turn must not bring its indicator back.
-  await new Promise(resolve => setTimeout(resolve, 1_700));
+  await vi.advanceTimersByTimeAsync(1_700);
   expect(waitingIndicatorText(tab)).toBeNull();
   expect(tab.state.waitingStatus).toBeNull();
 });
 
 it('leaves no waiting indicator behind when plugin shutdown dismisses a pending approval', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Write a note');
   await waitForFlavor(tab);
@@ -599,20 +416,21 @@ it('leaves no waiting indicator behind when plugin shutdown dismisses a pending 
   // Persistence that outlasts the indicator delay leaves time for a stale resume to fire.
   const { conversationController } = tab.controllers;
   const save = conversationController.save.bind(conversationController);
-  jest.spyOn(conversationController, 'save').mockImplementation(async (...args) => {
+  vi.spyOn(conversationController, 'save').mockImplementation(async (...args) => {
     await new Promise(resolve => setTimeout(resolve, 600));
     return save(...args);
   });
-  await tab.session.runtime.dispose();
+  const disposal = tab.session.runtime.dispose();
+  await waitFor(() => disposal);
   await approval;
 
   expect(tab.state.isStreaming).toBe(false);
-  expect(tab.state.thinkingEl).toBeNull();
+  expect(tab.dom.messagesEl.querySelector('.claudian-thinking')).toBeNull();
   expect(tab.state.waitingStatus).toBeNull();
 });
 
 it('reports a provider failure after streamed output as an error', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
 
   const session = await sendFromZen(tab, sessions, 'Long task');
@@ -627,7 +445,8 @@ it('reports a provider failure after streamed output as an error', async () => {
 });
 
 it('leaves sending and stopping to the moved composer', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  vi.useFakeTimers({ now: testDate() });
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const panel = zenPanel()!;
   expect(within(panel).queryByRole('button', { name: 'Send' })).toBeNull();
@@ -641,13 +460,13 @@ it('leaves sending and stopping to the moved composer', async () => {
   expect(session.cancelCalls).toBe(1);
   await waitFor(() => expect(preview()).toBe('Interrupted'));
   // A cancelled turn leaves no waiting indicator behind, even after a text pause would have elapsed.
-  await new Promise(resolve => setTimeout(resolve, 1_500));
+  await vi.advanceTimersByTimeAsync(1_500);
   expect(waitingIndicatorText(tab)).toBeNull();
   expect(preview()).toBe('Interrupted');
 });
 
 it('offers no history for a new conversation until it has messages', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const panel = zenPanel()!;
   const disclosure = panel.querySelector<HTMLButtonElement>('.claudian-zen-disclosure')!;
@@ -678,7 +497,7 @@ it('offers no history for a new conversation until it has messages', async () =>
 });
 
 it('moves the composer controls to their own row only once the typed text would reach them', async () => {
-  const { tab, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const slot = zenPanel()!.querySelector<HTMLElement>('.claudian-zen-composer')!;
   const toolbar = tab.dom.inputWrapper.querySelector<HTMLElement>(':scope > .claudian-input-toolbar')!;
@@ -687,7 +506,7 @@ it('moves the composer controls to their own row only once the typed text would 
   // jsdom has no layout: a 400px input row, a 180px control group, and 8px per typed character.
   Object.defineProperty(tab.dom.inputWrapper, 'clientWidth', { configurable: true, value: 400 });
   let toolbarWidth = 180;
-  jest.spyOn(toolbar, 'getBoundingClientRect').mockImplementation(() => ({ width: toolbarWidth } as DOMRect));
+  vi.spyOn(toolbar, 'getBoundingClientRect').mockImplementation(() => ({ width: toolbarWidth } as DOMRect));
   Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
     configurable: true,
     value(this: Range) {
@@ -731,7 +550,7 @@ it('moves the composer controls to their own row only once the typed text would 
 });
 
 it('follows chat state while transcript rendering is suspended', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   tab.state.messages = [
     { id: 'u1', role: 'user', content: 'Earlier question', timestamp: 1 },
     {
@@ -763,151 +582,36 @@ it('follows chat state while transcript rendering is suspended', async () => {
   await waitFor(() => expect(tab.state.isStreaming).toBe(false));
 });
 
-it.each([true, false])('toggles the normal sidebar composer with zen enabled=%s', async (enabled) => {
-  const { focusCommand: command, tab, noteEditor, rightSplit, sessions } = await createZenFixture({ enabled });
-  noteEditor.value = 'Selected note text';
-  noteEditor.focus();
-  noteEditor.setSelectionRange(2, 7);
-  tab.dom.inputEl.value = 'Sidebar draft';
-
-  expect(command.checkCallback!(true)).toBe(true);
-  expect(document.activeElement).toBe(noteEditor);
-  expect(command.checkCallback!(false)).toBe(true);
-  const input = within(tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
-  expect(document.activeElement).toBe(input);
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
-  expect([noteEditor.selectionStart, noteEditor.selectionEnd]).toEqual([2, 7]);
-  expect(tab.dom.inputEl.value).toBe('Sidebar draft');
-  expect(rightSplit.collapsed).toBe(false);
-  expect(sessions).toHaveLength(0);
-});
-
-it('focuses the selected normal chat view and keeps its return target independent from a presented zen chat', async () => {
-  const { focusCommand, addView, workspace, tab, noteEditor, rightSplit, setCollapsed } = await createZenFixture();
-  const central = await addView('main');
-  workspace.getActiveViewOfType.mockReturnValue(central.view);
-  noteEditor.focus();
-  focusCommand.checkCallback!(false);
-  const centralInput = within(central.tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
-  expect(document.activeElement).toBe(centralInput);
-
+it('closes the resume picker with Escape through the Obsidian keymap', async () => {
+  const { app, view, tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
+  view['wireEventHandlers']();
+  // Obsidian answers Escape at the app scope when no nearer scope consumes it.
+  const appEscape = vi.fn(() => false);
+  app.keymap.getRootScope().register([], 'Escape', appEscape);
+  assert(view.scope instanceof HostScope);
+  app.keymap.setWindowBaseScope(window, view.scope);
   setCollapsed(rightSplit, true);
-  focusCommand.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
-  focusCommand.checkCallback!(false);
-  const zenInput = within(tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' });
-  expect(document.activeElement).toBe(zenInput);
-  focusCommand.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
-});
+  const input = tab.dom.inputEl as unknown as HTMLElement;
+  input.focus();
+  // Command detection is covered elsewhere; this opens the picker the command opens.
+  const sessionsCommand = BUILT_IN_COMMANDS.find(command => command.name === 'sessions')!;
+  await tab.controllers.builtInCommandController.execute(
+    sessionsCommand, { supportsNativeHistory: true } as ProviderCapabilities,
+  );
+  const picker = screen.getByRole('listbox', { name: 'Resume conversation' });
+  expect(zenPanel()!.contains(picker)).toBe(true);
+  const targetEscape = vi.fn();
+  input.addEventListener('keydown', targetEscape);
 
-it('leaves focus alone when there is no existing composer or its sidebar is collapsed without zen', async () => {
-  const { focusCommand, noteEditor, rightSplit, setCollapsed, leaves, view } = await createZenFixture({ enabled: false });
-  noteEditor.focus();
-  setCollapsed(rightSplit, true);
-  expect(focusCommand.checkCallback!(true)).toBe(false);
-  expect(focusCommand.checkCallback!(false)).toBe(false);
-  expect(document.activeElement).toBe(noteEditor);
-  expect(rightSplit.collapsed).toBe(true);
-  setCollapsed(rightSplit, false);
-  expect(focusCommand.checkCallback!(true)).toBe(true);
-  view.tabManager = null;
-  expect(focusCommand.checkCallback!(true)).toBe(false);
-  leaves.splice(0);
-  expect(focusCommand.checkCallback!(false)).toBe(false);
-  expect(document.activeElement).toBe(noteEditor);
-});
+  expect(fireEvent.keyDown(input, { key: 'Escape' })).toBe(false);
 
-it.each(['display', 'visibility', 'opacity', 'detached'])('skips a composer hidden by %s and rejects the command if none remain visible', async (reason) => {
-  const { focusCommand, addView, view, noteEditor, leftSplit, setCollapsed } = await createZenFixture({ enabled: false });
-  const other = await addView('left');
-  noteEditor.focus();
-  expect(focusCommand.checkCallback!(true)).toBe(true);
-  if (reason === 'display') view.viewContainerEl.style.display = 'none';
-  else if (reason === 'visibility') view.viewContainerEl.style.visibility = 'hidden';
-  else if (reason === 'opacity') view.viewContainerEl.style.opacity = '0';
-  else view.viewContainerEl.remove();
-
-  expect(focusCommand.checkCallback!(false)).toBe(true);
-  expect(document.activeElement).toBe(within(other.tab.dom.inputComposerEl).getByRole('textbox', { name: 'Message' }));
-  focusCommand.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
-  setCollapsed(leftSplit, true);
-  expect(focusCommand.checkCallback!(true)).toBe(false);
-  expect(focusCommand.checkCallback!(false)).toBe(false);
-  expect(document.activeElement).toBe(noteEditor);
-});
-
-it('toggles focus between the attached zen composer and the previous control without changing drafts or execution', async () => {
-  const { focusCommand: command, tab, sessions, rightSplit, setCollapsed, noteEditor, scopes, settingsCoordinator } = await createZenFixture();
-  noteEditor.value = 'A note selection';
-  noteEditor.focus();
-  noteEditor.setSelectionRange(2, 6);
-  expect(command.checkCallback!(true)).toBe(true);
-  expect(document.activeElement).toBe(noteEditor);
-
-  setCollapsed(rightSplit, true);
-  tab.dom.inputEl.value = 'Unsent draft';
-  expect(command.checkCallback!(true)).toBe(true);
-  expect(document.activeElement).toBe(noteEditor);
-  expect(command.checkCallback!(false)).toBe(true);
-  const input = within(screen.getByRole('region', { name: 'Claudian chat' })).getByRole('textbox', { name: 'Message' });
-  expect(document.activeElement).toBe(input);
-  expect(scopes).toHaveLength(1);
-  expect(tab.dom.inputEl.value).toBe('Unsent draft');
-  expect(rightSplit.collapsed).toBe(true);
-  expect(sessions).toHaveLength(0);
-
-  expect(command.checkCallback!(true)).toBe(true);
-  expect(document.activeElement).toBe(input);
-  expect(command.checkCallback!(false)).toBe(true);
-  expect(document.activeElement).toBe(noteEditor);
-  expect([noteEditor.selectionStart, noteEditor.selectionEnd]).toEqual([2, 6]);
-  expect(scopes).toHaveLength(0);
-  expect(command.checkCallback!(false)).toBe(true);
-  expect(document.activeElement).toBe(input);
-  expect(tab.dom.inputEl.value).toBe('Unsent draft');
-
-  const otherControl = noteEditor.parentElement!.createEl('button', { text: 'Another control', attr: { type: 'button' } });
-  otherControl.focus();
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(input);
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(otherControl);
-
-  noteEditor.focus();
-  await settingsCoordinator.mutate(settings => { settings.enableZenMode = false; });
-  expect(command.checkCallback!(false)).toBe(false);
-  expect(document.activeElement).toBe(noteEditor);
-  expect(scopes).toHaveLength(0);
-});
-
-it('ignores removed focus targets and retains the return target across normal and zen presentation changes', async () => {
-  const { focusCommand: command, rightSplit, setCollapsed, noteEditor } = await createZenFixture();
-  setCollapsed(rightSplit, true);
-  noteEditor.focus();
-  command.checkCallback!(false);
-  const input = within(screen.getByRole('region', { name: 'Claudian chat' })).getByRole('textbox', { name: 'Message' });
-  noteEditor.remove();
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(input);
-
-  document.body.append(noteEditor);
-  noteEditor.focus();
-  command.checkCallback!(false);
-  setCollapsed(rightSplit, false);
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(input);
-  setCollapsed(rightSplit, true);
-  command.checkCallback!(false);
-  expect(document.activeElement).toBe(noteEditor);
+  expect(screen.queryByRole('listbox', { name: 'Resume conversation' })).toBeNull();
+  expect(appEscape).not.toHaveBeenCalled();
+  expect(targetEscape).not.toHaveBeenCalled();
 });
 
 it('sends with the existing keyboard rules and leaves note input alone', async () => {
-  const { app, tab, sessions, rightSplit, setCollapsed, noteEditor, scopes } = await createZenFixture();
+  const { app, tab, sessions, rightSplit, setCollapsed, noteEditor, scopes } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const input = tab.dom.inputEl as unknown as HTMLElement;
 
@@ -937,7 +641,7 @@ it('sends with the existing keyboard rules and leaves note input alone', async (
 });
 
 it('toggles history through its hotkey command while preserving focus and the active conversation', async () => {
-  const { zen, focusCommand, tab, sessions, rightSplit, setCollapsed, noteEditor } = await createZenFixture();
+  const { zen, focusCommand, tab, sessions, rightSplit, setCollapsed, noteEditor } = await createChatWorkspaceFixture();
   const command = zen.createToggleHistoryCommand();
   expect(command.checkCallback!(true)).toBe(false);
   expect(command.checkCallback!(false)).toBe(false);
@@ -978,7 +682,7 @@ it('toggles history through its hotkey command while preserving focus and the ac
 });
 
 it('discloses the existing transcript accessibly and remembers the choice for the view lifetime', async () => {
-  const { tab, rightSplit, setCollapsed, scopes, noteEditor } = await createZenFixture();
+  const { tab, rightSplit, setCollapsed, scopes, noteEditor } = await createChatWorkspaceFixture();
   seedHistory(tab);
   setCollapsed(rightSplit, true);
   const panel = zenPanel()!;
@@ -1011,7 +715,7 @@ it('discloses the existing transcript accessibly and remembers the choice for th
 });
 
 it('collapses the expanded transcript on a click or focus move elsewhere in Obsidian', async () => {
-  const { tab, rightSplit, setCollapsed, noteEditor } = await createZenFixture();
+  const { tab, rightSplit, setCollapsed, noteEditor } = await createChatWorkspaceFixture();
   seedHistory(tab);
   setCollapsed(rightSplit, true);
   const panel = zenPanel()!;
@@ -1049,21 +753,14 @@ it('collapses the expanded transcript on a click or focus move elsewhere in Obsi
 });
 
 it('moves the panel by its grip, docks it magnetically, and remembers where it was left', async () => {
-  const observers: Array<{ callback: ResizeObserverCallback; targets: Set<Element> }> = [];
-  globalThis.ResizeObserver = class {
-    readonly #entry: { callback: ResizeObserverCallback; targets: Set<Element> };
-    constructor(callback: ResizeObserverCallback) {
-      this.#entry = { callback, targets: new Set() };
-      observers.push(this.#entry);
-    }
-    observe(target: Element) { this.#entry.targets.add(target); }
-    unobserve(target: Element) { this.#entry.targets.delete(target); }
-    disconnect() { this.#entry.targets.clear(); }
-  } as unknown as typeof ResizeObserver;
+  const unobserve = vi.spyOn(ControlledResizeObserver.prototype, 'unobserve');
   const resize = (target: Element) => {
-    for (const { callback, targets } of observers) {
-      if (targets.has(target)) callback([], {} as ResizeObserver);
-    }
+    const rect = target.getBoundingClientRect();
+    const size = { inlineSize: rect.width, blockSize: rect.height };
+    triggerResize(target, {
+      contentRect: new DOMRectReadOnly(rect.x ?? rect.left, rect.y ?? rect.top, rect.width, rect.height),
+      contentBoxSize: [size], borderBoxSize: [size], devicePixelContentBoxSize: [size],
+    });
   };
   // jsdom lacks PointerEvent, so fireEvent would dispatch plain events without pointer coordinates.
   const originalPointerEvent = window.PointerEvent;
@@ -1075,24 +772,24 @@ it('moves the panel by its grip, docks it magnetically, and remembers where it w
     }
   } as unknown as typeof PointerEvent;
   cleanups.push(() => { window.PointerEvent = originalPointerEvent; });
-  const { rootEl, rightSplit, setCollapsed, settingsCoordinator, noteEditor, workspace } = await createZenFixture();
+  const { rootEl, rightSplit, setCollapsed, settingsCoordinator, noteEditor, workspace } = await createChatWorkspaceFixture();
   // jsdom has no layout: a 1000x800 central workspace holding a 600x100 panel, without zen styles.
   // A 584x60 composer sits 8px inside the panel's bottom, which follows the bottom offset; a
   // drawer, when shown, sits on it, 526px wide.
   Object.defineProperty(rootEl, 'clientWidth', { configurable: true, value: 1000 });
   Object.defineProperty(rootEl, 'clientHeight', { configurable: true, value: 800 });
-  jest.spyOn(rootEl, 'getBoundingClientRect').mockImplementation(() => ({ left: 0, right: 1000, width: 1000, top: 0, bottom: 800, height: 800 } as DOMRect));
+  vi.spyOn(rootEl, 'getBoundingClientRect').mockImplementation(() => ({ left: 0, right: 1000, width: 1000, top: 0, bottom: 800, height: 800 } as DOMRect));
   let panelHeight = 100;
   let drawerHeight = 0;
   const stubPanel = (panel: HTMLElement) => {
     const composerBottom = () => 800 - Number.parseFloat(panel.style.getPropertyValue('--claudian-zen-offset-y') || '0');
-    jest.spyOn(panel, 'getBoundingClientRect').mockImplementation(() => ({
+    vi.spyOn(panel, 'getBoundingClientRect').mockImplementation(() => ({
       left: 200, right: 800, top: composerBottom() + 8 - panelHeight, bottom: composerBottom() + 8,
       width: 600, height: panelHeight,
     } as DOMRect));
-    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-composer')!, 'getBoundingClientRect')
+    vi.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-composer')!, 'getBoundingClientRect')
       .mockImplementation(() => ({ left: 208, right: 792, top: composerBottom() - 60, bottom: composerBottom() } as DOMRect));
-    jest.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-drawer')!, 'getBoundingClientRect')
+    vi.spyOn(panel.querySelector<HTMLElement>('.claudian-zen-drawer')!, 'getBoundingClientRect')
       .mockImplementation(() => ({
         left: 237, right: 763, top: composerBottom() - 60 - drawerHeight, bottom: composerBottom() - 60,
         height: drawerHeight,
@@ -1228,7 +925,7 @@ it('moves the panel by its grip, docks it magnetically, and remembers where it w
   let statusLeft = 750;
   let statusHeight = 30;
   let statusBottom = 800;
-  jest.spyOn(statusBar, 'getBoundingClientRect').mockImplementation(() => ({
+  vi.spyOn(statusBar, 'getBoundingClientRect').mockImplementation(() => ({
     left: statusLeft, right: 1000, width: 1000 - statusLeft,
     top: statusBottom - statusHeight, bottom: statusBottom, height: statusHeight,
   } as DOMRect));
@@ -1290,11 +987,11 @@ it('moves the panel by its grip, docks it magnetically, and remembers where it w
   workspace.trigger('layout-change');
   expect(offset(panel)).toEqual(['-200px', '0px']);
   expect(savedPosition()).toEqual({ x: -0.2, y: 0 });
-  expect(observers.every(observer => !observer.targets.has(statusBar))).toBe(true);
+  expect(unobserve).toHaveBeenCalledWith(statusBar);
 });
 
 it('keeps the preview line on the main chat while a side chat is selected', async () => {
-  const { tab, sessions, rightSplit, setCollapsed, sideChatChipHostEl } = await createZenFixture();
+  const { tab, sessions, rightSplit, setCollapsed, sideChatChipHostEl } = await createChatWorkspaceFixture();
   tab.state.messages = [
     { id: 'u1', role: 'user', content: 'Remember A', timestamp: 1 },
     { id: 'a1', role: 'assistant', content: 'Noted A', assistantMessageId: 'checkpoint-1', timestamp: 2 },
@@ -1345,7 +1042,7 @@ it('keeps the preview line on the main chat while a side chat is selected', asyn
 });
 
 it('keeps the reader scroll intent through geometry-only scrolls after relocation', async () => {
-  const { tab, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   seedHistory(tab);
   setCollapsed(rightSplit, true);
   fireEvent.click(within(zenPanel()!).getByRole('button', { name: 'Show conversation' }));
@@ -1361,7 +1058,7 @@ it('keeps the reader scroll intent through geometry-only scrolls after relocatio
 });
 
 it('keeps the last visible reading position when collapsing the sidebar hides the transcript', async () => {
-  const { tab, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   seedHistory(tab);
   const messagesEl = tab.dom.messagesEl;
   let laidOut = true;
@@ -1389,7 +1086,7 @@ it('keeps the last visible reading position when collapsing the sidebar hides th
 });
 
 it('keeps a pending approval actionable while history is collapsed', async () => {
-  const { tab, sessions, rightSplit, setCollapsed } = await createZenFixture();
+  const { tab, sessions, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
   setCollapsed(rightSplit, true);
   const session = await sendFromZen(tab, sessions, 'Write a note');
 
@@ -1410,7 +1107,7 @@ it('keeps a pending approval actionable while history is collapsed', async () =>
 });
 
 it('presents one source across multiple views and hands over when it reopens', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   const left = await fixture.addView('left');
   fixture.setCollapsed(fixture.rightSplit, true);
   fixture.setCollapsed(fixture.leftSplit, true);
@@ -1434,21 +1131,58 @@ it('presents one source across multiple views and hands over when it reopens', a
 });
 
 it('releases every moved node and subscription on close and disposal', async () => {
-  const fixture = await createZenFixture();
+  const fixture = await createChatWorkspaceFixture();
   const { tab, rootEl, rightSplit, setCollapsed, view, zen, workspace } = fixture;
   setCollapsed(rightSplit, true);
   expect(zenPanel()).not.toBeNull();
 
-  view.stopZenModeSource();
+  view['stopZenModeSource']();
   expect(zenPanel()).toBeNull();
   expect(rootEl.classList.contains('claudian-zen-host')).toBe(false);
   expect(tab.dom.inputComposerEl.parentElement).toBe(fixture.activeInputSlotEl);
   expect(tab.dom.contentEl.firstElementChild).toBe(tab.dom.messagesWrapperEl);
 
-  view.startZenModeSource();
+  view['startZenModeSource']();
   expect(zenPanel()).not.toBeNull();
   zen.dispose();
   expect(zenPanel()).toBeNull();
+  view['sessions'].dispose();
   expect(workspace.listenerCount()).toBe(0);
   expect(screen.queryByRole('region', { name: 'Claudian chat' })).toBeNull();
+});
+
+it('announces the current error when the same zen panel binds another failed session', async () => {
+  const host = document.body.createDiv();
+  const panel = new ZenModePanel(host, { keymap: null, parentScope: new Scope(),
+    historyExpanded: false, position: null, onPositionChange() {}, onHistoryExpandedChange() {} });
+  cleanups.push(() => panel.destroy());
+  const source = (message: string): ZenPresentationPort => {
+    const state = new ChatState();
+    state.addMessage({ id: 'prompt', role: 'user', content: 'Please help', timestamp: testDate().getTime() });
+    state.addMessage({ id: 'reply', role: 'assistant', content: message, timestamp: testDate().getTime() });
+    state.recordActivity({ kind: 'error', message });
+    return { state, window, subscribeActivity: listener => state.subscribeActivity(listener),
+      captureScroll: () => ({ top: 0, follow: false }), restoreScroll() {} };
+  };
+  const first = source('Provider overloaded');
+  const second = source('Authentication expired');
+  panel.bind(first, 'claude');
+  const status = within(host).getByRole('status');
+  expect(status.textContent).toBe('Error: Provider overloaded');
+  panel.bind(second, 'claude');
+  expect(status.textContent).toBe('Error: Authentication expired');
+  expect(within(host).getByRole('button', { name: 'Show conversation', description: 'Error: Authentication expired' })).toBeDefined();
+  expect(await axe(host)).toHaveNoViolations();
+
+  const mutations = new MutationObserver(() => undefined);
+  mutations.observe(status, { childList: true, characterData: true, subtree: true });
+  vi.useFakeTimers();
+  try {
+    panel.bind(second, 'claude');
+    vi.advanceTimersByTime(50);
+    expect(status.textContent).toBe('Error: Authentication expired');
+    expect(mutations.takeRecords()).toHaveLength(0);
+  } finally {
+    mutations.disconnect(); vi.useRealTimers();
+  }
 });

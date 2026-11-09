@@ -1,4 +1,7 @@
+import { SESSION_TOOL_MCP_SERVER_NAME } from '@/core/session-tools/sessionToolMCP';
 import { diffFromStructuredPatch } from '@/core/tools/toolDiff';
+import { isSessionTool, type SessionToolName } from '@/core/tools/toolNames';
+import type { ACPToolRawNameProvenance } from '@/providers/acp/ACPToolStreamAdapter';
 import { stringifyUnknown } from '@/utils/stringify';
 
 import { extractResolvedAnswersFromResultText } from '../../../core/tools/toolInput';
@@ -34,7 +37,6 @@ import type {
   WebSearchResultItem,
 } from '../../../core/types';
 import type { StructuredPatchHunk } from '../../../core/types/diff';
-import type { ACPToolRawNameProvenance } from '../../acp/ACPToolStreamAdapter';
 import { GROK_SUBAGENT_LIFECYCLE_TOOL_NAMES } from './grokLifecycleToolNames';
 
 const GROK_TOOL_NAME_MAP: Readonly<Record<string, string>> = {
@@ -88,6 +90,8 @@ export interface GrokRawToolNameResolution {
 }
 
 export function normalizeGrokToolName(rawName: string, rawInput?: unknown, rawOutput?: unknown): string {
+  const sessionTool = resolveSessionToolName(rawName, rawInput, rawOutput);
+  if (sessionTool) return sessionTool;
   const normalized = rawName.trim();
   const lookup = normalized.toLowerCase();
   // Background shells share the task-output tool with subagents; only proven shell results leave the lifecycle.
@@ -101,7 +105,21 @@ export function normalizeGrokToolName(rawName: string, rawInput?: unknown, rawOu
   if (lookup === 'use_tool' && isRecord(rawInput) && typeof rawInput.tool_name === 'string' && rawInput.tool_name.trim()) {
     return `mcp__${rawInput.tool_name.trim()}`;
   }
-  return GROK_TOOL_NAME_MAP[lookup] ?? (normalized || 'tool');
+  // Own entries only: prototype keys (e.g. constructor) stay unknown names.
+  return Object.hasOwn(GROK_TOOL_NAME_MAP, lookup) ? GROK_TOOL_NAME_MAP[lookup] : (normalized || 'tool');
+}
+
+function resolveSessionToolName(rawName: string, rawInput?: unknown, rawOutput?: unknown): SessionToolName | undefined {
+  const key = isRecord(rawInput) && typeof rawInput.tool_name === 'string' ? rawInput.tool_name.trim() : rawName.trim();
+  const prefix = `${SESSION_TOOL_MCP_SERVER_NAME}__`;
+  const name = key.startsWith(prefix) ? key.slice(prefix.length) : undefined;
+  if (name && isSessionTool(name)) return name;
+  if (isRecord(rawOutput) && rawOutput.type === 'MCP'
+    && rawOutput.server_name === SESSION_TOOL_MCP_SERVER_NAME
+    && typeof rawOutput.tool_name === 'string' && isSessionTool(rawOutput.tool_name)) {
+    return rawOutput.tool_name;
+  }
+  return undefined;
 }
 
 export function resolveGrokRawToolName(
@@ -116,7 +134,7 @@ export function resolveGrokRawToolName(
   if (
     normalizedTitle
     && (
-      normalizedTitle in GROK_TOOL_NAME_MAP
+      Object.hasOwn(GROK_TOOL_NAME_MAP, normalizedTitle)
       || GROK_SUBAGENT_LIFECYCLE_TOOL_NAMES.has(normalizedTitle)
     )
   ) {
@@ -556,12 +574,17 @@ function normalizeGrokQuestionAnswers(
   const questionText = typeof question.question === 'string' ? question.question : '';
   if (!questionText) return undefined;
   const questionId = typeof question.id === 'string' ? question.id : '';
-  if (parsed && (parsed[questionText] !== undefined || (questionId && parsed[questionId] !== undefined))) {
+  if (parsed && (Object.hasOwn(parsed, questionText) || (questionId && Object.hasOwn(parsed, questionId)))) {
     return parsed;
   }
   const answers: AskUserAnswers = { [questionText]: message };
   if (questionId) {
-    answers[questionId] = message;
+    Object.defineProperty(answers, questionId, {
+      value: message,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return answers;
 }
@@ -570,6 +593,10 @@ export function normalizeGrokToolInput(rawName: string, value: unknown, rawOutpu
   const input = isRecord(value)
     ? value
     : value === undefined ? {} : { value };
+
+  if (resolveSessionToolName(rawName, value, rawOutput) && isRecord(input.tool_input)) {
+    return input.tool_input;
+  }
 
   switch (rawName.trim().toLowerCase()) {
     case 'get_command_or_subagent_output': {

@@ -1,16 +1,20 @@
-import { Menu, Notice, setIcon, TFile } from 'obsidian';
+import { type EventRef, Menu, Notice, setIcon, TFile } from 'obsidian';
 
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import type { ConversationMeta } from '@/core/types';
+import type { ConversationMeta, SessionManagerOrganization, SessionManagerSort } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import { getObsidianLanguage } from '@/features/chat/session-manager/ProvisionalNoteNames';
+import { SessionGroupCollapse } from '@/features/chat/session-manager/SessionGroupCollapse';
 import { renderSessionGroupToggleIcon } from '@/features/chat/session-manager/SessionManagerIcons';
 import {
   archiveScopeOptions,
   beginInlineRenameNextFrame,
+  createSessionHeaderAction,
+  createSessionHeaderMenuAction,
   type SessionSurfaceNavigation,
   type SessionSurfaceShared,
   setControlAvailability,
+  showMenuAt,
 } from '@/features/chat/session-manager/SessionSurfaceShared';
 
 type SessionSearchScrollState = {
@@ -32,34 +36,45 @@ export interface SessionSidebarDeps {
 
 /**
  * The wide layout's persistent session column: New/Search/Archive navigation,
- * IME-aware search with outside dismissal, organization, sorting and group
- * collapse, pinned Linked content, inline pins, and the metadata popover.
+ * IME-aware search with outside dismissal, the projects section with its sorting
+ * and expansion, session organization, sorting, section and group collapse, pinned
+ * Linked content, inline pins, session drag and drop, and the metadata popover.
  */
+interface SearchSession {
+  query: string;
+  /** IME composition in progress; Escape and rendering wait for it. */
+  composing: boolean;
+  /** List scroll positions to restore when filtering ends. */
+  readonly restoreState: SessionSearchScrollState;
+  /** Search starts every group and section expanded, matching projects included. */
+  readonly collapse: SessionGroupCollapse;
+  fieldEl: HTMLElement | null;
+  inputEl: HTMLInputElement | null;
+}
+
 export class SessionSidebar {
   private sidebarEl: HTMLElement | null = null;
   private surfaceEl: HTMLElement | null = null;
   private newButtonEl: HTMLElement | null = null;
-  private searchFieldEl: HTMLElement | null = null;
-  private searchInputEl: HTMLInputElement | null = null;
   private groupToggleButtonEl: HTMLElement | null = null;
+  private themeEvent: EventRef | null = null;
 
   private renderAbortController: AbortController | null = null;
   private dirty = true;
 
-  private isSearchActive = false;
-  private isSearchComposing = false;
-  private searchQuery = '';
-  private searchRestoreState: SessionSearchScrollState | null = null;
+  /** The active search; null while the sidebar lists sessions normally. */
+  #search: SearchSession | null = null;
   private searchDismissCleanup: (() => void) | null = null;
-  private searchCollapsedGroupKeys = new Set<string>();
-  private readonly collapsedGroupKeys = new Set<string>();
+  private readonly collapse: SessionGroupCollapse;
   private groupKeys = new Set<string>();
 
-  constructor(private readonly deps: SessionSidebarDeps) {}
+  constructor(private readonly deps: SessionSidebarDeps) {
+    this.collapse = new SessionGroupCollapse({ host: deps.plugin });
+  }
 
   /** True while search is composing IME input; Escape belongs to the composition. */
   get isComposing(): boolean {
-    return this.isSearchComposing;
+    return this.#search?.composing ?? false;
   }
 
   /** Builds the sidebar surface inside `sidebarEl`. */
@@ -67,6 +82,8 @@ export class SessionSidebar {
     this.sidebarEl = sidebarEl;
     const trackEl = sidebarEl.createDiv({ cls: 'claudian-sidebar-surface-track' });
     this.surfaceEl = trackEl.createDiv({ cls: 'claudian-session-surface' });
+    this.syncThemeBackground();
+    this.themeEvent = this.deps.plugin.app.workspace.on('css-change', () => this.syncThemeBackground());
   }
 
   markDirty(): void {
@@ -76,11 +93,18 @@ export class SessionSidebar {
   render(): void {
     const surfaceEl = this.surfaceEl ?? this.sidebarEl;
     if (!surfaceEl || !this.dirty || !this.deps.isWide()) return;
-    if (this.isSearchComposing) return;
+    if (this.#search?.composing) return;
+    // The whole surface waits, since its list render clears the controls built around it.
+    if (this.deps.shared.browser.deferWhileSortingProjects(() => this.render())) return;
 
-    const previousSearchInput = this.searchInputEl;
+    const previousSearchInput = this.#search?.inputEl ?? null;
     const shouldRestoreSearchFocus = previousSearchInput?.ownerDocument.activeElement
       === previousSearchInput;
+    const searchSelection = previousSearchInput && shouldRestoreSearchFocus ? {
+      selectionStart: previousSearchInput.selectionStart,
+      selectionEnd: previousSearchInput.selectionEnd,
+      selectionDirection: previousSearchInput.selectionDirection,
+    } : undefined;
 
     this.cancelRendering();
     const abortController = new AbortController();
@@ -88,13 +112,15 @@ export class SessionSidebar {
 
     this.deps.shared.profileListRender(() => {
       this.newButtonEl = null;
-      this.searchFieldEl = null;
-      this.searchInputEl = null;
+      if (this.#search) {
+        this.#search.fieldEl = null;
+        this.#search.inputEl = null;
+      }
       this.groupToggleButtonEl = null;
       this.renderList(surfaceEl, abortController.signal);
       this.buildHeaderActions(surfaceEl);
       if (shouldRestoreSearchFocus) {
-        this.focusSearchInput();
+        this.focusSearchInput(searchSelection);
       }
       this.dirty = false;
     });
@@ -108,7 +134,7 @@ export class SessionSidebar {
 
   /** Closes an active search for Escape; returns whether there was one. */
   dismissSearch(): boolean {
-    if (!this.isSearchActive) return false;
+    if (!this.#search) return false;
     this.closeSearch();
     return true;
   }
@@ -116,13 +142,7 @@ export class SessionSidebar {
   /** Drops search without rendering or restoring scroll, for a switch to another list. */
   discardSearch(): void {
     this.clearSearchDismissHandlers();
-    this.isSearchActive = false;
-    this.isSearchComposing = false;
-    this.searchQuery = '';
-    this.searchFieldEl = null;
-    this.searchInputEl = null;
-    this.searchRestoreState = null;
-    this.searchCollapsedGroupKeys = new Set<string>();
+    this.#search = null;
   }
 
   refreshNewAvailability(): void {
@@ -132,8 +152,22 @@ export class SessionSidebar {
   }
 
   dispose(): void {
+    if (this.themeEvent) {
+      this.deps.plugin.app.workspace.offref(this.themeEvent);
+      this.themeEvent = null;
+    }
     this.clearSearchDismissHandlers();
     this.cancelRendering();
+  }
+
+  private syncThemeBackground(): void {
+    // Themes can scope the navigation token to the left sidebar instead of the document.
+    const navigation = this.deps.plugin.app.workspace.containerEl.querySelector<HTMLElement>(
+      '.mod-left-split, .workspace-drawer.mod-left',
+    );
+    const background = navigation?.ownerDocument.defaultView?.getComputedStyle(navigation)
+      .getPropertyValue('--nav-item-background-active').trim() ?? '';
+    this.sidebarEl?.setCssProps({ '--claudian-session-background-active': background });
   }
 
   private renderList(container: HTMLElement, signal: AbortSignal): void {
@@ -147,9 +181,11 @@ export class SessionSidebar {
       showOpenStateLabels: false,
       showOpenStateActions: false,
       preserveListState: true,
+      // The sidebar stylesheet scrolls Pinned, Projects, and Sessions separately.
+      scrollLayout: 'sections',
       showInlinePinAction: true,
       onRequestInlineRename: (request) => {
-        if (this.isSearchActive) {
+        if (this.#search) {
           this.closeSearch();
         }
         beginInlineRenameNextFrame(container, request);
@@ -164,20 +200,18 @@ export class SessionSidebar {
       language: getObsidianLanguage(plugin.settings.locale),
       contentExists: (contentPath: string) => navigation.contentExists(contentPath),
       contentIsNote: (contentPath: string) => this.contentIsNote(contentPath),
-      searchQuery: this.isSearchActive ? this.searchQuery : undefined,
+      searchQuery: this.#search?.query,
       showMetadataPopover: true,
+      showLineageFolds: true,
       showAttentionState: !isArchiveView,
       showPinnedSection: !isArchiveView,
       pinnedLinkedContentPaths: new Set(plugin.settings.pinnedLinkedContentPaths ?? []),
       showArchivedSection: isArchiveView,
-      collapsedGroupKeys: this.getDisplayedCollapsedGroupKeys(),
+      isGroupCollapsed: (groupKey: string, defaultCollapsed?: boolean) => (
+        this.getDisplayedCollapse().isCollapsed(groupKey, defaultCollapsed)
+      ),
       onGroupCollapseChange: (groupKey: string, collapsed: boolean) => {
-        const collapsedGroupKeys = this.getDisplayedCollapsedGroupKeys();
-        if (collapsed) {
-          collapsedGroupKeys.add(groupKey);
-        } else {
-          collapsedGroupKeys.delete(groupKey);
-        }
+        this.getDisplayedCollapse().setCollapsed(groupKey, collapsed);
         this.updateGroupToggleButton();
       },
       onGroupKeysChange: (groupKeys: readonly string[]) => {
@@ -189,6 +223,10 @@ export class SessionSidebar {
       onStartLinkedContentConversation: (contentPath: string) => {
         shared.setArchiveView(false);
         return navigation.startLinkedContentConversation(contentPath);
+      },
+      onStartProjectConversation: (projectId: string) => {
+        shared.setArchiveView(false);
+        return navigation.startProjectConversation(projectId);
       },
       getProviderIcon: (conversation: ConversationMeta) => {
         try {
@@ -230,8 +268,8 @@ export class SessionSidebar {
     container.insertBefore(newControl, list);
     this.newButtonEl = newControl;
 
-    if (this.isSearchActive) {
-      this.buildSearchField(container, list);
+    if (this.#search) {
+      this.buildSearchField(container, list, this.#search);
     } else {
       const searchControl = container.createDiv({ cls: 'claudian-session-search-control' });
       searchControl.setAttribute('role', 'button');
@@ -269,26 +307,26 @@ export class SessionSidebar {
 
     this.groupToggleButtonEl = null;
     const actions = header.createDiv({ cls: 'claudian-session-header-actions' });
+    createSessionHeaderMenuAction(
+      actions,
+      'ellipsis',
+      'Session options',
+      (anchor, event) => this.showOptionsMenu(anchor, event),
+    );
     if (this.getOrganization() === 'linked-content' && this.groupKeys.size > 0) {
       const allCollapsed = this.areAllGroupsCollapsed();
-      this.groupToggleButtonEl = this.createHeaderAction(
+      this.groupToggleButtonEl = createSessionHeaderAction(
         actions,
         icon => renderSessionGroupToggleIcon(icon, allCollapsed ? 'expand' : 'collapse'),
         allCollapsed ? 'Expand all groups' : 'Collapse all groups',
         () => this.toggleAllGroups(),
       );
     }
-    const optionsButton = this.createHeaderAction(
-      actions,
-      'ellipsis',
-      'Session options',
-      (event) => this.showOptionsMenu(optionsButton, event),
-    );
 
     this.refreshNewAvailability();
   }
 
-  private buildSearchField(container: HTMLElement, list: HTMLElement): void {
+  private buildSearchField(container: HTMLElement, list: HTMLElement, search: SearchSession): void {
     const searchField = container.createDiv({ cls: 'claudian-session-search-field' });
     const searchIcon = searchField.createSpan({ cls: 'claudian-session-nav-icon' });
     setIcon(searchIcon, 'search');
@@ -302,14 +340,14 @@ export class SessionSidebar {
         'aria-label': label,
       },
     });
-    searchInput.value = this.searchQuery;
+    searchInput.value = search.query;
     let committedCompositionValue: string | null = null;
     searchInput.addEventListener('compositionstart', () => {
-      this.isSearchComposing = true;
+      search.composing = true;
       committedCompositionValue = null;
     });
     searchInput.addEventListener('compositionend', () => {
-      this.isSearchComposing = false;
+      search.composing = false;
       committedCompositionValue = searchInput.value;
       this.updateSearchQuery(searchInput.value);
       queueMicrotask(() => {
@@ -318,7 +356,7 @@ export class SessionSidebar {
     });
     searchInput.addEventListener('input', (event) => {
       if (
-        this.isSearchComposing
+        search.composing
         || (event as InputEvent | undefined)?.isComposing
       ) return;
       if (committedCompositionValue === searchInput.value) {
@@ -330,7 +368,7 @@ export class SessionSidebar {
     });
     searchInput.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
-      if (this.isSearchComposing || event.isComposing) {
+      if (search.composing || event.isComposing) {
         event.stopPropagation();
         return;
       }
@@ -338,21 +376,24 @@ export class SessionSidebar {
       this.closeSearch();
     });
     container.insertBefore(searchField, list);
-    this.searchFieldEl = searchField;
-    this.searchInputEl = searchInput;
+    search.fieldEl = searchField;
+    search.inputEl = searchInput;
   }
 
   private activateSearch(): void {
-    if (this.isSearchActive) {
+    if (this.#search) {
       this.focusSearchInput();
       return;
     }
 
-    this.searchRestoreState = this.captureSearchScrollState();
-    this.isSearchActive = true;
-    this.isSearchComposing = false;
-    this.searchQuery = '';
-    this.searchCollapsedGroupKeys = new Set<string>();
+    this.#search = {
+      collapse: new SessionGroupCollapse({ projectsStartExpanded: true }),
+      composing: false,
+      fieldEl: null,
+      inputEl: null,
+      query: '',
+      restoreState: this.captureSearchScrollState(),
+    };
     this.dirty = true;
     this.render();
     this.focusSearchInput();
@@ -360,49 +401,50 @@ export class SessionSidebar {
   }
 
   private updateSearchQuery(query: string): void {
+    const search = this.#search;
+    if (!search) return;
     const wasFiltering = this.isSearchFiltering();
-    this.searchQuery = query;
+    search.query = query;
     this.dirty = true;
     this.render();
     if (wasFiltering && !this.isSearchFiltering()) {
       this.restoreSearchScrollState();
     }
-    this.focusSearchInput();
   }
 
   private closeSearch(): void {
-    if (!this.isSearchActive) return;
+    const search = this.#search;
+    if (!search) return;
 
     this.clearSearchDismissHandlers();
-    this.isSearchActive = false;
-    this.isSearchComposing = false;
-    this.searchQuery = '';
-    this.searchFieldEl = null;
-    this.searchInputEl = null;
-    this.searchCollapsedGroupKeys = new Set<string>();
+    this.#search = null;
     this.dirty = true;
     this.render();
-    this.restoreSearchScrollState();
-    this.searchRestoreState = null;
+    this.restoreSearchScrollState(search.restoreState);
   }
 
-  private focusSearchInput(): void {
-    const input = this.searchInputEl;
+  private focusSearchInput(selection?: Pick<HTMLInputElement, 'selectionStart' | 'selectionEnd' | 'selectionDirection'>): void {
+    const input = this.#search?.inputEl;
     if (!input) return;
     input.focus();
-    input.setSelectionRange?.(input.value.length, input.value.length);
+    input.setSelectionRange?.(
+      selection?.selectionStart ?? input.value.length,
+      selection?.selectionEnd ?? input.value.length,
+      selection?.selectionDirection ?? undefined,
+    );
   }
 
   private scheduleSearchDismissHandlers(): void {
     queueMicrotask(() => {
-      if (!this.isSearchActive || !this.searchInputEl) return;
+      const search = this.#search;
+      if (!search?.inputEl) return;
 
       this.clearSearchDismissHandlers();
-      const ownerDocument = this.searchInputEl.ownerDocument;
+      const ownerDocument = search.inputEl.ownerDocument;
       const ownerWindow = ownerDocument.defaultView;
       let pointerDownOutsideSearch = false;
       const isOutsideSearch = (event: Event): boolean => {
-        const searchField = this.searchFieldEl;
+        const searchField = this.#search?.fieldEl;
         const target = event.target;
         return !searchField || !target || !searchField.contains(target as Node);
       };
@@ -469,8 +511,7 @@ export class SessionSidebar {
     };
   }
 
-  private restoreSearchScrollState(): void {
-    const state = this.searchRestoreState;
+  private restoreSearchScrollState(state = this.#search?.restoreState): void {
     if (!state) return;
 
     const { pinnedList, sessionList } = this.findScrollLists();
@@ -479,7 +520,7 @@ export class SessionSidebar {
   }
 
   private isSearchFiltering(): boolean {
-    return this.isSearchActive && this.searchQuery.trim().length > 0;
+    return (this.#search?.query.trim().length ?? 0) > 0;
   }
 
   private getModelLabel(conversation: ConversationMeta): string {
@@ -504,52 +545,26 @@ export class SessionSidebar {
     return target instanceof TFile && target.extension.toLocaleLowerCase() === 'md';
   }
 
-  private createHeaderAction(
-    parent: HTMLElement,
-    icon: string | ((container: HTMLElement) => void),
-    label: string,
-    action: (event?: MouseEvent) => void,
-  ): HTMLElement {
-    const control = parent.createDiv({ cls: 'claudian-session-header-btn' });
-    control.setAttribute('role', 'button');
-    control.setAttribute('tabindex', '0');
-    control.setAttribute('aria-label', label);
-
-    const iconEl = control.createDiv({ cls: 'claudian-session-header-icon' });
-    if (typeof icon === 'string') {
-      setIcon(iconEl, icon);
-    } else {
-      icon(iconEl);
-    }
-
-    control.addEventListener('click', (event) => action(event));
-    control.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter' && event.key !== ' ') return;
-      event.preventDefault();
-      action();
-    });
-    return control;
-  }
-
-  private getOrganization(): 'list' | 'linked-content' {
+  private getOrganization(): SessionManagerOrganization {
     return this.deps.plugin.settings.sessionManagerOrganization === 'linked-content'
       ? 'linked-content'
       : 'list';
   }
 
-  private getSort(): 'last-updated' | 'created' {
+  private getSort(): SessionManagerSort {
     const sort = this.deps.plugin.settings.sessionManagerSort;
     return sort === 'created' ? sort : 'last-updated';
   }
 
-  private getDisplayedCollapsedGroupKeys(): Set<string> {
-    return this.isSearchFiltering() ? this.searchCollapsedGroupKeys : this.collapsedGroupKeys;
+  private getDisplayedCollapse(): SessionGroupCollapse {
+    const search = this.#search;
+    return search && this.isSearchFiltering() ? search.collapse : this.collapse;
   }
 
   private areAllGroupsCollapsed(): boolean {
-    const collapsedGroupKeys = this.getDisplayedCollapsedGroupKeys();
+    const collapse = this.getDisplayedCollapse();
     return this.groupKeys.size > 0
-      && [...this.groupKeys].every(groupKey => collapsedGroupKeys.has(groupKey));
+      && [...this.groupKeys].every(groupKey => collapse.isCollapsed(groupKey));
   }
 
   private updateGroupToggleButton(): void {
@@ -567,19 +582,15 @@ export class SessionSidebar {
   private toggleAllGroups(): void {
     if (this.groupKeys.size === 0) return;
 
-    const collapsedGroupKeys = this.getDisplayedCollapsedGroupKeys();
+    const collapse = this.getDisplayedCollapse();
     const shouldExpand = this.areAllGroupsCollapsed();
     for (const groupKey of this.groupKeys) {
-      if (shouldExpand) {
-        collapsedGroupKeys.delete(groupKey);
-      } else {
-        collapsedGroupKeys.add(groupKey);
-      }
+      collapse.setCollapsed(groupKey, !shouldExpand);
     }
     this.refreshPresentation();
   }
 
-  private showOptionsMenu(anchor: HTMLElement, event?: MouseEvent): void {
+  private showOptionsMenu(anchor: HTMLElement, event?: MouseEvent): Menu {
     const menu = new Menu().setUseNativeMenu(false);
     const organization = this.getOrganization();
     const sort = this.getSort();
@@ -608,22 +619,18 @@ export class SessionSidebar {
       .setChecked(sort === 'created')
       .onClick(() => this.setSort('created')));
 
-    if (event) {
-      menu.showAtMouseEvent(event);
-      return;
-    }
-    const rect = anchor.getBoundingClientRect();
-    menu.showAtPosition({ x: rect.left, y: rect.bottom }, anchor.ownerDocument);
+    showMenuAt(menu, anchor, event);
+    return menu;
   }
 
-  private setOrganization(organization: 'list' | 'linked-content'): void {
+  private setOrganization(organization: SessionManagerOrganization): void {
     void this.deps.plugin.mutateSettings((settings) => {
       settings.sessionManagerOrganization = organization;
     })
       .catch(() => new Notice('Failed to update session organization'));
   }
 
-  private setSort(sort: 'last-updated' | 'created'): void {
+  private setSort(sort: SessionManagerSort): void {
     void this.deps.plugin.mutateSettings((settings) => {
       settings.sessionManagerSort = sort;
     })

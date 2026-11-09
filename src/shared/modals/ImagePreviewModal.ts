@@ -1,5 +1,8 @@
+import { type Keymap, Scope } from 'obsidian';
+
 import type { ImageAttachment } from '@/core/types';
 import { t } from '@/i18n/i18n';
+import { setModalAccessibility } from '@/shared/modals/AccessibleModal';
 
 function getFocusableActiveElement(ownerDocument: Document): HTMLElement | null {
   const activeElement = ownerDocument.activeElement;
@@ -13,15 +16,13 @@ function getFocusableActiveElement(ownerDocument: Document): HTMLElement | null 
 export class ImagePreviewModal {
   private closeCurrent: (() => void) | null = null;
 
-  open(ownerDocument: Document, image: ImageAttachment): void {
+  open(ownerDocument: Document, image: ImageAttachment, keymap: Keymap): void {
     this.close();
 
     const previouslyFocusedElement = getFocusableActiveElement(ownerDocument);
     const overlay = ownerDocument.body.createDiv({ cls: 'claudian-image-modal-overlay' });
     const modal = overlay.createDiv({ cls: 'claudian-image-modal' });
-    modal.setAttribute('role', 'dialog');
-    modal.setAttribute('aria-modal', 'true');
-    modal.setAttribute('aria-label', t('chat.images.preview', { name: image.name }));
+    setModalAccessibility(modal, t('chat.images.preview', { name: image.name }));
 
     modal.createEl('img', {
       attr: {
@@ -39,11 +40,13 @@ export class ImagePreviewModal {
     });
     closeButton.setText('\u00D7');
 
+    // A modal scope takes precedence over the view scope in Obsidian's window-capture keymap.
+    const scope = new Scope();
     let isClosed = false;
     const close = () => {
       if (isClosed) return;
       isClosed = true;
-      ownerDocument.removeEventListener('keydown', handleKeyDown);
+      keymap.popScope(scope);
       overlay.remove();
       if (this.closeCurrent === close) {
         this.closeCurrent = null;
@@ -52,20 +55,20 @@ export class ImagePreviewModal {
         previouslyFocusedElement.focus();
       }
     };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        close();
-      } else if (event.key === 'Tab') {
-        event.preventDefault();
-        closeButton.focus();
-      }
-    };
+    scope.register(null, 'Escape', () => {
+      close();
+      return false;
+    });
+    scope.register(null, 'Tab', () => {
+      closeButton.focus();
+      return false;
+    });
 
     closeButton.addEventListener('click', close);
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay) close();
     });
-    ownerDocument.addEventListener('keydown', handleKeyDown);
+    keymap.pushScope(scope);
     this.closeCurrent = close;
     closeButton.focus();
   }

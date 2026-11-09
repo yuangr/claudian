@@ -1,4 +1,5 @@
 import {
+  compareScopedRuntimeInputFingerprints,
   createRuntimeInputFingerprint,
   isVersionedRuntimeInputFingerprint,
   RUNTIME_INPUT_FINGERPRINT_VERSION,
@@ -76,5 +77,21 @@ describe('RuntimeInputFingerprint', () => {
     expect(fingerprint).not.toContain(Buffer.from(secret, 'utf8').toString('base64'));
     expect(fingerprint).not.toContain(Buffer.from(secret, 'utf8').toString('hex'));
     expect(changedFingerprint).not.toBe(fingerprint);
+  });
+
+  it.each([
+    ['unchanged inputs', ['r1', 's1'], ['r1', 's1'], false, 'reload'],
+    ['a launch-only change', ['r1', 's1'], ['r2', 's1'], true, 'reload'],
+    ['a session-scope change', ['r1', 's1'], ['r2', 's2'], true, 'invalidate'],
+    ['a pre-split backfill with unchanged runtime', ['r1', ''], ['r1', 's1'], true, 'reload'],
+    ['a pre-split runtime change of unknown scope', ['r1', ''], ['r2', 's1'], true, 'invalidate'],
+    ['a first launch-only input after none was configured', ['', ''], ['r1', 'empty'], true, 'reload'],
+    ['a first session-scope input after none was configured', ['', ''], ['r1', 's1'], true, 'invalidate'],
+  ] as const)('classifies %s', (_label, [environmentHash, sessionEnvironmentHash], [runtime, session], changed, sessionPolicy) => {
+    expect(compareScopedRuntimeInputFingerprints(
+      { environmentHash, sessionEnvironmentHash },
+      { runtime, session },
+      'empty',
+    )).toEqual({ changed, sessionPolicy });
   });
 });

@@ -1,64 +1,69 @@
+const actualModule0 = await import('fs');
+const actualModule1 = await import('os');
+const actualModule2 = await import('path');
 import type * as fsType from 'fs';
-import type * as osType from 'os';
-import type * as pathType from 'path';
 
-const fs = jest.requireActual<typeof fsType>('fs');
-const os = jest.requireActual<typeof osType>('os');
-const path = jest.requireActual<typeof pathType>('path');
+const fs = actualModule0;
+const os = actualModule1;
+const path = actualModule2;
 
 import { findClaudeBinaryPath } from '@/providers/claude/runtime/ClaudeBinaryLocator';
+
 
 const isWindows = process.platform === 'win32';
 
 describe('findClaudeBinaryPath', () => {
   let findClaudeBinaryPath: (pathValue?: string) => string | null;
   const originalPlatform = process.platform;
-  let originalEnv: NodeJS.ProcessEnv;
+  const originalEnv = { ...process.env };
 
-  beforeEach(() => {
-    originalEnv = { ...process.env };
+  beforeEach(async () => {
+    // These cases supply virtual files; permission filtering is exercised with real files in CLI discovery integration.
+    vi.spyOn(fs, 'accessSync').mockImplementation(() => undefined);
     process.env.PATH = '';
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
     Object.defineProperty(process, 'platform', { value: originalPlatform });
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   describe('on Unix/macOS', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
       Object.defineProperty(process, 'platform', { value: 'darwin' });
       process.env.HOME = '/home/test';
-      jest.isolateModules(() => {
-        ({ findClaudeBinaryPath } = jest.requireActual('@/providers/claude/runtime/ClaudeBinaryLocator'));
-      });
+      vi.resetModules();
+      ({ findClaudeBinaryPath } = await import('@/providers/claude/runtime/ClaudeBinaryLocator'));
     });
 
     function mockExistingFile(...paths: string[]) {
       const pathSet = new Set(paths.map(value => path.normalize(value)));
-      jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => pathSet.has(p));
-      jest.spyOn(fs, 'statSync').mockImplementation((p: any) => ({
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => pathSet.has(String(p)));
+      vi.spyOn(fs, 'statSync').mockImplementation((p) => ({
         isFile: () => pathSet.has(String(p)),
       }) as fsType.Stats);
     }
 
     it('should prefer the user-local native install over a system installation', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
       mockExistingFile('/home/test/.local/bin/claude', '/usr/local/bin/claude');
 
       expect(findClaudeBinaryPath()).toBe(path.normalize('/home/test/.local/bin/claude'));
     });
 
     it('should return null when Claude CLI is not found', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
-      jest.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
+      vi.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
 
       expect(findClaudeBinaryPath()).toBeNull();
     });
 
     it('should check cli-wrapper.cjs paths as fallback on Unix', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
       mockExistingFile('/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs');
 
       expect(findClaudeBinaryPath()).toBe(path.normalize('/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs'));
@@ -72,7 +77,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should expand home directory in custom PATH', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
       mockExistingFile('/home/test/bin/claude');
 
       const customPath = '~/bin:/usr/bin';
@@ -80,10 +85,10 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should not return a directory path even if it exists', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+      vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
       const dirPath = path.join('/home/test', '.local', 'bin', 'claude');
-      jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => p === dirPath);
-      jest.spyOn(fs, 'statSync').mockImplementation(() => ({
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => p === dirPath);
+      vi.spyOn(fs, 'statSync').mockImplementation(() => ({
         isFile: () => false,
       }) as fsType.Stats);
 
@@ -92,27 +97,26 @@ describe('findClaudeBinaryPath', () => {
   });
 
   describe('on Windows', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
       Object.defineProperty(process, 'platform', { value: 'win32' });
       process.env.ProgramFiles = 'C:\\Program Files';
       process.env['ProgramFiles(x86)'] = 'C:\\Program Files (x86)';
       process.env.APPDATA = 'C:\\Users\\test\\AppData\\Roaming';
       process.env.HOME = 'C:\\Users\\test';
-      jest.isolateModules(() => {
-        ({ findClaudeBinaryPath } = jest.requireActual('@/providers/claude/runtime/ClaudeBinaryLocator'));
-      });
+      vi.resetModules();
+      ({ findClaudeBinaryPath } = await import('@/providers/claude/runtime/ClaudeBinaryLocator'));
     });
 
     function mockExistingFile(...paths: string[]) {
       const pathSet = new Set(paths);
-      jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => pathSet.has(p));
-      jest.spyOn(fs, 'statSync').mockImplementation((p: any) => ({
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => pathSet.has(String(p)));
+      vi.spyOn(fs, 'statSync').mockImplementation((p) => ({
         isFile: () => pathSet.has(String(p)),
       }) as fsType.Stats);
     }
 
     it('should prefer .exe when both .exe and cli-wrapper.cjs exist', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       const exePath = path.join('C:\\Users\\test', '.claude', 'local', 'claude.exe');
       const cliWrapperPath = path.join('C:\\Users\\test', 'AppData', 'Roaming', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'cli-wrapper.cjs');
       mockExistingFile(exePath, cliWrapperPath);
@@ -121,7 +125,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should prioritize cli-wrapper.cjs over .cmd files on Windows', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       // Note: path.join uses actual platform separator, so we match against that
       const cliWrapperPath = path.join('C:\\Users\\test', 'AppData', 'Roaming', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'cli-wrapper.cjs');
       const cmdPath = path.join('C:\\Users\\test', 'AppData', 'Roaming', 'npm', 'claude.cmd');
@@ -131,7 +135,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should find cli-wrapper.cjs in custom npm global path via npm_config_prefix', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       process.env.npm_config_prefix = 'D:\\nodejs\\node_global';
       const expectedPath = path.join('D:\\nodejs\\node_global', 'node_modules', '@anthropic-ai', 'claude-code', 'cli-wrapper.cjs');
       mockExistingFile(expectedPath);
@@ -140,7 +144,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should fall back to .exe if package entrypoint is not found', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       const expectedPath = path.join('C:\\Users\\test', '.claude', 'local', 'claude.exe');
       mockExistingFile(expectedPath);
 
@@ -148,7 +152,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should ignore .cmd fallback on Windows', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       const expectedPath = path.join('C:\\Users\\test', 'AppData', 'Roaming', 'npm', 'claude.cmd');
       mockExistingFile(expectedPath);
 
@@ -158,7 +162,7 @@ describe('findClaudeBinaryPath', () => {
     it.each(['claude', 'claude.cmd'])(
       'should ignore %s shell shims in shared discovery directories',
       (filename) => {
-        jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+        vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
         mockExistingFile(path.join('C:\\Users\\test', '.local', 'bin', filename));
 
         expect(findClaudeBinaryPath()).toBeNull();
@@ -182,8 +186,8 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should return null when no CLI is found on Windows', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
-      jest.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
 
       expect(findClaudeBinaryPath()).toBeNull();
     });
@@ -208,7 +212,7 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should ignore the extension-less npm sh shim when no package entrypoint exists', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       const npmBin = 'D:\\npm-global';
       mockExistingFile(path.join(npmBin, 'claude'));
 
@@ -217,11 +221,11 @@ describe('findClaudeBinaryPath', () => {
     });
 
     it('should not return a directory path even if it exists', () => {
-      jest.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
+      vi.spyOn(os, 'homedir').mockReturnValue('C:\\Users\\test');
       const dirPath = path.join('C:\\Users\\test', '.claude', 'local', 'claude');
       // Simulate a directory named 'claude' (exists but isFile returns false)
-      jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => p === dirPath);
-      jest.spyOn(fs, 'statSync').mockImplementation(() => ({
+      vi.spyOn(fs, 'existsSync').mockImplementation((p) => p === dirPath);
+      vi.spyOn(fs, 'statSync').mockImplementation(() => ({
         isFile: () => false,
       }) as fsType.Stats);
 
@@ -231,19 +235,23 @@ describe('findClaudeBinaryPath', () => {
 });
 
 describe('native platform CLI discovery', () => {
-  let originalEnv: NodeJS.ProcessEnv;
+  const originalEnv = { ...process.env };
 
-  beforeEach(() => {
-    originalEnv = { ...process.env };
+  beforeEach(async () => {
+    // These cases supply virtual files; permission filtering is exercised with real files in CLI discovery integration.
+    vi.spyOn(fs, 'accessSync').mockImplementation(() => undefined);
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
-    process.env = originalEnv;
+    vi.restoreAllMocks();
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   it('returns null when nothing found', () => {
-    jest.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
+    vi.spyOn(fs, 'statSync').mockImplementation(() => { throw new Error('Not found'); });
     const result = findClaudeBinaryPath('/nonexistent/path');
     expect(result).toBeNull();
   });
@@ -253,10 +261,10 @@ describe('native platform CLI discovery', () => {
       ? 'C:\\custom\\bin\\claude.exe'
       : '/custom/bin/claude';
 
-    jest.spyOn(fs, 'existsSync').mockImplementation(
+    vi.spyOn(fs, 'existsSync').mockImplementation(
       p => String(p) === claudePath
     );
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === claudePath }) as fsType.Stats
     );
 
@@ -267,10 +275,10 @@ describe('native platform CLI discovery', () => {
   it('finds claude from common paths when no custom path provided', () => {
     const commonPath = path.join(os.homedir(), '.claude', 'local', isWindows ? 'claude.exe' : 'claude');
 
-    jest.spyOn(fs, 'existsSync').mockImplementation(
+    vi.spyOn(fs, 'existsSync').mockImplementation(
       p => String(p) === commonPath
     );
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === commonPath }) as fsType.Stats
     );
 
@@ -284,10 +292,10 @@ describe('native platform CLI discovery', () => {
       '@anthropic-ai', 'claude-code', 'cli-wrapper.cjs'
     );
 
-    jest.spyOn(fs, 'existsSync').mockImplementation(
+    vi.spyOn(fs, 'existsSync').mockImplementation(
       p => String(p) === cliWrapperPath
     );
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === cliWrapperPath }) as fsType.Stats
     );
 
@@ -301,10 +309,10 @@ describe('native platform CLI discovery', () => {
       '@anthropic-ai', 'claude-code', 'cli.js'
     );
 
-    jest.spyOn(fs, 'existsSync').mockImplementation(
+    vi.spyOn(fs, 'existsSync').mockImplementation(
       p => String(p) === legacyCliPath
     );
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === legacyCliPath }) as fsType.Stats
     );
 
@@ -318,10 +326,10 @@ describe('native platform CLI discovery', () => {
     const originalPath = process.env.PATH;
     process.env.PATH = [envBin, originalPath ?? ''].join(path.delimiter);
 
-    jest.spyOn(fs, 'existsSync').mockImplementation(
+    vi.spyOn(fs, 'existsSync').mockImplementation(
       p => String(p) === envClaudePath
     );
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === envClaudePath }) as fsType.Stats
     );
 
@@ -334,7 +342,7 @@ describe('native platform CLI discovery', () => {
   });
 
   it('handles inaccessible filesystem paths gracefully', () => {
-    jest.spyOn(fs, 'statSync').mockImplementation(() => {
+    vi.spyOn(fs, 'statSync').mockImplementation(() => {
       throw new Error('Permission denied');
     });
 
@@ -354,21 +362,21 @@ describe('native platform CLI discovery', () => {
     const claudePath = path.join(nvmDir, 'versions', 'node', 'v22.18.0', 'bin', 'claude');
     const binDir = path.join(nvmDir, 'versions', 'node', 'v22.18.0', 'bin');
 
-    jest.spyOn(os, 'homedir').mockReturnValue('/fake/home');
+    vi.spyOn(os, 'homedir').mockReturnValue('/fake/home');
     process.env.HOME = '/fake/home';
-    jest.spyOn(fs, 'existsSync').mockImplementation(p => {
+    vi.spyOn(fs, 'existsSync').mockImplementation(p => {
       const s = String(p);
       return s === claudePath || s === binDir;
     });
-    jest.spyOn(fs, 'readFileSync').mockImplementation(((p: string) => {
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((p: string) => {
       if (String(p) === path.join(nvmDir, 'alias', 'default')) return '22';
       throw new Error('not found');
     }) as typeof fs.readFileSync);
-    jest.spyOn(fs, 'readdirSync').mockImplementation(((p: string) => {
+    vi.spyOn(fs, 'readdirSync').mockImplementation(((p: string) => {
       if (String(p) === path.join(nvmDir, 'versions', 'node')) return ['v22.18.0'];
       return [];
     }) as typeof fs.readdirSync);
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === claudePath }) as fsType.Stats
     );
 
@@ -393,21 +401,21 @@ describe('native platform CLI discovery', () => {
     const claudePath = path.join(nvmDir, 'versions', 'node', 'v22.18.0', 'bin', 'claude');
     const binDir = path.join(nvmDir, 'versions', 'node', 'v22.18.0', 'bin');
 
-    jest.spyOn(os, 'homedir').mockReturnValue('/fake/home');
+    vi.spyOn(os, 'homedir').mockReturnValue('/fake/home');
     process.env.HOME = '/fake/home';
-    jest.spyOn(fs, 'existsSync').mockImplementation(p => {
+    vi.spyOn(fs, 'existsSync').mockImplementation(p => {
       const s = String(p);
       return s === claudePath || s === binDir;
     });
-    jest.spyOn(fs, 'readFileSync').mockImplementation(((p: string) => {
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((p: string) => {
       if (String(p) === path.join(nvmDir, 'alias', 'default')) return 'node';
       throw new Error('not found');
     }) as typeof fs.readFileSync);
-    jest.spyOn(fs, 'readdirSync').mockImplementation(((p: string) => {
+    vi.spyOn(fs, 'readdirSync').mockImplementation(((p: string) => {
       if (String(p) === path.join(nvmDir, 'versions', 'node')) return ['v20.10.0', 'v22.18.0'];
       return [];
     }) as typeof fs.readdirSync);
-    jest.spyOn(fs, 'statSync').mockImplementation(
+    vi.spyOn(fs, 'statSync').mockImplementation(
       p => ({ isFile: () => String(p) === claudePath }) as fsType.Stats
     );
 
@@ -420,3 +428,7 @@ describe('native platform CLI discovery', () => {
     else delete process.env.NVM_DIR;
   });
 });
+
+vi.mock('fs', async () => ({ ...await vi.importActual<typeof import('fs')>('fs') }));
+
+vi.mock('os', async () => ({ ...await vi.importActual<typeof import('os')>('os') }));

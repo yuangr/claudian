@@ -1,19 +1,26 @@
-/** @jest-environment jsdom */
-import '@/providers';
+/** @vitest-environment jsdom */
 
-import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createProjectsFake } from '@test/helpers/features/chat/ProjectsFake';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { waitFor, within } from '@testing-library/dom';
 import { App, Component, MarkdownRenderer } from 'obsidian';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
 import type { ClaudianSettings, Conversation } from '@/core/types';
-import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { SessionMessagingService } from '@/features/chat/session-messaging/SessionMessagingService';
 import { activateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
 import { PiExecutionBackend, type PiExecutionKernel, type PiExecutionKernelCallbacks } from '@/providers/pi/execution';
+import { piProviderRegistration } from '@/providers/pi/registration';
+import { PiExtensionUIBridge } from '@/providers/pi/runtime/PiExtensionUIBridge';
 import type { PiLaunchSpec } from '@/providers/pi/runtime/PiLaunchSpecBuilder';
+import type { PiRPCTransport } from '@/providers/pi/runtime/PiRPCTransport';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
+
+registerProviderModules([claudeProviderRegistration, piProviderRegistration]);
 
 const MODEL = 'pi:anthropic/claude-sonnet-4';
 
@@ -44,6 +51,13 @@ class ScriptedPiKernel implements PiExecutionKernel {
     return {} as T;
   }
 
+  /** Extension notifications pass through the real native-UI bridge into this session. */
+  notify(notifyType: string | undefined): void {
+    const transport = { send: () => { throw new Error('A notification must not request a native response'); } };
+    new PiExtensionUIBridge(transport as unknown as PiRPCTransport, null, this.callbacks.onExtensionChunk)
+      .handleRequest({ type: 'extension_ui_request', method: 'notify', message: 'Extension policy message', notifyType });
+  }
+
   /** One assistant message that thinks, then answers without calling tools. */
   answer(text: string): void {
     this.emit({ message: { role: 'assistant' }, type: 'message_start' });
@@ -52,12 +66,24 @@ class ScriptedPiKernel implements PiExecutionKernel {
     this.emit({ message: { role: 'assistant', stopReason: 'stop', timestamp: Date.now() }, type: 'message_end' });
   }
 
+  /** A completed native tool call, as Pi reports extension tools such as Peeps. */
+  tool(toolCallId: string, toolName: string, args: Record<string, unknown>, details: Record<string, unknown>): void {
+    this.emit({ args, toolCallId, toolName, type: 'tool_execution_start' });
+    this.emit({
+      isError: false,
+      result: { content: [{ text: JSON.stringify(details), type: 'text' }], details },
+      toolCallId,
+      toolName,
+      type: 'tool_execution_end',
+    });
+  }
+
   /** A Peeps result delivered with `pi.sendMessage({ display: true })`. */
   result(runId: string, text: string): void {
     const message = {
       content: `[Peeps automated result — ${runId} — answer]\n${text}`,
       customType: 'peeps-result',
-      details: { runId, status: 'answer' },
+      details: { owner: 'pi-session', results: [{ runId, seq: 1, status: 'answer' }] },
       display: true,
       role: 'custom',
     };
@@ -81,12 +107,12 @@ beforeEach(() => {
     toggleClass(this: HTMLElement, name: string, enabled: boolean) { this.classList.toggle(name, enabled); },
     scrollIntoView() {},
   });
-  jest.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
+  vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
     (el as HTMLElement).createEl('p', { text: markdown });
   });
 });
 afterEach(() => {
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
   document.body.replaceChildren();
 });
 
@@ -95,7 +121,6 @@ async function createPiView() {
   Object.assign(app.vault.adapter, { basePath: '/vault' });
   Object.assign(app.vault, { on: () => ({}), offref() {} });
   Object.assign(app.workspace, { getActiveViewOfType: () => null });
-  const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
   const settings = {
     model: MODEL, effortLevel: 'off', permissionMode: 'normal',
     enableAutoTitleGeneration: false, excludedTags: [], mediaFolder: '', systemPrompt: '', userName: '',
@@ -107,47 +132,42 @@ async function createPiView() {
       enabled: true,
       visibleModels: [MODEL],
     } },
-  } as unknown as ClaudianSettings;
+  } satisfies Partial<ClaudianSettings>;
   const conversation = {
     id: 'conversation-1', providerId: 'pi', selectedModel: MODEL, messages: [],
-  } as unknown as Conversation;
-  const providerHost = {
-    app, settings, executionLifecycleRegistry: lifecycleRegistry,
-    getResolvedProviderCliPath: async () => '/bin/pi',
-    getActiveEnvironmentVariables: () => '',
-  };
-  const kernels: ScriptedPiKernel[] = [];
-  const backend = new PiExecutionBackend(providerHost as never, {
-    commandCatalog: { setCommandSnapshot() {} } as never,
-  }, {
-    createKernel: (spec, callbacks) => {
-      const kernel = new ScriptedPiKernel(spec, callbacks);
-      kernels.push(kernel);
-      return kernel;
-    },
-  });
-  jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(backend);
-  const plugin = {
-    app, settings, providerHost,
+    title: 'Pi extension', createdAt: 1, lastActivityAt: 1, sessionId: null,
+  } satisfies Conversation;
+  const pool = createSessionRuntimePool(() => plugin);
+  const messaging = new SessionMessagingService({ getHost: () => plugin, getActiveConversationId: () => conversation.id, refreshModelControls: () => undefined });
+  const plugin = await createChatFeatureHost({
+    sessionRuntimes: pool,
+    bindSessionTools: id => messaging.bindSessionTools(id),
+    app, settings,
     executionPersistence: {
       registerExecutionBinding() {}, releaseExecutionBinding() {},
       assertConversationExecutionAuthority: async () => {},
       persistExecutionSnapshot: async () => true,
       recordConversationActivity: async () => {},
     },
-    getSessionSnapshotDirectory: () => '/tmp/claudian-sessions',
-    getCommittedSettings: () => settings,
-    getActiveEnvironmentVariables: () => '',
     getConversationSummary: () => conversation,
+    projects: createProjectsFake(),
     getConversationSync: () => conversation,
     getConversationById: async () => conversation,
-    getConversationList: () => [conversation],
+    getConversationList: () => [{ ...conversation, messageCount: 0, preview: '' }],
     renameConversation: async () => {},
     updateConversation: async () => {},
-    mutateSettings: async (mutate: (settings: ClaudianSettings) => void) => mutate(settings),
     chatModelSelection: { beginIntent: () => 1, commitIntent: async () => true },
-  } as unknown as ChatFeatureHost;
-  if (!plugin.sessionRuntimes) installSessionRuntimePool(plugin);
+  });
+  vi.spyOn(plugin.providerHost, 'getResolvedProviderCliPath').mockResolvedValue('/bin/pi');
+  const kernels: ScriptedPiKernel[] = [];
+  const backend = new PiExecutionBackend(plugin.providerHost.getRuntimeHost('pi'), {
+    createKernel: (spec, callbacks) => {
+      const kernel = new ScriptedPiKernel(spec, callbacks);
+      kernels.push(kernel);
+      return kernel;
+    },
+  });
+  vi.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(backend);
   const tab = await createTabRuntime({
     plugin, conversation, component: new Component(),
     containerEl: document.body.createDiv(),
@@ -155,13 +175,13 @@ async function createPiView() {
     getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
     openConversation: async () => {}, startNewConversation: async () => {},
   });
-  tab.hydrationState = 'ready';
+  await tab.session.runtime.model.hydrate();
   await tab.executionCoordinator.bindConversation({ conversationId: conversation.id, providerId: 'pi' });
   await tab.executionCoordinator.prepare();
   activateTab(tab);
   return {
     tab, kernels,
-    dispose: async () => { await destroyTab(tab); await lifecycleRegistry.dispose(); },
+    dispose: async () => { await destroyTab(tab); await messaging.dispose(); await plugin.providerHost.executionLifecycleRegistry.dispose(); },
   };
 }
 
@@ -196,6 +216,27 @@ async function sendPrompt(view: PiView, text: string, script: (kernel: ScriptedP
 function later(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 20));
 }
+
+it.each([
+  ['warning', 'Warning'], ['error', 'Warning'], ['info', 'Notice'], [undefined, 'Notice'],
+])('renders extension notification severity %s as %s without terminating the turn', async (notifyType, label) => {
+  const view = await createPiView();
+  try {
+    await sendPrompt(view, 'Check policy', async kernel => {
+      kernel.emit({ type: 'agent_start' });
+      kernel.notify(notifyType);
+      await waitFor(() => expect(view.tab.dom.messagesEl.textContent).toContain(`**${label}:** Extension policy message`));
+      expect(view.tab.state.isStreaming).toBe(true);
+      kernel.answer('The turn continued.');
+      kernel.emit({ messages: [], type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+    });
+    expect(view.tab.state.isStreaming).toBe(false);
+    expectVisibleAnswer(responseElements(view)[0], 'The turn continued.');
+  } finally {
+    await view.dispose();
+  }
+});
 
 describe('Pi extension-initiated turns in the chat view', () => {
   it('ends the prompt at its answer and renders each later result as a notification with its reply', async () => {
@@ -244,6 +285,53 @@ describe('Pi extension-initiated turns in the chat view', () => {
       expectVisibleAnswer(replyB, 'Reply B.');
       expect(within(replyB).getByText('Result B.')).toBeTruthy();
       expect(view.tab.dom.messagesEl.textContent).not.toContain('Peeps automated result');
+    } finally {
+      await view.dispose();
+    }
+  });
+
+  it('renders a Peeps child as a subagent card that its later result completes', async () => {
+    const view = await createPiView();
+    try {
+      await sendPrompt(view, 'Delegate the probe', async (kernel) => {
+        kernel.emit({ type: 'agent_start' });
+        kernel.emit({ message: { role: 'assistant' }, type: 'message_start' });
+        kernel.emit({ message: { role: 'assistant', stopReason: 'toolUse', timestamp: Date.now() }, type: 'message_end' });
+        kernel.tool('spawn-1', 'peeps_spawn', { label: 'vault probe', task: 'List the vault root.' }, {
+          id: 'run-1', label: 'vault probe', status: 'starting',
+        });
+        kernel.tool('inspect-1', 'peeps_inspect', { id: 'run-1' }, { id: 'run-1', status: 'working' });
+        await later();
+        kernel.answer('Spawned.');
+        kernel.emit({ messages: [], type: 'agent_end' });
+        kernel.emit({ type: 'agent_settled' });
+      });
+      // Work before the answer collapses into its disclosure.
+      await waitFor(() => within(view.tab.dom.messagesEl)
+        .getByRole('button', { hidden: true, name: /^Subagent task: vault probe - Status: running/ }));
+      // The card replaces the spawn's generic tool card; status tools keep theirs.
+      expect(within(view.tab.dom.messagesEl).queryByText('peeps_spawn')).toBeNull();
+      expect(within(view.tab.dom.messagesEl).getByText('peeps_inspect')).toBeTruthy();
+
+      const kernel = view.kernels[0];
+      kernel.emit({ type: 'agent_start' });
+      await later();
+      kernel.result('run-1', 'Inbox, Work, Template.');
+      await later();
+      kernel.answer('The probe finished.');
+      kernel.emit({ messages: [], type: 'agent_end' });
+      kernel.emit({ type: 'agent_settled' });
+      await waitFor(() => expect(view.tab.executionCoordinator.hasBackgroundWork).toBe(false));
+      await view.tab.session.runtime.awaitBackgroundWork();
+
+      const completed = within(view.tab.dom.messagesEl)
+        .getByRole('button', { hidden: true, name: /^Subagent task: vault probe - Status: completed/ });
+      const [prompted] = responseElements(view);
+      expect(prompted.contains(completed)).toBe(true);
+      const content = completed.closest<HTMLElement>('[data-subagent-id]')!;
+      expect(within(content).getByText('List the vault root.')).toBeTruthy();
+      expect(within(content).getByText('Inbox, Work, Template.')).toBeTruthy();
+      expect(view.tab.dom.messagesEl.querySelectorAll('[data-subagent-id="spawn-1"]')).toHaveLength(1);
     } finally {
       await view.dispose();
     }

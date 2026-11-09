@@ -83,12 +83,17 @@ export function getWebSearchLabel(input: Record<string, unknown>, maxLength: num
 }
 
 function parseWebSearchLinks(result: string): WebSearchLink[] {
-  const linksMatch = result.match(/Links:\s*(\[[\s\S]*?\])(?:\n|$)/);
+  const linksMatch = result.match(/Links:\s*(\[[\s\S]*?\])(?:\r?\n|$)/);
   if (!linksMatch) return [];
 
   try {
-    const parsed = JSON.parse(linksMatch[1]) as WebSearchLink[];
-    return Array.isArray(parsed) ? parsed.filter(l => l.title && l.url) : [];
+    const parsed: unknown = JSON.parse(linksMatch[1]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is WebSearchLink => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return false;
+      const { title, url } = entry as Record<string, unknown>;
+      return typeof title === 'string' && title.length > 0 && typeof url === 'string' && url.length > 0;
+    });
   } catch {
     return [];
   }

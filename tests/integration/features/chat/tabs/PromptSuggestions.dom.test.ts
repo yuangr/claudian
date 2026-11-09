@@ -1,17 +1,19 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
 import * as sdkModule from '@anthropic-ai/claude-agent-sdk';
 import { claudeCatalogFixture } from '@test/helpers/claudeModels';
-import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createProjectsFake } from '@test/helpers/features/chat/ProjectsFake';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
+import { testDate } from '@test/helpers/testClock';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
 import { App, Component } from 'obsidian';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ClaudianSettings, Conversation } from '@/core/types';
-import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import { SessionMessagingService } from '@/features/chat/session-messaging/SessionMessagingService';
 import { activateTab, deactivateTab, destroyTab } from '@/features/chat/tabs/TabLifecycle';
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
@@ -22,77 +24,56 @@ const sdkMock = sdkModule as unknown as {
   getLastOptions(): sdkModule.Options;
 };
 
-const originalResizeObserver = globalThis.ResizeObserver;
 beforeEach(() => {
-  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
   sdkMock.resetMockMessages();
-  Object.assign(HTMLElement.prototype, {
-    hasClass(this: HTMLElement, name: string) { return this.classList.contains(name); },
-    addClass(this: HTMLElement, ...names: string[]) { this.classList.add(...names); },
-    removeClass(this: HTMLElement, ...names: string[]) { this.classList.remove(...names); },
-    empty(this: HTMLElement) { this.replaceChildren(); },
-    setText(this: HTMLElement, text: string) { this.textContent = text; },
-    appendText(this: HTMLElement, text: string) { this.appendChild(this.ownerDocument.createTextNode(text)); },
-    setCssProps(this: HTMLElement, props: Record<string, string>) {
-      for (const [key, value] of Object.entries(props)) this.style.setProperty(key, value);
-    },
-    toggleClass(this: HTMLElement, name: string, enabled: boolean) { this.classList.toggle(name, enabled); },
-    scrollIntoView() {},
-  });
+
 });
 afterEach(() => {
-  globalThis.ResizeObserver = originalResizeObserver;
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
   document.body.replaceChildren();
 });
 
 async function createView(fakeBackend?: FakeSideBackend) {
-  if (fakeBackend) jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(fakeBackend);
+  if (fakeBackend) vi.spyOn(ProviderRegistry, 'createExecutionBackend').mockReturnValue(fakeBackend);
   const app = new App();
   Object.assign(app.vault.adapter, { basePath: '/vault' });
-  Object.assign(app.vault, { on: () => ({}), offref() {} });
   Object.assign(app.workspace, { getActiveViewOfType: () => null });
-  const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
-  const settings = {
+  const settings: Partial<ClaudianSettings> = {
     model: 'claude-sonnet-4-5', effortLevel: 'high', permissionMode: 'normal',
     enableAutoTitleGeneration: false, excludedTags: [], mediaFolder: '', systemPrompt: '', userName: '',
     providerConfigs: { claude: {
       ...claudeCatalogFixture(['claude-sonnet-4-5', 'claude-opus-4-6'], ['low', 'high']),
       promptSuggestions: true,
     } },
-  } as unknown as ClaudianSettings;
-  const conversation = {
+  };
+  const conversation: Conversation = {
     id: 'conversation-1', providerId: 'claude', selectedModel: 'claude-sonnet-4-5',
-    sessionId: 'main-session', messages: [],
-  } as unknown as Conversation;
+    sessionId: 'main-session', messages: [], title: 'Main session', createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(),
+  };
   const conversations = new Map([[conversation.id, conversation]]);
   const saved: unknown[] = [];
-  const plugin = {
-    app, settings,
-    providerHost: {
-      app, settings, executionLifecycleRegistry: lifecycleRegistry,
-      getResolvedProviderCliPath: async () => '/bin/claude',
-      getActiveEnvironmentVariables: () => '',
-    },
+  const pool = createSessionRuntimePool(() => plugin);
+  const messaging = new SessionMessagingService({ getHost: () => plugin, getActiveConversationId: () => conversation.id, refreshModelControls: () => undefined });
+  onTestFinished(() => messaging.dispose());
+  const plugin = await createChatFeatureHost({
+    app, settings, sessionRuntimes: pool,
+    bindSessionTools: id => messaging.bindSessionTools(id),
     executionPersistence: {
       registerExecutionBinding() {}, releaseExecutionBinding() {},
       assertConversationExecutionAuthority: async () => {},
       persistExecutionSnapshot: async (...args: unknown[]) => { saved.push(args); return true; },
       recordConversationActivity: async () => {},
     },
-    getSessionSnapshotDirectory: () => '/tmp/claudian-sessions',
-    getCommittedSettings: () => settings,
-    getActiveEnvironmentVariables: () => '',
-    getConversationSummary: (id: string) => conversations.get(id),
-    getConversationSync: (id: string) => conversations.get(id),
-    getConversationById: async (id: string) => conversations.get(id),
-    getConversationList: () => [...conversations.values()],
+    getConversationSummary: (id: string) => conversations.get(id) ?? null,
+    projects: createProjectsFake(),
+    getConversationSync: (id: string) => conversations.get(id) ?? null,
+    getConversationById: async (id: string) => conversations.get(id) ?? null,
+    getConversationList: () => [...conversations.values()].map(value => ({ ...value, messageCount: value.messages.length, preview: '' })),
     renameConversation: async () => {},
     updateConversation: async (_id: string, patch: unknown) => { saved.push(structuredClone(patch)); },
-    mutateSettings: async (mutate: (settings: ClaudianSettings) => void) => mutate(settings),
     chatModelSelection: { beginIntent: () => 1, commitIntent: async () => true },
-  } as unknown as ChatFeatureHost;
-  if (!plugin.sessionRuntimes) installSessionRuntimePool(plugin);
+  });
+  vi.spyOn(plugin.providerHost, 'getResolvedProviderCliPath').mockResolvedValue('/bin/claude');
   let tab = await createTabRuntime({
     plugin, conversation, component: new Component(),
     containerEl: document.body.createDiv(),
@@ -100,10 +81,10 @@ async function createView(fakeBackend?: FakeSideBackend) {
     getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
     openConversation: async () => {}, startNewConversation: async () => {},
   });
-  tab.hydrationState = 'ready';
+  await tab.session.runtime.model.hydrate();
   await tab.executionCoordinator.bindConversation({ conversationId: conversation.id, providerId: 'claude' });
   await tab.executionCoordinator.prepare();
-  jest.spyOn(tab.dom.messagesEl, 'getClientRects').mockImplementation(() => (tab.dom.contentEl.hasClass('claudian-hidden') ? [] : [{}]) as unknown as DOMRectList);
+  vi.spyOn(tab.dom.messagesEl, 'getClientRects').mockImplementation(() => (tab.dom.contentEl.hasClass('claudian-hidden') ? [] : [{}]) as unknown as DOMRectList);
   activateTab(tab);
   tab.dom.inputEl.focus();
   return { get tab() { return tab; }, conversation, saved, plugin,
@@ -119,10 +100,10 @@ async function createView(fakeBackend?: FakeSideBackend) {
         getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
         openConversation: async () => {}, startNewConversation: async () => {},
       });
-      jest.spyOn(tab.dom.messagesEl, 'getClientRects').mockReturnValue([{}] as unknown as DOMRectList);
+      vi.spyOn(tab.dom.messagesEl, 'getClientRects').mockReturnValue([{}] as unknown as DOMRectList);
       activateTab(tab);
     },
-    dispose: async () => { await destroyTab(tab); await lifecycleRegistry.dispose(); },
+    dispose: async () => { await destroyTab(tab); await plugin.providerHost.executionLifecycleRegistry.dispose(); },
   };
 }
 
@@ -174,10 +155,10 @@ function returnToMainComposer(view: View): void {
 /** Composer activity that neither starts a main turn nor changes the main tab's model. */
 const retainingActivity = {
   'rewind in progress': async (view: View) => {
-    jest.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(true);
+    vi.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(true);
     view.tab.dom.inputEl.value = 'Retry later';
     await view.tab.controllers.inputController.sendMessage();
-    jest.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(false);
+    vi.spyOn(view.tab.state, 'isRewinding', 'get').mockReturnValue(false);
     expect(view.tab.dom.inputEl.value).toBe('Retry later');
   },
   'rejected side command': async (view: View) => {
@@ -212,7 +193,7 @@ it('routes a native post-result suggestion to the composer without persisting it
     expect(view.tab.dom.inputEl.value).toBe('');
     expect(JSON.stringify(view.saved)).not.toContain('Add tests next');
     expect(JSON.stringify(view.tab.state.messages)).not.toContain('Add tests next');
-    const send = jest.spyOn(view.tab.controllers.inputController, 'sendMessage');
+    const send = vi.spyOn(view.tab.controllers.inputController, 'sendMessage');
     fireEvent.keyDown(within(view.tab.dom.inputEl).getByRole('textbox'), { key: 'Tab' });
     expect(view.tab.dom.inputEl.value).toBe('Add tests next');
     expect(send).not.toHaveBeenCalled();
@@ -373,7 +354,7 @@ it('hides a prediction while the completion menu or resume picker is open and re
   } finally { await view.dispose(); }
 });
 
-it.each(['', 'Unsent draft'])('discards the prediction when an automatic turn starts (draft: %p)', async draft => {
+it.each(['', 'Unsent draft'])('discards the prediction when an automatic turn starts (draft: %o)', async draft => {
   const backend = new FakeSideBackend();
   const view = await createView(backend);
   try {

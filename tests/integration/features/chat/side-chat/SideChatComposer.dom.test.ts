@@ -1,21 +1,21 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
+import { axe } from '@test/helpers/accessibility';
 import {
   createHarness,
   releaseSideChatHarnesses,
   startSideChat,
 } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { fireEvent, screen, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
 
 import { createTabPlacementPort } from '@/features/chat/tabs/runtime/TabRuntimePorts';
 import { ChatPresentationPlacement } from '@/features/chat/view/ChatPresentationPlacement';
 
 afterEach(releaseSideChatHarnesses);
 
-it('previews the side colour for a complete command token only', () => {
-  const harness = createHarness();
+it('previews the side colour for a complete command token only', async () => {
+  const harness = await createHarness();
   for (const partial of ['/sid', '/sideways ask', 'please use /side later']) {
     harness.inputEl.value = partial;
     harness.controller.handleComposerInput();
@@ -37,7 +37,7 @@ it('previews the side colour for a complete command token only', () => {
 });
 
 it('opens expanded with a joined border, then collapses to an idle chip over the normal composer', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   expect(harness.destinationChanges).toEqual([]);
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
@@ -76,7 +76,7 @@ it('opens expanded with a joined border, then collapses to an idle chip over the
 });
 
 it('toggles full height without changing the destination, and keeps it across collapse', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
   harness.backend.latest.complete();
@@ -97,7 +97,7 @@ it('toggles full height without changing the destination, and keeps it across co
 });
 
 it('keeps separate main and side drafts across expansion changes', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   harness.inputEl.value = '/side Explore B';
   const { started } = await startSideChat(harness);
   expect(harness.inputEl.value).toBe('');
@@ -117,7 +117,7 @@ it('keeps separate main and side drafts across expansion changes', async () => {
 });
 
 it('preserves a saved side draft when a slash follow-up resumes the collapsed child', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
   harness.backend.latest.complete();
@@ -144,7 +144,7 @@ it('preserves a saved side draft when a slash follow-up resumes the collapsed ch
 });
 
 it('discards the side chat, releases its session and restores the main composer', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
   harness.backend.latest.complete();
@@ -155,12 +155,36 @@ it('discards the side chat, releases its session and restores the main composer'
   await waitFor(() => expect(native.disposeCalls).toBe(1));
   expect(screen.queryByRole('heading', { name: 'Side chat' })).toBeNull();
   expect(harness.controller.destination).toBe('main');
-  expect(harness.controller.hasSideChat).toBe(false);
+  expect(harness.controller.runtime).toBeNull();
   expect(harness.composerEl.classList.contains('claudian-side-chat-expanded')).toBe(false);
 });
 
+it('starts a new side chat while a discarded start is still unwinding', async () => {
+  const harness = await createHarness();
+  const coordinator = harness.tab.executionCoordinator;
+  const resolveForkSource = coordinator.resolveForkSource.bind(coordinator);
+  let releaseFirst!: () => void;
+  const firstCaptured = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const firstCapture = vi.spyOn(coordinator, 'resolveForkSource')
+    .mockImplementationOnce(async (...args) => { await firstCaptured; return resolveForkSource(...args); });
+  const first = harness.controller.handleCommandSubmission('First', []);
+  await waitFor(() => expect(firstCapture).toHaveBeenCalledTimes(1));
+  const discarding = harness.controller.discard();
+
+  const request = harness.backend.nextRequest(request => request.toolPolicy.kind === 'provider-default');
+  const second = harness.controller.handleCommandSubmission('Second', []);
+  // A discarded start no longer owns the side chat, so the next command is not refused as a duplicate.
+  const outcome = await Promise.race([request.then(() => 'started'), second.then(started => (started ? 'started' : 'refused'))]);
+  releaseFirst();
+  await Promise.all([first, discarding]);
+
+  expect(outcome).toBe('started');
+  expect((await request).input).toEqual([{ text: 'Second', type: 'text' }]);
+  expect(await first).toBe(false);
+});
+
 it('rejects a nested side command and an empty prompt without creating anything', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
   harness.backend.latest.complete();
@@ -170,27 +194,27 @@ it('rejects a nested side command and an empty prompt without creating anything'
   expect(harness.backend.sessions).toHaveLength(1);
   expect(harness.backend.latest.requests).toHaveLength(1);
 
-  const fresh = createHarness();
+  const fresh = await createHarness();
   await fresh.controller.handleCommandSubmission('', []);
   expect(fresh.backend.sessions).toHaveLength(0);
-  expect(fresh.controller.hasSideChat).toBe(false);
+  expect(fresh.controller.runtime).toBeNull();
 });
 
 it('reports an unavailable provider and a missing checkpoint without starting native work', async () => {
-  const unsupported = createHarness({ supportsFork: false });
+  const unsupported = await createHarness({ supportsFork: false });
   await unsupported.controller.handleCommandSubmission('Explore B', []);
   expect(unsupported.backend.sessions).toHaveLength(0);
-  expect(unsupported.controller.hasSideChat).toBe(false);
+  expect(unsupported.controller.runtime).toBeNull();
 
-  const withoutCheckpoint = createHarness({ checkpoint: null });
+  const withoutCheckpoint = await createHarness({ checkpoint: null });
   await withoutCheckpoint.controller.handleCommandSubmission('Explore B', []);
   expect(withoutCheckpoint.backend.sessions).toHaveLength(0);
-  expect(withoutCheckpoint.controller.hasSideChat).toBe(false);
+  expect(withoutCheckpoint.controller.runtime).toBeNull();
 });
 
 
 it('updates the collapsed chip as queued prompts begin and finish', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   const native = harness.backend.latest;
   native.establishChild('child-session');
@@ -217,7 +241,7 @@ it('updates the collapsed chip as queued prompts begin and finish', async () => 
 
 
 it('places the collapsed active chip before navigation in single pane and restores it in dual pane', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   let activeController = harness.controller;
   let isWide = false;
   const { placement, footer, navHost } = mountChipPlacement({
@@ -238,7 +262,7 @@ it('places the collapsed active chip before navigation in single pane and restor
   const chip = screen.getByRole('button', { name: 'Side chat' });
   expect(host.contains(chip)).toBe(true);
   expect(chip.compareDocumentPosition(nav) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  activeController = createHarness().controller;
+  activeController = (await createHarness()).controller;
   placement.updateChip();
   expect(host.childElementCount).toBe(0);
   expect(harness.composerEl.contains(chip)).toBe(true);
@@ -262,7 +286,7 @@ it('places the collapsed active chip before navigation in single pane and restor
 
 
 it('uses the navigation row for a single-tab chip and moves it above navigation when more tabs exist', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   let tabCount = 1;
   const { placement, footer, navHost } = mountChipPlacement({
     getActiveTab: () => chipTabFor(harness.controller),
@@ -301,7 +325,7 @@ it('uses the navigation row for a single-tab chip and moves it above navigation 
 });
 
 it('applies full height to the view only for the active tab expanded in the footer', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   let activeController = harness.controller;
   const { placement, chatPanelEl } = mountChipPlacement({
     getActiveTab: () => chipTabFor(activeController),
@@ -319,7 +343,7 @@ it('applies full height to the view only for the active tab expanded in the foot
   fireEvent.click(screen.getByRole('button', { name: 'Full height' }));
   expect(isFullHeight()).toBe(true);
 
-  activeController = createHarness().controller;
+  activeController = (await createHarness()).controller;
   placement.updateChip();
   expect(isFullHeight()).toBe(false);
   activeController = harness.controller;

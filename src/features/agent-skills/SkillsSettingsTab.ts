@@ -1,4 +1,4 @@
-import { type App, Notice, Setting } from 'obsidian';
+import { type App } from 'obsidian';
 
 import { normalizeHiddenCommandList } from '@/core/providers/commands/hiddenCommands';
 import type { FolderLinkState, VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
@@ -16,7 +16,8 @@ import { SkillSyncModal } from '@/features/agent-skills/SkillSyncModal';
 import type { FeatureHost } from '@/features/FeatureHost';
 import { t } from '@/i18n/i18n';
 import type { TranslationKey } from '@/i18n/types';
-import { DebouncedSettingsWriter } from '@/shared/settings/DebouncedSettingsWriter';
+import { AccessibleSetting } from '@/shared/settings/AccessibleSetting';
+import type { DebouncedSettingsWriter } from '@/shared/settings/DebouncedSettingsWriter';
 
 type SkillsSubTab = 'claude' | 'shared';
 
@@ -29,7 +30,6 @@ export type SkillsSettingsHost = Pick<FeatureHost, 'settings' | 'mutateSettings'
  */
 export class SkillsSettingsTab {
   private activeSubTab: SkillsSubTab = 'claude';
-  private readonly textEdits: DebouncedSettingsWriter<ClaudianSettings>;
   private renderGeneration = 0;
   private readonly panels: AgentSkillSettings[] = [];
   private readonly sync: ClaudeSkillSync;
@@ -40,9 +40,8 @@ export class SkillsSettingsTab {
     private readonly app: App,
     private readonly files: VaultFileAdapter,
     private readonly host: SkillsSettingsHost,
+    private readonly textEdits: DebouncedSettingsWriter<ClaudianSettings>,
   ) {
-    this.textEdits = new DebouncedSettingsWriter(mutation => host.mutateSettings(mutation),
-      () => { new Notice('Failed to save settings'); });
     this.sync = new ClaudeSkillSync(files);
     this.bodyEl = containerEl.createDiv({ cls: 'claudian-skills-tab' });
     this.#renderHiddenCommands(containerEl);
@@ -198,7 +197,7 @@ export class SkillsSettingsTab {
   }
 
   #renderHiddenCommands(containerEl: HTMLElement): void {
-    new Setting(containerEl)
+    new AccessibleSetting(containerEl)
       .setName(t('settings.skills.hidden.name'))
       .setDesc(t('settings.skills.hidden.desc'))
       .setClass('claudian-settings-textarea')
@@ -206,7 +205,7 @@ export class SkillsSettingsTab {
       .addTextArea((text) => {
         text
           .setPlaceholder(t('settings.skills.hidden.placeholder'))
-          .setValue(this.host.settings.hiddenCommands.join('\n'))
+          .setValue(this.textEdits.projectDraft(this.host.settings).hiddenCommands.join('\n'))
           .onChange((value) => {
             this.textEdits.schedule('hiddenCommands', (settings) => {
               settings.hiddenCommands = normalizeHiddenCommandList(value.split(/\r?\n/));

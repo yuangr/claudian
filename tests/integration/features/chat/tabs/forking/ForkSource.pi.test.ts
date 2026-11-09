@@ -1,12 +1,16 @@
+// @test-ci {"inputs":["tests/fixtures/providers/pi/**"]}
+import '@/providers';
+
+const actualModule0 = (await vi.importActual<{ default: typeof spawn }>('cross-spawn')).default;
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-jest.mock('cross-spawn', () => jest.fn());
+vi.mock('cross-spawn', () => ({ default: vi.fn() }));
 import { createForkTestEnvironment, type ForkTestEnvironment } from '@test/helpers/features/chat/ProviderForkTestHarness';
 import spawn from 'cross-spawn';
 
-import { PiCommandCatalog } from '@/providers/pi/commands/PiCommandCatalog';
 import { PiExecutionBackend } from '@/providers/pi/execution/PiExecutionBackend';
+
 
 async function readRecords(file: string) {
   return (await fs.readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
@@ -15,14 +19,14 @@ async function readRecords(file: string) {
 async function createNativePi(env: ForkTestEnvironment) {
   const sourceFile = path.join(env.root, 'source.jsonl');
   await fs.writeFile(sourceFile, JSON.stringify({ type: 'session', version: 3, id: 'pi-source', cwd: env.root }) + '\n');
-  const realSpawn = jest.requireActual<typeof spawn>('cross-spawn');
+  const realSpawn = actualModule0;
   let mismatch = false;
-  jest.mocked(spawn).mockImplementation((_command, args = [], options = {}) => realSpawn(
+  vi.mocked(spawn).mockImplementation((_command, args = [], options = {}) => realSpawn(
     process.execPath,
     [path.resolve('tests/fixtures/providers/pi/PiSessionProcess.mjs'), ...args],
     { ...options, env: { ...options.env, CLAUDIAN_TEST_PI_ROOT: env.root, CLAUDIAN_TEST_PI_MISMATCH: mismatch ? '1' : '0' } },
   ));
-  const backend = new PiExecutionBackend(env.host, { commandCatalog: new PiCommandCatalog() });
+  const backend = new PiExecutionBackend(env.host.getRuntimeHost('pi'));
   return {
     backend, sourceFile,
     contexts: () => readRecords(path.join(env.root, 'contexts.jsonl')),
@@ -33,7 +37,7 @@ async function createNativePi(env: ForkTestEnvironment) {
 describe('Pi fork integration', () => {
   let env: ForkTestEnvironment;
   beforeEach(async () => { env = await createForkTestEnvironment(); });
-  afterEach(async () => { await env.dispose(); jest.mocked(spawn).mockReset(); });
+  afterEach(async () => { await env.dispose(); vi.mocked(spawn).mockReset(); });
 
   it.each([1, 2])('continues a fork of live reply %i using an isolated native file and accepted input prefix', async checkpoint => {
     const native = await createNativePi(env);

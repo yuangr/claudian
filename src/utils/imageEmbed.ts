@@ -8,6 +8,7 @@
  */
 
 import type { App, TFile } from 'obsidian';
+import * as path from 'path';
 
 import { escapeHTML } from './html';
 import { transformMarkdownSegments } from './markdownSegments';
@@ -41,19 +42,31 @@ function resolveImageFile(
   imagePath: string,
   options: Required<ReplaceImageEmbedsOptions>
 ): TFile | null {
+  // With a note context, resolve the embed through Obsidian's note-relative
+  // link resolution before the configured media-folder fallback.
+  if (options.sourcePath) {
+    const resolved = app.metadataCache.getFirstLinkpathDest(imagePath, options.sourcePath);
+    if (resolved) return resolved;
+  }
+
   let file = getVaultFileByPath(app, imagePath);
   if (file) return file;
 
   if (options.mediaFolder) {
-    const withFolder = `${options.mediaFolder}/${imagePath}`;
+    const { mediaFolder } = options;
+    const isVaultRelative = !path.posix.isAbsolute(mediaFolder) && !path.win32.isAbsolute(mediaFolder)
+      && !mediaFolder.split('/').includes('..');
+    const folder = isVaultRelative ? path.posix.normalize(mediaFolder).replace(/\/$/, '') : mediaFolder;
+    const withFolder = `${folder}/${imagePath}`;
     file = getVaultFileByPath(app, withFolder);
     if (file) return file;
   }
 
-  const resolved = app.metadataCache.getFirstLinkpathDest(imagePath, options.sourcePath);
-  if (resolved) return resolved;
+  if (options.sourcePath) {
+    return null;
+  }
 
-  return null;
+  return app.metadataCache.getFirstLinkpathDest(imagePath, options.sourcePath);
 }
 
 
@@ -109,7 +122,7 @@ export function replaceImageEmbedsWithHTML(
   app: App,
   options?: string | ReplaceImageEmbedsOptions
 ): string {
-  if (!app?.vault || !app?.metadataCache) {
+  if (!markdown.includes('![[') || !app?.vault || !app?.metadataCache) {
     return markdown;
   }
 

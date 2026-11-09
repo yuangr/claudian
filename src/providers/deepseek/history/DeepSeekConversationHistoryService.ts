@@ -8,6 +8,7 @@ import type {
 
 import { encodeDeepSeekModelId } from '../models';
 import { type DeepSeekReader,DeepSeekRemoteError, isRecord } from '../remote/DeepSeekRemoteClient';
+import { type DeepSeekExecutionContext, toDeepSeekHostPath } from '../runtime/DeepSeekExecutionContext';
 import { isSameDeepSeekHome } from '../runtime/DeepSeekHome';
 import type { DeepSeekHost } from '../runtime/DeepSeekHost';
 import { decodeDeepSeekCheckpoint, decodeDeepSeekState } from '../types';
@@ -51,13 +52,27 @@ export class DeepSeekConversationHistoryService implements ProviderConversationH
     const id = this.resolveSessionIdForConversation(input);
     if (!id) return {};
     const state = decodeDeepSeekState(input.providerState);
-    return this.read(input, context, async client => {
+    return this.read(input, context, async (client, execution) => {
       const projection = await readDeepSeekProjection(client, id);
       const cut = state?.pendingFork?.atSeq ?? projection.asOfSeq;
       if (cut > projection.asOfSeq) throw new Error('DeepSeek fork checkpoint is not present in native history.');
-      const messages = await loadDeepSeekHistory(client, id, cut);
+      const messages = await loadDeepSeekHistory(client, id, cut, path => toDeepSeekHostPath(path, execution));
       return { messages };
     });
+  }
+
+  /** The committed sequence of a live session, read cold and only from a Host that is already running. */
+  async readNativeHistoryRevision(input: ProviderHistoryInput, _vaultPath: string | null, context?: ProviderHistoryPathContext): Promise<string | null> {
+    if (!input.sessionId || this.isPendingForkConversation(input)) return null;
+    const id = input.sessionId;
+    try {
+      const host = await this.resolveHost(context);
+      const asOfSeq = await host.readIfRunning((reader, home, execution) => {
+        this.assertSameHome(input, home, execution);
+        return readDeepSeekProjection(reader, id).then(projection => projection.asOfSeq);
+      });
+      return asOfSeq === undefined ? null : `seq:${asOfSeq}`;
+    } catch { return null; }
   }
 
   buildForkProviderState(sourceSessionId: string, resumeAt: string, sourceProviderState?: Record<string, unknown>): Record<string, unknown> {
@@ -71,12 +86,16 @@ export class DeepSeekConversationHistoryService implements ProviderConversationH
     return state ? { ...state } : undefined;
   }
 
-  private async read<T>(input: ProviderHistoryInput, context: ProviderHistoryPathContext | undefined, operation: (client: DeepSeekReader) => Promise<T>): Promise<T> {
+  private async read<T>(input: ProviderHistoryInput, context: ProviderHistoryPathContext | undefined, operation: (client: DeepSeekReader, execution?: DeepSeekExecutionContext) => Promise<T>): Promise<T> {
     const host = await this.resolveHost(context);
-    const state = decodeDeepSeekState(input.providerState);
-    return host.read((reader, home) => {
-      if (state && !isSameDeepSeekHome(state.home, home)) throw new Error('DeepSeek history belongs to a different native store. Restore the original store binding before continuing.');
-      return operation(reader);
+    return host.read((reader, home, execution) => {
+      this.assertSameHome(input, home, execution);
+      return operation(reader, execution);
     });
+  }
+
+  private assertSameHome(input: ProviderHistoryInput, home: string, execution?: DeepSeekExecutionContext): void {
+    const state = decodeDeepSeekState(input.providerState);
+    if (state && !isSameDeepSeekHome(state.home, home, execution?.target.platformOs === 'linux' ? 'linux' : undefined)) throw new Error('DeepSeek history belongs to a different native store. Restore the original store binding before continuing.');
   }
 }

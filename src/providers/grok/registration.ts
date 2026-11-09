@@ -7,12 +7,14 @@ import {
   grokWorkspaceRegistration,
 } from './app/GrokWorkspaceServices';
 import { GROK_PROVIDER_CAPABILITIES } from './capabilities';
+import { getGrokMigratedVisibleModelIds, getOrderedGrokVisibleModelIds } from './config';
 import { grokSettingsReconciler } from './env/GrokSettingsReconciler';
 import { GrokExecutionBackend } from './execution/GrokExecutionBackend';
 import { grokModelPolicy } from './GrokModelPolicy';
 import { GrokConversationHistoryService } from './history/GrokConversationHistoryService';
 import { grokSubagentLifecycleAdapter } from './normalization/grokSubagentNormalization';
-import { getGrokMigratedVisibleModelIds, getGrokProviderSettings, getOrderedGrokVisibleModelIds, projectGrokModelSettings, updateGrokProviderSettings } from './settings';
+import { resolveGrokExecutionWorkingDirectory } from './runtime/GrokExecutionContext';
+import { getGrokProviderSettings, projectGrokModelSettings, updateGrokProviderSettings } from './settings';
 import { grokChatUIConfig } from './ui/GrokChatUIConfig';
 
 export const grokProviderRegistration: ProviderModule = {
@@ -21,10 +23,10 @@ export const grokProviderRegistration: ProviderModule = {
   capabilities: GROK_PROVIDER_CAPABILITIES,
   modelPolicy: grokModelPolicy,
   chatUIConfig: grokChatUIConfig,
+  resolveExecutionWorkingDirectory: (host, cwd) => resolveGrokExecutionWorkingDirectory(host.getRuntimeHost('grok'), cwd),
   createExecutionBackend: (plugin) => {
     const workspace = getGrokWorkspaceServices();
-    return new GrokExecutionBackend(plugin, {
-      commandCatalog: workspace.commandCatalog,
+    return new GrokExecutionBackend(plugin.getRuntimeHost('grok'), {
       modelCatalogCoordinator: workspace.modelCatalogCoordinator,
     });
   },
@@ -44,7 +46,7 @@ export const grokProviderRegistration: ProviderModule = {
         return !model || (!model.reasoningEfforts.length && !model.reasoningMetadataResolved);
       });
     },
-    hostScopedFields: ['cliPathsByHost', 'catalogsByHost', 'selectedModelsByHost'],
+    hostScopedFields: ['installationMethodsByHost', 'wslDistroOverridesByHost', 'cliPathsByHost', 'catalogsByHost', 'selectedModelsByHost'],
     normalizeStored(target, stored) {
       const storedConfig = getProviderConfig(stored, 'grok');
       const current = getGrokProviderSettings(stored);

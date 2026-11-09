@@ -1,0 +1,943 @@
+import { testDate, testTime } from '@test/helpers/testClock';
+
+import { encodeRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
+import { encodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
+import {
+  correlatePiUserMessages,
+  getPiTurnStats,
+  parsePiSessionContent,
+  parsePiSessionEntries,
+  type PiSessionEntry,
+  resolvePiActivePath,
+} from '@/providers/pi/history/PiHistoryStore';
+
+describe('PiHistoryStore', () => {
+  it('decodes session senders while preserving live-to-native input matching', () => {
+    const envelope = encodeSessionMessage({ from: 'Planner', sessionId: 'sender', text: 'Check this' });
+    const native = parsePiSessionContent(JSON.stringify({ type: 'message', id: 'native-user',
+      message: { role: 'user', content: envelope + '\n\n<active_note>Note</active_note>' } }));
+    expect(native[0]).toMatchObject({ sessionMessage: { from: 'Planner', sessionId: 'sender' }, displayContent: 'Check this' });
+    expect(correlatePiUserMessages([{ id: 'live', role: 'user', content: 'Check this', timestamp: testDate().getTime() }], native))
+      .toEqual({ live: 'native-user' });
+  });
+
+  it('keeps neutral session tool names and native names in replay', () => {
+    const messages = parsePiSessionContent(JSON.stringify({ type: 'message', id: 'assistant', message: {
+      role: 'assistant', content: [{ type: 'toolCall', id: 'tool', name: 'claudian_send_message', arguments: { text: 'Hello' } }],
+    } }));
+    expect(messages[0].toolCalls).toEqual([{ id: 'tool', name: 'claudian_send_message', input: { text: 'Hello' },
+      status: 'running', providerPayload: { rawName: 'claudian_send_message' } }]);
+  });
+
+  it('correlates repeated live prompts by their anchored order and leaves unsaved input unbound', () => {
+    const native = parsePiSessionContent([
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Repeat' } },
+      { type: 'message', id: 'u2', parentId: 'u1', message: { role: 'user', content: 'Repeat' } },
+      { type: 'message', id: 'u3', parentId: 'u2', message: { role: 'user', content: 'Repeat' } },
+    ].map(entry => JSON.stringify(entry)).join('\n'));
+    const live = native.map((message, index) => ({ ...message, id: `local-${index}`,
+      userMessageId: index === 1 ? 'u2' : undefined }));
+    expect(correlatePiUserMessages(live, native)).toEqual({ 'local-0': 'u1', 'local-1': 'u2', 'local-2': 'u3' });
+    expect(correlatePiUserMessages([...live, { ...live[2], id: 'unsaved' }], native)).toEqual({ 'local-0': 'u1', 'local-1': 'u2' });
+  });
+
+  it('projects sibling prompts across configuration entries without mixing their continuations', () => {
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'A' } },
+      { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: 'Answer A' } },
+      { type: 'model_change', id: 'model', parentId: null },
+      { type: 'message', id: 'u2', parentId: 'model', message: { role: 'user', content: 'B' } },
+      { type: 'message', id: 'a2', parentId: 'u2', message: { role: 'assistant', content: 'Answer B' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+    expect(parsePiSessionContent(content, { leafEntryId: 'a1' })).toMatchObject([
+      { content: 'A', treeBranches: ['u1', 'u2'] }, { content: 'Answer A' },
+    ]);
+    expect(parsePiSessionContent(content, { leafEntryId: 'a2' })).toMatchObject([
+      { content: 'B', treeBranches: ['u1', 'u2'] }, { content: 'Answer B' },
+    ]);
+  });
+
+  it('recovers the accepted prompt when an acknowledged steer was never consumed', () => {
+    const native = parsePiSessionContent([
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'First' } },
+      { type: 'message', id: 'u2', parentId: 'u1', message: { role: 'user', content: 'Second' } },
+    ].map(entry => JSON.stringify(entry)).join('\n'));
+    const live = [native[0], { ...native[1], id: 'accepted', userMessageId: undefined,
+      executionInput: { schemaVersion: 1 as const, canonicalText: 'Second' } },
+    { ...native[1], id: 'queued', content: 'Queued steer', userMessageId: undefined }];
+    expect(correlatePiUserMessages(live, native)).toEqual({ u1: 'u1', accepted: 'u2' });
+  });
+
+  it('replays extension custom messages as the notifications live output renders', () => {
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Delegate' } },
+      { type: 'custom_message', id: 'c1', parentId: 'u1', customType: 'peeps-result', display: true, content: 'Steered result' },
+      { type: 'message', id: 'a1', parentId: 'c1', message: { role: 'assistant', content: 'Folded in', stopReason: 'stop' } },
+      { type: 'custom_message', id: 'c2', parentId: 'a1', customType: 'peeps-result', display: true, content: [{ type: 'text', text: '[Peeps automated result — run-2 — answer]\nIdle result' }] },
+      { type: 'message', id: 'a2', parentId: 'c2', message: { role: 'assistant', content: 'Woke up', stopReason: 'stop' } },
+      { type: 'custom_message', id: 'c3', parentId: 'a2', customType: 'context', display: false, content: 'Hidden' },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const messages = parsePiSessionContent(content);
+    expect(messages.map(message => ({
+      automatic: message.isAutomaticResponse === true,
+      blocks: message.contentBlocks?.map(block => block.type === 'text' || block.type === 'task_notification'
+        ? `${block.type}:${block.content}` : block.type),
+      role: message.role,
+    }))).toEqual([
+      { automatic: false, blocks: undefined, role: 'user' },
+      { automatic: false, blocks: ['task_notification:Steered result', 'text:Folded in'], role: 'assistant' },
+      { automatic: true, blocks: ['task_notification:Idle result', 'text:Woke up'], role: 'assistant' },
+    ]);
+    expect(messages[2].content).toBe('Woke up');
+  });
+
+  it('keeps a result steered after a tool call inside the prompted response', () => {
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Delegate' } },
+      { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'toolCall', id: 't1', name: 'peeps_spawn', arguments: {} }], stopReason: 'toolUse' } },
+      { type: 'message', id: 'r1', parentId: 'a1', message: { role: 'toolResult', toolCallId: 't1', toolName: 'peeps_spawn', content: [{ type: 'text', text: 'Accepted' }] } },
+      { type: 'custom', id: 'm1', parentId: 'r1', customType: 'peeps/run', data: {} },
+      { type: 'custom_message', id: 'c1', parentId: 'm1', customType: 'peeps-result', display: true, content: 'Steered result' },
+      { type: 'message', id: 'a2', parentId: 'c1', message: { role: 'assistant', content: 'Done', stopReason: 'stop' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const messages = parsePiSessionContent(content);
+    expect(messages.map(message => ({
+      automatic: message.isAutomaticResponse === true,
+      blocks: message.contentBlocks?.map(block => block.type === 'task_notification' ? `${block.type}:${block.content}` : block.type),
+      role: message.role,
+    }))).toEqual([
+      { automatic: false, blocks: undefined, role: 'user' },
+      { automatic: false, blocks: ['tool_use', 'task_notification:Steered result', 'text'], role: 'assistant' },
+    ]);
+    expect(messages[1].assistantMessageId).toBe('a2');
+  });
+
+  it.each([
+    [false, 'aborted'], [true, 'aborted'], [false, 'stop'], [true, 'stop'],
+  ] as const)('preserves a completed turn before a custom trigger (display: %s, later stop: %s)', (display, stopReason) => {
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, timestamp: testTime(), message: { role: 'user', content: 'Say hello' } },
+      { type: 'message', id: 'a1', parentId: 'u1', timestamp: testTime({ seconds: 5 }), message: {
+        role: 'assistant', timestamp: testDate({ seconds: 2 }).getTime(), content: [{ type: 'text', text: 'Hello' }],
+        stopReason: 'stop', usage: { output: 12 },
+      } },
+      { type: 'custom_message', id: 'n1', parentId: 'a1', timestamp: testTime({ seconds: 6 }),
+        customType: 'background-result', display, content: 'Background result' },
+      { type: 'message', id: 'a2', parentId: 'n1', timestamp: testTime({ seconds: 8 }), message: {
+        role: 'assistant', timestamp: testDate({ seconds: 7 }).getTime(),
+        content: [{ type: 'text', text: 'Partial automatic reply' }], stopReason, usage: { output: 3 },
+      } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const messages = parsePiSessionContent(content);
+    const completed = messages[1];
+    expect(completed).toMatchObject({
+      id: 'a1', assistantMessageId: 'a1', content: 'Hello', role: 'assistant',
+      contentBlocks: [{ type: 'text', content: 'Hello' }], durationSeconds: 5,
+      completedAt: testDate({ seconds: 5 }).getTime(), turnStats: { outputTokens: 12, durationMs: 5000 },
+    });
+    expect(completed.contentBlocks).toEqual([{ type: 'text', content: 'Hello' }]);
+    expect(completed.isInterrupt).toBeUndefined();
+    expect(completed.isAutomaticResponse).toBeUndefined();
+    expect(messages).toHaveLength(3);
+    const automatic = messages[2];
+    expect(automatic).toMatchObject({
+      id: display ? 'n1' : 'a2', assistantMessageId: 'a2', role: 'assistant',
+      content: 'Partial automatic reply', isAutomaticResponse: true,
+    });
+    expect(automatic.contentBlocks).toEqual([
+      ...(display ? [{ type: 'task_notification', content: 'Background result' }] : []),
+      { type: 'text', content: 'Partial automatic reply' },
+    ]);
+    expect(automatic.isInterrupt).toBe(stopReason === 'aborted' ? true : undefined);
+    expect(automatic.completedAt).toBeUndefined();
+    expect(automatic.durationSeconds).toBeUndefined();
+    expect(automatic.turnStats).toBeUndefined();
+    expect(completed.turnId).toEqual(expect.stringMatching(/.+/));
+    expect(automatic.turnId).toEqual(expect.stringMatching(/.+/));
+    expect(automatic.turnId).not.toBe(completed.turnId);
+  });
+
+  it.each([false, true])('keeps a custom message inside an active prompted tool turn (display: %s)', display => {
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, timestamp: testTime(), message: { role: 'user', content: 'Inspect' } },
+      { type: 'message', id: 'a1', parentId: 'u1', timestamp: testTime({ seconds: 2 }), message: {
+        role: 'assistant', stopReason: 'toolUse', usage: { output: 4 }, content: [
+          { type: 'text', text: 'Working' }, { type: 'toolCall', id: 'read', name: 'read', arguments: { path: 'note.md' } },
+        ],
+      } },
+      { type: 'custom_message', id: 'n1', parentId: 'a1', timestamp: testTime({ seconds: 3 }),
+        customType: 'background-result', display, content: 'Background result' },
+      { type: 'message', id: 'r1', parentId: 'n1', timestamp: testTime({ seconds: 4 }),
+        message: { role: 'toolResult', toolCallId: 'read', content: 'Note contents' } },
+      { type: 'message', id: 'a2', parentId: 'r1', timestamp: testTime({ seconds: 5 }),
+        message: { role: 'assistant', stopReason: 'stop', usage: { output: 8 }, content: 'Done' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const messages = parsePiSessionContent(content);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({
+      id: 'a1', assistantMessageId: 'a2', content: 'WorkingDone', durationSeconds: 5,
+      completedAt: testDate({ seconds: 5 }).getTime(), turnStats: { outputTokens: 12, durationMs: 5000 },
+      toolCalls: [{ id: 'read', status: 'completed', result: 'Note contents' }],
+    });
+    expect(messages[1].contentBlocks).toEqual([
+      { type: 'text', content: 'Working' }, { type: 'tool_use', toolId: 'read' },
+      ...(display ? [{ type: 'task_notification', content: 'Background result' }] : []),
+      { type: 'text', content: 'Done' },
+    ]);
+    expect(messages[1].isAutomaticResponse).toBeUndefined();
+    expect(messages[1].isInterrupt).toBeUndefined();
+  });
+
+  it('attaches Peeps answers and closures to the tool calls that started the work', () => {
+    const launched = (id: string) => ({ id, status: 'starting' });
+    const toolCall = (id: string, name: string, args: Record<string, unknown>) => ({ type: 'toolCall', id, name, arguments: args });
+    const toolResult = (id: string, parentId: string, toolCallId: string, details: Record<string, unknown>) => ({
+      type: 'message', id, parentId,
+      message: { role: 'toolResult', toolCallId, toolName: 'peeps', content: [{ type: 'text', text: JSON.stringify(details) }], details },
+    });
+    const content = [
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'Delegate' } },
+      { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', stopReason: 'toolUse', content: [
+        toolCall('t1', 'peeps_spawn', { task: 'Read notes', label: 'reader' }),
+        toolCall('t2', 'peeps_spawn', { task: 'Count files' }),
+        toolCall('t3', 'peeps_inspect', { id: 'run-1' }),
+      ] } },
+      toolResult('r1', 'a1', 't1', launched('run-1')),
+      toolResult('r2', 'r1', 't2', { ...launched('run-2'), label: 'counter' }),
+      toolResult('r3', 'r2', 't3', { id: 'run-1', status: 'working' }),
+      { type: 'message', id: 'a2', parentId: 'r3', message: { role: 'assistant', content: 'Spawned', stopReason: 'stop' } },
+      { type: 'custom', id: 'm1', parentId: 'a2', customType: 'peeps/run', data: { run: { id: 'run-2', status: 'failed', error: 'Child exited' } } },
+      { type: 'custom_message', id: 'c1', parentId: 'm1', customType: 'peeps-result', display: true,
+        content: '[Peeps automated result — run-1 — answer]\nNotes read',
+        details: { owner: 'parent', results: [{ runId: 'run-1', seq: 1, status: 'answer' }] } },
+      { type: 'message', id: 'a3', parentId: 'c1', message: { role: 'assistant', stopReason: 'toolUse', content: [
+        toolCall('t4', 'peeps_send', { id: 'run-1', message: 'Summarize them' }),
+      ] } },
+      toolResult('r4', 'a3', 't4', { id: 'run-1', status: 'working' }),
+      { type: 'message', id: 'a4', parentId: 'r4', message: { role: 'assistant', content: 'Asked', stopReason: 'stop' } },
+      // A repeated notice of an applied report must not answer later work.
+      { type: 'custom_message', id: 'c2', parentId: 'a4', customType: 'peeps-result', display: true,
+        content: '[Peeps automated result — run-1 — answer]\nNotes read',
+        details: { owner: 'parent', results: [{ runId: 'run-1', seq: 1, status: 'answer' }] } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const subagents = Object.fromEntries(parsePiSessionContent(content)
+      .flatMap(message => message.toolCalls ?? [])
+      .map(tool => [tool.id, tool.subagent && {
+        agentId: tool.subagent.agentId,
+        description: tool.subagent.description,
+        prompt: tool.subagent.prompt,
+        result: tool.subagent.result,
+        status: tool.subagent.status,
+      }]));
+    expect(subagents).toEqual({
+      t1: { agentId: 'run-1', description: 'reader', prompt: 'Read notes', result: 'Notes read', status: 'completed' },
+      t2: { agentId: 'run-2', description: 'counter', prompt: 'Count files', result: 'Child exited', status: 'error' },
+      t3: undefined,
+      t4: { agentId: 'run-1', description: 'reader', prompt: 'Summarize them', result: undefined, status: 'running' },
+    });
+  });
+
+  it('parses linear user and assistant messages', () => {
+    const content = [
+      JSON.stringify({ type: 'session', id: 's1' }),
+      JSON.stringify({ id: 'u1', type: 'entry', message: { role: 'user', content: 'Hello' } }),
+      JSON.stringify({
+        id: 'a1',
+        type: 'entry',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', text: 'Thinking' },
+            { type: 'text', text: 'Hi' },
+          ],
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0].treeBranches).toBeUndefined();
+    expect(messages[0]).toMatchObject({
+      content: 'Hello',
+      role: 'user',
+      userMessageId: 'u1',
+    });
+    expect(messages[1]).toMatchObject({
+      assistantMessageId: 'a1',
+      content: 'Hi',
+      contentBlocks: [
+        { type: 'thinking', content: 'Thinking' },
+        { type: 'text', content: 'Hi' },
+      ],
+      role: 'assistant',
+    });
+  });
+
+  it('restores turn duration through tool calls using the final entry timestamp', () => {
+    const content = [
+      { type: 'message', id: 'u1', timestamp: testTime({ days: 11, hours: 10, milliseconds: 10 }),
+        message: { role: 'user', timestamp: testDate({ days: 11, hours: 10 }).getTime(), content: 'Inspect' } },
+      { type: 'message', id: 'a1', parentId: 'u1', timestamp: testTime({ days: 11, hours: 10, seconds: 4 }),
+        message: { role: 'assistant', timestamp: testDate({ days: 11, hours: 10, milliseconds: 10 }).getTime(), stopReason: 'toolUse',
+          content: [{ type: 'toolCall', id: 'read', name: 'read', arguments: { path: 'README.md' } }] } },
+      { type: 'message', id: 'tr1', parentId: 'a1', timestamp: testTime({ days: 11, hours: 10, seconds: 5 }),
+        message: { role: 'toolResult', toolCallId: 'read', content: [{ type: 'text', text: 'Details' }] } },
+      { type: 'message', id: 'a2', parentId: 'tr1', timestamp: testTime({ days: 11, hours: 10, minutes: 1, seconds: 5, milliseconds: 900 }),
+        message: { role: 'assistant', timestamp: testDate({ days: 11, hours: 10, seconds: 5 }).getTime(), stopReason: 'stop',
+          content: [{ type: 'text', text: 'Complete.' }] } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    expect(parsePiSessionContent(content)).toMatchObject([
+      { role: 'user', content: 'Inspect' },
+      { role: 'assistant', assistantMessageId: 'a2', content: 'Complete.', durationSeconds: 65, completedAt: Date.parse(testTime({ days: 11, hours: 10, minutes: 1, seconds: 5, milliseconds: 900 })) },
+    ]);
+    expect(parsePiSessionContent(content, { leafEntryId: 'a1' })[1].durationSeconds).toBeUndefined();
+  });
+
+  it.each([
+    ['stop', testTime({ days: 11, hours: 10, milliseconds: 900 }), 0],
+    ['length', testTime({ days: 11, hours: 10, seconds: 5 }), 5],
+    ['aborted', testTime({ days: 11, hours: 10, seconds: 5 }), undefined],
+    ['error', testTime({ days: 11, hours: 10, seconds: 5 }), undefined],
+    ['toolUse', testTime({ days: 11, hours: 10, seconds: 5 }), undefined],
+    ['stop', undefined, undefined],
+    ['stop', 'invalid', undefined],
+    ['stop', testTime({ days: 11, hours: 9, minutes: 59, seconds: 59 }), undefined],
+  ])('restores only completed durations with valid timing (%s, %s)', (stopReason, timestamp, expected) => {
+    const content = [
+      { id: 'u1', type: 'message', timestamp: testTime({ days: 11, hours: 10 }),
+        message: { role: 'user', content: 'Inspect' } },
+      { id: 'a1', parentId: 'u1', type: 'message', timestamp,
+        message: { role: 'assistant', timestamp: testDate({ days: 11, hours: 10, milliseconds: 10 }).getTime(), stopReason, content: 'Reply' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    expect(parsePiSessionContent(content)[1].durationSeconds).toBe(expected);
+  });
+
+  it('marks user-stopped turns interrupted without timing or an error, and keeps errored turns as failures', () => {
+    const at = (seconds: number) => testTime({ days: 11, hours: 10, seconds });
+    const content = [
+      { type: 'message', id: 'u1', timestamp: at(0), message: { role: 'user', content: 'Run the build' } },
+      { type: 'message', id: 'a1', parentId: 'u1', timestamp: at(4), message: { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'Build first.' },
+        { type: 'toolCall', id: 'bash', name: 'bash', arguments: { command: 'npm run build' } },
+      ], stopReason: 'aborted', errorMessage: 'Operation aborted', usage: { output: 12 } } },
+      { type: 'message', id: 'u2', parentId: 'a1', timestamp: at(10), message: { role: 'user', content: 'Never mind' } },
+      { type: 'message', id: 'a2', parentId: 'u2', timestamp: at(11), message: { role: 'assistant', content: [],
+        stopReason: 'aborted', errorMessage: 'Operation aborted' } },
+      { type: 'message', id: 'u3', parentId: 'a2', timestamp: at(20), message: { role: 'user', content: 'Try again' } },
+      { type: 'message', id: 'a3', parentId: 'u3', timestamp: at(25), message: { role: 'assistant', content: [{ type: 'text', text: 'Partial' }],
+        stopReason: 'error', errorMessage: 'Provider failed' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages.map(({ id, isInterrupt, durationSeconds, completedAt, turnStats }) => (
+      { id, isInterrupt, durationSeconds, completedAt, turnStats }))).toEqual([
+      { id: 'u1' }, { id: 'a1', isInterrupt: true }, { id: 'u2' }, { id: 'a2', isInterrupt: true }, { id: 'u3' }, { id: 'a3' },
+    ].map(message => ({ isInterrupt: undefined, durationSeconds: undefined, completedAt: undefined, turnStats: undefined, ...message })));
+    expect(messages[1].toolCalls).toEqual([expect.objectContaining({ id: 'bash' })]);
+    expect(messages[3]).toMatchObject({ content: '' });
+    expect(JSON.stringify(messages)).not.toContain('Operation aborted');
+  });
+
+  it('keeps an interrupted requested turn requested across notices and compaction', () => {
+    const content = [
+      { type: 'message', id: 'u1', message: { role: 'user', content: 'Delegate' } },
+      { type: 'custom_message', id: 'c1', parentId: 'u1', customType: 'peeps-result', display: true, content: 'Early result' },
+      { type: 'message', id: 'a1', parentId: 'c1', message: { role: 'assistant', stopReason: 'toolUse',
+        content: [{ type: 'toolCall', id: 'read', name: 'read', arguments: { path: 'README.md' } }] } },
+      { type: 'compaction', id: 'k1', parentId: 'a1', summary: 'Internal summary' },
+      { type: 'custom_message', id: 'c2', parentId: 'k1', customType: 'peeps-result', display: true, content: 'Later result' },
+      { type: 'message', id: 'a2', parentId: 'c2', message: { role: 'assistant', stopReason: 'aborted', errorMessage: 'Operation aborted',
+        content: [{ type: 'text', text: 'Partial' }] } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    const assistants = parsePiSessionContent(content).filter(message => message.role === 'assistant');
+
+    // One requested native turn: one turn identity, none of it automatic, the last interrupted.
+    expect(assistants.map(({ turnId, isAutomaticResponse, isInterrupt }) => ({ turnId, isAutomaticResponse, isInterrupt })))
+      .toEqual(assistants.map((_message, index) => ({
+        turnId: assistants[0].turnId,
+        isAutomaticResponse: undefined,
+        isInterrupt: index === assistants.length - 1 ? true : undefined,
+      })));
+    expect(assistants[0].turnId).toEqual(expect.any(String));
+    expect(assistants.length).toBeGreaterThan(1);
+  });
+
+  it('starts timing again at the next user prompt', () => {
+    const content = [
+      { id: 'u1', type: 'message', timestamp: testTime({ days: 11, hours: 10 }),
+        message: { role: 'user', content: 'First' } },
+      { id: 'a1', parentId: 'u1', type: 'message', timestamp: testTime({ days: 11, hours: 10, seconds: 5 }),
+        message: { role: 'assistant', stopReason: 'stop', content: 'First reply' } },
+      { id: 'u2', parentId: 'a1', type: 'message', timestamp: testTime({ days: 11, hours: 12 }),
+        message: { role: 'user', content: 'Second' } },
+      { id: 'a2', parentId: 'u2', type: 'message', timestamp: testTime({ days: 11, hours: 12, seconds: 3 }),
+        message: { role: 'assistant', stopReason: 'stop', content: 'Second reply' } },
+    ].map(entry => JSON.stringify(entry)).join('\n');
+
+    expect(parsePiSessionContent(content).filter(message => message.role === 'assistant')).toMatchObject([
+      { content: 'First reply', durationSeconds: 5 },
+      { content: 'Second reply', durationSeconds: 3 },
+    ]);
+  });
+
+  it('preserves hidden XML context wrappers in raw user content', () => {
+    const content = [
+      JSON.stringify({
+        id: 'u1',
+        type: 'entry',
+        message: {
+          role: 'user',
+          content: 'Summarize this\n\n<current_note>\nnotes/today.md\n</current_note>',
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0]).toMatchObject({
+      content: 'Summarize this\n\n<current_note>\nnotes/today.md\n</current_note>',
+      role: 'user',
+    });
+    expect(messages[0].displayContent).toBeUndefined();
+  });
+
+  it.each([
+    {
+      displayContent: '/skill:commit-push',
+      suffix: '',
+    },
+    {
+      displayContent: '/skill:commit-push include untracked files',
+      suffix: [
+        '',
+        '',
+        'include untracked files',
+        '',
+        '<linked_note path="notes/release.md" />',
+      ].join('\n'),
+    },
+  ])('restores $displayContent from Pi-expanded skill prompts', ({
+    displayContent,
+    suffix,
+  }) => {
+    const expandedPrompt = [
+      '<skill name="commit-push" location="/Users/test/.agents/skills/commit-push/SKILL.md">',
+      'References are relative to /Users/test/.agents/skills/commit-push.',
+      '',
+      'Commit all uncommitted changes, then push to remote.',
+      '</skill>',
+    ].join('\n') + suffix;
+    const content = JSON.stringify({
+      id: 'u1',
+      type: 'message',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: expandedPrompt }],
+      },
+    });
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0]).toMatchObject({
+      content: expandedPrompt,
+      displayContent,
+      role: 'user',
+    });
+  });
+
+  it('rehydrates user image content parts', () => {
+    const content = [
+      JSON.stringify({
+        id: 'u1',
+        type: 'entry',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            {
+              type: 'image',
+              mimeType: 'image/png',
+              data: 'aGVsbG8=',
+            },
+          ],
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0]).toMatchObject({
+      content: 'What is in this image?',
+      images: [{
+        data: 'aGVsbG8=',
+        id: 'pi-img-u1-0',
+        mediaType: 'image/png',
+        name: 'image-1.png',
+        size: 5,
+        source: 'paste',
+      }],
+      role: 'user',
+    });
+  });
+
+  it('attaches tool results to the previous assistant tool call', () => {
+    const content = [
+      JSON.stringify({
+        id: 'a1',
+        type: 'entry',
+        message: {
+          role: 'assistant',
+          content: [
+            { id: 'tool-1', input: { path: 'a.md' }, name: 'read', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        result: { content: [{ text: 'file contents', type: 'text' }] },
+        toolCallId: 'tool-1',
+        type: 'toolResult',
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0].toolCalls).toEqual([{
+      id: 'tool-1',
+      input: { file_path: 'a.md', path: 'a.md' },
+      name: 'Read',
+      result: 'file contents',
+      resultFormat: 'plain',
+      status: 'completed',
+    }]);
+  });
+
+  it('attaches real Pi message-role tool results to shared renderer tool calls', () => {
+    const content = [
+      JSON.stringify({
+        id: 'a1',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { arguments: { path: 'a.md' }, id: 'tool-1', name: 'read', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        id: 'tr1',
+        parentId: 'a1',
+        type: 'message',
+        message: {
+          content: [{ text: 'file contents', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'tool-1',
+          toolName: 'read',
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0].toolCalls).toEqual([{
+      id: 'tool-1',
+      input: { file_path: 'a.md', path: 'a.md' },
+      name: 'Read',
+      result: 'file contents',
+      resultFormat: 'plain',
+      status: 'completed',
+    }]);
+    expect(messages[0].contentBlocks).toEqual([{ toolId: 'tool-1', type: 'tool_use' }]);
+  });
+
+  it('rehydrates Pi web extension tools with shared renderer names', () => {
+    const content = [
+      JSON.stringify({
+        id: 'assistant-web',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              arguments: { count: 5, query: 'provider protocol' },
+              id: 'web-search-1',
+              name: 'web_search',
+              type: 'toolCall',
+            },
+            {
+              arguments: { url: 'https://example.com/reference' },
+              id: 'web-fetch-1',
+              name: 'web_fetch',
+              type: 'toolCall',
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'message',
+        message: {
+          content: [{ text: 'Search result', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'web-search-1',
+          toolName: 'web_search',
+        },
+      }),
+      JSON.stringify({
+        type: 'message',
+        message: {
+          content: [{ text: 'Fetched page', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'web-fetch-1',
+          toolName: 'web_fetch',
+        },
+      }),
+    ].join('\n');
+
+    const toolCalls = parsePiSessionContent(content)[0].toolCalls ?? [];
+
+    expect(toolCalls).toEqual([
+      expect.objectContaining({
+        input: { count: 5, query: 'provider protocol' },
+        name: 'WebSearch',
+        result: 'Search result',
+      }),
+      expect.objectContaining({
+        input: { url: 'https://example.com/reference' },
+        name: 'WebFetch',
+        result: 'Fetched page',
+      }),
+    ]);
+  });
+
+  it('merges Pi assistant continuations split by tool results into one chat message', () => {
+    const content = [
+      JSON.stringify({ id: 'u1', type: 'message', message: { role: 'user', content: 'Hide scrollbars' } }),
+      JSON.stringify({
+        id: 'a1',
+        parentId: 'u1',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Inspecting snippets' },
+            { arguments: { path: '.obsidian' }, id: 'ls-1', name: 'ls', type: 'toolCall' },
+            { arguments: { path: '.obsidian/snippets' }, id: 'ls-2', name: 'ls', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        id: 'tr1',
+        parentId: 'a1',
+        type: 'message',
+        message: {
+          content: [{ text: 'appearance.json\nsnippets/', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'ls-1',
+          toolName: 'ls',
+        },
+      }),
+      JSON.stringify({
+        id: 'tr2',
+        parentId: 'tr1',
+        type: 'message',
+        message: {
+          content: [{ text: 'existing.css', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'ls-2',
+          toolName: 'ls',
+        },
+      }),
+      JSON.stringify({
+        id: 'a2',
+        parentId: 'tr2',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { arguments: { path: '.obsidian/appearance.json' }, id: 'read-1', name: 'read', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        id: 'tr3',
+        parentId: 'a2',
+        type: 'message',
+        message: {
+          content: [{ text: '{"enabledCssSnippets":[]}', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'read-1',
+          toolName: 'read',
+        },
+      }),
+      JSON.stringify({
+        id: 'a3',
+        parentId: 'tr3',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Creating snippet' },
+            { arguments: { path: '.obsidian/snippets/hide-scrollbars.css', content: 'css' }, id: 'write-1', name: 'write', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        id: 'tr4',
+        parentId: 'a3',
+        type: 'message',
+        message: {
+          content: [{ text: 'Successfully wrote file', type: 'text' }],
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'write-1',
+          toolName: 'write',
+        },
+      }),
+      JSON.stringify({
+        id: 'a4',
+        parentId: 'tr4',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Done.' }],
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({
+      assistantMessageId: 'a4',
+      content: 'Done.',
+      role: 'assistant',
+    });
+    expect(messages[1].contentBlocks).toEqual([
+      { type: 'thinking', content: 'Inspecting snippets' },
+      { type: 'tool_use', toolId: 'ls-1' },
+      { type: 'tool_use', toolId: 'ls-2' },
+      { type: 'tool_use', toolId: 'read-1' },
+      { type: 'thinking', content: 'Creating snippet' },
+      { type: 'tool_use', toolId: 'write-1' },
+      { type: 'text', content: 'Done.' },
+    ]);
+    expect(messages[1].toolCalls?.map(toolCall => ({
+      id: toolCall.id,
+      result: toolCall.result,
+      status: toolCall.status,
+    }))).toEqual([
+      { id: 'ls-1', result: 'appearance.json\nsnippets/', status: 'completed' },
+      { id: 'ls-2', result: 'existing.css', status: 'completed' },
+      { id: 'read-1', result: '{"enabledCssSnippets":[]}', status: 'completed' },
+      { id: 'write-1', result: 'Successfully wrote file', status: 'completed' },
+    ]);
+  });
+
+  it('falls back to edit input pairs when a Pi edit result has only the numbered display diff', () => {
+    const content = [
+      JSON.stringify({
+        id: 'a1',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              arguments: {
+                edits: [{ oldText: 'old', newText: 'new' }],
+                path: 'notes/a.md',
+              },
+              id: 'edit-1',
+              name: 'edit',
+              type: 'toolCall',
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        id: 'tr1',
+        parentId: 'a1',
+        type: 'message',
+        message: {
+          content: [{ text: 'Edited notes/a.md', type: 'text' }],
+          // Results without `details.patch` carry only Pi's TUI diff, whose gutters are not diff syntax.
+          details: { diff: '-1 old\n+1 new', firstChangedLine: 1 },
+          isError: false,
+          role: 'toolResult',
+          toolCallId: 'edit-1',
+          toolName: 'edit',
+        },
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content);
+
+    expect(messages[0].toolCalls?.[0]).toMatchObject({
+      id: 'edit-1',
+      input: {
+        edits: [{ oldText: 'old', newText: 'new' }],
+        file_path: 'notes/a.md',
+        path: 'notes/a.md',
+      },
+      name: 'Edit',
+      result: 'Edited notes/a.md',
+      status: 'completed',
+    });
+    expect(messages[0].toolCalls?.[0].diffData).toMatchObject({
+      filePath: 'notes/a.md',
+      stats: { added: 1, removed: 1 },
+    });
+    expect(messages[0].toolCalls?.[0].diffData?.diffLines.map(line => line.text)).toEqual(['old', 'new']);
+  });
+
+  it('resolves only the active branch path', () => {
+    const entries: PiSessionEntry[] = [
+      { id: 'root', raw: {}, type: 'entry' },
+      { id: 'left', parentId: 'root', raw: {}, type: 'entry' },
+      { id: 'right', parentId: 'root', raw: {}, type: 'entry' },
+    ];
+
+    expect(resolvePiActivePath(entries, 'left').map(entry => entry.id)).toEqual(['root', 'left']);
+    expect(resolvePiActivePath(entries).map(entry => entry.id)).toEqual(['root', 'right']);
+  });
+
+  it('keeps id-less tool results attached to the active branch', () => {
+    const content = [
+      JSON.stringify({
+        id: 'root',
+        type: 'entry',
+        message: { role: 'user', content: 'Read the active file' },
+      }),
+      JSON.stringify({
+        id: 'left',
+        parentId: 'root',
+        type: 'entry',
+        message: {
+          role: 'assistant',
+          content: [
+            { id: 'tool-left', input: { path: 'left.md' }, name: 'read', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        result: { content: [{ text: 'left contents', type: 'text' }] },
+        toolCallId: 'tool-left',
+        type: 'toolResult',
+      }),
+      JSON.stringify({
+        id: 'right',
+        parentId: 'root',
+        type: 'entry',
+        message: {
+          role: 'assistant',
+          content: [
+            { id: 'tool-right', input: { path: 'right.md' }, name: 'read', type: 'toolCall' },
+          ],
+        },
+      }),
+      JSON.stringify({
+        result: { content: [{ text: 'right contents', type: 'text' }] },
+        toolCallId: 'tool-right',
+        type: 'toolResult',
+      }),
+    ].join('\n');
+
+    const messages = parsePiSessionContent(content, { leafEntryId: 'left' });
+
+    expect(messages[1].toolCalls).toEqual([{
+      id: 'tool-left',
+      input: { file_path: 'left.md', path: 'left.md' },
+      name: 'Read',
+      result: 'left contents',
+      resultFormat: 'plain',
+      status: 'completed',
+    }]);
+  });
+
+  it('truncates linear Pi sessions through the requested checkpoint', () => {
+    const content = [
+      JSON.stringify({ id: 'u1', type: 'message', message: { role: 'user', content: 'First' } }),
+      JSON.stringify({ id: 'a1', type: 'message', message: { role: 'assistant', content: 'Done' } }),
+      JSON.stringify({ id: 'u2', type: 'message', message: { role: 'user', content: 'Later' } }),
+      JSON.stringify({ id: 'a2', type: 'message', message: { role: 'assistant', content: 'Do not include' } }),
+    ].join('\n');
+    expect(parsePiSessionContent(content, { leafEntryId: 'a1' }).map(message => message.content)).toEqual([
+      'First',
+      'Done',
+    ]);
+  });
+
+  it('keeps id-less trailing entries during normal linear hydration', () => {
+    const content = [
+      JSON.stringify({ id: 'u1', type: 'message', message: { role: 'user', content: 'First' } }),
+      JSON.stringify({ id: 'a1', type: 'message', message: { role: 'assistant', content: 'Done', stopReason: 'stop' } }),
+      JSON.stringify({ type: 'custom_message', content: 'Trailing notice' }),
+    ].join('\n');
+
+    expect(parsePiSessionContent(content).map(message => message.content || message.contentBlocks?.[0])).toEqual([
+      'First',
+      'Done',
+      { content: 'Trailing notice', type: 'task_notification' },
+    ]);
+    expect(parsePiSessionContent(content, { leafEntryId: 'a1' }).map(message => message.content)).toEqual([
+      'First',
+      'Done',
+    ]);
+  });
+
+
+
+
+
+  it('ignores malformed lines and maps compaction boundaries', () => {
+    const content = [
+      'not-json',
+      JSON.stringify({ id: 'c1', type: 'compaction' }),
+    ].join('\n');
+
+    expect(parsePiSessionContent(content)[0].contentBlocks).toEqual([{ type: 'context_compacted' }]);
+  });
+});
+
+it.each([false, true])('restores Pi turn output across tool loops (missing usage: %s)', (missing) => {
+  const content = [
+    { type: 'session', id: 'session' },
+    { type: 'message', id: 'u', parentId: null, timestamp: testTime({ days: 24, hours: 11, milliseconds: 10 }),
+      message: { role: 'user', content: 'Work', timestamp: Date.parse(testTime({ days: 24, hours: 11 })) } },
+    { type: 'message', id: 'a', parentId: 'u', timestamp: testTime({ days: 24, hours: 11, seconds: 1 }),
+      message: { role: 'assistant', stopReason: 'toolUse', usage: missing ? undefined : { output: 100 },
+        content: [{ type: 'toolCall', id: 'tool', name: 'read', arguments: {} }] } },
+    { type: 'message', id: 'r', parentId: 'a', timestamp: testTime({ days: 24, hours: 11, seconds: 2 }),
+      message: { role: 'toolResult', toolCallId: 'tool', content: [{ type: 'text', text: 'Result' }] } },
+    { type: 'message', id: 'final', parentId: 'r', timestamp: testTime({ days: 24, hours: 11, seconds: 2, milliseconds: 500 }),
+      message: { role: 'assistant', stopReason: 'stop', usage: { output: 25 },
+        timestamp: Date.parse(testTime({ days: 24, hours: 11, seconds: 2 })), content: [{ type: 'text', text: 'Done' }] } },
+  ].map(entry => JSON.stringify(entry)).join('\n');
+  expect(parsePiSessionContent(content).at(-1)?.turnStats).toEqual(missing ? undefined : { outputTokens: 125, durationMs: 2500 });
+});
+
+it('keeps live and replay stats unavailable for a hidden recovery-only input', () => {
+  const content = [
+    { type: 'message', id: 'recovery', timestamp: testTime({ days: 24, hours: 11 }),
+      message: { role: 'user', content: encodeRecoveryPrompt('User: Previous question', null) } },
+    { type: 'message', id: 'answer', parentId: 'recovery', timestamp: testTime({ days: 24, hours: 11, seconds: 2, milliseconds: 500 }),
+      message: { role: 'assistant', content: 'Answer', stopReason: 'stop', usage: { output: 125 } } },
+  ].map(record => JSON.stringify(record)).join('\n');
+  const entries = resolvePiActivePath(parsePiSessionEntries(content).entries);
+  expect(getPiTurnStats(entries, 'answer')).toBeUndefined();
+  expect(parsePiSessionContent(content).at(-1)?.turnStats).toBeUndefined();
+});

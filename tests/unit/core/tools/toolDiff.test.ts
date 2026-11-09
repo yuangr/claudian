@@ -6,7 +6,7 @@ import {
   resolveToolDiffData,
 } from '@/core/tools/toolDiff';
 import type { DiffLine, StructuredPatchHunk } from '@/core/types/diff';
-import type { ToolCallInfo } from '@/core/types/tools';
+import type { ToolCallInfo, ToolDiffData } from '@/core/types/tools';
 
 /** Helper to create a ToolCallInfo for testing. */
 function makeToolCall(name: string, input: Record<string, unknown>): ToolCallInfo {
@@ -357,6 +357,34 @@ describe('resolveToolDiffData input fallback', () => {
     expect(result!.stats).toEqual({ added: 3, removed: 3 });
   });
 
+  describe.each([
+    ['Edit old_string/new_string', (oldText: string, newText: string): ToolDiffData | undefined =>
+      resolveToolDiffData(undefined, makeToolCall('Edit', { file_path: 'src/r.ts', old_string: oldText, new_string: newText }))],
+    ['Edit edits array', (oldText: string, newText: string): ToolDiffData | undefined =>
+      resolveToolDiffData(undefined, makeToolCall('Edit', { file_path: 'src/r.ts', edits: [{ oldText, newText }] }))],
+    ['ACP raw replacement pair', (oldText: string, newText: string): ToolDiffData | undefined =>
+      resolveToolDiffData(diffFromReplacements([{ oldText, newText }], 'src/r.ts'),
+        makeToolCall('Edit', { file_path: 'src/r.ts', old_string: oldText, new_string: newText }))],
+  ])('replacement side boundaries through %s', (_source, build) => {
+    it.each<[string, string, string, string[], string[], { added: number; removed: number }]>([
+      ['terminated sides drop their separators', 'old\n', 'new\n', ['old'], ['new'], { added: 1, removed: 1 }],
+      ['an empty old side has no lines', '', 'a\n\n', [], ['a', ''], { added: 2, removed: 0 }],
+      ['an empty new side has no lines', 'a\n\n', '', ['a', ''], [], { added: 0, removed: 2 }],
+      ['unterminated sides stay single lines', 'old', 'new', ['old'], ['new'], { added: 1, removed: 1 }],
+      ['CRLF sides keep CR in their text', 'old\r\n', 'new\r\n', ['old\r'], ['new\r'], { added: 1, removed: 1 }],
+      ['a CRLF-only old side keeps its CR', '\r\n', 'new\n', ['\r'], ['new'], { added: 1, removed: 1 }],
+    ])('%s', (_name, oldText, newText, removed, added, stats) => {
+      const result = build(oldText, newText);
+
+      expect(result).toBeDefined();
+      expect(result!.diffLines.map(line => [line.type, line.text])).toEqual([
+        ...removed.map(text => ['delete', text]),
+        ...added.map(text => ['insert', text]),
+      ]);
+      expect(result!.stats).toEqual(stats);
+    });
+  });
+
   it('uses path as the fallback file path for Pi Write input', () => {
     const toolCall = makeToolCall('Write', {
       path: 'src/pi-new.ts',
@@ -394,6 +422,28 @@ describe('resolveToolDiffData input fallback', () => {
     expect(result!.diffLines).toHaveLength(3);
     expect(result!.diffLines.every(l => l.type === 'insert')).toBe(true);
     expect(result!.stats).toEqual({ added: 3, removed: 0 });
+  });
+
+  it.each<[string, string, string[]]>([
+    ['an empty content has no lines', '', []],
+    ['a final LF terminates the last line', 'a\n', ['a']],
+    ['a lone LF is one blank line', '\n', ['']],
+    ['a blank line before the final LF survives', 'a\n\n', ['a', '']],
+    ['unterminated lines have no separator to drop', 'a\nb', ['a', 'b']],
+    ['a CRLF line keeps its CR text', 'a\r\n', ['a\r']],
+    ['a CRLF-only line keeps its CR text', '\r\n', ['\r']],
+    ['a CRLF blank line keeps its CR text', 'a\r\n\r\n', ['a\r', '\r']],
+    ['unterminated CRLF lines keep their CR text', 'a\r\nb', ['a\r', 'b']],
+    ['a lone CR is one line', '\r', ['\r']],
+    ['spaces stay line content', ' ', [' ']],
+  ])('splits raw Write content into literal lines: %s', (_name, content, texts) => {
+    const result = resolveToolDiffData(undefined, makeToolCall('Write', { file_path: 'src/w.ts', content }));
+
+    expect(result).toBeDefined();
+    expect(result!.diffLines.map(line => line.text)).toEqual(texts);
+    expect(result!.diffLines.map(line => line.type)).toEqual(texts.map(() => 'insert'));
+    expect(result!.diffLines.map(line => line.newLineNum)).toEqual(texts.map((_text, index) => index + 1));
+    expect(result!.stats).toEqual({ added: texts.length, removed: 0 });
   });
 
   it('returns undefined for Edit with non-string inputs', () => {

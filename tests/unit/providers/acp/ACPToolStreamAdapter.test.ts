@@ -191,3 +191,23 @@ describe('ACPToolStreamAdapter', () => {
       .toEqual([]);
   });
 });
+
+it.each([{}, { rawInput: null, rawOutput: null }])('keeps previous raw state for a v1 no-change update: %j', update => {
+  const adapter = createAdapter();
+  const rawInput = { target_file: 'note.md' };
+  const rawOutput = { content: 'note body' };
+  adapter.normalizeToolCall({ title: 'read_file', toolCallId: 'read', rawInput, rawOutput }, []);
+  expect(adapter.normalizeToolCallUpdate({ toolCallId: 'read', ...update }, [
+    { type: 'tool_result', id: 'read', content: 'complete' },
+  ]).at(-1)).toMatchObject({ providerPayload: { rawInput, rawOutput }, content: 'complete' });
+});
+
+it('retains an initial null payload and accepts a later concrete replacement', () => {
+  const adapter = createAdapter();
+  expect(adapter.normalizeToolCall({ title: 'read_file', toolCallId: 'read', rawInput: null, rawOutput: null }, [
+    { type: 'tool_use', id: 'read', name: 'Read', input: {} },
+  ])[0]).toMatchObject({ providerPayload: { rawInput: null, rawOutput: null } });
+  expect(adapter.normalizeToolCallUpdate({ toolCallId: 'read', rawInput: { target_file: 'next.md' }, rawOutput: 'next' }, [
+    { type: 'tool_result', id: 'read', content: 'complete' },
+  ]).at(-1)).toMatchObject({ providerPayload: { rawInput: { target_file: 'next.md' }, rawOutput: 'next' } });
+});

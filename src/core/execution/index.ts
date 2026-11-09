@@ -24,6 +24,7 @@ export {
   type ProviderBackgroundEventScope,
   type ProviderBackgroundOutputEvent,
   type ProviderBackgroundTurnCompletedEvent,
+  type ProviderBackgroundTurnCompletionReason,
   type ProviderBackgroundTurnStartedEvent,
   type ProviderCancelledEvent,
   type ProviderCitationsEvent,
@@ -74,6 +75,7 @@ export {
   type ProviderExecutionContext,
   type ProviderExecutionInputBlock,
   type ProviderExecutionRequest,
+  type ProviderExplicitInstructionPurpose,
   type ProviderLinkedContentContext,
   type ProviderSystemInstructions,
   type ProviderToolPolicy,
@@ -98,6 +100,10 @@ export {
   type ProviderSessionSnapshot,
   type ProviderSessionStatus,
 } from './ProviderSessionSnapshot';
+export {
+  isSessionToolPolicyAllowed,
+  type ProviderSessionToolPort,
+} from './ProviderSessionToolPort';
 export {
   type RequestedRunCancelSource,
   RequestedRunChannel,

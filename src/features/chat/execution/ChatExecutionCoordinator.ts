@@ -19,6 +19,7 @@ import type {
   ProviderNativeResumeSeed,
   ProviderSessionEvent,
   ProviderSessionSnapshot,
+  ProviderSystemInstructions,
   ProviderToolPolicy,
 } from '@/core/execution';
 import {
@@ -44,6 +45,7 @@ import {
   reduceRequestedTurnIdentity,
 } from '@/features/chat/execution/RequestedTurnIdentity';
 import { SessionEventStream } from '@/features/chat/execution/SessionEventStream';
+import type { SessionToolBinding } from '@/features/chat/session-messaging/SessionMessagingService';
 import { throwIfAborted } from '@/utils/abort';
 import { toError } from '@/utils/error';
 
@@ -120,8 +122,11 @@ export interface ChatExecutionCoordinatorDeps {
   readonly resolveBackend: (providerId: ProviderId) => ProviderExecutionBackend;
   readonly persistence: ChatExecutionPersistence;
   readonly interactionPort: ProviderInteractionPort;
-  readonly vaultWorkingDirectory: string;
+  readonly workingDirectory: string;
   readonly createId: () => string;
+  readonly bindSessionTools?: (conversationId: string) => SessionToolBinding;
+  /** Reads the stored binding, which may have advanced since this coordinator bound it. */
+  readonly loadConversationBinding?: (conversationId: string) => Promise<ChatExecutionConversationBinding | null>;
   readonly onRequestedEvent?: (
     event: ProviderExecutionEvent,
     context: ChatExecutionEventContext,
@@ -175,7 +180,10 @@ interface SessionBinding {
   lastSnapshotRevision: number;
   pendingWorkCount: number;
   readonly events: SessionEventStream;
+  readonly sessionTools?: SessionToolBinding;
   model?: string;
+  /** Native history changed outside this process; it must be replaced before it handles another turn. */
+  nativeHistoryChanged?: boolean;
 }
 
 interface ActiveExecution {
@@ -185,6 +193,15 @@ interface ActiveExecution {
   readonly requestController: AbortController;
   terminationOverride: 'cancelled' | 'invalidated' | null;
 }
+
+/** The one foreground operation: a turn, holding its execution once handed off, or a branch change. */
+interface ForegroundTurn {
+  readonly kind: 'turn';
+  readonly controller: AbortController;
+  execution: ActiveExecution | null;
+}
+
+type ForegroundOperation = ForegroundTurn | { readonly kind: 'branch'; readonly controller: AbortController };
 
 interface PendingSteerAttempt {
   readonly conversationId: string;
@@ -216,18 +233,24 @@ export class ChatExecutionCoordinator {
   readonly #interactions: ExecutionInteractions;
   #conversation: ChatExecutionConversationBinding | null = null;
   #sessionBinding: SessionBinding | null = null;
-  #activeExecution: ActiveExecution | null = null;
-  #requestController: AbortController | null = null;
+  #foreground: ForegroundOperation | null = null;
   #branchRecoveryRequired = false;
   readonly #pendingSteerAttempts = new Map<string, PendingSteerAttempt>();
   #disposed = false;
   #disposePromise: Promise<void> | null = null;
+  /** Settles once every released binding has given up its claim; replacements register only after it. */
+  #bindingReleases: Promise<void> = Promise.resolve();
   #stale = false;
   #publishedBackgroundWork = false;
   #protectedOperationCount = 0;
   #preparationTail: Promise<void> = Promise.resolve();
   #idleTimer: number | null = null;
   #idleTimerGeneration = 0;
+
+  /** The directory this coordinator's sessions run in, captured when the session runtime was assembled. */
+  get workingDirectory(): string {
+    return this.deps.workingDirectory;
+  }
 
   constructor(private readonly deps: ChatExecutionCoordinatorDeps) {
     this.#supervisor = new ExecutionSessionSupervisor(deps.lifecycleRegistry);
@@ -244,6 +267,11 @@ export class ChatExecutionCoordinator {
     if (this.#activeExecution) return 'active';
     if (this.#stale) return 'stale';
     return this.#sessionBinding ? 'idle' : 'absent';
+  }
+
+  /** Steering joins the active request's already-resolved instructions. */
+  get systemInstructions(): ProviderSystemInstructions | null {
+    return this.#activeExecution?.submission.configuration.systemInstructions ?? null;
   }
 
   get snapshot(): ProviderSessionSnapshot | null {
@@ -327,9 +355,17 @@ export class ChatExecutionCoordinator {
   }
 
   async #prepareSession(): Promise<void> {
+    // A release can start while this waits; nothing below awaits before registering, so once the barrier is
+    // unchanged after settling, no release can start before the claim.
+    let releases: Promise<void>;
+    do {
+      releases = this.#bindingReleases;
+      await releases;
+    } while (releases !== this.#bindingReleases);
     this.#assertAvailable();
     const conversation = this.#requireConversation();
-    if (this.#sessionBinding && this.#isBindingCurrent(this.#sessionBinding)) return;
+    const current = this.#sessionBinding;
+    if (current && this.#isBindingCurrent(current)) return;
     const backend = this.deps.resolveBackend(conversation.providerId);
     if (backend.providerId !== conversation.providerId) {
       throw new Error(
@@ -337,18 +373,26 @@ export class ChatExecutionCoordinator {
       );
     }
 
-    const supervised = this.#supervisor.acquire(
-      backend,
-      {
-        lifecycle: 'persistent',
-        nativePersistence: 'enabled',
-        resumeSeed: conversation.resumeSeed,
-        vaultWorkingDirectory: this.deps.vaultWorkingDirectory,
-        interactionPort: this.#interactions,
-      },
-      (reason) => this.#handleLeaseInvalidation(reason),
-      (event) => this.#handleSessionEvent(event),
-    );
+    const sessionTools = this.deps.bindSessionTools?.(conversation.conversationId);
+    let supervised;
+    try {
+      supervised = this.#supervisor.acquire(
+        backend,
+        {
+          lifecycle: 'persistent',
+          nativePersistence: 'enabled',
+          resumeSeed: conversation.resumeSeed,
+          workingDirectory: this.deps.workingDirectory,
+          interactionPort: this.#interactions,
+          sessionTools: sessionTools?.port,
+        },
+        (reason, released) => this.#handleLeaseInvalidation(reason, released),
+        (event) => this.#handleSessionEvent(event),
+      );
+    } catch (error) {
+      sessionTools?.dispose();
+      throw error;
+    }
     const binding: SessionBinding = {
       conversation,
       bindingId: this.deps.createId(),
@@ -357,6 +401,7 @@ export class ChatExecutionCoordinator {
       lastSnapshotRevision: -1,
       pendingWorkCount: 0,
       events: new SessionEventStream(supervised.session.sessionInstanceId),
+      sessionTools,
     };
     this.#sessionBinding = binding;
     this.#stale = false;
@@ -376,28 +421,36 @@ export class ChatExecutionCoordinator {
   async execute(submission: ChatTurnSubmission, signal?: AbortSignal): Promise<ChatExecutionResult> {
     this.#assertAvailable();
     if (this.#branchRecoveryRequired) throw new ChatExecutionPreHandoffError('Conversation branch recovery must finish before sending.');
-    if (this.#requestController) throw new Error('A chat execution is already active');
-    const controller = new AbortController();
-    this.#requestController = controller;
+    if (this.#foreground) throw new Error('A chat execution is already active');
+    const turn: ForegroundTurn = { controller: new AbortController(), execution: null, kind: 'turn' };
+    this.#foreground = turn;
     const cancel = () => this.cancel();
     signal?.addEventListener('abort', cancel, { once: true });
-    if (signal?.aborted) controller.abort();
+    if (signal?.aborted) turn.controller.abort();
     try {
-      return await this.#runProtectedOperation(() => this.#executeProtected(submission, controller));
+      return await this.#runProtectedOperation(() => this.#executeProtected(submission, turn));
     } finally {
       signal?.removeEventListener('abort', cancel);
-      this.#requestController = null;
+      if (this.#foreground === turn) this.#foreground = null;
     }
+  }
+
+  get #activeExecution(): ActiveExecution | null {
+    const foreground = this.#foreground;
+    return foreground?.kind === 'turn' ? foreground.execution : null;
   }
 
   async #executeProtected(
     submission: ChatTurnSubmission,
-    requestController: AbortController,
+    turn: ForegroundTurn,
   ): Promise<ChatExecutionResult> {
-    const conversation = this.#requireConversation();
+    const requestController = turn.controller;
+    let conversation: ChatExecutionConversationBinding;
     let binding: SessionBinding;
     let run: ProviderExecutionRun;
     try {
+      await this.#replaceChangedHistorySession();
+      conversation = this.#requireConversation();
       throwIfAborted(requestController.signal, 'Turn cancelled before provider handoff');
       await this.prepare();
       throwIfAborted(requestController.signal, 'Turn cancelled before provider handoff');
@@ -431,25 +484,23 @@ export class ChatExecutionCoordinator {
       submission,
       terminationOverride: null,
     };
-    this.#activeExecution = active;
+    turn.execution = active;
 
     try {
       return await this.#consumeRequestedEvents(active);
     } finally {
       this.#interactions.dismissTurn(active.run.turnId, 'native-rejected');
-      if (this.#activeExecution === active) {
-        this.#activeExecution = null;
-      }
+      if (turn.execution === active) turn.execution = null;
     }
   }
 
   cancel(): void {
-    if (this.#requestController?.signal.aborted) return;
-    this.#requestController?.abort();
-    const active = this.#activeExecution;
+    const foreground = this.#foreground;
+    if (!foreground || foreground.controller.signal.aborted) return;
+    foreground.controller.abort();
+    const active = foreground.kind === 'turn' ? foreground.execution : null;
     if (!active) return;
     active.terminationOverride = 'cancelled';
-    active.requestController.abort();
     this.#interactions.dismissTurn(active.run.turnId, 'cancelled');
     active.run.cancel();
   }
@@ -462,7 +513,7 @@ export class ChatExecutionCoordinator {
 
   async steer(submission: ChatTurnSubmission, signal?: AbortSignal): Promise<ChatSteerOutcome> {
     const controller = new AbortController();
-    const sources = [signal, this.#requestController?.signal];
+    const sources = [signal, this.#foreground?.controller.signal];
     const cancel = () => controller.abort();
     for (const source of sources) {
       source?.addEventListener('abort', cancel, { once: true });
@@ -601,11 +652,12 @@ export class ChatExecutionCoordinator {
     if (this.#branchRecoveryRequired && 'userMessageId' in request) {
       return { status: 'recovery-required', error: 'Reconcile the current branch before navigating again.' };
     }
-    if (this.#requestController || this.#protectedOperationCount > 0 || this.hasBackgroundWork || this.#interactions.hasPending) {
+    if (this.#foreground || this.#protectedOperationCount > 0 || this.hasBackgroundWork || this.#interactions.hasPending) {
       return { status: 'failed', error: 'Conversation is busy.' };
     }
     const controller = new AbortController();
-    this.#requestController = controller;
+    const operation: ForegroundOperation = { controller, kind: 'branch' };
+    this.#foreground = operation;
     const conversation = this.#conversation;
     const abort = () => controller.abort(request.signal?.reason);
     request.signal?.addEventListener('abort', abort, { once: true });
@@ -639,7 +691,7 @@ export class ChatExecutionCoordinator {
       return { status: 'failed', error: String(error) };
     } finally {
       request.signal?.removeEventListener('abort', abort);
-      this.#requestController = null;
+      if (this.#foreground === operation) this.#foreground = null;
     }
   }
 
@@ -714,7 +766,8 @@ export class ChatExecutionCoordinator {
     this.#pendingSteerAttempts.clear();
     this.#disposePromise = this.#preparationTail
       .catch(() => undefined)
-      .then(() => this.#releaseSessionBinding());
+      .then(() => this.#releaseSessionBinding())
+      .then(() => this.#bindingReleases);
     return this.#disposePromise;
   }
 
@@ -728,6 +781,7 @@ export class ChatExecutionCoordinator {
       && this.#activeExecution === null
       && !this.#interactions.hasPending
       && !binding.session.hasBackgroundWork?.()
+      && !binding.session.blocksIdleRelease?.()
       && !binding.events.hasBackgroundWork
       && binding.pendingWorkCount === 0
       && (this.deps.isOwnerIdle?.() ?? true),
@@ -752,16 +806,57 @@ export class ChatExecutionCoordinator {
     this.#idleTimer = null;
   }
 
+  /**
+   * Native history changed outside Claudian, so the provider process's context predates it. Releases it
+   * now when idle; otherwise (a native task still runs in it) it stays bound for that work, and the next
+   * send replaces it once it can be released, or is refused while it cannot.
+   */
+  releaseForChangedHistory(): Promise<void> {
+    return this.#enqueuePreparation(async () => {
+      const binding = this.#sessionBinding;
+      if (!binding) return;
+      binding.nativeHistoryChanged = true;
+      await this.#releaseIdleBinding();
+    });
+  }
+
+  /**
+   * A session kept for a native task when its history changed is replaced before the next turn, resuming
+   * from the stored binding: the conversation may have gained its native session after this one bound.
+   */
+  async #replaceChangedHistorySession(): Promise<void> {
+    const stale = this.#sessionBinding;
+    if (!stale?.nativeHistoryChanged || !this.#isBindingCurrent(stale)) return;
+    if (stale.session.blocksIdleRelease?.() || this.hasBackgroundWork) {
+      throw new Error('This chat continued outside Claudian while a background task from its earlier session is still running. Stop the task or wait for it to finish, then send again.');
+    }
+    await this.#enqueuePreparation(async () => {
+      if (this.#sessionBinding !== stale) return;
+      await this.#persistSnapshot(stale, stale.session.getSnapshot());
+      if (this.#sessionBinding === stale) await this.#releaseSessionBinding();
+    });
+    const bound = this.#conversation;
+    if (!bound || !this.deps.loadConversationBinding) return;
+    const stored = await this.deps.loadConversationBinding(bound.conversationId);
+    if (stored && this.#conversation === bound && !this.#sessionBinding && stored.providerId === bound.providerId) {
+      this.#conversation = stored;
+    }
+  }
+
+  async #releaseIdleBinding(isCurrent: () => boolean = () => true): Promise<void> {
+    const binding = this.#sessionBinding;
+    if (!binding || !isCurrent() || !this.#isIdle()) return;
+    await this.#persistSnapshot(binding, binding.session.getSnapshot());
+    if (this.#sessionBinding !== binding || !isCurrent() || !this.#isIdle()) return;
+    await this.#releaseSessionBinding();
+    this.deps.onIdleRelease?.();
+  }
+
   async #releaseIdleSession(generation: number): Promise<void> {
     const binding = this.#sessionBinding;
     if (!binding || generation !== this.#idleTimerGeneration) return;
     try {
-      if (!this.#isIdle()) return;
-      await this.#persistSnapshot(binding, binding.session.getSnapshot());
-      if (this.#sessionBinding === binding && generation === this.#idleTimerGeneration && this.#isIdle()) {
-        await this.#releaseSessionBinding();
-        this.deps.onIdleRelease?.();
-      }
+      await this.#releaseIdleBinding(() => generation === this.#idleTimerGeneration);
     } finally {
       // Retry busy or failed releases without replacing a newer activity timer.
       if (this.#sessionBinding === binding && generation === this.#idleTimerGeneration) {
@@ -943,9 +1038,18 @@ export class ChatExecutionCoordinator {
     snapshot: ProviderSessionSnapshot,
     requirePersistence = false,
   ): Promise<void> {
+    if (!this.#isBindingCurrent(binding)) return;
+    await this.#writeSnapshot(binding, snapshot, requirePersistence);
+  }
+
+  /** Writes a newer snapshot under the binding's claim; callers establish that the claim is still held. */
+  async #writeSnapshot(
+    binding: SessionBinding,
+    snapshot: ProviderSessionSnapshot,
+    requirePersistence = false,
+  ): Promise<void> {
     if (
-      !this.#isBindingCurrent(binding)
-      || snapshot.providerId !== binding.conversation.providerId
+      snapshot.providerId !== binding.conversation.providerId
       || snapshot.revision <= binding.lastSnapshotRevision
     ) {
       return;
@@ -979,38 +1083,64 @@ export class ChatExecutionCoordinator {
 
   #handleLeaseInvalidation(
     _reason: ProviderExecutionInvalidationReason,
+    released: Promise<void>,
   ): void {
     const binding = this.#sessionBinding;
     if (!binding) return;
     this.#sessionBinding = null;
+    binding.sessionTools?.dispose();
     this.#publishBackgroundWork();
     this.#stale = true;
     this.#pendingSteerAttempts.clear();
     this.#invalidateActiveExecution('invalidated', 'provider-transition');
-    this.deps.persistence.releaseExecutionBinding(
-      binding.conversation.conversationId,
-      binding.bindingId,
-    );
+    const settle = this.#holdReleasedBinding(binding);
+    void this.#trackBindingRelease(settle(released)).catch(error => this.deps.onError?.(error));
     this.#clearIdleTimer();
   }
 
   async #releaseSessionBinding(): Promise<void> {
     const binding = this.#sessionBinding;
     this.#sessionBinding = null;
+    binding?.sessionTools?.dispose();
     this.#pendingSteerAttempts.clear();
     this.#clearIdleTimer();
     this.#publishBackgroundWork();
-    try {
-      await this.#supervisor.release();
-    } finally {
-      // Keep the claim until the previous native session has finished disposal.
-      if (binding) {
+    const settle = binding ? this.#holdReleasedBinding(binding) : null;
+    const release = this.#supervisor.release();
+    await (settle ? this.#trackBindingRelease(settle(release)) : release);
+  }
+
+  /**
+   * Release can settle provider state after event routing ends (Pi follows a stopped turn's native leaf once
+   * its process exits). Listening from before the release starts, the returned step persists that state while
+   * the claim is still held, then gives the claim up once the native session has finished disposal. The final
+   * disposed announcement only reports teardown, and may carry state the release's caller already reset.
+   */
+  #trackBindingRelease(release: Promise<void>): Promise<void> {
+    const settled = release.catch(() => undefined);
+    this.#bindingReleases = Promise.all([this.#bindingReleases, settled]).then(() => undefined);
+    return release;
+  }
+
+  #holdReleasedBinding(binding: SessionBinding): (release: Promise<void>) => Promise<void> {
+    let settled: ProviderSessionSnapshot | undefined;
+    const stopListening = binding.session.onEvent((event) => {
+      if (event.type === 'session_state_changed' && event.snapshot.status !== 'disposed') {
+        settled = event.snapshot;
+      }
+    });
+    return async (release) => {
+      try {
+        await release;
+        if (settled) await this.#writeSnapshot(binding, settled).catch(error => this.deps.onError?.(error));
+      } finally {
+        stopListening();
         this.deps.persistence.releaseExecutionBinding(
           binding.conversation.conversationId,
           binding.bindingId,
         );
       }
-    }
+    };
   }
 
   async #runProtectedOperation<T>(operation: () => Promise<T>): Promise<T> {

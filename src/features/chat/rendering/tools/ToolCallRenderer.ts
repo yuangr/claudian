@@ -24,7 +24,10 @@ interface ToolCardOptions {
   eagerWhen?: boolean;
 }
 
-type ToolCardUpdate = (tool: ToolCallInfo) => void;
+interface ToolCardUpdate {
+  refreshHeader: () => void;
+  updateResult: (tool: ToolCallInfo) => void;
+}
 
 const toolCardUpdates = new WeakMap<HTMLElement, ToolCardUpdate>();
 
@@ -76,19 +79,27 @@ function createToolCard(parentEl: HTMLElement, tool: ToolCallInfo, options: Tool
   };
   if (eager || initiallyExpanded || options.eagerWhen) renderContent();
 
-  toolCardUpdates.set(toolEl, next => {
-    currentTool = next;
-    pendingText = undefined;
-    dirty = true;
-    if (live) next.isExpanded = state.isExpanded;
-    nameEl.setText(getToolName(next.name, next.input));
-    setDetail(next.input);
-    setCardStatus(statusEl, next, false);
-    if (eager || state.isExpanded) renderContent();
+  const refreshHeader = () => {
+    nameEl.setText(getToolName(currentTool.name, currentTool.input));
+    summaryEl.setText(getToolSummary(currentTool.name, currentTool.input));
+    setDetail(currentTool.input);
+    refreshLabel();
+  };
+  toolCardUpdates.set(toolEl, {
+    refreshHeader,
+    updateResult: next => {
+      currentTool = next;
+      pendingText = undefined;
+      dirty = true;
+      if (live) next.isExpanded = state.isExpanded;
+      refreshHeader();
+      setCardStatus(statusEl, next, false);
+      if (eager || state.isExpanded) renderContent();
+    },
   });
 
   if (live) tool.isExpanded = initiallyExpanded;
-  setupCollapsible(toolEl, header, content, state, {
+  const refreshLabel = setupCollapsible(toolEl, header, content, state, {
     initiallyExpanded,
     onToggle: expanded => {
       if (live) currentTool.isExpanded = expanded;
@@ -96,7 +107,7 @@ function createToolCard(parentEl: HTMLElement, tool: ToolCallInfo, options: Tool
       if (detailEl) statusEl.toggleClass('claudian-hidden', expanded);
       if (expanded) renderContent();
     },
-    baseAriaLabel: getToolLabel(tool.name, tool.input),
+    baseAriaLabel: () => getToolLabel(currentTool.name, currentTool.input),
   });
 
   return toolEl;
@@ -117,7 +128,12 @@ export function renderToolCall(
 
 /** Applies a newer snapshot of the tool to a card rendered by this module. */
 export function updateToolCallResult(toolEl: HTMLElement | undefined, toolCall: ToolCallInfo): void {
-  if (toolEl) toolCardUpdates.get(toolEl)?.(toolCall);
+  if (toolEl) toolCardUpdates.get(toolEl)?.updateResult(toolCall);
+}
+
+/** Refreshes refined input without settling the result or materializing its body. */
+export function refreshToolCallHeader(toolEl: HTMLElement | undefined): void {
+  if (toolEl) toolCardUpdates.get(toolEl)?.refreshHeader();
 }
 
 /** For stored (non-streaming) tool calls — collapsed by default. */

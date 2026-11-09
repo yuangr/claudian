@@ -13,6 +13,11 @@ export interface ComposerInputElement extends HTMLElement {
   setCommandResolver?: (resolver: ComposerCommandResolver | null) => void;
   /** Completed chips are not editable completion queries. */
   isChipRange?: (from: number, to: number) => boolean;
+  /**
+   * Whether the collapsed caret is on the first (`up`) or last (`down`) rendered row, counting soft
+   * wraps. Null when the input cannot measure its layout.
+   */
+  isCaretOnEdgeRow?: (direction: 'up' | 'down') => boolean | null;
   /** Element currently exposed as the textbox; popup relationships belong on it. Defaults to the input itself. */
   getAccessibleTextbox?: () => HTMLElement;
 }
@@ -27,6 +32,12 @@ export interface ComposerTriggerMatch {
   readonly trigger: string;
 }
 
+/** Half-open character range of the typed query within a displayed text. */
+export interface ComposerTextMatch {
+  readonly start: number;
+  readonly end: number;
+}
+
 export interface ComposerDropdownValueItem {
   readonly className?: string;
   readonly detail?: string;
@@ -35,23 +46,11 @@ export interface ComposerDropdownValueItem {
   readonly id: string;
   readonly kind: 'value';
   readonly label: string;
+  readonly labelMatch?: ComposerTextMatch;
+  /** Secondary name shown in parentheses after the label, such as the alias the query matched. */
+  readonly labelNote?: { readonly text: string; readonly match?: ComposerTextMatch };
   readonly replacement: string;
   readonly value?: unknown;
-}
-
-export interface ComposerDropdownFolderItem {
-  readonly className?: string;
-  readonly detail?: string;
-  readonly disabled?: boolean;
-  readonly icon?: string;
-  readonly id: string;
-  readonly inputPrefix?: string;
-  readonly kind: 'folder';
-  readonly label: string;
-  load(
-    query: string,
-    signal: AbortSignal,
-  ): Promise<readonly ComposerDropdownItem[]> | readonly ComposerDropdownItem[];
 }
 
 export interface ComposerDropdownStatusItem {
@@ -65,7 +64,6 @@ export interface ComposerDropdownStatusItem {
 
 export type ComposerDropdownItem =
   | ComposerDropdownValueItem
-  | ComposerDropdownFolderItem
   | ComposerDropdownStatusItem;
 
 export type ComposerSelectionAction =
@@ -82,7 +80,7 @@ export type ComposerSelectionAction =
 export interface ComposerDropdownSource {
   readonly id: string;
   onOpen?(): void;
-  readonly inputLoadPolicy?: 'debounced' | 'immediate';
+  onClose?(): void;
   load(
     match: ComposerTriggerMatch,
     signal: AbortSignal,

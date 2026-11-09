@@ -1,10 +1,12 @@
+import { App } from 'obsidian';
+const actualModule0 = await import('fs');
+const actualModule1 = await import('os');
+const actualModule2 = await import('path');
 import type * as fsType from 'fs';
-import type * as osType from 'os';
-import type * as pathType from 'path';
 
-const fs = jest.requireActual<typeof fsType>('fs');
-const os = jest.requireActual<typeof osType>('os');
-const path = jest.requireActual<typeof pathType>('path');
+const fs = actualModule0;
+const os = actualModule1;
+const path = actualModule2;
 
 import {
   expandHomePath,
@@ -17,17 +19,19 @@ import {
   translateMsysPath,
 } from '@/utils/path';
 
+
 const isWindows = process.platform === 'win32';
+
+// Adapter shape is deliberately variable: these cases exercise wrapped/malformed host adapters.
+function appWithAdapter(adapter: unknown): App {
+  const app = new App();
+  Object.defineProperty(app.vault, 'adapter', { value: adapter, configurable: true });
+  return app;
+}
 
 describe('getVaultPath', () => {
   it('returns basePath when adapter exposes the property directly', () => {
-    const mockApp = {
-      vault: {
-        adapter: {
-          basePath: '/Users/test/my-vault',
-        },
-      },
-    } as any;
+    const mockApp = appWithAdapter({ basePath: '/Users/test/my-vault' });
 
     expect(getVaultPath(mockApp)).toBe('/Users/test/my-vault');
   });
@@ -41,24 +45,24 @@ describe('getVaultPath', () => {
     );
 
     expect('basePath' in adapter).toBe(false);
-    expect(getVaultPath({ vault: { adapter } } as any)).toBe('/Users/test/wrapped-vault');
+    expect(getVaultPath(appWithAdapter(adapter))).toBe('/Users/test/wrapped-vault');
   });
 
   it('returns null when adapter does not expose a string basePath', () => {
-    expect(getVaultPath({ vault: { adapter: {} } } as any)).toBeNull();
-    expect(getVaultPath({ vault: { adapter: { basePath: 123 } } } as any)).toBeNull();
+    expect(getVaultPath(appWithAdapter({}))).toBeNull();
+    expect(getVaultPath(appWithAdapter({ basePath: 123 }))).toBeNull();
   });
 
   it('returns null when adapter is undefined', () => {
-    expect(getVaultPath({ vault: { adapter: undefined } } as any)).toBeNull();
+    expect(getVaultPath(appWithAdapter(undefined))).toBeNull();
   });
 
   it('preserves empty and platform-specific base paths', () => {
-    expect(getVaultPath({ vault: { adapter: { basePath: '' } } } as any)).toBe('');
-    expect(getVaultPath({ vault: { adapter: { basePath: '/Users/test/My Obsidian Vault' } } } as any)).toBe(
+    expect(getVaultPath(appWithAdapter({ basePath: '' }))).toBe('');
+    expect(getVaultPath(appWithAdapter({ basePath: '/Users/test/My Obsidian Vault' }))).toBe(
       '/Users/test/My Obsidian Vault',
     );
-    expect(getVaultPath({ vault: { adapter: { basePath: 'C:\\Users\\test\\vault' } } } as any)).toBe(
+    expect(getVaultPath(appWithAdapter({ basePath: 'C:\\Users\\test\\vault' }))).toBe(
       'C:\\Users\\test\\vault',
     );
   });
@@ -141,12 +145,12 @@ describe('normalizePathForFilesystem', () => {
   });
 
   it('returns empty string for null-like input', () => {
-    expect(normalizePathForFilesystem(null as any)).toBe('');
-    expect(normalizePathForFilesystem(undefined as any)).toBe('');
+    expect(normalizePathForFilesystem(null as unknown as string)).toBe('');
+    expect(normalizePathForFilesystem(undefined as unknown as string)).toBe('');
   });
 
   it('returns empty string for non-string input', () => {
-    expect(normalizePathForFilesystem(123 as any)).toBe('');
+    expect(normalizePathForFilesystem(123 as unknown as string)).toBe('');
   });
 
   it('normalizes a regular path', () => {
@@ -193,8 +197,8 @@ describe('normalizePathForComparison', () => {
   });
 
   it('returns empty string for null-like input', () => {
-    expect(normalizePathForComparison(null as any)).toBe('');
-    expect(normalizePathForComparison(undefined as any)).toBe('');
+    expect(normalizePathForComparison(null as unknown as string)).toBe('');
+    expect(normalizePathForComparison(undefined as unknown as string)).toBe('');
   });
 
   it('removes trailing slash', () => {
@@ -253,25 +257,25 @@ describe('isPathWithinVault', () => {
 
 describe('isPathWithinDirectory', () => {
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('expands home paths before checking containment', () => {
-    jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+    vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
 
     expect(isPathWithinDirectory('~/.claude/settings.json', '/home/test/.claude', '/vault')).toBe(true);
   });
 
   it('blocks symlink escapes from the allowed directory', () => {
-    const realpathMock = jest.fn((input: fsType.PathLike) => {
+    const realpathMock = vi.fn((input: fsType.PathLike) => {
       const value = String(input);
       if (value === '/home/test/.claude') return '/home/test/.claude';
       if (value === '/home/test/.claude/skills/link') return '/home/test/.ssh';
       return path.resolve(value);
     });
 
-    const realpathSpy = jest.spyOn(fs, 'realpathSync').mockImplementation(realpathMock as any);
-    (realpathSpy as any).native = realpathMock;
+    const realpathSpy = vi.spyOn(fs, 'realpathSync').mockImplementation(realpathMock);
+    Object.assign(realpathSpy, { native: realpathMock });
 
     expect(isPathWithinDirectory('/home/test/.claude/skills/link', '/home/test/.claude', '/vault')).toBe(false);
   });
@@ -465,7 +469,7 @@ describe('relative Vault paths', () => {
 
 describe('Vault boundary edge cases', () => {
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('should block path traversal escaping vault', () => {
@@ -473,7 +477,7 @@ describe('Vault boundary edge cases', () => {
   });
 
   it('should expand tilde and still enforce vault boundary', () => {
-    jest.spyOn(os, 'homedir').mockReturnValue('/home/test');
+    vi.spyOn(os, 'homedir').mockReturnValue('/home/test');
     expect(isPathWithinVault('~/vault/notes/a.md', '/vault')).toBe(false);
   });
 
@@ -484,7 +488,7 @@ describe('Vault boundary edge cases', () => {
 
   it('should handle non-existent paths via fallback resolution', () => {
     // When fs.realpathSync throws (file doesn't exist), path.resolve is used
-    jest.spyOn(fs, 'realpathSync').mockImplementation(() => {
+    vi.spyOn(fs, 'realpathSync').mockImplementation(() => {
       throw new Error('ENOENT');
     });
     // Even with mock throwing, function should still work via fallback
@@ -492,19 +496,19 @@ describe('Vault boundary edge cases', () => {
   });
 
   it('should block symlink escapes for non-existent targets', () => {
-    jest.spyOn(fs, 'existsSync').mockImplementation((p: any) => {
+    vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
       const s = String(p);
       return s === '/' || s === '/vault' || s === '/vault/export';
     });
 
-    const realpathSpy = jest.spyOn(fs, 'realpathSync').mockImplementation((p: any) => {
+    const realpathSpy = vi.spyOn(fs, 'realpathSync').mockImplementation((p) => {
       const s = String(p);
       if (s === '/') return '/';
       if (s === '/vault') return '/vault';
       if (s === '/vault/export') return '/tmp/export';
       throw new Error('ENOENT');
     });
-    (fs.realpathSync as any).native = realpathSpy;
+    Object.assign(fs.realpathSync, { native: realpathSpy });
 
     expect(isPathWithinVault('export/newfile.txt', '/vault')).toBe(false);
   });
@@ -519,19 +523,19 @@ describe('Windows separator normalization', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' });
     // Force Windows-style separator to detect regressions when comparisons rely on path.sep.
     Object.defineProperty(path, 'sep', { value: '\\', writable: true });
-    jest.spyOn(path, 'isAbsolute').mockImplementation((p: any) => {
+    vi.spyOn(path, 'isAbsolute').mockImplementation((p) => {
       const value = String(p);
       return /^[A-Za-z]:[\\/]/.test(value) || originalIsAbsolute(value);
     });
 
-    const realpathSpy = jest.spyOn(fs, 'realpathSync').mockImplementation((p: any) => String(p) as any);
-    (fs.realpathSync as any).native = realpathSpy;
+    const realpathSpy = vi.spyOn(fs, 'realpathSync').mockImplementation((p) => String(p));
+    Object.assign(fs.realpathSync, { native: realpathSpy });
   });
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', { value: originalPlatform });
     Object.defineProperty(path, 'sep', { value: originalSep, writable: true });
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('allows vault paths after slash normalization', () => {
@@ -562,7 +566,7 @@ describe('MSYS translation across simulated platforms', () => {
     });
 
     it('should handle root drive paths', () => {
-      expect(translateMsysPath('/c')).toBe('C:');
+      expect(translateMsysPath('/c')).toBe('C:\\');
       expect(translateMsysPath('/c/')).toBe('C:\\');
     });
 
@@ -592,3 +596,9 @@ describe('MSYS translation across simulated platforms', () => {
     });
   });
 });
+
+vi.mock('fs', async () => ({ ...await vi.importActual<typeof import('fs')>('fs') }));
+
+vi.mock('os', async () => ({ ...await vi.importActual<typeof import('os')>('os') }));
+
+vi.mock('path', async () => ({ ...await vi.importActual<typeof import('path')>('path') }));

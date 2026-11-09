@@ -40,7 +40,7 @@ export function normalizeResolvedAnswers(value: unknown): AskUserAnswers | undef
   for (const [question, rawValue] of Object.entries(value as Record<string, unknown>)) {
     const normalized = normalizeAnswerValue(rawValue);
     if (normalized) {
-      answers[question] = normalized;
+      Object.defineProperty(answers, question, { value: normalized, enumerable: true, writable: true, configurable: true });
     }
   }
 
@@ -71,7 +71,7 @@ function parseAnswersFromQuotedPairs(resultText: string): AskUserAnswers | undef
   for (const match of resultText.matchAll(pattern)) {
     const question = match[1]?.trim();
     if (!question) continue;
-    answers[question] = match[2] ?? '';
+    Object.defineProperty(answers, question, { value: match[2] ?? '', enumerable: true, writable: true, configurable: true });
   }
 
   return Object.keys(answers).length > 0 ? answers : undefined;

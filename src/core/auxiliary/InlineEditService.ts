@@ -3,27 +3,33 @@ import { appendContextFiles } from '@/core/prompt/promptContext';
 import {
   buildInlineEditPrompt,
   getInlineEditSystemPrompt,
+  type InlineEditRequest,
+  type InlineEditResult,
   parseInlineEditResponse,
 } from '../prompt/inlineEdit';
-import type {
-  InlineEditRequest,
-  InlineEditResult,
-  InlineEditService as InlineEditServiceContract,
-} from '../providers/types';
 import type { AuxiliaryExecutionContext } from './AuxiliaryExecutionContext';
 import { AuxiliarySessionController } from './AuxiliarySessionController';
 
 const CONTINUITY_RESET_MESSAGE =
   'The provider environment changed. Start a new inline edit.';
 
-export class InlineEditService implements InlineEditServiceContract {
-  private readonly controller: AuxiliarySessionController;
-  private readonly vaultWorkingDirectory: string;
-  private hasConversation = false;
-  private modelOverride: string | undefined;
+/** The model and effort a request runs with; null effort omits it, an omitted field follows the provider's saved selection. */
+export interface InlineEditExecutionSelection {
+  readonly model?: string;
+  readonly reasoning?: string | null;
+}
 
-  constructor(context: AuxiliaryExecutionContext) {
-    this.vaultWorkingDirectory = context.vaultWorkingDirectory;
+/**
+ * One inline edit's read-only provider conversation. It alone decides whether a request opens the
+ * conversation with its editor context or continues a clarification with just the instruction.
+ */
+export class InlineEditService {
+  private readonly controller: AuxiliarySessionController;
+  private readonly workingDirectory: string;
+  private conversing = false;
+
+  constructor(private readonly context: AuxiliaryExecutionContext) {
+    this.workingDirectory = context.workingDirectory;
     this.controller = new AuxiliarySessionController(
       context,
       'inline-edit',
@@ -31,62 +37,56 @@ export class InlineEditService implements InlineEditServiceContract {
     );
   }
 
-  setModelOverride(model?: string): void {
-    const trimmed = model?.trim();
-    this.modelOverride = trimmed ? trimmed : undefined;
+  /** Whether the next request continues a clarification instead of starting from the editor context. */
+  get isConversing(): boolean {
+    return this.conversing;
   }
 
-  resetConversation(): void {
-    this.hasConversation = false;
-    this.controller.reset();
-  }
-
-  async editText(request: InlineEditRequest): Promise<InlineEditResult> {
-    this.hasConversation = false;
+  /** The selection applies to this request only; the caller owns it across a clarification. */
+  async send(
+    request: InlineEditRequest,
+    selection: InlineEditExecutionSelection = {},
+  ): Promise<InlineEditResult> {
+    if (this.conversing && this.controller.requiresReset) {
+      this.end();
+      return { success: false, error: CONTINUITY_RESET_MESSAGE };
+    }
+    if (this.conversing && this.controller.hasSession) {
+      return this.sendMessage(request.contextFiles?.length
+        ? appendContextFiles(request.instruction, request.contextFiles)
+        : request.instruction, selection);
+    }
+    this.conversing = false;
     try {
       await this.controller.startRoot();
     } catch (error) {
       return toFailure(error);
     }
-    return this.sendMessage(buildInlineEditPrompt(request));
+    return this.sendMessage(buildInlineEditPrompt(request), selection);
   }
 
-  async continueConversation(
-    message: string,
-    contextFiles?: string[],
-  ): Promise<InlineEditResult> {
-    if (this.controller.requiresReset) {
-      return {
-        error: CONTINUITY_RESET_MESSAGE,
-        resetRequired: true,
-        success: false,
-      };
-    }
-    if (!this.hasConversation || !this.controller.hasSession) {
-      return { success: false, error: 'No active conversation to continue' };
-    }
-    const prompt = contextFiles?.length
-      ? appendContextFiles(message, contextFiles)
-      : message;
-    return this.sendMessage(prompt);
+  /** Cancels work in flight and forgets the conversation; the next request starts a new one. */
+  end(): void {
+    this.conversing = false;
+    this.controller.reset();
   }
 
-  cancel(): void {
-    this.hasConversation = false;
-    this.controller.cancel();
-  }
-
-  private async sendMessage(prompt: string): Promise<InlineEditResult> {
+  private async sendMessage(prompt: string, selection: InlineEditExecutionSelection): Promise<InlineEditResult> {
     try {
       const text = await this.controller.execute({
-        model: this.modelOverride,
+        model: selection.model,
+        reasoning: selection.reasoning,
         prompt,
-        systemPrompt: getInlineEditSystemPrompt(this.vaultWorkingDirectory),
+        systemPrompt: getInlineEditSystemPrompt(
+          await this.context.resolveExecutionWorkingDirectory?.(this.workingDirectory) ?? this.workingDirectory,
+        ),
       });
-      this.hasConversation = true;
-      return parseInlineEditResponse(text);
+      const result = parseInlineEditResponse(text);
+      // A clarification opens the conversation; an empty reply leaves it as it was.
+      this.conversing = result.clarification !== undefined || (this.conversing && !result.success);
+      return result;
     } catch (error) {
-      this.hasConversation = false;
+      this.conversing = false;
       await this.controller.dispose();
       return toFailure(error);
     }

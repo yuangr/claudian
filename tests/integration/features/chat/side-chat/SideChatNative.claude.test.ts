@@ -1,3 +1,5 @@
+import '@/providers';
+
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -13,7 +15,7 @@ function createNativeClaude() {
   const launches: sdk.Options[] = [];
   const prompts: Array<{ sessionId: string; context: string[]; text: string }> = [];
   let ordinal = 0;
-  jest.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
+  vi.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
     const config = options!;
     launches.push(config);
     const generator = async function* () {
@@ -64,7 +66,7 @@ function createNativeClaude() {
 
 function createToolingClaude(sideEffect: () => Promise<void>) {
   const requests: Array<{ permissionMode?: string; toolName: string; decision: string }> = [];
-  jest.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
+  vi.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
     const config = options!;
     const generator = async function* () {
       let sessionId = config.resume ?? 'claude-source';
@@ -108,11 +110,11 @@ describe('Claude side-chat native child', () => {
   beforeEach(async () => {
     env = await createForkTestEnvironment();
   });
-  afterEach(async () => { await env.dispose(); jest.restoreAllMocks(); });
+  afterEach(async () => { await env.dispose(); vi.restoreAllMocks(); });
 
   it('answers from source context and its own turns while the parent keeps its own history and Claudian record', async () => {
     const native = createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const checkpoint = await env.send(source, 'Remember A');
     const conversationsBefore = env.repository.list().map(conversation => conversation.id);
@@ -140,7 +142,7 @@ describe('Claude side-chat native child', () => {
 
   it('does not refork or resume the parent when the child continues after a later main turn', async () => {
     const native = createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const checkpoint = await env.send(source, 'Remember A');
     const child = await traceSideChild(env, source, checkpoint, backend, {
@@ -162,7 +164,7 @@ describe('Claude side-chat native child', () => {
 
   it('reports an unavailable captured checkpoint without starting the child or changing the source', async () => {
     const native = createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const checkpoint = await env.send(source, 'Remember A');
     const child = await traceSideChild(env, source, checkpoint, backend, {
@@ -178,11 +180,11 @@ describe('Claude side-chat native child', () => {
 
   it('runs a benign fixture tool under the copied permission policy and keeps its effect after disposal', async () => {
     createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const checkpoint = await env.send(source, 'Remember A');
     const written = path.join(env.root, 'side-note.md');
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
     const tooling = createToolingClaude(async () => { await fs.writeFile(written, 'from side chat'); });
 
     const child = await traceSideChild(env, source, checkpoint, backend, {
@@ -202,11 +204,11 @@ describe('Claude side-chat native child', () => {
 
   it('denies a fixture tool when the side owner rejects the approval', async () => {
     createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const checkpoint = await env.send(source, 'Remember A');
     const written = path.join(env.root, 'denied-note.md');
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
     const tooling = createToolingClaude(async () => { await fs.writeFile(written, 'should not exist'); });
 
     const child = await traceSideChild(env, source, checkpoint, backend, {

@@ -1,0 +1,75 @@
+import '@/providers';
+
+import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
+import type { Mock } from 'vitest';
+
+import { ClaudianSettingsStorage } from '@/app/settings/ClaudianSettingsStorage';
+import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
+import { getClaudeProviderSettings } from '@/providers/claude/settings';
+
+
+
+function createStorage(initial: Record<string, unknown>) {
+  let content = JSON.stringify(initial);
+  const adapter = {
+    exists: vi.fn(async () => Boolean(content)),
+    read: vi.fn(async () => content),
+    write: vi.fn(async (_path: string, value: string) => { content = value; }),
+    delete: vi.fn(async () => undefined),
+  } as unknown as VaultFileAdapter;
+  return {
+    adapter,
+    storage: new ClaudianSettingsStorage(adapter, DEFAULT_CLAUDIAN_SETTINGS),
+    read: () => JSON.parse(content) as { effortLevel?: string; providerConfigs: { claude: { effortMetadataMigrated?: boolean; defaultModel?: string; visibleModels?: string[]; selectedModels: Array<{ value: string; label: string; description: string; supportedEffortLevels?: string[] }> } } },
+  };
+}
+
+describe('Claude effort metadata migration', () => {
+  it('leaves missing metadata for native startup discovery instead of filling a hardcoded table', async () => {
+    const { storage, read } = createStorage({
+      effortLevel: 'xhigh',
+      providerConfigs: { claude: {
+        visibleModels: ['haiku', 'opus', 'claude-fable-5-1[1m]'],
+        selectedModels: [
+          { value: 'haiku', label: 'Haiku', description: '', resolvedModel: 'claude-haiku-4-5' },
+          { value: 'opus', label: 'Opus', description: '', resolvedModel: 'claude-opus-5-5' },
+          { value: 'claude-fable-5-1[1m]', label: 'Fable', description: '', resolvedModel: 'claude-fable-5-1' },
+        ],
+      } },
+    });
+
+    const loaded = await storage.load();
+
+    const stored = read().providerConfigs.claude;
+    expect(stored.effortMetadataMigrated).toBeUndefined();
+    expect(stored.selectedModels.map((model) => [model.value, model.supportedEffortLevels])).toEqual([
+      ['haiku', undefined],
+      ['opus', undefined],
+      ['claude-fable-5-1[1m]', undefined],
+    ]);
+    expect(read().effortLevel).toBe('xhigh');
+    expect(getClaudeProviderSettings(loaded).discoveredModels[1].supportedEffortLevels).toBeUndefined();
+  });
+
+  it('removes retired keys without treating missing metadata as complete', async () => {
+    const { storage, read, adapter } = createStorage({
+      providerConfigs: { claude: { effortMetadataMigrated: true, defaultModel: 'haiku', visibleModels: ['haiku'], selectedModels: [
+        { value: 'haiku', label: 'Haiku', description: '' },
+      ] } },
+    });
+    const loaded = await storage.load();
+    expect(read().providerConfigs.claude.effortMetadataMigrated).toBeUndefined();
+    expect(read().providerConfigs.claude.defaultModel).toBeUndefined();
+    expect((loaded.providerConfigs as Record<string, Record<string, unknown>>).claude).not.toHaveProperty('defaultModel');
+
+    const settings = read();
+    settings.providerConfigs.claude.visibleModels = ['claude-sonnet-5'];
+    settings.providerConfigs.claude.selectedModels = [
+      { value: 'claude-sonnet-5', label: 'Sonnet', description: '', supportedEffortLevels: [] },
+    ];
+    await (adapter.write as Mock)('', JSON.stringify(settings));
+    const reloaded = await storage.load();
+
+    expect(getClaudeProviderSettings(reloaded).discoveredModels[0].supportedEffortLevels).toEqual([]);
+  });
+});

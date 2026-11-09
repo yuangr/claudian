@@ -5,6 +5,9 @@ import {
   TOOL_ASK_USER_QUESTION,
   TOOL_BASH,
   TOOL_BASH_OUTPUT,
+  TOOL_CLAUDIAN_LIST_DESTINATIONS,
+  TOOL_CLAUDIAN_READ_SESSION,
+  TOOL_CLAUDIAN_SEND_MESSAGE,
   TOOL_EDIT,
   TOOL_EDIT_IMAGE,
   TOOL_ENTER_PLAN_MODE,
@@ -36,6 +39,11 @@ import type { ToolCallInfo } from '@/core/types';
 import { getApplyPatchSummary, renderApplyPatchExpanded, setApplyPatchStatus } from '@/features/chat/rendering/tools/applyPatchContent';
 import { renderAskUserQuestionContent } from '@/features/chat/rendering/tools/askUserQuestionContent';
 import { getScriptLanguage, getScriptSummary, renderScriptContent } from '@/features/chat/rendering/tools/scriptContent';
+import {
+  renderListDestinationsContent,
+  renderReadSessionContent,
+  renderSendMessageContent,
+} from '@/features/chat/rendering/tools/sessionToolContent';
 import { getCurrentTaskText, getTodoLabel, getTodoName, renderTodoWriteContent, setTodoWriteStatus } from '@/features/chat/rendering/tools/todoContent';
 import {
   contentFallback,
@@ -249,6 +257,21 @@ const TOOL_PRESENTATIONS: ReadonlyMap<string, ToolPresentation> = new Map<string
   }],
   [TOOL_WRITE_STDIN, { summary: getWriteStdinSummary }],
   [TOOL_WORKFLOW, scriptPresentation('Workflow')],
+  [TOOL_CLAUDIAN_LIST_DESTINATIONS, {
+    name: () => t('chat.tools.listDestinations'),
+    body: renderListDestinationsContent,
+  }],
+  [TOOL_CLAUDIAN_SEND_MESSAGE, {
+    // An interrupt without a message only stops the recipient.
+    name: input => (getInputText(input, 'mode') === 'interrupt' && !getInputText(input, 'text')
+      ? t('chat.tools.stopSession') : t('chat.tools.messageSession')),
+    body: renderSendMessageContent,
+  }],
+  [TOOL_CLAUDIAN_READ_SESSION, {
+    name: () => t('chat.tools.readSession'),
+    body: renderReadSessionContent,
+    handlesMissingResult: true,
+  }],
   [TOOL_SEND_MESSAGE, { ...AGENT_LIFECYCLE, name: () => t('chat.tools.messageAgent'), summary: agentTargetMessageSummary }],
   [TOOL_FOLLOWUP_TASK, { ...AGENT_LIFECYCLE, name: () => t('chat.tools.continueAgent'), summary: agentTargetMessageSummary }],
   [TOOL_LIST_AGENTS, { ...AGENT_LIFECYCLE, name: () => t('chat.tools.listAgents'), summary: input => getInputText(input, 'path_prefix', t('chat.tools.allAgents')) }],

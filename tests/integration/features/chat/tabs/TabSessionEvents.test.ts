@@ -1,53 +1,60 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
 import { createTabSession } from '@test/helpers/ConversationPorts';
-import { enqueueTabSessionEvent } from '@test/helpers/features/chat/SessionEventsHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createTabMessageId } from '@test/helpers/features/chat/SessionEventsHarness';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { testDate } from '@test/helpers/testClock';
+import { fireEvent, within } from '@testing-library/dom';
 import { Component, MarkdownRenderer } from 'obsidian';
 
 import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ChatMessage, ConversationMutablePatch } from '@/core/types';
+import { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
 import { ConversationController } from '@/features/chat/conversation/ConversationController';
 import { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { LinkedContentController } from '@/features/chat/linked-content';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import { SessionEvents } from '@/features/chat/sessions/SessionEvents';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { StreamController } from '@/features/chat/turns/StreamController';
 import { CodexSubagentTracker } from '@/providers/codex/execution/CodexSubagentTracker';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
 
-HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
-HTMLElement.prototype.removeClass = function (...classes) { this.classList.remove(...classes); };
+
+
+
+
 
 /** Longer than any progress-coalescing window; persistence must not depend on its exact value. */
 const QUIET_PERIOD_MS = 60_000;
 
 beforeEach(() => {
   document.body.replaceChildren();
-  jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'clearImmediate', 'performance', 'Date'] });
-  jest.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
+  vi.useFakeTimers({ toNotFake: ['nextTick', 'setImmediate', 'clearImmediate', 'performance', 'Date'] });
+  vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
     (el as HTMLElement).createEl('p', { text: markdown });
   });
 });
 
 afterEach(() => {
-  jest.useRealTimers();
+  vi.useRealTimers();
 });
 
 async function createCodexChildTab() {
   const messagesEl = document.body.createDiv();
+  const inputEl = document.createElement('textarea');
   const saves: ChatMessage[][] = [];
-  const plugin = {
-    app: {}, settings: { mediaFolder: '', showMessageTimestamps: false },
-    updateConversation: jest.fn(async (_id: string, patch: ConversationMutablePatch) => {
+  const plugin = await createChatFeatureHost({
+    settings: { mediaFolder: '', showMessageTimestamps: false },
+    updateConversation: vi.fn(async (_id: string, patch: ConversationMutablePatch) => {
       saves.push(structuredClone(patch.messages ?? []));
     }),
-    switchConversation: jest.fn(async (id: string) => ({ id, providerId: 'codex', messages: [], sessionId: null })),
-  } as any;
+    switchConversation: vi.fn(async (id: string) => ({ id, providerId: 'codex', title: id, createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(), messages: [], sessionId: null })),
+  });
   const renderer = new MessageRenderer(plugin,
     new Component(), messagesEl,
     undefined, undefined, () => ProviderRegistry.getCapabilities('codex'));
@@ -60,38 +67,49 @@ async function createCodexChildTab() {
   const workChanges: boolean[] = [];
   const coordinator = new ChatExecutionCoordinator({
     lifecycleRegistry, resolveBackend: () => backend,
-    persistence: { persistExecutionSnapshot: async () => true, registerExecutionBinding: () => undefined, releaseExecutionBinding: () => undefined } as any,
-    interactionPort: {} as any, vaultWorkingDirectory: '/vault', createId: () => 'binding',
+    persistence: { persistExecutionSnapshot: async () => true, registerExecutionBinding: () => undefined, releaseExecutionBinding: () => undefined,
+      assertConversationExecutionAuthority: async () => undefined, recordConversationActivity: async () => undefined },
+    interactionPort: { requestApproval: async () => { throw new Error('Unexpected approval'); },
+      askUserQuestion: async () => { throw new Error('Unexpected question'); }, dismissInteraction: () => undefined }, workingDirectory: '/vault', createId: () => 'binding',
     resolveMissingProviderSession: async () => 'not_found',
-    onSessionEvent: (event, context) => enqueueTabSessionEvent(tab, plugin, event, context),
+    onSessionEvent: (event, context) => events.enqueue(event, context),
     onBackgroundWorkChanged: working => workChanges.push(working),
   });
   const session = createTabSession({ id: 'tab', conversationId: 'conversation', draftModel: null,
-    providerId: 'codex', lifecycleState: 'ready' } as any, coordinator);
+    providerId: 'codex', lifecycleState: 'open' }, coordinator);
+  const linkedContent = new LinkedContentController({ app: plugin.app, getExcludedTags: () => [],
+    getCachedVaultFiles: () => [], getCachedVaultFolders: () => [] });
   const conversationController = new ConversationController({
     plugin, state, renderer, subagentManager: subagents,
-    session: session.runtime, drafts: { restore: jest.fn() }, clearQueuedMessage: jest.fn(),
-    getLinkedContentController: () => ({ lock: jest.fn() }),
-    getWelcomeEl: () => null, setWelcomeEl: () => undefined,
+    session: session.runtime, drafts: new ComposerDraftController({ getInput: () => inputEl, getImages: () => null, getDestination: () => 'main' }),
+    getLinkedContentController: () => linkedContent,
+    getWelcomeEl: () => null, setWelcomeEl: () => undefined, getMessagesEl: () => messagesEl,
     getExecutionCoordinator: () => coordinator,
-    awaitBackgroundWork: () => session.runtime.awaitBackgroundWork(),
-    ensureExecutionForConversation: async (conversation: { id: string; providerId: 'codex' } | null) => {
+    ensureExecutionForConversation: async conversation => {
       await coordinator.bindConversation(conversation && { conversationId: conversation.id, providerId: conversation.providerId });
     },
     isConversationHydrated: () => true,
-  } as any);
-  const tab: any = { state, renderer, session, executionCoordinator: coordinator, lifecycleState: 'ready',
-    dom: { contentEl: messagesEl }, services: { subagentManager: subagents },
-    ui: { promptSuggestion: { discard: () => undefined, receive: () => undefined } },
-    controllers: { streamController: stream, conversationController } };
+  });
+  const events: SessionEvents = new SessionEvents({
+    state, renderer, session: session.runtime, executionCoordinator: coordinator, stream,
+    persistence: conversationController, createMessageId: createTabMessageId,
+    updatePermissionMode: async () => { throw new Error('Unexpected permission change'); },
+    receiveSuggestion: () => undefined, discardSuggestion: () => undefined, canAcceptBackgroundWork: () => true,
+  });
 
   await coordinator.bindConversation({ conversationId: 'conversation', providerId: 'claude' });
   await coordinator.prepare();
+  // The provider reports background work while a published child is still running.
+  const running = new Set<string>();
   const tracker = new CodexSubagentTracker(
-    subagent => backend.latest.emitSessionEvent({ type: 'subagent_updated', subagent }),
+    subagent => {
+      if (subagent.status === 'running') running.add(subagent.id);
+      else running.delete(subagent.id);
+      backend.latest.emitSessionEvent({ type: 'subagent_updated', subagent });
+    },
     async () => { throw new Error('Child read unavailable'); },
   );
-  Object.assign(backend.latest, { hasBackgroundWork: () => tracker.hasBackgroundWork() });
+  Object.assign(backend.latest, { hasBackgroundWork: () => running.size > 0 });
 
   state.currentConversationId = 'conversation';
   const message: ChatMessage = {
@@ -187,6 +205,9 @@ it('coalesces Codex child progress saves between immediate lifecycle saves and k
   try {
     // The spawn card is already running, so attaching the child and streaming its output is progress.
     startChild(view);
+    await view.settle();
+    fireEvent.click(within(view.messagesEl).getByRole('button', { name: /Subagent.*helper/ }));
+    fireEvent.click(within(view.messagesEl).getByRole('button', { name: /Bash/ }));
     const lines = Array.from({ length: 20 }, (_, index) => `line ${index}\n`);
     streamOutput(view, lines);
     await view.settle();
@@ -196,7 +217,7 @@ it('coalesces Codex child progress saves between immediate lifecycle saves and k
     expect(view.saves).toHaveLength(0);
     expect(view.workChanges).toEqual([true]);
 
-    await jest.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
+    await vi.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
     await view.settle();
     expect(view.saves).toHaveLength(1);
     expect(view.savedStatus()).toBe('running');
@@ -205,14 +226,14 @@ it('coalesces Codex child progress saves between immediate lifecycle saves and k
     streamOutput(view, ['tail\n']);
     view.tracker.turnCompleted('child', { id: 'child-turn', status: 'completed', error: null, items: [
       { type: 'agentMessage', id: 'answer', text: 'Ready.', phase: 'final_answer', memoryCitation: null },
-    ] } as any);
+    ] });
     await view.settle();
     // The terminal transition persists immediately and supersedes the pending progress save.
     expect(view.saves).toHaveLength(2);
     expect(view.saves.at(-1)![0].toolCalls![0].subagent).toMatchObject({ status: 'completed', result: 'Ready.' });
     expect(view.savedChildTool()?.result).toContain('tail\n');
     expect(view.workChanges).toEqual([true, false]);
-    await jest.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
+    await vi.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
     await view.settle();
     expect(view.saves).toHaveLength(2);
   } finally {
@@ -233,10 +254,38 @@ it('flushes pending Codex child progress with the next direct save and does not 
     expect(view.saves).toHaveLength(1);
     expect(view.savedStatus()).toBe('running');
     expect(view.savedChildTool()?.result).toBe('before close\nstill running\n');
-    await jest.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
+    await vi.advanceTimersByTimeAsync(QUIET_PERIOD_MS);
     await view.settle();
     expect(view.saves).toHaveLength(1);
   } finally {
     await view.dispose();
   }
+});
+
+it('keeps the next turn\'s notification out of a stopped automatic turn rendered after it through the session queue', async () => {
+  const view = await createCodexChildTab();
+  try {
+    const native = view.backend.latest;
+    native.emitSessionEvent({ type: 'task_notification', content: 'First job finished.' });
+    native.emitBackgroundEvent({ type: 'background_turn_started' }, 'first');
+    native.emitBackgroundEvent({ type: 'text_delta', text: 'First reply.' }, 'first');
+    native.emitBackgroundEvent({ type: 'background_turn_completed', reason: 'interrupted' }, 'first');
+    // Received after the stopped turn ended: notifications render ahead of its queued completion.
+    native.emitSessionEvent({ type: 'task_notification', content: 'Second job finished.' });
+    native.emitBackgroundEvent({ type: 'background_turn_started' }, 'second');
+    native.emitBackgroundEvent({ type: 'text_delta', text: 'Second reply.' }, 'second');
+    native.emitBackgroundEvent({ type: 'background_turn_completed', reason: 'completed' }, 'second');
+    await view.settle();
+
+    const second = view.state.messages.find(message => message.contentBlocks?.some(block =>
+      block.type === 'task_notification' && block.content === 'Second job finished.'))!;
+    expect(second.isInterrupt).toBeUndefined();
+    const header = within(view.messagesEl).getByRole('button', { name: 'Interrupted · What should Claudian do instead?' });
+    const history = document.getElementById(header.getAttribute('aria-controls')!)!;
+    fireEvent.click(header);
+    expect(history.textContent).toContain('First reply.');
+    expect(history.textContent).not.toContain('Task notification');
+    expect(within(view.messagesEl).getAllByRole('button', { name: 'Task notification' })).toHaveLength(2);
+    expect(within(view.messagesEl).getByText('Second reply.').closest('[hidden]')).toBeNull();
+  } finally { await view.dispose(); }
 });

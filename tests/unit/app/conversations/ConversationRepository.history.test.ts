@@ -1,5 +1,7 @@
 import '@/providers';
 
+import type { Mocked } from 'vitest';
+
 import { ConversationRepository } from '@/app/conversations/ConversationRepository';
 import type { ConversationPersistence } from '@/app/storage/ConversationPersistenceStore';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
@@ -8,7 +10,9 @@ import type { Conversation } from '@/core/types';
 import { ClaudeConversationHistoryService } from '@/providers/claude/history/ClaudeConversationHistoryService';
 import * as claudeHistory from '@/providers/claude/history/ClaudeHistoryStore';
 import { OpencodeConversationHistoryService } from '@/providers/opencode/history/OpencodeConversationHistoryService';
-import * as history from '@/providers/opencode/history/OpencodeHistoryStore';
+import type { OpencodeServerService } from '@/providers/opencode/http/OpencodeServerService';
+
+
 
 function createConversation(id = 'conversation-1'): Conversation {
   return {
@@ -23,26 +27,26 @@ function createConversation(id = 'conversation-1'): Conversation {
 }
 
 function createRepository(conversation = createConversation()) {
-  const persistence: jest.Mocked<ConversationPersistence> = {
+  const persistence: Mocked<ConversationPersistence> = {
     metadataReader: {
-      revalidate: jest.fn().mockResolvedValue([]),
-      load: jest.fn().mockResolvedValue(null),
-      scan: jest.fn().mockResolvedValue({
+      revalidate: vi.fn().mockResolvedValue([]),
+      load: vi.fn().mockResolvedValue(null),
+      scan: vi.fn().mockResolvedValue({
         records: [],
         complete: true,
         invalidMetadataCount: 0,
       }),
-      loadMetadata: jest.fn().mockResolvedValue(null),
-      scanMetadata: jest.fn().mockResolvedValue({
+      loadMetadata: vi.fn().mockResolvedValue(null),
+      scanMetadata: vi.fn().mockResolvedValue({
         metadata: [],
         complete: true,
         invalidMetadataCount: 0,
       }),
-      listMetadata: jest.fn().mockResolvedValue([]),
+      listMetadata: vi.fn().mockResolvedValue([]),
     },
-    saveMetadata: jest.fn().mockResolvedValue(undefined),
-    deleteCurrentMetadata: jest.fn().mockResolvedValue(undefined),
-    assignMetadataToDevice: jest.fn().mockResolvedValue(undefined),
+    saveMetadata: vi.fn().mockResolvedValue(undefined),
+    deleteCurrentMetadata: vi.fn().mockResolvedValue(undefined),
+    assignMetadataToDevice: vi.fn().mockResolvedValue(undefined),
   };
   const repository = new ConversationRepository({
     providers: ProviderRegistry,
@@ -50,64 +54,43 @@ function createRepository(conversation = createConversation()) {
     getSettings: () => ({}),
     getVaultPath: () => '/vault',
     persistence,
-    onConversationDeleted: jest.fn().mockResolvedValue(undefined),
+    onConversationDeleted: vi.fn().mockResolvedValue(undefined),
   });
   repository.replaceAll([conversation]);
   return { repository, persistence };
 }
 
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => vi.restoreAllMocks());
 
-test('releases cached history behind pending writes, preserves overlays, and reloads native history', async () => {
-  const conversation = createConversation();
-  conversation.messages = [{ id: 'local', role: 'assistant', content: 'Live client fragment', timestamp: 1 }];
-  const service = new ClaudeConversationHistoryService();
-  const projection = jest.spyOn(service, 'buildPersistedProviderState').mockImplementation((input, options) =>
-    options?.preserveProviderState ? input.providerState : { overlay: input.messages.map(message => message.content) });
-  const hydrate = jest.spyOn(service, 'hydrateConversationHistory').mockResolvedValue({
-    messages: [{ id: 'native', role: 'assistant', content: 'Native history', timestamp: 2 }],
-  });
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue(service);
-  const { repository, persistence } = createRepository(conversation);
-  let release!: () => void;
-  persistence.saveMetadata.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
-  const saving = repository.rename(conversation.id, 'Saved title');
-  while (!release) await Promise.resolve();
-  let mayRelease = true;
-  const evicting = repository.releaseHistory(conversation.id, () => mayRelease);
-  mayRelease = false;
-  release();
-  await saving;
-  await expect(evicting).resolves.toBe(false);
-  expect(repository.getCachedConversation(conversation.id)?.messages[0].content).toBe('Live client fragment');
-  mayRelease = true;
-  await expect(repository.releaseHistory(conversation.id, () => mayRelease)).resolves.toBe(true);
-  expect(repository.getCachedConversation(conversation.id)?.messages).toEqual([]);
-  await repository.rename(conversation.id, 'After eviction');
-  expect(persistence.saveMetadata.mock.calls.at(-1)?.[0].providerState).toEqual({ overlay: ['Live client fragment'] });
-  expect(projection.mock.calls.at(-1)?.[1]).toEqual({ preserveProviderState: true });
-  expect((await repository.getById(conversation.id))?.messages.map(message => message.content)).toEqual(['Native history']);
-  expect(hydrate).toHaveBeenCalledTimes(1);
-});
+/** Serves native OpenCode history through the server lease port without launching a process. */
+function createOpencodeHistoryService(readMessages: (route: string) => Promise<unknown[]>): OpencodeConversationHistoryService {
+  const server = {
+    acquire: async () => ({
+      request: async (route: string) => ({ data: await readMessages(route) }),
+      dispose: async () => {},
+    }),
+  } as unknown as OpencodeServerService;
+  return new OpencodeConversationHistoryService({ getServerService: async () => server });
+}
+
+function nativeAssistant(id: string, text: string, created: number) {
+  return { id, type: 'assistant', time: { created }, content: [{ type: 'text', text }] };
+}
 
 test('a superseded native history read cannot overwrite the current conversation', async () => {
   let started!: () => void;
   let release!: () => void;
   const reading = new Promise<void>(resolve => { started = resolve; });
   const deferred = new Promise<void>(resolve => { release = resolve; });
-  const oldMessages: Conversation['messages'] = [
-    { id: 'old-message', role: 'assistant', content: 'Old session response', timestamp: 1 },
-  ];
   const newMessages: Conversation['messages'] = [
     { id: 'new-message', role: 'assistant', content: 'Current session response', timestamp: 2 },
   ];
-  jest.spyOn(history, 'loadOpencodeSessionMessages').mockImplementation(async () => {
-    started();
-    await deferred;
-    return oldMessages;
-  });
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
-    .mockReturnValue(new OpencodeConversationHistoryService());
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService')
+    .mockReturnValue(createOpencodeHistoryService(async () => {
+      started();
+      await deferred;
+      return [nativeAssistant('old-message', 'Old session response', 1)];
+    }));
   const conversation = createConversation();
   conversation.providerId = 'opencode';
   conversation.selectedModel = 'opencode/example';
@@ -124,8 +107,9 @@ test('a superseded native history read cannot overwrite the current conversation
 test('does not publish recovered identity after concurrent deletion', async () => {
   const conversation = createConversation();
   const { repository, persistence } = createRepository(conversation);
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
     hydrateConversationHistory: async () => ({}),
+    readNativeHistoryRevision: async () => null,
     resolveSessionIdForConversation: value => value?.sessionId ?? null,
     isPendingForkConversation: () => false,
     buildForkProviderState: () => ({}),
@@ -146,10 +130,10 @@ test('keeps relocated Claude history readable after its metadata save fails', as
     { id: 'native-response', role: 'assistant', content: 'Native history', timestamp: 2 },
   ];
   const location = { availability: 'relocated' as const, sessionPath: '/old-vault/session-1.jsonl' };
-  jest.spyOn(claudeHistory, 'locateSDKSession').mockResolvedValue(location);
-  jest.spyOn(claudeHistory, 'locateSDKSessions').mockResolvedValue(new Map([['session-1', location]]));
-  jest.spyOn(claudeHistory, 'loadSDKSessionMessages').mockResolvedValue({ messages, skippedLines: 0 });
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
+  vi.spyOn(claudeHistory, 'locateSDKSession').mockResolvedValue(location);
+  vi.spyOn(claudeHistory, 'locateSDKSessions').mockResolvedValue(new Map([['session-1', location]]));
+  vi.spyOn(claudeHistory, 'loadSDKSessionMessages').mockResolvedValue({ messages, skippedLines: 0 });
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService')
     .mockReturnValue(new ClaudeConversationHistoryService());
   const { repository, persistence } = createRepository(conversation);
   persistence.saveMetadata.mockRejectedValue(new Error('Metadata unavailable'));
@@ -159,27 +143,23 @@ test('keeps relocated Claude history readable after its metadata save fails', as
 });
 
 test('OpenCode hydrates a fresh projection after another projection was discarded', async () => {
-  const service = new OpencodeConversationHistoryService();
+  const service = createOpencodeHistoryService(async () => [nativeAssistant('native-response', 'Native history', 2)]);
   const first = { ...createConversation(), providerId: 'opencode' };
-  const nativeMessages: Conversation['messages'] = [
-    { id: 'native-response', role: 'assistant', content: 'Native history', timestamp: 2 },
-  ];
-  jest.spyOn(history, 'loadOpencodeSessionMessages').mockResolvedValue(nativeMessages);
   Object.assign(first, await service.hydrateConversationHistory(first, '/vault'));
   const fresh = { ...createConversation(), providerId: 'opencode', messages: [
     { id: 'local-input', role: 'user' as const, content: 'Local draft', timestamp: 1 },
   ] };
   Object.assign(fresh, await service.hydrateConversationHistory(fresh, '/vault'));
-  expect(fresh.messages).toEqual(nativeMessages);
+  expect(fresh.messages.map(message => [message.id, message.content])).toEqual([['native-response', 'Native history']]);
 });
 
 test('restores the conversation when missing-session metadata removal fails', async () => {
   const conversation = createConversation();
   const { repository, persistence } = createRepository(conversation);
-  jest.spyOn(claudeHistory, 'locateSDKSessions').mockResolvedValue(new Map([
+  vi.spyOn(claudeHistory, 'locateSDKSessions').mockResolvedValue(new Map([
     ['session-1', { availability: 'missing' as const }],
   ]));
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService')
     .mockReturnValue(new ClaudeConversationHistoryService());
   persistence.deleteCurrentMetadata.mockRejectedValue(new Error('Metadata cleanup failed'));
 
@@ -191,7 +171,7 @@ test('restores the conversation when missing-session metadata removal fails', as
 test('surfaces a failed missing-session reset save while preserving live identity', async () => {
   const conversation = { ...createConversation(), providerId: 'opencode' };
   const { repository, persistence } = createRepository(conversation);
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService')
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService')
     .mockReturnValue(new OpencodeConversationHistoryService());
   persistence.saveMetadata.mockRejectedValue(new Error('Metadata save failed'));
 
@@ -204,8 +184,9 @@ test('late accepted binding survives a missing-session decision', async () => {
   const conversation = createConversation();
   const { repository } = createRepository(conversation);
   let updating: Promise<void> | undefined;
-  jest.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
+  vi.spyOn(ProviderRegistry, 'getConversationHistoryService').mockReturnValue({
     hydrateConversationHistory: async () => ({}),
+    readNativeHistoryRevision: async () => null,
     resolveSessionIdForConversation: value => value?.sessionId ?? null,
     isPendingForkConversation: () => false,
     buildForkProviderState: () => ({}),

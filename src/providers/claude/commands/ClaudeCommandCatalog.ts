@@ -36,11 +36,8 @@ function slashCommandToEntry(cmd: SlashCommand): ProviderCommandEntry {
   };
 }
 
-// SDK built-in skills that have no meaning inside Claudian
-const BUILTIN_HIDDEN_COMMANDS = new Set([
-  'context', 'cost', 'debug', 'extra-usage', 'heapdump', 'init',
-  'insights', 'loop', 'schedule', 'security-review', 'simplify', 'update-config',
-]);
+// Built-ins Claudian supports in its chat (it forwards `active_goal` state), so the picker keeps them.
+const LISTED_NATIVE_COMMANDS = new Set(['goal']);
 
 // A cold CLI start plus capped MCP startup can exceed the shared picker deadline.
 const CLAUDE_COMMAND_DISCOVERY_TIMEOUT_MS = 30_000;
@@ -55,8 +52,6 @@ interface ActiveCommandProbe {
 
 export class ClaudeCommandCatalog implements ProviderCommandCatalog {
   private readonly activeProbes = new Set<ActiveCommandProbe>();
-  private cacheGeneration = 0;
-  private commandSnapshot: SlashCommand[] = [];
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
   private quiescenceDepth = 0;
@@ -66,30 +61,21 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
 
   constructor(private probe?: CommandProbe) {}
 
-  setCommandSnapshot(commands: SlashCommand[]): void {
-    if (this.probesBlocked) return;
-    this.#invalidateProbeCache();
-    this.commandSnapshot = commands.map(command => ({ ...command }));
-  }
-
   async listDropdownEntries(context: ProviderCommandListContext): Promise<ProviderCommandEntry[]> {
     context.signal?.throwIfAborted();
     // SDK commands already include vault commands/skills (the SDK scans
     // .claude/commands/ and .claude/skills/ internally). No file scan needed.
-    let commands = context.commandSnapshot;
-    if (commands === undefined) {
-      const allowCachedCommandSnapshot = context.allowCachedCommandSnapshot !== false;
-      if (allowCachedCommandSnapshot && this.commandSnapshot.length > 0) {
-        commands = this.commandSnapshot;
-      } else {
-        const probedCommands = await this.#ensureProbed(context.signal);
-        commands = allowCachedCommandSnapshot && this.commandSnapshot.length > 0
-          ? this.commandSnapshot
-          : probedCommands;
-      }
-    }
+    const commands = context.commandSnapshot ?? await this.#ensureProbed(context.signal);
+    // Claude Code's own commands mostly target its terminal UI, so the picker offers only skills and
+    // custom commands, plus the few built-ins Claudian supports. A marked row runs for its name, so it
+    // also hides an unmarked row sharing that name.
+    // Snapshots from CLIs that do not mark built-ins cannot be classified and are kept whole.
+    const nativeNames = new Set(commands
+      .filter(cmd => cmd.source === 'builtin')
+      .map(cmd => cmd.name.toLowerCase())
+      .filter(name => !LISTED_NATIVE_COMMANDS.has(name)));
     return commands
-      .filter(cmd => !BUILTIN_HIDDEN_COMMANDS.has(cmd.name.toLowerCase()))
+      .filter(cmd => !nativeNames.has(cmd.name.toLowerCase()))
       .map(slashCommandToEntry);
   }
 
@@ -114,7 +100,6 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
   }
 
   async #runProbe(signal?: AbortSignal): Promise<SlashCommand[]> {
-    const generation = this.cacheGeneration;
     let resolveCompletion!: () => void;
     const entry: ActiveCommandProbe = {
       completion: new Promise(resolve => { resolveCompletion = resolve; }),
@@ -129,12 +114,11 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
       entry.controller.signal.throwIfAborted();
       const commands = await this.probe?.(entry.controller.signal) ?? [];
       entry.controller.signal.throwIfAborted();
-      if (this.disposed || generation !== this.cacheGeneration) return [];
       this.probedCommands = commands.map(command => ({ ...command }));
       return this.probedCommands;
     } catch (error) {
       signal?.throwIfAborted();
-      if (this.disposed || generation !== this.cacheGeneration) return [];
+      if (entry.controller.signal.aborted) return [];
       // Failures stay uncached so a retry re-probes.
       throw error;
     } finally {
@@ -180,7 +164,6 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
   async #drainProbes(): Promise<void> {
     const sharedProbe = this.probePromise;
     this.#invalidateProbeCache();
-    this.commandSnapshot = [];
     const active = [...this.activeProbes];
     await Promise.all([
       ...active.map(entry => entry.completion),
@@ -196,7 +179,6 @@ export class ClaudeCommandCatalog implements ProviderCommandCatalog {
   }
 
   #invalidateProbeCache(): void {
-    this.cacheGeneration += 1;
     this.probedCommands = null;
     for (const entry of this.activeProbes) {
       entry.controller.abort();

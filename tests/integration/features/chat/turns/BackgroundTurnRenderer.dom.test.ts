@@ -1,20 +1,22 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
+import { axe } from '@test/helpers/accessibility';
 import { createFixture, deferred } from '@test/helpers/ChatInputHarness';
 import { createTabSession } from '@test/helpers/ConversationPorts';
-import { enqueueTabSessionEvent } from '@test/helpers/features/chat/SessionEventsHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createTabMessageId } from '@test/helpers/features/chat/SessionEventsHarness';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { useClaudeSessionFiles } from '@test/helpers/providers/claudeHistory';
 import { testClock, testDate } from '@test/helpers/testClock';
-import { waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
 import { Component, MarkdownRenderer } from 'obsidian';
 
 import { ProviderExecutionLifecycleRegistry, type ProviderExecutionRequest } from '@/core/execution';
 import type { ChatMessage, ImageAttachment } from '@/core/types';
 import { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import { SessionEvents } from '@/features/chat/sessions/SessionEvents';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { BackgroundResponses } from '@/features/chat/turns/BackgroundResponses';
@@ -23,15 +25,14 @@ import { ResponseStream } from '@/features/chat/turns/ResponseStream';
 import { StreamController } from '@/features/chat/turns/StreamController';
 import { TurnCoordinator } from '@/features/chat/turns/TurnCoordinator';
 import { loadSDKSessionMessages } from '@/providers/claude/history/ClaudeHistoryStore';
+import { parsePiSessionContent } from '@/providers/pi/history/PiHistoryStore';
 
-jest.mock('node:fs/promises');
+vi.mock('node:fs/promises');
 const writeSession = useClaudeSessionFiles();
-HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
-HTMLElement.prototype.removeClass = function (...classes) { this.classList.remove(...classes); };
+
 beforeEach(() => {
   document.body.replaceChildren();
-  jest.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
+  vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, el) => {
     (el as HTMLElement).createEl('p', { text: markdown });
   });
 });
@@ -39,9 +40,9 @@ beforeEach(() => {
 it.each(['attached', 'detached', 'absent', 'late-text', 'late-thinking'] as const)(
   'retains ordered text and thinking blocks with %s transcript content', async presentation => {
     const clock = testClock();
-    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock().getTime());
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock().getTime());
     const messagesEl = document.body.createDiv();
-    const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+    const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
     const renderer = new MessageRenderer(plugin, new Component(), messagesEl);
     const state = new ChatState();
     const subagents = new SubagentManager(() => undefined);
@@ -79,7 +80,7 @@ it.each(['attached', 'detached', 'absent', 'late-text', 'late-thinking'] as cons
         { type: 'thinking', content: 'Consider the result.', durationSeconds: 3 },
         { type: 'text', content: 'After thinking.' },
         { type: 'tool_use', toolId: 'read' },
-        { type: 'text', content: '\n\n⚠️ **Blocked:** Unavailable file\n\n❌ **Error:** Unable to continue' },
+        { type: 'text', content: '\n\n⚠️ **Warning:** Unavailable file\n\n❌ **Error:** Unable to continue' },
       ]);
       expect(message.toolCalls).toEqual([expect.objectContaining({ id: 'read', status: 'completed', result: 'Note contents' })]);
     } finally {
@@ -104,7 +105,7 @@ it.each([false, true])('replay places the second notification before automatic o
   const replay = await loadSDKSessionMessages('/vault', 'session', undefined, sessionPath);
   expect(replay.error).toBeUndefined();
   const messagesEl = document.body.createDiv();
-  const renderer = new MessageRenderer({ app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any, new Component(), messagesEl);
+  const renderer = new MessageRenderer(await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } }), new Component(), messagesEl);
   try {
     replay.messages.forEach((message, index) => renderer.renderStoredMessage(message, replay.messages, index));
     await Promise.resolve();
@@ -121,7 +122,7 @@ it.each([false, true])('replay places the second notification before automatic o
 it.each([
   [false, false], [true, false], [false, true], [true, true],
 ])('keeps background tools and notification order (compaction: %s, steering: %s)', async (compaction, steering) => {
-  const { messagesEl, renderer, state, stream, coordinator, session, backend, dispose } = createBackgroundChat();
+  const { messagesEl, renderer, state, stream, coordinator, session, backend, dispose } = (await createBackgroundChat());
   try {
     await coordinator.bindConversation({ conversationId: 'conversation', providerId: 'claude' });
     await coordinator.prepare();
@@ -169,7 +170,7 @@ it.each([
 it.each([
   ['', 'steered reply'], ['', ''], ['automatic prefix', 'steered reply'], ['automatic prefix', ''],
 ])('preserves background output around accepted input (prefix: %s, reply: %s)', async (prefix, reply) => {
-  const { messagesEl, renderer, state, coordinator, session, backend, dispose } = createBackgroundChat();
+  const { messagesEl, renderer, state, coordinator, session, backend, dispose } = (await createBackgroundChat());
   try {
     await coordinator.bindConversation({ conversationId: 'conversation', providerId: 'claude' });
     await coordinator.prepare();
@@ -202,7 +203,7 @@ it.each([
 });
 
 it('does not continue a steered reply from a later turn notification', async () => {
-  const { messagesEl, state, coordinator, session, backend, dispose } = createBackgroundChat();
+  const { messagesEl, state, coordinator, session, backend, dispose } = (await createBackgroundChat());
   try {
     await coordinator.bindConversation({ conversationId: 'conversation', providerId: 'claude' });
     await coordinator.prepare();
@@ -231,13 +232,13 @@ it.each([
   ['pending', 'requested'], ['uncertain', 'requested'],
   ['uncertain', 'rejected'],
 ])('reconciles late image input through real chat owners (%s acknowledgement, %s turn)', async (acknowledgement, destination) => {
-  const { messagesEl, state, coordinator, session, backend, input, setImages, dispose } = createBackgroundChat(true);
+  const { messagesEl, state, coordinator, session, backend, input, setImages, dispose } = (await createBackgroundChat(true));
   try {
     await coordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
     await coordinator.prepare();
     const native = backend.latest;
     const admission = deferred<boolean>();
-    const nativeSteer = jest.fn((_request: ProviderExecutionRequest) => Promise.resolve(true))
+    const nativeSteer = vi.fn((_request: ProviderExecutionRequest) => Promise.resolve(true))
       .mockImplementationOnce(() => admission.promise);
     Object.assign(native, { steer: nativeSteer });
     input!.input.value = 'initial message';
@@ -259,8 +260,11 @@ it.each([
     }
     native.complete();
     await first;
-    state.hasPendingConversationSave = false;
-    const accept = jest.spyOn(coordinator, 'acceptSteerFromProviderEvent');
+    state.discardPendingConversationSave();
+    const savedMessages: ChatMessage[][] = [];
+    input!.plugin.updateConversation.mockImplementation(async (_id, updates) => {
+      if (updates.messages) savedMessages.push(structuredClone(updates.messages));
+    });
     let next: Promise<void> | undefined;
     const late = { type: 'user_message_started' as const, content: '', nativeUserMessageId: 'late-image-user',
       inputId: nativeSteer.mock.calls[0][0].inputId };
@@ -269,7 +273,7 @@ it.each([
       input!.input.value = 'new message';
       next = input!.controller.sendMessage();
     } else if (destination === 'rejected') {
-      jest.spyOn(native, 'execute').mockImplementationOnce(() => {
+      vi.spyOn(native, 'execute').mockImplementationOnce(() => {
         native.emitBackgroundEvent({ type: 'background_turn_started' });
         native.emitBackgroundEvent(late);
         throw new Error('New request failed admission');
@@ -316,7 +320,7 @@ it.each([
       { content: display, images: [image], userMessageId: 'late-image-user' },
       ...(destination === 'requested' ? [{ content: 'new steer', userMessageId: 'new-steer-user' }] : []),
     ]);
-    expect(accept).toHaveBeenCalledWith(expect.any(String), 'late-image-user');
+    expect(coordinator.getSteerSubmission(late.inputId!)).toBeUndefined();
     expect(within(messagesEl).getByRole('img', { name: 'pixel.png' })).toBeTruthy();
     expect(within(messagesEl).getByText('image answer')).toBeTruthy();
     const prefix = 'automatic work before steering';
@@ -336,51 +340,57 @@ it.each([
     expect((await axe(messagesEl)).violations).toEqual([]);
     expect(input!.input.value).toBe(destination === 'rejected' ? 'new message' : '');
     expect(input!.controller.queue.message).toBeNull();
-    expect(state.hasPendingConversationSave).toBe(true);
+    expect(state.hasPendingConversationSave).toBe(destination !== 'requested');
+    const savedLateMessages = savedMessages.at(-1)?.filter(message =>
+      message.userMessageId === 'late-image-user' || message.content === 'image answer') ?? [];
+    expect(savedLateMessages).toMatchObject(destination === 'requested' ? [
+      { role: 'user', userMessageId: 'late-image-user', images: [image] },
+      { role: 'assistant', content: 'image answer' },
+    ] : []);
     expect(native.requests).toHaveLength(destination === 'requested' ? 2 : 1);
     expect(nativeSteer).toHaveBeenCalledTimes(destination === 'requested' ? 2 : 1);
   } finally { await dispose(); }
 });
 
-function createBackgroundChat(withInput = false) {
+async function createBackgroundChat(withInput = false) {
   const messagesEl = document.body.createDiv();
-  const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
   const renderer = new MessageRenderer(plugin,
     new Component(), messagesEl);
   const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
   const backend = new FakeSideBackend();
-  let input: ReturnType<typeof createFixture> | undefined;
-  const coordinator = new ChatExecutionCoordinator({
+  let input: Awaited<ReturnType<typeof createFixture>> | undefined;
+  const coordinator: ChatExecutionCoordinator = new ChatExecutionCoordinator({
     lifecycleRegistry, resolveBackend: () => backend,
     persistence: { persistExecutionSnapshot: async () => true, registerExecutionBinding: () => undefined,
       releaseExecutionBinding: () => undefined, assertConversationExecutionAuthority: async () => undefined,
       recordConversationActivity: async () => undefined },
-    interactionPort: {} as any, vaultWorkingDirectory: '/vault', createId: () => 'binding',
+    interactionPort: { requestApproval: vi.fn(), askUserQuestion: vi.fn(), dismissInteraction: vi.fn() }, workingDirectory: '/vault', createId: () => 'binding',
     resolveMissingProviderSession: async () => 'not_found',
     onRequestedEvent: event => input?.controller.handleExecutionEvent(event),
-    onSessionEvent: (event, context) => enqueueTabSessionEvent(tab, plugin, event, context),
+    onSessionEvent: (event, context) => events.enqueue(event, context),
   });
   const tabSession = createTabSession({ id: 'tab', conversationId: 'conversation', draftModel: null,
-    providerId: 'claude', lifecycleState: 'ready' } as any, coordinator);
+    providerId: 'claude', lifecycleState: 'open' }, coordinator);
   const session = tabSession.runtime;
   const state = new ChatState({}, undefined, session.turns);
   const subagents = new SubagentManager(() => undefined);
   const stream = new StreamController({ plugin, state, renderer, subagentManager: subagents,
     getMessagesEl: () => messagesEl, updateQueueIndicator: () => undefined });
-  let images: ImageAttachment[] = [];
-  const setImages = (next: ImageAttachment[]) => { images = next; };
-  if (withInput) input = createFixture({
+  const setImages = (next: ImageAttachment[]) => {
+    if (!input) throw new Error('Input fixture required for attachments');
+    input.images.setImages(next);
+  };
+  if (withInput) input = (await createFixture({
     state, session, renderer, streamController: stream,
     getMessagesEl: () => messagesEl, getExecutionCoordinator: () => coordinator,
-    getImageContextManager: () => ({
-      clearImages: () => setImages([]), getAttachedImages: () => images,
-      hasImages: () => images.length > 0, setImages,
-    }),
+  }));
+  const events: SessionEvents = new SessionEvents({ state, renderer, stream, session, executionCoordinator: coordinator,
+    persistence: { save: async () => undefined, scheduleProgressSave: () => undefined },
+    createMessageId: createTabMessageId, updatePermissionMode: async () => undefined,
+    receiveSuggestion: () => undefined, discardSuggestion: () => undefined, canAcceptBackgroundWork: () => true,
+    claimBackgroundUserMessage: (nativeUserMessageId, inputId) => input?.controller.claimBackgroundUserMessage(nativeUserMessageId, inputId),
   });
-  const tab = { state, renderer, session: tabSession, executionCoordinator: coordinator, lifecycleState: 'ready',
-    ui: { promptSuggestion: { discard() {} } },
-    dom: { contentEl: messagesEl }, services: { subagentManager: subagents },
-    controllers: { inputController: input?.controller, streamController: stream, conversationController: { save: async () => undefined } } } as any;
   return { messagesEl, renderer, state, stream, coordinator, session, backend, input, setImages, dispose: async () => {
     await coordinator.dispose(); await lifecycleRegistry.dispose();
     stream.dispose(); subagents.clear(); renderer.dispose();
@@ -389,7 +399,7 @@ function createBackgroundChat(withInput = false) {
 
 it('records requested and background segments around notifications with no presenter', async () => {
   const state = new ChatState();
-  const plugin = { app: {}, settings: {} } as any;
+  const plugin = await createChatFeatureHost({ settings: {} });
   const manager = new SubagentManager(() => undefined);
   const renderer = null;
   const stream = new StreamController({ plugin, state, renderer, subagentManager: manager,
@@ -422,7 +432,7 @@ it('records requested and background segments around notifications with no prese
 
 it('retains a successful edit diff when no tool card was created', async () => {
   const state = new ChatState();
-  const plugin = { app: { vault: { adapter: {} } }, settings: {} } as any;
+  const plugin = await createChatFeatureHost({ settings: {} });
   const manager = new SubagentManager(() => undefined);
   const messagesEl = document.body.createDiv();
   const renderer = new MessageRenderer(plugin, new Component(), messagesEl);
@@ -438,4 +448,478 @@ it('retains a successful edit diff when no tool card was created', async () => {
       diffLines: [{ type: 'delete', text: 'old', oldLineNum: 1 }, { type: 'insert', text: 'new', newLineNum: 1 }], stats: { added: 1, removed: 1 } });
     expect(messagesEl.childElementCount).toBe(0);
   } finally { stream.dispose(); manager.clear(); renderer.dispose(); }
+});
+
+/** Text a reader sees in an element, skipping collapsed disclosure content. */
+function visibleText(element: HTMLElement): string {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  const parts: string[] = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!node.parentElement?.closest('[hidden]') && node.textContent?.trim()) parts.push(node.textContent.trim());
+  }
+  return parts.join(' ');
+}
+
+function visibleTranscript(root: HTMLElement): string {
+  return Array.from(root.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean).join(' ');
+}
+
+it.each([true, false])('folds a stopped automatic reply under Interrupted after its notification, live and on reload (output: %s)', async output => {
+  const messagesEl = document.body.createDiv();
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  const renderer = new MessageRenderer(plugin, new Component(), messagesEl, undefined, vi.fn());
+  const state = new ChatState();
+  const manager = new SubagentManager(() => undefined);
+  const stream = new StreamController({ plugin, state, renderer, subagentManager: manager,
+    getMessagesEl: () => messagesEl, updateQueueIndicator: () => undefined });
+  let nextId = 0;
+  const host = { state, renderer, stream, createMessageId: () => `message-${++nextId}` };
+  const background = new BackgroundResponses(host);
+  const scope = { kind: 'background' as const, sessionInstanceId: 'native', turnId: 'automatic', sequence: 0 };
+  const next = () => ({ ...scope, sequence: ++scope.sequence });
+  const inspect = () => {
+    const header = within(messagesEl).queryByRole('button', { name: 'Interrupted · What should Claudian do instead?' });
+    const history = header && document.getElementById(header.getAttribute('aria-controls')!)!;
+    const collapsed = visibleTranscript(messagesEl);
+    const actions = within(messagesEl).queryAllByRole('button', { name: /^(Copy message|Fork conversation|Worked.*)$/ }).length;
+    if (header) fireEvent.click(header);
+    const result = {
+      collapsed, actions,
+      folded: history ? visibleText(history) : null,
+      // The header carries the indicator; the body never repeats it.
+      indicatorInBody: history ? history.querySelector('.claudian-interrupted') !== null : null,
+    };
+    if (header) fireEvent.click(header);
+    return result;
+  };
+  try {
+    renderSessionTaskNotification(host, 'Job finished.', undefined, next());
+    background.reserve('binding', 'automatic');
+    if (output) {
+      await background.handle('binding', { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: 'job.log' }, scope: next() }, () => true);
+      await background.handle('binding', { type: 'text_delta', text: 'Checking the job.', scope: next() }, () => true);
+    }
+    await background.handle('binding', { type: 'background_turn_completed', reason: 'interrupted', nativeAssistantId: 'native-reply', scope: next() }, () => true);
+    await Promise.resolve();
+    // Replays may describe a never-finished tool differently; the fold, its order and its header must match.
+    const foldedBody = expect.stringMatching(/^Read job\.log\b.*Checking the job\.$/);
+    const live = { collapsed: 'Task notification Interrupted · What should Claudian do instead?', actions: 0,
+      indicatorInBody: output ? false : null, folded: output ? foldedBody : null };
+    expect(inspect()).toEqual(live);
+    expect((await axe(messagesEl)).violations).toEqual([]);
+
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(live);
+
+    // DeepSeek and Pi replay the notification and the stopped reply as one automatic message.
+    renderer.renderMessages([{ id: 'replayed', role: 'assistant', isAutomaticResponse: true, isInterrupt: true,
+      assistantMessageId: 'native-reply', content: output ? 'Checking the job.' : '', timestamp: testDate().getTime(),
+      toolCalls: output ? [{ id: 'read', name: 'Read', input: { file_path: 'job.log' }, status: 'running' }] : [],
+      contentBlocks: [{ type: 'task_notification', content: 'Job finished.' },
+        ...(output ? [{ type: 'tool_use' as const, toolId: 'read' }, { type: 'text' as const, content: 'Checking the job.' }] : [])] }], () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(live);
+
+    // Claude Code 2.1.303 records the Stop as `[Request interrupted by user]` after the automatic reply.
+    const at = (seconds: number) => new Date(testDate().getTime() + seconds * 1_000).toISOString();
+    const claude = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession([
+      { type: 'user', uuid: 'notification', timestamp: at(0), message: { content:
+        '<task-notification>\n<task-id>job</task-id>\n<status>completed</status>\n<summary>Job finished.</summary>\n</task-notification>' } },
+      ...(output ? [
+        { type: 'assistant', uuid: 'tool', parentUuid: 'notification', timestamp: at(1), message: { stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'job.log' } }] } },
+        { type: 'user', uuid: 'result', parentUuid: 'tool', timestamp: at(2), toolUseResult: { content: 'Log.' },
+          message: { content: [{ type: 'tool_result', tool_use_id: 'read', content: 'Log.' }] } },
+        { type: 'assistant', uuid: 'reply', parentUuid: 'result', timestamp: at(3), message: { content: [{ type: 'text', text: 'Checking the job.' }] } },
+      ] : []),
+      { type: 'user', uuid: 'interrupt', parentUuid: output ? 'reply' : 'notification', timestamp: at(4),
+        message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } },
+    ]));
+    expect(claude.error).toBeUndefined();
+    renderer.renderMessages(claude.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(live);
+  } finally { stream.dispose(); manager.clear(); renderer.dispose(); }
+});
+
+async function createBackgroundSession() {
+  const messagesEl = document.body.createDiv();
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  const renderer = new MessageRenderer(plugin, new Component(), messagesEl);
+  const state = new ChatState();
+  const manager = new SubagentManager(() => undefined);
+  const stream = new StreamController({ plugin, state, renderer, subagentManager: manager,
+    getMessagesEl: () => messagesEl, updateQueueIndicator: () => undefined });
+  let nextId = 0;
+  const host = { state, renderer, stream, createMessageId: () => `message-${++nextId}` };
+  const background = new BackgroundResponses(host);
+  const scope = { kind: 'background' as const, sessionInstanceId: 'native', turnId: 'automatic', sequence: 0 };
+  const next = () => ({ ...scope, sequence: ++scope.sequence });
+  const text = (value: string) => background.handle('binding', { type: 'text_delta', text: value, scope: next() }, () => true);
+  const stop = () => background.handle('binding', { type: 'background_turn_completed', reason: 'interrupted', scope: next() }, () => true);
+  return { messagesEl, renderer, state, host, background, next, text, stop,
+    dispose: () => { stream.dispose(); manager.clear(); renderer.dispose(); } };
+}
+
+it('keeps a reply before a steer intact and ends the steered input in an indicator when stopped before new output', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const inspect = () => ({
+    transcript: Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean),
+    disclosures: within(messagesEl).queryAllByRole('button', { name: /^(Interrupted|Worked)/ }).length,
+  });
+  try {
+    renderSessionTaskNotification(session.host, 'Job finished.', undefined, session.next());
+    background.reserve('binding', 'automatic');
+    await session.text('Background reply.');
+    background.userMessage('binding', { type: 'user_message_started', content: 'Make it shorter', scope: session.next() });
+    await session.stop();
+    await Promise.resolve();
+    const expected = { transcript: ['Task notification', 'Background reply.', 'Make it shorter',
+      'Interrupted · What should Claudian do instead?'], disclosures: 0 };
+    expect(inspect()).toEqual(expected);
+    expect(state.messages.find(message => message.content === 'Background reply.')?.isInterrupt).toBeUndefined();
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+// A bare marker belongs to the turn that stopped: an automatic turn with no visible trigger
+// that stops before output ends in a plain indicator and leaves the completed answer before it alone.
+it('keeps a completed answer intact when the automatic turn after it stops before output', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const inspect = () => ({
+    transcript: Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean),
+    interrupted: within(messagesEl).queryAllByRole('button', { name: /^Interrupted/ }).length,
+  });
+  try {
+    const prompt: ChatMessage = { id: 'prompt', role: 'user', content: 'Do the work', timestamp: testDate().getTime() };
+    const answer: ChatMessage = { id: 'answer', role: 'assistant', content: 'Completed answer.', timestamp: testDate().getTime(),
+      completedAt: testDate().getTime(), contentBlocks: [{ type: 'text', content: 'Completed answer.' }] };
+    state.addMessage(prompt);
+    state.addMessage(answer);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    background.reserve('binding', 'automatic');
+    await session.stop();
+    await Promise.resolve();
+    const expected = { transcript: ['Do the work', 'Completed answer.', 'Interrupted · What should Claudian do instead?'], interrupted: 0 };
+    expect(inspect()).toEqual(expected);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+// The interrupted reply before a marker only shows the marker of its own turn.
+it('keeps the indicator of an automatic turn stopped before output after an interrupted requested reply', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const indicators = () => within(messagesEl).getAllByText('Interrupted').length;
+  try {
+    const prompt: ChatMessage = { id: 'prompt', role: 'user', content: 'Do the work', timestamp: testDate().getTime() };
+    state.addMessage(prompt);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    const requested = new ResponseStream({ ...session.host, turns: new TurnCoordinator() });
+    requested.start();
+    await requested.handleEvent({ type: 'text_delta', text: 'Requested partial.',
+      scope: { kind: 'requested', sessionInstanceId: 'native', executionId: 'execution', turnId: 'requested', sequence: 1 } });
+    await requested.finish(requested.active!, { interrupted: true, failed: false });
+    background.reserve('binding', 'automatic');
+    await session.stop();
+    await Promise.resolve();
+    expect(indicators()).toBe(2);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(indicators()).toBe(2);
+  } finally { session.dispose(); }
+});
+
+// Blank thinking is no output: the stop ends the reply before it, as the shared layout reads it.
+it.each([true, false])('folds a background turn stopped after blank thinking like rerender (earlier reply: %s)', async earlier => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const inspect = () => ({ transcript: visibleTranscript(messagesEl),
+    headers: within(messagesEl).queryAllByRole('button', { name: /^Interrupted/ }).length });
+  try {
+    background.reserve('binding', 'automatic');
+    if (earlier) {
+      await session.text('Earlier reply.');
+      renderSessionTaskNotification(session.host, 'Job finished.', undefined, session.next());
+    }
+    await background.handle('binding', { type: 'thinking_delta', text: '   ', scope: session.next() }, () => true);
+    await session.stop();
+    await Promise.resolve();
+    const expected = { transcript: 'Interrupted · What should Claudian do instead?', headers: earlier ? 1 : 0 };
+    expect(inspect()).toEqual(expected);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+// Output-free segments on either side of a notification show nothing: a turn stopped without
+// output keeps its notification visible and ends in a plain indicator.
+it('keeps a notification visible when blank thinking surrounds it in a stopped background turn', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const blankThinking = () => background.handle('binding', { type: 'thinking_delta', text: '   ', scope: session.next() }, () => true);
+  const inspect = () => ({ transcript: visibleTranscript(messagesEl),
+    headers: within(messagesEl).queryAllByRole('button', { name: /^Interrupted/ }).length });
+  try {
+    background.reserve('binding', 'automatic');
+    await blankThinking();
+    renderSessionTaskNotification(session.host, 'Job finished.', undefined, session.next());
+    await blankThinking();
+    await session.stop();
+    await Promise.resolve();
+    const expected = { transcript: 'Task notification Interrupted · What should Claudian do instead?', headers: 0 };
+    expect(inspect()).toEqual(expected);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+it('folds a stopped automatic turn across a later notification once, live and on Claude reload', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const inspect = () => {
+    const header = within(messagesEl).getByRole('button', { name: 'Interrupted · What should Claudian do instead?' });
+    const history = document.getElementById(header.getAttribute('aria-controls')!)!;
+    const collapsed = Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean).join(' ');
+    fireEvent.click(header);
+    const body = visibleText(history);
+    fireEvent.click(header);
+    return { collapsed, body, headers: within(messagesEl).getAllByRole('button', { name: /^Interrupted/ }).length };
+  };
+  // Replays may describe the never-finished tool differently; the fold, its order and its header must match.
+  const expected = { collapsed: 'Task notification Interrupted · What should Claudian do instead?',
+    body: expect.stringMatching(/^First part\. Read job\.log\b.*Task notification Second part\.$/), headers: 1 };
+  try {
+    renderSessionTaskNotification(session.host, 'First job finished.', undefined, session.next());
+    background.reserve('binding', 'automatic');
+    await session.text('First part.');
+    await background.handle('binding', { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: 'job.log' }, scope: session.next() }, () => true);
+    renderSessionTaskNotification(session.host, 'Second job finished.', undefined, { ...session.next() });
+    await session.text('Second part.');
+    await session.stop();
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+    expect((await axe(messagesEl)).violations).toEqual([]);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+
+    const notification = claudeNotification;
+    // Claude delivers the second notification mid-turn, between the tool call and its result.
+    const claude = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession([
+      { type: 'user', uuid: 'first', timestamp: at(0), message: { content: notification('First job finished.') } },
+      { type: 'assistant', uuid: 'a1', parentUuid: 'first', timestamp: at(1), message: { stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'First part.' }, { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'job.log' } }] } },
+      { type: 'user', uuid: 'second', parentUuid: 'a1', timestamp: at(2), message: { content: notification('Second job finished.') } },
+      { type: 'user', uuid: 'result', parentUuid: 'second', timestamp: at(3), toolUseResult: { content: 'Log.' },
+        message: { content: [{ type: 'tool_result', tool_use_id: 'read', content: 'Log.' }] } },
+      { type: 'assistant', uuid: 'a2', parentUuid: 'result', timestamp: at(4), message: { content: [{ type: 'text', text: 'Second part.' }] } },
+      { type: 'user', uuid: 'interrupt', parentUuid: 'a2', timestamp: at(5), message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } },
+    ]));
+    // DeepSeek merges notices consumed within one turn into its reply.
+    const deepseek: ChatMessage = { id: 'replayed', role: 'assistant', isAutomaticResponse: true, isInterrupt: true,
+      content: 'First part.Second part.', timestamp: testDate().getTime(),
+      toolCalls: [{ id: 'read', name: 'Read', input: { file_path: 'job.log' }, status: 'running' }],
+      contentBlocks: [{ type: 'task_notification', content: 'First job finished.' }, { type: 'text', content: 'First part.' },
+        { type: 'tool_use', toolId: 'read' }, { type: 'task_notification', content: 'Second job finished.' },
+        { type: 'text', content: 'Second part.' }] };
+    // Pi starts a new automatic message for an extension notice and records the Stop as `aborted`.
+    const pi = parsePiSessionContent([
+      { type: 'custom_message', id: 'c1', customType: 'peeps-result', display: true, content: 'First job finished.' },
+      { type: 'message', id: 'a1', parentId: 'c1', message: { role: 'assistant', stopReason: 'toolUse',
+        content: [{ type: 'text', text: 'First part.' }, { type: 'toolCall', id: 'read', name: 'read', arguments: { path: 'job.log' } }] } },
+      { type: 'custom_message', id: 'c2', parentId: 'a1', customType: 'peeps-result', display: true, content: 'Second job finished.' },
+      { type: 'message', id: 'a2', parentId: 'c2', message: { role: 'assistant', stopReason: 'aborted', errorMessage: 'Operation aborted',
+        content: [{ type: 'text', text: 'Second part.' }] } },
+    ].map(entry => JSON.stringify(entry)).join('\n'));
+    for (const replay of [claude.messages, [deepseek], pi]) {
+      renderer.renderMessages(replay, () => 'Welcome');
+      await Promise.resolve();
+      expect(inspect()).toEqual(expected);
+    }
+  } finally { session.dispose(); }
+});
+
+it('keeps a completed Pi reply outside a later hidden-trigger interrupted disclosure on stored replay', async () => {
+  const messages = parsePiSessionContent([
+    { type: 'message', id: 'u1', parentId: null, timestamp: at(0), message: { role: 'user', content: 'Say hello' } },
+    { type: 'message', id: 'a1', parentId: 'u1', timestamp: at(5), message: {
+      role: 'assistant', timestamp: testDate({ seconds: 2 }).getTime(), stopReason: 'stop',
+      usage: { output: 12 }, content: [{ type: 'text', text: 'Hello' }],
+    } },
+    { type: 'custom_message', id: 'n1', parentId: 'a1', timestamp: at(6), customType: 'background-result',
+      display: false, content: 'Hidden background result' },
+    { type: 'message', id: 'a2', parentId: 'n1', timestamp: at(8), message: {
+      role: 'assistant', stopReason: 'aborted', content: [{ type: 'text', text: 'Partial automatic reply' }],
+    } },
+  ].map(entry => JSON.stringify(entry)).join('\n'));
+  const messagesEl = document.body.createDiv();
+  const renderer = new MessageRenderer(await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } }),
+    new Component(), messagesEl);
+  try {
+    renderer.renderMessages(messages, () => 'Welcome');
+    const header = await waitFor(() => within(messagesEl).getByRole('button', {
+      name: 'Interrupted \u00b7 What should Claudian do instead?',
+    }));
+    const history = document.getElementById(header.getAttribute('aria-controls')!)!;
+    expect(history).not.toBeNull();
+    expect(header.getAttribute('aria-expanded')).toBe('false');
+    expect(visibleTranscript(messagesEl)).toContain('Hello');
+    expect(visibleTranscript(messagesEl)).not.toContain('Partial automatic reply');
+    const completed = within(messagesEl).getByText('Hello', { exact: true });
+    expect(history.contains(completed)).toBe(false);
+    expect(messagesEl.textContent).not.toContain('Hidden background result');
+    fireEvent.click(header);
+    expect(header.getAttribute('aria-expanded')).toBe('true');
+    expect(within(history).getByText('Partial automatic reply', { exact: true })).toBeTruthy();
+    expect(history.textContent).not.toContain('Hello');
+    expect(messagesEl.textContent).not.toContain('Hidden background result');
+    expect((await axe(messagesEl)).violations).toEqual([]);
+  } finally { renderer.dispose(); messagesEl.remove(); }
+});
+
+const claudeNotification = (summary: string) =>
+  `<task-notification>\n<task-id>${summary}</task-id>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>`;
+const at = (seconds: number) => new Date(testDate().getTime() + seconds * 1_000).toISOString();
+
+it('keeps per-notification boundaries of a completed automatic turn, live and on Claude reload', async () => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, background } = session;
+  const transcript = () => ({
+    visible: Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean).join(' '),
+    disclosures: within(messagesEl).queryAllByRole('button', { name: /^(Interrupted|Worked)/ }).length,
+  });
+  // Each reply stays beside the notification it followed, with its tool visible.
+  const expected = { visible: expect.stringMatching(/^Task notification First part\. Read job\.log\b.*Task notification Final answer\.$/), disclosures: 0 };
+  try {
+    renderSessionTaskNotification(session.host, 'First job finished.', undefined, session.next());
+    background.reserve('binding', 'automatic');
+    await session.text('First part.');
+    await background.handle('binding', { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: 'job.log' }, scope: session.next() }, () => true);
+    renderSessionTaskNotification(session.host, 'Second job finished.', undefined, session.next());
+    await background.handle('binding', { type: 'tool_completed', toolCallId: 'read', toolScope: { kind: 'main' }, content: 'Log.', scope: session.next() }, () => true);
+    await session.text('Final answer.');
+    await background.handle('binding', { type: 'background_turn_completed', reason: 'completed', scope: session.next() }, () => true);
+    await Promise.resolve();
+    expect(transcript()).toEqual(expected);
+
+    const claude = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession([
+      { type: 'user', uuid: 'first', timestamp: at(0), message: { content: claudeNotification('First job finished.') } },
+      { type: 'assistant', uuid: 'a1', parentUuid: 'first', timestamp: at(1), message: { stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'First part.' }, { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'job.log' } }] } },
+      { type: 'user', uuid: 'second', parentUuid: 'a1', timestamp: at(2), message: { content: claudeNotification('Second job finished.') } },
+      { type: 'user', uuid: 'result', parentUuid: 'second', timestamp: at(3), toolUseResult: { content: 'Log.' },
+        message: { content: [{ type: 'tool_result', tool_use_id: 'read', content: 'Log.' }] } },
+      { type: 'assistant', uuid: 'a2', parentUuid: 'result', timestamp: at(4), message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Final answer.' }] } },
+    ]));
+    renderer.renderMessages(claude.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(transcript()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+it.each([true, false])('folds a notification that trails the stopped reply into its turn, live and on Claude reload (output: %s)', async output => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const INTERRUPTED = 'Interrupted · What should Claudian do instead?';
+  const inspect = () => {
+    const header = within(messagesEl).queryByRole('button', { name: INTERRUPTED });
+    const visible = Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean).join(' ');
+    if (!header) return { visible, body: null };
+    const history = document.getElementById(header.getAttribute('aria-controls')!)!;
+    fireEvent.click(header);
+    const body = visibleText(history);
+    fireEvent.click(header);
+    return { visible, body };
+  };
+  // The trailing notification arrived during the stopped turn: with output it folds with it; without, the line follows it.
+  const foldedBody = expect.stringMatching(/^First part\. Read job\.log\b.*Task notification$/);
+  const expected = output
+    ? { visible: `Task notification ${INTERRUPTED}`, body: foldedBody }
+    : { visible: `Task notification Task notification ${INTERRUPTED}`, body: null };
+  try {
+    renderSessionTaskNotification(session.host, 'First job finished.', undefined, session.next());
+    background.reserve('binding', 'automatic');
+    if (output) {
+      await session.text('First part.');
+      await background.handle('binding', { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: 'job.log' }, scope: session.next() }, () => true);
+    }
+    renderSessionTaskNotification(session.host, 'Second job finished.', undefined, session.next());
+    await session.stop();
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+
+    const claude = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession([
+      { type: 'user', uuid: 'first', timestamp: at(0), message: { content: claudeNotification('First job finished.') } },
+      ...(output ? [{ type: 'assistant', uuid: 'a1', parentUuid: 'first', timestamp: at(1), message: { stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'First part.' }, { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'job.log' } }] } }] : []),
+      { type: 'user', uuid: 'second', parentUuid: output ? 'a1' : 'first', timestamp: at(2), message: { content: claudeNotification('Second job finished.') } },
+      { type: 'user', uuid: 'interrupt', parentUuid: 'second', timestamp: at(3), message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } },
+    ]));
+    renderer.renderMessages(claude.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
+});
+
+it.each([true, false])('folds a stopped automatic turn across compaction once, live and on Claude reload (output after compaction: %s)', async after => {
+  const session = (await createBackgroundSession());
+  const { messagesEl, renderer, state, background } = session;
+  const INTERRUPTED = 'Interrupted · What should Claudian do instead?';
+  const inspect = () => {
+    const header = within(messagesEl).getByRole('button', { name: INTERRUPTED });
+    const history = document.getElementById(header.getAttribute('aria-controls')!)!;
+    const visible = Array.from(messagesEl.querySelectorAll<HTMLElement>('.claudian-message'), visibleText).filter(Boolean).join(' ');
+    fireEvent.click(header);
+    const body = visibleText(history);
+    fireEvent.click(header);
+    return { visible, body };
+  };
+  const foldedBody = expect.stringMatching(after
+    ? /^Before compaction\. Read job\.log\b.*Conversation compacted After compaction\.$/
+    : /^Before compaction\. Read job\.log\b.*Conversation compacted$/);
+  const expected = { visible: `Task notification ${INTERRUPTED}`, body: foldedBody };
+  try {
+    renderSessionTaskNotification(session.host, 'Job finished.', undefined, session.next());
+    background.reserve('binding', 'automatic');
+    await session.text('Before compaction.');
+    await background.handle('binding', { type: 'tool_started', toolCallId: 'read', toolScope: { kind: 'main' }, name: 'Read', input: { file_path: 'job.log' }, scope: session.next() }, () => true);
+    await background.handle('binding', { type: 'context_compacted', scope: session.next() }, () => true);
+    if (after) await session.text('After compaction.');
+    await session.stop();
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+    renderer.renderMessages(state.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+
+    const claude = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession([
+      { type: 'user', uuid: 'n', timestamp: at(0), message: { content: claudeNotification('Job finished.') } },
+      { type: 'assistant', uuid: 'tool', parentUuid: 'n', timestamp: at(1), message: { stop_reason: 'tool_use',
+        content: [{ type: 'text', text: 'Before compaction.' }, { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'job.log' } }] } },
+      { type: 'user', uuid: 'result', parentUuid: 'tool', timestamp: at(2), toolUseResult: { content: 'Log.' },
+        message: { content: [{ type: 'tool_result', tool_use_id: 'read', content: 'Log.' }] } },
+      { type: 'system', subtype: 'compact_boundary', uuid: 'compact', parentUuid: 'result', timestamp: at(3),
+        content: 'Conversation compacted', compactMetadata: { trigger: 'auto' } },
+      ...(after ? [{ type: 'assistant', uuid: 'after', parentUuid: 'compact', timestamp: at(4),
+        message: { content: [{ type: 'text', text: 'After compaction.' }] } }] : []),
+      { type: 'user', uuid: 'interrupt', parentUuid: after ? 'after' : 'compact', timestamp: at(5),
+        message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } },
+    ]));
+    renderer.renderMessages(claude.messages, () => 'Welcome');
+    await Promise.resolve();
+    expect(inspect()).toEqual(expected);
+  } finally { session.dispose(); }
 });

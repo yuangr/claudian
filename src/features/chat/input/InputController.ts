@@ -6,12 +6,13 @@ import {
   detectSideChatCommand,
   isSideChatCommandSupported,
 } from '@/core/commands/builtInCommands';
-import type { ProviderExecutionEvent } from '@/core/execution';
+import type { ProviderExecutionContext, ProviderExecutionEvent } from '@/core/execution';
 import type { BrowserSelectionContext } from '@/core/prompt/browserContext';
 import type { CanvasSelectionContext } from '@/core/prompt/canvasContext';
 import type { EditorSelectionContext } from '@/core/prompt/editorContext';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ProviderCapabilities, ProviderId, TitleGenerationService } from '@/core/providers/types';
+import { encodeSessionMessage, type MailboxMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import type { AskUserAnswers, ChatMessage, ToolCallInfo } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import type { ChatSettings } from '@/features/chat/ChatSettings';
@@ -27,11 +28,12 @@ import { deliverAsyncQuestion } from '@/features/chat/interactions/asyncQuestion
 import type { SessionInteractions } from '@/features/chat/interactions/SessionInteractions';
 import type { LinkedContentController } from '@/features/chat/linked-content';
 import type { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
-import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
+import type { SessionMessageUnsentReason } from '@/features/chat/session-messaging/SessionMailbox';
+import type { ChatSessionRuntime, TurnCancelOptions } from '@/features/chat/sessions/ChatSessionRuntime';
 import type { SessionComposerPort } from '@/features/chat/sessions/SessionComposer';
 import type { SideChatController } from '@/features/chat/side-chat/SideChatController';
 import type { ChatState } from '@/features/chat/state/ChatState';
-import { cloneChatTurnRequest, createQueuedMessage } from '@/features/chat/state/chatTurnRequest';
+import { captureSelectionSnapshots, createQueuedMessage } from '@/features/chat/state/chatTurnRequest';
 import type { ChatTurnRequest, TabReviewOutcome } from '@/features/chat/state/types';
 import { type MainTurn, MainTurnExecution } from '@/features/chat/turns/MainTurnExecution';
 import type { StreamController } from '@/features/chat/turns/StreamController';
@@ -66,13 +68,15 @@ export interface InputControllerDeps {
   getTabProviderId: () => ProviderId | null;
   /** Returns true if ready. */
   ensureExecutionInitialized: () => Promise<boolean>;
+  /** The shown history is being checked, or reloaded after a change outside Claudian. */
+  historyRefresh: () => 'checking' | 'reloading' | null;
   builtInCommands: Pick<BuiltInCommandController, 'execute'>;
   /** Captures a review reporter when a terminal provider turn becomes visible. */
   captureReviewableSettlement?: (outcome: TabReviewOutcome) => () => void;
   canStartTurn: () => boolean;
   isClosing: () => boolean;
   /** The session-owned turn activity and its single cancellation recipe. */
-  session: Pick<ChatSessionRuntime, 'turns' | 'cancelTurn' | 'stopMainBackgroundWork'>;
+  session: Pick<ChatSessionRuntime, 'turns' | 'cancelTurn' | 'stopMainBackgroundWork' | 'mailbox'>;
   /** Queued work and preparation can outlive the foreground turn's idle notification. */
   onWorkChanged?: () => void;
   /** Destination seam for the shared composer; absent means main-only. */
@@ -119,9 +123,9 @@ export class InputController {
       canStartTurn: () => this.deps.canStartTurn(),
       toQueuedChatTurn: message => ({
         displayContent: message.content,
-        request: cloneChatTurnRequest(message.turnRequest),
+        request: message.turnRequest,
       }),
-      createSubmission: (displayContent, request) => this.execution.createSubmission(displayContent, request),
+      createSubmission: (displayContent, request) => this.execution.createSteerSubmission(displayContent, request),
       onVisibleSteerChanged: () => this.queue.updateIndicator(),
       returnUnsent: message => this.queue.returnUnsent(message),
     });
@@ -137,8 +141,9 @@ export class InputController {
         this.deps.conversationController.cancelBranchDraft();
         const images = message.turnRequest.images ?? [];
         return this.execution.run({
+          origin: 'user',
           displayContent: message.content,
-          request: cloneChatTurnRequest(message.turnRequest),
+          request: message.turnRequest,
           images: images.length > 0 ? [...images] : undefined,
           composerDraft: 'none',
           onDelivery: message.onDelivery,
@@ -204,11 +209,65 @@ export class InputController {
         new Notice(t('chat.selectAvailableModel'));
         return;
       }
+      // Main input waits for a reload of changed history; the draft stays for the user to send again.
+      if (this.deps.historyRefresh() && (options?.destination ?? this.deps.drafts.destination) === 'main') {
+        new Notice(t('chat.reloadingHistory'));
+        return;
+      }
       const result = await this.#dispatchMessage(options);
       queued = result === 'queued';
     } finally {
       if (!queued) options?.onDelivery?.(false);
     }
+  }
+
+  /**
+   * Mailbox dispatch never reads the composer destination, drafts, or live selections. A reload does not
+   * block it: dispatch loads the history first, which also retries a failed reload.
+   */
+  get canStartSessionMessage(): boolean {
+    return this.deps.canStartTurn() && !this.turns.isActive && !this.queue.message && this.deps.historyRefresh() !== 'checking'
+      && !this.preparations.pendingMainAdmission && !this.isPreparingMainTurn
+      && !this.deps.conversationController.hasBranchDraft;
+  }
+
+  async sendSessionMessage(message: MailboxMessage, options: {
+    assertBeforeHandoff(): void;
+    onUnsent(reason: SessionMessageUnsentReason): void;
+  }): Promise<void> {
+    if (!this.canStartSessionMessage) {
+      options.onUnsent('deferred');
+      return;
+    }
+    if (this.deps.getTabProviderId() === null) {
+      options.onUnsent('failed');
+      return;
+    }
+    await this.turns.run(signal => this.execution.run({
+      origin: 'session-message',
+      displayContent: message.text,
+      request: { text: encodeSessionMessage(message), images: [], editorSelection: null, browserSelection: null, canvasSelection: null },
+      images: [],
+      composerDraft: 'none',
+      ...options,
+    }, signal));
+  }
+
+  /** Joins another session's message to the running turn; an unsent steer is dropped, never returned to the composer. */
+  async steerSessionMessage(message: MailboxMessage, signal: AbortSignal): Promise<'accepted' | 'uncertain' | 'not-sent'> {
+    // A turn waiting on the user's answer is not steered by another session; the message waits its turn.
+    if (!this.steering.canSteer || this.deps.inlinePrompts.pendingCount > 0) return 'not-sent';
+    const request: ChatTurnRequest = {
+      text: encodeSessionMessage(message), images: [], editorSelection: null, browserSelection: null, canvasSelection: null,
+    };
+    return this.steering.steerMessage(createQueuedMessage(message.text, request), 'drop', () => undefined, signal);
+  }
+
+  /** Another session's interrupt: the user's Stop for main work, keeping pending session messages. */
+  interruptForSessionMessage(): void {
+    const cancelledPreparation = this.preparations.isPreparing('main');
+    this.preparations.abort('main');
+    if (!this.#cancelMainStreaming({ keepMailbox: true }) && !cancelledPreparation) this.deps.session.stopMainBackgroundWork();
   }
 
   updateAsyncQuestion(tool: ToolCallInfo): void {
@@ -235,14 +294,9 @@ export class InputController {
         return {
           steer: async onDelivery => {
             if (!this.steering.canSteer) return 'not-sent';
-            const pending = await this.steering.steer(
-              { ...createQueuedMessage(reply.displayContent, turnRequest), onDelivery }, () => undefined, signal,
+            return this.steering.steerMessage(
+              { ...createQueuedMessage(reply.displayContent, turnRequest), onDelivery }, 'drop', () => undefined, signal,
             );
-            if (pending.providerDisposition === 'definitely-unsent') {
-              this.steering.release(pending);
-              return 'not-sent';
-            }
-            return pending.providerDisposition === 'accepted-awaiting-correlation' ? 'accepted' : 'uncertain';
           },
           submit: (onDelivery, assertBeforeHandoff) => this.sendMessage({
             destination: 'main', content: reply.displayContent, images: [], turnRequestOverride: turnRequest,
@@ -253,14 +307,18 @@ export class InputController {
     }, signal);
   }
 
+  settledTranscriptEnd(messages: readonly ChatMessage[]): number | null {
+    return this.execution.settledTranscriptEnd(messages);
+  }
+
+  /** A main submission Stop can still withdraw; drives the busy UI and Stop. */
   get isPreparingMainTurn(): boolean {
     return this.preparations.isPreparing('main');
   }
 
-  resumeQueuedTurnAfterIntentAdmission(): void {
-    if (!this.deps.canStartTurn()) return;
-    if (this.turns.isActive || !this.queue.message) return;
-    this.queue.scheduleContinuation();
+  /** Any main preparation that has not settled, including stopped ones still unwinding into the composer. */
+  get hasUnsettledMainWork(): boolean {
+    return this.preparations.hasUnsettled('main');
   }
 
   handleExecutionEvent(event: ProviderExecutionEvent): Promise<void> {
@@ -313,7 +371,7 @@ export class InputController {
         ? [...(imageOverride ?? composerDraft.images)]
         : [];
       // The side controller owns composer clearing so a rejected command keeps the draft.
-      await sideChat.handleCommandSubmission(sideCommand.argument, images, this.deps.selections.capture());
+      await sideChat.handleCommandSubmission(sideCommand.argument, images, this.#captureSideContext());
       return 'handled';
     }
 
@@ -383,7 +441,7 @@ export class InputController {
       const capturedSideRuntime = sideChat?.runtime;
       const images = [...(imageOverride ?? composerDraft.images)];
       const captured = this.#buildTurnSubmission(content, images, options);
-      const sideContext = this.deps.selections.capture();
+      const sideContext = this.#captureSideContext();
       const original = shouldUseInput ? this.deps.drafts.consume(destination) : { content, images };
       const preparation = new AbortController();
       const ownsMainTurn = destination === 'main' && !this.turns.isActive && !this.queue.message;
@@ -446,7 +504,7 @@ export class InputController {
       const images = hasImages
         ? [...(imageOverride ?? composerDraft.images)]
         : [];
-      const context = this.deps.selections.capture();
+      const context = this.#captureSideContext();
       const previousDraft = shouldUseInput ? this.deps.drafts.consume('side') : null;
       const accepted = await sideChat.submitToSide(
         content,
@@ -490,6 +548,7 @@ export class InputController {
     const { displayContent, turnRequest } = this.#buildTurnSubmission(content, imagesForMessage, options);
     const fromComposer = options?.content === undefined || options?.draftConsumed === true;
     return {
+      origin: 'user',
       displayContent,
       request: turnRequest,
       images: imagesForMessage,
@@ -497,6 +556,12 @@ export class InputController {
       assertBeforeHandoff: options?.assertBeforeHandoff,
       onDelivery: options?.onDelivery,
     };
+  }
+
+  /** Live selections for a side-chat turn, in capture order. */
+  #captureSideContext(): ProviderExecutionContext {
+    const selections = captureSelectionSnapshots(this.deps.selections.capture());
+    return selections.length ? { selections } : {};
   }
 
   #resolveSelections(options?: SendMessageOptions): Required<Pick<ChatTurnRequest, 'editorSelection' | 'browserSelection' | 'canvasSelection'>> {
@@ -519,12 +584,12 @@ export class InputController {
     turnRequest: ChatTurnRequest;
   } {
     if (options?.turnRequestOverride) {
-      return { displayContent: content, turnRequest: cloneChatTurnRequest(options.turnRequestOverride) };
+      return { displayContent: content, turnRequest: options.turnRequestOverride };
     }
     // Linked content is bound only at admission, never from capture-time transcript state.
     return {
       displayContent: content,
-      turnRequest: cloneChatTurnRequest({ text: content, images, ...this.#resolveSelections(options) }),
+      turnRequest: { text: content, images, ...this.#resolveSelections(options) },
     };
   }
 
@@ -552,30 +617,24 @@ export class InputController {
       sideChat.cancelSide();
       return;
     }
+    this.deps.session.mailbox?.clear();
     // Withdrawing a preparation is the whole Stop; background work keeps running.
     if (!this.#cancelMainStreaming() && !cancelledPreparation) this.deps.session.stopMainBackgroundWork();
   }
 
   /** Returns whether an in-flight response was cancelled. */
-  #cancelMainStreaming(): boolean {
+  #cancelMainStreaming(options: TurnCancelOptions = {}): boolean {
     this.deps.inlinePrompts.cancelAsyncSubmissions();
     // Settlement already owns the response; only queued input can still be withdrawn.
     if (!this.turns.isInFlight) {
       this.queue.restoreToComposer();
       return false;
     }
-    this.deps.session.cancelTurn('user');
+    this.deps.session.cancelTurn('user', options);
     this.queue.restoreToComposer();
     this.steering.clearCurrentUi();
     this.deps.streamController.thinkingIndicator.hide();
     return true;
-  }
-
-  /** Cancels the active turn and waits for its cleanup and conversation persistence. */
-  async cancelStreamingAndWait(): Promise<void> {
-    const activeTurn = Promise.allSettled([this.turns.drain(), this.preparations.settled()]);
-    this.cancelStreaming();
-    await activeTurn;
   }
 
   dismissPendingApproval(): void {

@@ -3,9 +3,9 @@ import { OpencodeCommandCatalog } from '@/providers/opencode/commands/OpencodeCo
 describe('OpencodeCommandCatalog', () => {
   it('maps runtime commands into slash dropdown entries', async () => {
     const catalog = new OpencodeCommandCatalog();
-    catalog.setCommandSnapshot([
+    const commandSnapshot = [
       {
-        id: 'acp:review',
+        id: 'opencode-command:review',
         name: 'local:shared-review',
         description: 'Review the current changes',
         argumentHint: '$1',
@@ -13,24 +13,24 @@ describe('OpencodeCommandCatalog', () => {
         source: 'sdk',
       },
       {
-        id: 'acp:review-duplicate',
+        id: 'opencode-command:review-duplicate',
         name: 'local:shared-review',
         description: 'Duplicate entry',
         content: '',
         source: 'sdk',
       },
       {
-        id: 'acp:fix',
+        id: 'opencode-command:fix',
         name: 'shared-review',
         description: 'Apply a fix',
         content: '',
         source: 'sdk',
       },
-    ]);
+    ] as const;
 
-    await expect(catalog.listDropdownEntries({ includeBuiltIns: false })).resolves.toEqual([
+    await expect(catalog.listDropdownEntries({ commandSnapshot, includeBuiltIns: false })).resolves.toEqual([
       {
-        id: 'acp:review',
+        id: 'opencode-command:review',
         providerId: 'opencode',
         kind: 'command',
         name: 'local:shared-review',
@@ -45,7 +45,7 @@ describe('OpencodeCommandCatalog', () => {
         insertPrefix: '/',
       },
       {
-        id: 'acp:review-duplicate',
+        id: 'opencode-command:review-duplicate',
         providerId: 'opencode',
         kind: 'command',
         name: 'local:shared-review',
@@ -59,7 +59,7 @@ describe('OpencodeCommandCatalog', () => {
         insertPrefix: '/',
       },
       {
-        id: 'acp:fix',
+        id: 'opencode-command:fix',
         providerId: 'opencode',
         kind: 'command',
         name: 'shared-review',
@@ -85,6 +85,7 @@ describe('OpencodeCommandCatalog', () => {
       skillPrefix: '/',
       commandPrefix: '/',
       discoveryTimeoutMs: 'provider-owned',
+      refreshOnOpen: true,
     });
     expect('listVaultEntries' in catalog).toBe(false);
     expect('saveVaultEntry' in catalog).toBe(false);

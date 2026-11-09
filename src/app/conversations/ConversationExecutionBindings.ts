@@ -9,6 +9,8 @@ export interface ExecutionBindingState {
   readonly providerId: ProviderId;
   readonly providerGeneration: number;
   closed: boolean;
+  /** Ended by session invalidation: later snapshots keep their history but never bind. */
+  retired: boolean;
   latestSnapshot: ProviderSessionSnapshot | null;
   lastPersistedRevision: number;
 }
@@ -19,6 +21,8 @@ export interface ConversationExecutionBindingsDeps {
   isTransientDeletionBinding(conversationId: string, binding: ExecutionBindingState): boolean;
   /** A fresh native session supersedes any pending historical model recovery. */
   discardModelRecovery(conversation: Conversation): void;
+  /** Applies provider session invalidation, turning a native binding into history-only state. */
+  invalidateSession(conversation: Conversation): void;
 }
 
 /**
@@ -59,6 +63,7 @@ export class ConversationExecutionBindings {
       providerId: conversation.providerId,
       providerGeneration,
       closed: false,
+      retired: false,
       latestSnapshot: null,
       lastPersistedRevision: -1,
     });
@@ -82,7 +87,7 @@ export class ConversationExecutionBindings {
       || (!conversation && !isTransientDeletionBinding)
       || binding.bindingId !== bindingId
       || binding.providerGeneration !== providerGeneration
-      || binding.closed
+      || (binding.closed && !binding.retired)
       || snapshot.providerId !== binding.providerId
       || snapshot.revision < (binding.latestSnapshot?.revision ?? -1)
       || snapshot.revision <= binding.lastPersistedRevision
@@ -127,6 +132,17 @@ export class ConversationExecutionBindings {
     );
   }
 
+  /**
+   * Ends the binding's execution authority after its session was invalidated. Its later and
+   * still-queued snapshots are applied as invalidated, keeping their history but never binding.
+   */
+  retire(conversationId: string): void {
+    const binding = this.bindings.get(conversationId);
+    if (!binding) return;
+    binding.closed = true;
+    binding.retired = true;
+  }
+
   release(
     conversationId: string,
     bindingId: string,
@@ -145,11 +161,9 @@ export class ConversationExecutionBindings {
     const { fence } = this.deps;
     const conversation = fence.getRecord(conversationId);
     const binding = this.bindings.get(conversationId);
-    if (!conversation || !await fence.canWrite(conversation)
-      || fence.getRecord(conversationId) !== conversation
+    if (!conversation || !fence.canWrite(conversation)
       || !binding || binding.closed
-      || binding.bindingId !== bindingId || binding.providerGeneration !== providerGeneration
-      || this.bindings.get(conversationId) !== binding) {
+      || binding.bindingId !== bindingId || binding.providerGeneration !== providerGeneration) {
       throw new Error(`Conversation is no longer available: ${conversationId}`);
     }
   }
@@ -168,19 +182,13 @@ export class ConversationExecutionBindings {
         return false;
       }
       const current = fence.getRecord(conversationId);
-      if (!current || !await fence.canWrite(current)) {
-        return false;
-      }
-      if (
-        this.bindings.get(conversationId) !== binding
-        || !binding.latestSnapshot
-        || binding.latestSnapshot.revision <= binding.lastPersistedRevision
-      ) {
+      if (!current || !fence.canWrite(current)) {
         return false;
       }
 
       const latest = binding.latestSnapshot;
       this.#applySnapshot(current, latest);
+      if (binding.retired) this.deps.invalidateSession(current);
       await fence.writeMetadata(current);
       binding.lastPersistedRevision = latest.revision;
       return true;

@@ -1,14 +1,22 @@
 import { randomUUID } from 'node:crypto';
 
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
+import { invokeSessionTool, type SessionToolInvocation } from '@/core/session-tools/invokeSessionTool';
+import type { SessionToolEndpoint, SessionToolRoute } from '@/core/session-tools/SessionToolEndpoint';
+import { createWSLSessionToolRelay } from '@/core/session-tools/WSLSessionToolRelay';
+import { toAbortError } from '@/utils/abort';
 
+import { opencodeEnvironment,OpencodeTargetEnvironment, opencodeTargetPath } from '../runtime/OpencodeExecutionTarget';
 import { prepareOpencodeLaunchArtifacts } from '../runtime/OpencodeLaunchArtifacts';
 import { resolveOpencodeDatabasePath } from '../runtime/OpencodePaths';
+import { verifyOpencodeNativeVersion } from '../runtime/OpencodeVersion';
 import { isRecord, OpencodeHTTPClient, type OpencodeHTTPEvent, pollOpencodeUntil } from './OpencodeHTTPClient';
 import { createOpencodeServerConfig, type OpencodeServerConfig } from './OpencodeServerConfig';
 
-type Subscriber = { event: (event: OpencodeHTTPEvent) => void; error: (error: Error) => void; interactive: () => boolean };
+type Subscriber = { event: (event: OpencodeHTTPEvent) => void; error: (error: Error) => void; interactive: () => boolean; sessionTools?: (nativeId: string) => SessionToolInvocation | undefined };
 interface Server {
+  callRoute?: SessionToolRoute;
   client: OpencodeHTTPClient;
   config: OpencodeServerConfig;
   databasePath: string | null;
@@ -26,13 +34,15 @@ interface ServerEntry {
   readonly launchKey: string;
   retainWhenIdle: boolean;
   consumers: number;
-  retired: boolean;
+  /** `admitting` entries are keyed in `servers`; `draining` ones in `draining`; `closing` ones in neither. */
+  state: 'admitting' | 'draining' | 'closing';
   readonly retirementListeners: Set<() => void>;
   readonly supersessionListeners: Set<() => void>;
 }
 
 /** Provider-owned native processes. Persistent consumers share by environment and database. */
 export class OpencodeServerService {
+  readonly targetEnvironment = new OpencodeTargetEnvironment();
   private readonly servers = new Map<string, ServerEntry>();
   private readonly draining = new Set<ServerEntry>();
   private readonly closing = new Set<Promise<void>>();
@@ -42,6 +52,8 @@ export class OpencodeServerService {
   /** The committed default launch; retained when idle and never evicted as an idle peer. */
   private currentLaunch: { compatibility: string; key: string } | null = null;
 
+  constructor(private readonly sessionToolEndpoint?: SessionToolEndpoint) {}
+
   /** Retained execution kernels must fence new turns as well as new leases. */
   async waitUntilAvailable(signal?: AbortSignal): Promise<void> {
     do {
@@ -50,20 +62,42 @@ export class OpencodeServerService {
     } while (this.fence.isUnavailable());
   }
 
-  acquire(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<OpencodeServerLease> {
-    return this.borrow(cliPath, cwd, environment, signal, false);
+  acquire(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal?: AbortSignal, target?: ExecutionTarget): Promise<OpencodeServerLease> {
+    return this.borrow(cliPath, cwd, environment, signal, false, target);
   }
 
   /** Owned native deletion must finish before the transition can reopen normal admission. */
-  acquireCleanup(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv): Promise<OpencodeServerLease> {
-    return this.borrow(cliPath, cwd, environment, undefined, true);
+  acquireCleanup(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, target?: ExecutionTarget): Promise<OpencodeServerLease> {
+    return this.borrow(cliPath, cwd, environment, undefined, true, target);
   }
 
-  private async borrow(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal: AbortSignal | undefined, cleanup: boolean): Promise<OpencodeServerLease> {
+  /**
+   * Leases the server already up for a launch, or null: never starts, reconnects or retires a
+   * process, and never waits out a transition. The launch is resolved only while some server is up.
+   */
+  async acquireRunning(resolveLaunch: () => Promise<{ cliPath: string; cwd: string; environment: NodeJS.ProcessEnv; target?: ExecutionTarget } | null>): Promise<OpencodeServerLease | null> {
+    if (this.disposal || this.fence.isUnavailable() || this.servers.size === 0) return null;
+    const generation = this.generation.signal;
+    const resolved = await resolveLaunch();
+    if (!resolved) return null;
+    const { cliPath, cwd, environment, target } = resolved;
+    const launch = normalizeLaunch(cliPath, cwd, environment, target);
+    const entry = launch.ephemeral ? undefined : this.servers.get(launch.key);
+    if (!entry || generation.aborted || this.fence.isUnavailable()) return null;
+    entry.consumers += 1;
+    try {
+      const server = await entry.promise;
+      if (!generation.aborted && entry.state === 'admitting' && !server.close && server.client.isStarted()) return this.lease(entry, server);
+    } catch { /* A failed start is not a running server. */ }
+    await this.release(entry);
+    return null;
+  }
+
+  private async borrow(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal: AbortSignal | undefined, cleanup: boolean, target?: ExecutionTarget): Promise<OpencodeServerLease> {
     if (this.disposal) throw new Error('OpenCode server service is disposed.');
     if (!cleanup) await this.waitUntilAvailable(signal);
     const generation = this.generation.signal;
-    const launch = normalizeLaunch(cliPath, cwd, environment);
+    const launch = normalizeLaunch(cliPath, cwd, environment, target);
     const { compatibility, ephemeral, normalized } = launch;
     const obsolete = this.currentLaunch !== null && this.currentLaunch.compatibility !== compatibility;
     const key = ephemeral ? JSON.stringify([launch.key, randomUUID()]) : launch.key;
@@ -73,13 +107,13 @@ export class OpencodeServerService {
       let entry = this.servers.get(key) ?? ((cleanup || obsolete) ? [...this.draining].find(draining => draining.key === key) : undefined);
       if (!entry) {
         entry = {
-          promise: this.create(cliPath, cwd, normalized, generation),
+          promise: this.create(cliPath, cwd, normalized, generation, target),
           key,
           compatibility,
           launchKey: launch.key,
           retainWhenIdle: false,
           consumers: 0,
-          retired: obsolete,
+          state: obsolete ? 'draining' : 'admitting',
           retirementListeners: new Set(),
           supersessionListeners: new Set(),
         };
@@ -123,7 +157,7 @@ export class OpencodeServerService {
       (event, listener) => {
         const listeners = event === 'retired' ? entry.retirementListeners : entry.supersessionListeners;
         listeners.add(listener);
-        if (event === 'retired' ? entry.retired : this.isSuperseded(entry)) listener();
+        if (event === 'retired' ? entry.state !== 'admitting' : this.isSuperseded(entry)) listener();
         return () => listeners.delete(listener);
       },
       () => {
@@ -137,8 +171,8 @@ export class OpencodeServerService {
    * Commit the default launch. Incompatible generations stop admitting consumers without
    * interrupting native work; compatible database bindings keep their process.
    */
-  reconcileLaunch(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv): void {
-    const launch = normalizeLaunch(cliPath, cwd, environment);
+  reconcileLaunch(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, target?: ExecutionTarget): void {
+    const launch = normalizeLaunch(cliPath, cwd, environment, target);
     this.currentLaunch = { compatibility: launch.compatibility, key: launch.key };
     for (const entry of [...this.servers.values(), ...this.draining]) {
       if (this.isSuperseded(entry)) for (const listener of [...entry.supersessionListeners]) listener();
@@ -149,7 +183,7 @@ export class OpencodeServerService {
         continue;
       }
       this.servers.delete(key);
-      entry.retired = true;
+      entry.state = 'draining';
       this.draining.add(entry);
       for (const listener of [...entry.retirementListeners]) listener();
       if (entry.consumers === 0) void this.retire(entry);
@@ -175,6 +209,7 @@ export class OpencodeServerService {
   private retire(entry: ServerEntry, error?: Error): Promise<void> {
     if (this.servers.get(entry.key) === entry) this.servers.delete(entry.key);
     this.draining.delete(entry);
+    entry.state = 'closing';
     entry.retirementListeners.clear();
     entry.supersessionListeners.clear();
     const closing = entry.promise.then(server => this.close(server, error), () => undefined);
@@ -186,11 +221,15 @@ export class OpencodeServerService {
     return closing;
   }
 
-  beginTransition(): void { this.fence.beginTransition(); }
+  beginTransition(): void {
+    this.targetEnvironment.reset();
+    this.fence.beginTransition();
+  }
 
   endTransition(): void { this.fence.endTransition(); }
 
   async invalidate(): Promise<void> {
+    this.targetEnvironment.reset();
     this.fence.beginTransition();
     const previous = [...this.servers.values(), ...this.draining];
     this.generation.abort();
@@ -209,22 +248,50 @@ export class OpencodeServerService {
     return this.disposal ??= this.invalidate();
   }
 
-  private async create(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal: AbortSignal): Promise<Server> {
-    // Leases register agents with their own instructions; base prompt files are placeholders.
-    const artifacts = await prepareOpencodeLaunchArtifacts({ workspaceRoot: cwd, runtimeEnv: environment, nativeVersion: 2, preserveExistingPrompts: true });
+  private async create(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, signal: AbortSignal, target?: ExecutionTarget): Promise<Server> {
+    // Every consumer of a launched process shares this one check of the binary it runs.
+    await verifyOpencodeNativeVersion(cliPath, environment, target, cwd);
     signal.throwIfAborted();
-    const config = await createOpencodeServerConfig(cwd, environment);
-    const client = new OpencodeHTTPClient(cliPath, cwd, { ...environment, OPENCODE_CONFIG: config.file, OPENCODE_CONFIG_CONTENT: artifacts.configContent });
-    const server: Server = { client, config, databasePath: artifacts.databasePath, subscribers: new Set(), forms: new Map() };
+    const subscribers = new Set<Subscriber>();
+    const config = await createOpencodeServerConfig(cwd, environment, !!this.sessionToolEndpoint, target);
+    let callRoute: SessionToolRoute | undefined;
+    let client: OpencodeHTTPClient | undefined;
     try {
+      callRoute = await this.sessionToolEndpoint?.registerCallRoute(request => {
+        const owners = [...subscribers].flatMap(subscriber => {
+          const owner = subscriber.sessionTools?.(request.callerNativeId);
+          return owner ? [owner] : [];
+        });
+        const owner = owners.length === 1 ? owners[0] : undefined;
+        return invokeSessionTool(request.name, request.args, {
+          port: owner?.port, toolPolicy: owner?.toolPolicy,
+          signal: owner ? AbortSignal.any([owner.signal, request.signal]) : request.signal,
+        });
+      });
+      // Session instructions and the per-process route never enter the sharing key.
+      const artifacts = await prepareOpencodeLaunchArtifacts({ workspaceRoot: cwd, runtimeEnv: environment, target, sessionToolsPluginPath: config.sessionToolsPluginPath });
+      const relay = callRoute && target?.method === 'wsl'
+        ? await createWSLSessionToolRelay({ target, hostCwd: cwd, env: opencodeEnvironment(environment), route: callRoute, mode: 'call' }) : undefined;
+      signal.throwIfAborted();
+      client = new OpencodeHTTPClient(cliPath, cwd, {
+        ...environment, OPENCODE_CONFIG: opencodeTargetPath(config.file, target), OPENCODE_CONFIG_CONTENT: artifacts.configContent,
+        ...(relay ? { CLAUDIAN_SESSION_TOOLS_RELAY: JSON.stringify(relay) } : {}),
+        ...(callRoute && !relay ? { CLAUDIAN_SESSION_TOOLS_URL: callRoute.url, CLAUDIAN_SESSION_TOOLS_ROUTE_ID: callRoute.routeId } : {}),
+      }, target);
+      const server: Server = { client, config, callRoute, databasePath: artifacts.databasePath, subscribers, forms: new Map() };
       await config.initialize(error => { void this.close(server, error); });
       signal.throwIfAborted();
       return server;
-    } catch (error) { await this.close(server); throw error; }
+    } catch (error) {
+      callRoute?.dispose();
+      try { await client?.dispose(); } finally { await config.dispose(); }
+      throw error;
+    }
   }
 
   private close(server: Server, error?: Error): Promise<void> {
     if (server.close) return server.close;
+    server.callRoute?.dispose();
     server.close = (async () => {
       if (error) await Promise.allSettled([...server.subscribers].map(async subscriber => subscriber.error(error)));
       server.subscribers.clear();
@@ -269,6 +336,8 @@ export class OpencodeServerLease {
     return this.retainLease();
   }
 
+  get target(): ExecutionTarget { return this.server.client.target; }
+  get workingDirectory(): string { return this.server.client.cwd; }
   get databasePath(): string | null { return this.server.databasePath; }
   signal(signal?: AbortSignal): AbortSignal { return this.server.client.signal(AbortSignal.any([this.controller.signal, ...(signal ? [signal] : [])])); }
   isReusable(): boolean { return !this.controller.signal.aborted && this.server.client.isReusable(); }
@@ -287,13 +356,25 @@ export class OpencodeServerLease {
     }
   }
 
-  async subscribe(event: Subscriber['event'], error: Subscriber['error'], interactive: Subscriber['interactive']): Promise<void> {
+  async subscribe(event: Subscriber['event'], error: Subscriber['error'], interactive: Subscriber['interactive'], sessionTools?: Subscriber['sessionTools']): Promise<void> {
     this.controller.signal.throwIfAborted();
-    const subscriber = { event, error, interactive };
+    const subscriber = { event, error, interactive, sessionTools };
     this.subscriber = subscriber;
     this.server.subscribers.add(subscriber);
-    await subscribeToServer(this.server, this.failServer);
-    this.controller.signal.throwIfAborted();
+    const signal = this.signal();
+    let onAbort!: () => void;
+    try {
+      // Only admission belongs to this lease; the pending transport can still admit its peers.
+      await Promise.race([
+        subscribeToServer(this.server, this.failServer),
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(toAbortError(signal, 'OpenCode event subscription aborted.'));
+          signal.addEventListener('abort', onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+      ]);
+      signal.throwIfAborted();
+    } finally { signal.removeEventListener('abort', onAbort); }
   }
 
   async refreshGlobalForms(): Promise<void> {
@@ -374,25 +455,26 @@ function dispatchServerEvent(server: Server, event: OpencodeHTTPEvent): void {
 export async function withOpencodeServerLease<T>(
   shared: OpencodeServerService | null | undefined, cliPath: string, cwd: string, environment: NodeJS.ProcessEnv,
   use: (lease: OpencodeServerLease) => Promise<T>,
+  target?: ExecutionTarget,
 ): Promise<T> {
   const service = shared ?? new OpencodeServerService();
   try {
-    const lease = await service.acquire(cliPath, cwd, environment);
+    const lease = await service.acquire(cliPath, cwd, environment, undefined, target);
     try { return await use(lease); } finally { await lease.dispose(); }
   } finally {
     if (!shared) await service.dispose();
   }
 }
 
-function normalizeLaunch(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv) {
-  const databasePath = resolveOpencodeDatabasePath(environment);
-  const normalized = { ...environment, ...(databasePath ? { OPENCODE_DB: databasePath } : {}) };
+function normalizeLaunch(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, target?: ExecutionTarget) {
+  const databasePath = resolveOpencodeDatabasePath(environment, target);
+  const normalized = { ...environment, ...(databasePath ? { OPENCODE_DB: opencodeTargetPath(databasePath, target) } : {}) };
   const entries = Object.entries(normalized).filter(([, value]) => value !== undefined).sort(([a], [b]) => a.localeCompare(b));
   return {
     normalized,
     ephemeral: databasePath === ':memory:',
-    key: JSON.stringify([cliPath, cwd, entries]),
+    key: JSON.stringify([cliPath, cwd, target?.method === 'wsl' ? target : undefined, entries]),
     // Database overrides remain legitimate historical bindings within the current launch environment.
-    compatibility: JSON.stringify([cliPath, cwd, entries.filter(([name]) => name !== 'OPENCODE_DB')]),
+    compatibility: JSON.stringify([cliPath, cwd, target?.method === 'wsl' ? target : undefined, entries.filter(([name]) => name !== 'OPENCODE_DB')]),
   };
 }

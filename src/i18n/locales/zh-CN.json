@@ -14,8 +14,17 @@
     "none": "无"
   },
   "chat": {
+    "queue": {
+      "queued": "排队中",
+      "steering": "引导中",
+      "steerNow": "立即引导",
+      "edit": "编辑排队消息",
+      "discard": "丢弃排队消息",
+      "images": "[图片]"
+    },
     "promptSuggestionHint": "按 Tab 接受",
     "selectAvailableModel": "请先选择可用的模型再发送。",
+    "reloadingHistory": "此对话在 Claudian 之外发生了变化，正在重新加载。加载完成后请重新发送。",
     "selectAvailableTitleModel": "请在 Claudian 设置中选择可用的标题生成模型。",
     "rewind": {
       "confirmMessage": "回退到此处？此消息之后的文件更改可能被覆盖或删除。此操作无法撤销。",
@@ -104,9 +113,57 @@
       "showLess": "收起",
       "moreItems": "+{count} 项"
     },
+    "welcome": {
+      "sunday": "周日快乐",
+      "sundayNamed": "周日快乐，{name}",
+      "monday": "周一快乐",
+      "mondayNamed": "周一快乐，{name}",
+      "tuesday": "周二快乐",
+      "tuesdayNamed": "周二快乐，{name}",
+      "wednesday": "周三快乐",
+      "wednesdayNamed": "周三快乐，{name}",
+      "thursday": "周四快乐",
+      "thursdayNamed": "周四快乐，{name}",
+      "friday": "周五快乐",
+      "fridayNamed": "周五快乐，{name}",
+      "saturday": "周六快乐！",
+      "saturdayNamed": "周六快乐，{name}",
+      "backAtIt": "继续加油！",
+      "backAtItNamed": "{name}，继续加油！",
+      "fridayFeeling": "周五的感觉真好",
+      "fridayFeelingNamed": "周五的感觉真好，{name}",
+      "weekend": "周末到了",
+      "weekendNamed": "{name}，周末到了",
+      "sundaySession": "周日来一场？",
+      "morning": "早上好",
+      "morningNamed": "早上好，{name}",
+      "coffee": "喝杯咖啡，开始用 {brand}？",
+      "afternoon": "下午好",
+      "afternoonNamed": "下午好，{name}",
+      "hey": "嗨，你好",
+      "heyNamed": "嗨，{name}",
+      "howGoing": "最近怎么样？",
+      "howGoingNamed": "{name}，最近怎么样？",
+      "evening": "晚上好",
+      "eveningNamed": "晚上好，{name}",
+      "eveningShort": "晚上好呀",
+      "eveningShortNamed": "晚上好呀，{name}",
+      "howDay": "今天过得怎么样？",
+      "howDayNamed": "{name}，今天过得怎么样？",
+      "nightOwl": "你好，夜猫子",
+      "hiHow": "嗨，你好吗？",
+      "hiHowNamed": "{name}，你好吗？",
+      "welcomeBack": "欢迎回来！",
+      "welcomeBackNamed": "欢迎回来，{name}！",
+      "whatsNew": "有什么新鲜事？",
+      "whatsNewNamed": "{name}，有什么新鲜事？",
+      "returnsNamed": "{name} 回来了！",
+      "right": "你说得完全正确！"
+    },
     "worked": "已完成工作",
     "taskNotification": "任务通知",
     "copyMessage": "复制消息",
+    "showEarlierMessages": "显示更早的消息",
     "renderFailed": "消息内容渲染失败。",
     "interruptedHint": "· 你希望 Claudian 改做什么？",
     "sessions": {
@@ -184,6 +241,10 @@
       "enteringPlan": "正在进入规划模式",
       "planComplete": "规划完成",
       "messageAgent": "向代理发送消息",
+      "listDestinations": "列出目标",
+      "messageSession": "向会话发送消息",
+      "stopSession": "停止会话",
+      "readSession": "读取会话",
       "continueAgent": "继续代理任务",
       "listAgents": "列出代理",
       "interruptAgent": "中断代理",
@@ -194,6 +255,27 @@
       "toolsPlaceholder": "工具",
       "agentCount": "{count} 个代理",
       "agentCountPlural": "{count} 个代理"
+    },
+    "subagentUI": {
+      "prompt": "提示词",
+      "result": "结果",
+      "taskLabel": "子代理任务：{description} - {status}",
+      "backgroundTaskLabel": "后台任务：{description} - {status}",
+      "statusLabel": "状态：{status}",
+      "initializing": "初始化中",
+      "error": "错误",
+      "orphaned": "未完成",
+      "completed": "已完成",
+      "runningInBackground": "后台运行中",
+      "running": "运行中",
+      "orphanedResult": "对话在任务完成前已结束",
+      "lastTool": "最近工具：{name}",
+      "toolUse": "{count} 次工具调用",
+      "toolUses": "{count} 次工具调用",
+      "tokens": "{value} 个 token",
+      "compactTokens": "{value}k 个 token",
+      "previousRuns": "之前的运行（{count}）",
+      "runLabel": "第 {number} 次运行 · {status}"
     },
     "citations": {
       "memoryUsed": "引用的记忆",
@@ -245,6 +327,11 @@
       "active": "思考中，已用时 {seconds} 秒…",
       "completed": "思考了 {seconds} 秒",
       "label": "思考过程"
+    },
+    "contextUsage": {
+      "label": "上下文用量",
+      "details": "上下文用量：{details}",
+      "nearLimit": "（接近上限，运行 {command} 以继续）"
     },
     "suggestions": {
       "loading": "正在加载…",
@@ -314,6 +401,169 @@
     "pi": {
       "extension": "Pi 扩展",
       "notification": "Pi 扩展通知。"
+    },
+    "sessionMessage": {
+      "undelivered": "无法投递来自 {senders} 的消息。",
+      "fromLabel": "来自会话："
+    },
+    "sessionTools": {
+      "noSessions": "没有会话",
+      "thisSession": "本会话",
+      "truncated": "还有更多会话未显示",
+      "recipient": "接收方",
+      "model": "模型",
+      "reasoning": "推理",
+      "message": "消息",
+      "openSession": "打开会话 {sessionId}",
+      "openProviderSession": "打开 {provider} 会话 {sessionId}",
+      "sessionMissing": "该会话已不存在。",
+      "openFailed": "无法打开会话：{message}",
+      "openUnavailable": "无法从此处打开会话。",
+      "providersIncluded": "已包含可用的提供商和模型",
+      "newSession": "新会话",
+      "session": "会话",
+      "turns": "轮次",
+      "turnRange": "{from}–{to}，共 {total}",
+      "noTurns": "暂无",
+      "mode": "投递方式",
+      "modeSteer": "插入正在进行的轮次",
+      "modeInterrupt": "中断当前工作"
+    },
+    "modelPicker": {
+      "options": "模型选项",
+      "provider": "提供商",
+      "modelLabel": "模型：{label}",
+      "unavailable": "模型不可用",
+      "setup": "设置模型",
+      "guidance": "请在提供商设置中选择已启用的模型。如果发现失败，请刷新模型列表。",
+      "model": "模型",
+      "empty": "没有可用模型。请检查提供商设置；如果发现失败，请刷新模型列表。",
+      "changeModelFailed": "无法切换模型",
+      "defaultEffort": "默认",
+      "effortLabel": "思考强度 {label}",
+      "thinking": "思考",
+      "changeEffortFailed": "无法更改思考强度",
+      "fastActive": "快速模式已开启",
+      "fast": "快速",
+      "fastLabel": "快速模式：{label}",
+      "changeTierFailed": "无法更改服务层级"
+    },
+    "navigation": {
+      "scrollToTop": "滚动到顶部",
+      "previousMessage": "上一条消息",
+      "directory": "对话目录",
+      "nextMessage": "下一条消息",
+      "scrollToBottom": "滚动到底部",
+      "emptyDirectory": "此对话中暂无用户提示词"
+    },
+    "tabNavigation": {
+      "tabName": "标签页名称",
+      "renameTab": "重命名标签页…",
+      "resetName": "重置标签页名称",
+      "showNumber": "显示编号",
+      "showName": "显示名称",
+      "showTitle": "显示标题",
+      "closeTab": "关闭标签页",
+      "active": "当前",
+      "needsInput": "需要您输入",
+      "working": "工作中",
+      "errorReview": "因错误而停止，可供查看",
+      "finishedReview": "已完成，可供查看",
+      "idle": "空闲",
+      "badge": "{title}，{status}",
+      "namedBadge": "{label}（{title}），{status}",
+      "newTab": "新建标签页",
+      "newConversation": "新建对话",
+      "showWideFailed": "无法在双栏布局中显示会话",
+      "createTabFailed": "无法创建标签页",
+      "createConversationFailed": "无法创建对话",
+      "startConversationFailed": "无法开始新对话",
+      "switchFailed": "无法切换标签页",
+      "closeFailed": "无法关闭标签页",
+      "resize": "调整对话会话区域大小",
+      "previewCloseFailed": "无法关闭临时会话预览",
+      "commandNew": "新建",
+      "commandReplace": "替换当前对话",
+      "commandClose": "关闭当前标签页",
+      "commandRename": "重命名当前标签页"
+    },
+    "projects": {
+      "header": "项目",
+      "noSessions": "暂无会话",
+      "newSessionIn": "在 {name} 中新建会话",
+      "actionsFor": "{name} 的操作",
+      "newProjectAction": "新建项目",
+      "chipLabel": "项目：{name}",
+      "noProject": "无项目",
+      "menu": {
+        "edit": "编辑项目",
+        "openMemory": "打开项目记忆",
+        "archive": "归档项目",
+        "restore": "恢复项目",
+        "pin": "固定项目",
+        "unpin": "取消固定项目",
+        "delete": "删除项目",
+        "moveTo": "移动到项目…",
+        "moveSelectionTo": "将 {count} 个会话移动到项目…",
+        "removeFrom": "从项目中移除",
+        "removeSelectionFrom": "从项目中移除 {count} 个会话",
+        "removeSelectionFromPlural": "从项目中移除 {count} 个会话",
+        "newProject": "新建项目…"
+      },
+      "deleteConfirm": "删除项目“{name}”并将其记忆文件移到废纸篓？会话会保留，但不再属于任何项目。",
+      "errors": {
+        "create": "创建项目失败",
+        "update": "更新项目失败",
+        "delete": "删除项目失败",
+        "archive": "无法归档项目",
+        "restore": "无法恢复项目",
+        "pin": "更新项目固定状态失败",
+        "reorder": "重新排序项目失败",
+        "move": "将会话移动到项目失败",
+        "remove": "从项目中移除会话失败",
+        "start": "在此项目中新建会话失败"
+      },
+      "editor": {
+        "titleNew": "新建项目",
+        "titleEdit": "编辑项目",
+        "name": "名称",
+        "nameDesc": "显示在会话管理器和成员会话中。",
+        "namePlaceholder": "项目名称",
+        "iconButton": "项目图标：{icon}",
+        "iconDefault": "默认文件夹",
+        "iconPicker": "选择项目图标",
+        "iconSearch": "搜索图标",
+        "iconNoMatches": "没有匹配的图标。",
+        "instructions": "指令",
+        "instructionsDesc": "从下一轮起添加到每个成员会话的系统提示词中。",
+        "memoryPath": "记忆文件",
+        "memoryPathDesc": "项目记忆文件在库中的路径。缺少 .md 扩展名时会自动添加。更改后会移动该文件。",
+        "memoryPathPlaceholder": "文件夹/MEMORY.md",
+        "memoryPathInvalid": "请输入库内的文件路径，例如 Projects/MEMORY.md。",
+        "memoryPathTaken": "{path} 已被某个文件或其他项目使用。",
+        "openMemory": "打开",
+        "nameRequired": "请输入项目名称。"
+      },
+      "memory": {
+        "title": "项目记忆：{name}",
+        "reload": "重新加载",
+        "overwrite": "覆盖",
+        "recreate": "从模板重新创建",
+        "edit": "编辑",
+        "preview": "预览",
+        "missing": "项目记忆文件不存在。",
+        "conflict": "记忆文件在加载后已被修改。重新加载将丢弃你的编辑，覆盖则保留你的编辑。",
+        "loadFailed": "加载项目记忆失败",
+        "saveFailed": "保存项目记忆失败",
+        "saved": "项目记忆已保存",
+        "loading": "加载中…",
+        "updated": "{time}更新",
+        "changedOutside": "记忆文件已在此窗口之外被更新，可能是代理所为。",
+        "keepMine": "保留我的编辑",
+        "discardConfirm": "放弃对项目记忆的未保存更改？",
+        "discard": "放弃",
+        "emptyHint": "代理会随着项目推进填写这里。"
+      }
     }
   },
   "settings": {
@@ -558,21 +808,8 @@
       }
     },
     "codex": {
-      "installationMethod": {
-        "name": "安装方式",
-        "desc": "Claudian 在 Windows 上启动 Codex 的方式。原生 Windows 使用 Windows 可执行文件路径；WSL 会在所选发行版内启动 Linux CLI。",
-        "nativeWindows": "原生 Windows",
-        "wsl": "WSL"
-      },
       "cliPath": {
-        "name": "Codex CLI 路径",
-        "validation": {
-          "wslWindowsPath": "WSL 模式需要 Linux 命令或 Linux 绝对路径，而不是 Windows 可执行文件路径。"
-        }
-      },
-      "wslDistroOverride": {
-        "name": "WSL 发行版覆盖",
-        "desc": "可选高级覆盖。留空时会尽可能从 WSL 工作区路径推断发行版，否则使用默认 WSL 发行版。"
+        "name": "Codex CLI 路径"
       },
       "safeMode": {
         "workspaceWrite": "工作区可写",
@@ -648,12 +885,13 @@
       }
     },
     "opencode": {
+      "emptyModels": "OpenCode 服务端没有为此仓库返回已启用的模型。请检查仓库的 .opencode/opencode.json 和 OpenCode 日志（运行 opencode debug paths 查看位置）。使用 OpenCode v2 时，配置的 V1 插件可能不兼容。请在仓库中运行 opencode models --standalone 对比，然后点击“发现”。",
       "environment": {
         "name": "OpenCode 环境变量",
         "desc": "传递给 OpenCode 的额外环境变量。"
       },
       "migrationNotice": {
-        "text": "Claudian 现已支持 OpenCode v2。OpenCode v1 支持将于 2026 年 10 月 30 日结束。",
+        "text": "OpenCode v1 已不再受支持。请更新到 OpenCode v2 以在 Claudian 中使用。",
         "link": "迁移到 OpenCode v2"
       }
     },
@@ -661,6 +899,9 @@
       "environment": {
         "name": "Pi 环境变量",
         "desc": "仅传递给 Pi 的环境变量。"
+      },
+      "models": {
+        "desc": "Claudian 维护独立于 Pi enabledModels 的模型列表。Discover 会列出 Pi 在当前环境中可认证的所有模型，并按 Pi 实际调用的提供商路由分组。路由决定凭据和计费。"
       }
     },
     "grok": {
@@ -669,16 +910,21 @@
         "desc": "仅传递给 Grok Build 的环境变量。自定义模型的密钥保留在此提供商范围内，并在原生配置中通过 env_key 引用。"
       }
     },
+    "antigravity": {
+      "environment": {
+        "name": "Antigravity 环境变量",
+        "desc": "仅传递给 Antigravity（agy）的环境变量，例如 GEMINI_API_KEY。"
+      }
+    },
     "deepseek": {
       "installation": {
         "desc": "自动模式优先使用 dsh，其次检测 macOS 或 Windows 上的 Desktop。两者都已安装时，输入 Desktop 的 .app 路径或 Windows 安装文件夹即可选择它。请先打开 Desktop 完成初始设置。",
-        "desktop": "使用你的原生 Desktop 配置文件。",
-        "web": "使用你的原生 Web 配置文件。"
+        "wslDesc": "WSL 需要在所选发行版中安装 Linux Node.js 和 npm dsh，并配置其原生 Web 配置。DeepSeek Harness Desktop 不能作为 WSL 安装使用。请在该发行版中安装 @deepseek-ai/dsh，或选择“原生 Windows”以使用 Desktop。"
       },
       "preset": "预设",
       "codeMode": {
         "name": "启用代码模式",
-        "desc": "从每个对话的下一轮开始生效，包括已有对话。在直接工具之外添加原生 run_code。"
+        "desc": "从每个对话的下一轮开始生效，包括已有对话。模型通过原生 run_code 程序调用工具，而不是直接调用。"
       },
       "presetPlugins": {
         "name": "附加预设插件",
@@ -772,6 +1018,19 @@
         "failed": "同步失败:{message}",
         "summary": "已移动 {moved},已转换 {converted},已移到回收站 {trashed},已移除 {unlinked} 个链接。"
       }
+    },
+    "executionTarget": {
+      "installationMethod": {
+        "name": "安装方式",
+        "desc": "Claudian 在 Windows 上启动 {provider} 的方式。原生 Windows 使用 Windows 可执行文件路径；WSL 会在所选发行版内启动 Linux CLI。",
+        "nativeWindows": "原生 Windows",
+        "wsl": "WSL"
+      },
+      "wslDistroOverride": {
+        "name": "WSL 发行版覆盖",
+        "desc": "可选高级覆盖。留空时会尽可能从 WSL 工作区路径推断发行版，否则使用默认 WSL 发行版。"
+      },
+      "wslWindowsPath": "WSL 模式需要 Linux 命令或 Linux 绝对路径，而不是 Windows 可执行文件路径。"
     }
   }
 }

@@ -16,7 +16,6 @@ export type ProviderExecutionInputBlock =
 
 export interface ProviderLinkedContentContext {
   readonly path: string;
-  readonly content?: string;
 }
 
 export interface ProviderSessionReference {
@@ -24,7 +23,6 @@ export interface ProviderSessionReference {
   readonly title: string;
   readonly providerId: string;
   readonly updatedAt: string;
-  readonly snapshotPath: string;
 }
 
 export type ProviderSelectionSnapshot =
@@ -33,19 +31,29 @@ export type ProviderSelectionSnapshot =
   | { readonly kind: 'canvas'; readonly selection: CanvasSelectionContext };
 
 export interface ProviderExecutionContext {
-  /** Ordered captures; when present, supersedes the legacy singular selection fields. */
+  /** Selections in capture order. */
   readonly selections?: readonly ProviderSelectionSnapshot[];
   readonly sessionReferences?: readonly ProviderSessionReference[];
   readonly linkedContent?: ProviderLinkedContentContext;
-  readonly editorSelection?: EditorSelectionContext | null;
-  readonly browserSelection?: BrowserSelectionContext | null;
-  readonly canvasSelection?: CanvasSelectionContext | null;
 }
 
+export type ProviderExplicitInstructionPurpose = 'title' | 'inline-edit';
+
+/**
+ * Literal text resolved by callers; adapters deliver it using native transport and kind/purpose framing.
+ * Changes normally apply from the next turn. Providers with immutable native session prompts retain the
+ * creation-time instructions until a new session. Non-persistent sessions may refuse changes that would lose context.
+ */
 export type ProviderSystemInstructions =
-  | { readonly kind: 'provider-default' }
+  | {
+      /** The default Main Agent prompt, built by the shared core prompt builder. */
+      readonly kind: 'main-agent';
+      readonly projectId?: string;
+      readonly instructions: string;
+    }
   | {
       readonly kind: 'explicit';
+      readonly purpose: ProviderExplicitInstructionPurpose;
       readonly instructions: string;
     };
 
@@ -56,7 +64,6 @@ export interface ProviderExecutionConfiguration {
   readonly reasoning?: string | null;
   readonly permissionMode?: string;
   readonly serviceTier?: string;
-  readonly readableRoots?: readonly string[];
   /** Request a transient next-prompt prediction, subject to provider settings and support. Omitted for auxiliary work. */
   readonly promptSuggestions?: boolean;
 }
@@ -84,7 +91,7 @@ export type ProviderToolPolicy =
  *
  * Provider backends resolve their own settings at execution time and map this
  * desired configuration into their native protocol. This contract deliberately
- * carries no feature-purpose discriminator, provider credentials, environment,
+ * carries resolved instruction purpose, but no provider credentials, environment,
  * or opaque provider settings bag.
  */
 export interface ProviderExecutionRequest {

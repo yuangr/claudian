@@ -2,17 +2,20 @@ import { NOOP_TASK_RESULT_INTERPRETER } from '../../core/providers/NoopTaskResul
 import type { ProviderModule } from '../../core/providers/types';
 import {
   codexWorkspaceRegistration,
+  getCodexWorkspaceServices,
 } from './app/CodexWorkspaceServices';
 import { CODEX_PROVIDER_CAPABILITIES } from './capabilities';
 import { codexModelPolicy } from './CodexModelPolicy';
+import { getVisibleCodexModelIds } from './config';
 import { codexSettingsReconciler } from './env/CodexSettingsReconciler';
 import { CodexExecutionBackend } from './execution/CodexExecutionBackend';
 import { CodexConversationHistoryService } from './history/CodexConversationHistoryService';
 import { findCodexModel } from './models';
 import { formatCodexQuestionReply } from './normalization/codexQuestionNormalization';
 import { codexSubagentLifecycleAdapter } from './normalization/codexSubagentNormalization';
+import { resolveCodexExecutionWorkingDirectory } from './runtime/codexAppServerSupport';
 import {
-  getCodexProviderSettings, getVisibleCodexModelIds,
+  getCodexProviderSettings,
   normalizeCodexStoredConfig, projectCodexModelSettings, updateCodexProviderSettings
 } from './settings';
 import { codexChatUIConfig } from './ui/CodexChatUIConfig';
@@ -44,7 +47,11 @@ export const codexProviderRegistration: ProviderModule = {
       return normalization.changed;
     },
   },
-  createExecutionBackend: (plugin) => new CodexExecutionBackend(plugin),
+  resolveExecutionWorkingDirectory: (plugin, workingDirectory) => resolveCodexExecutionWorkingDirectory(plugin.getRuntimeHost('codex'), workingDirectory),
+  createExecutionBackend: (plugin) => new CodexExecutionBackend(
+    plugin.getRuntimeHost('codex'),
+    () => getCodexWorkspaceServices().runtime,
+  ),
 
   historyService: new CodexConversationHistoryService(),
   taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,

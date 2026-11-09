@@ -1,6 +1,4 @@
-import { createReadStream } from 'node:fs';
 import * as fsp from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import type * as fs from 'fs';
@@ -12,9 +10,13 @@ import {
   parseImageDataUri,
 } from '@/core/execution/imageAttachment';
 import { extractUserDisplayContent } from '@/core/prompt/promptContext';
+import { unwrapRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
+import { decodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
+import type { NormalizedCodexToolCall } from '@/providers/codex/normalization/codexToolNormalization';
 import {
   extractCodexUserVisibleText,
   joinCodexUserTextParts,
+  trimCodexUserText,
 } from '@/providers/codex/normalization/codexUserText';
 import { forEachJSONLLine } from '@/utils/jsonlFile';
 
@@ -27,7 +29,7 @@ import type {
   SubagentInfo,
   ToolCallInfo,
 } from '../../../core/types';
-import { createTurnStats, isTokenCount } from '../../../core/types';
+import { createTurnStats, isTokenCount, settleInterruptedTurn } from '../../../core/types';
 import {
   normalizeCodexMemoryCitation,
   stripCodexMemoryCitationMarkup,
@@ -46,9 +48,6 @@ import {
   isCodexInternalToolCall,
   isCodexSilentWriteStdinCall,
   isCodexToolOutputError,
-  normalizeCodexMCPToolInput,
-  normalizeCodexMCPToolName,
-  normalizeCodexMCPToolState,
   normalizeCodexToolCall,
   normalizeCodexToolResult,
   normalizeCodexWebSearchInput,
@@ -58,7 +57,7 @@ import {
 } from '../normalization/codexToolNormalization';
 
 interface PersistedMessagePart {
-  image_url?: string | { url?: string };
+  image_url?: string;
   type?: string;
   text?: string;
 }
@@ -101,19 +100,6 @@ interface PersistedWebSearchCallPayload {
     pattern?: string;
   };
   status?: string;
-  call_id?: string;
-}
-
-interface PersistedMCPToolCallPayload {
-  type: 'mcp_tool_call';
-  server?: string;
-  tool?: string;
-  call_id?: string;
-  status?: string;
-  arguments?: string | Record<string, unknown>;
-  result?: { content?: Array<{ type?: string; text?: string }> } | null;
-  error?: string | null;
-  duration_ms?: number | null;
 }
 
 interface PersistedEventPayload {
@@ -187,7 +173,6 @@ type PersistedPayload =
   | PersistedToolCallPayload
   | PersistedToolCallOutputPayload
   | PersistedWebSearchCallPayload
-  | PersistedMCPToolCallPayload
   | PersistedCompactionPayload
   | PersistedEventPayload
   | undefined;
@@ -296,7 +281,7 @@ function pushToolInvocation(bubble: CodexAssistantBubble, toolCall: ToolCallInfo
 }
 
 function appendUniqueChunk(chunks: string[], value: string): void {
-  const trimmed = value.trim();
+  const trimmed = trimCodexUserText(value);
   if (!trimmed) return;
   if (chunks[chunks.length - 1] === trimmed) return;
   chunks.push(trimmed);
@@ -443,8 +428,9 @@ function extractUserMessageText(content: PersistedMessagePart[] | undefined): st
     return '';
   }
 
+  // Decode replay envelopes intact; image cleanup would change their recorded length.
   return joinCodexUserTextParts(
-    content.map(part => (typeof part?.text === 'string' ? part.text : '')),
+    content.map(part => (typeof part?.text === 'string' ? unwrapRecoveryPrompt(part.text) : '')),
   );
 }
 
@@ -463,12 +449,7 @@ function extractMessageImages(
       continue;
     }
 
-    const imageUrl = typeof part.image_url === 'string'
-      ? part.image_url
-      : typeof part.image_url?.url === 'string'
-        ? part.image_url.url
-        : null;
-    const parsed = parseImageDataUri(imageUrl);
+    const parsed = parseImageDataUri(part.image_url);
     if (!parsed) {
       continue;
     }
@@ -496,12 +477,7 @@ function hasMessageImages(content: PersistedMessagePart[] | undefined): boolean 
     if (part?.type !== 'input_image') {
       return false;
     }
-    const imageUrl = typeof part.image_url === 'string'
-      ? part.image_url
-      : typeof part.image_url?.url === 'string'
-        ? part.image_url.url
-        : null;
-    return parseImageDataUri(imageUrl) !== null;
+    return parseImageDataUri(part.image_url) !== null;
   });
 }
 
@@ -648,7 +624,7 @@ function processPersistedToolCall(
 
 function processPersistedNormalizedToolCall(
   callId: string,
-  normalized: { name: string; input: Record<string, unknown> },
+  normalized: NormalizedCodexToolCall,
   timestamp: number,
   ctx: PersistedParseContext,
 ): void {
@@ -682,7 +658,7 @@ function processPersistedNormalizedToolCall(
 
 function pushPersistedNormalizedToolCall(
   callId: string,
-  normalized: { name: string; input: Record<string, unknown> },
+  normalized: NormalizedCodexToolCall,
   timestamp: number,
   ctx: PersistedParseContext,
 ): void {
@@ -699,6 +675,7 @@ function pushPersistedNormalizedToolCall(
     id: callId,
     name: normalized.name,
     input: normalized.input,
+    ...(normalized.providerPayload ? { providerPayload: normalized.providerPayload } : {}),
     status: 'running',
   };
 
@@ -935,7 +912,7 @@ function readPersistedCommandToolResult(rawOutputText: string): {
     metadata = metadata.value as Record<string, unknown>;
     commandResultText = JSON.stringify(metadata);
   }
-  const exitCodeMatch = commandResultText.match(/(?:Exit code:|Process exited with code)\s*(-?\d+)/i);
+  const exitCodeMatch = commandResultText.match(/(?:Exit code:|Process exited with code) (-?\d+)/i);
   const exitCode = typeof metadata.exit_code === 'number' && Number.isInteger(metadata.exit_code)
     ? metadata.exit_code
     : exitCodeMatch ? Number(exitCodeMatch[1]) : undefined;
@@ -1026,11 +1003,9 @@ function processPersistedWebSearchCall(
   const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
   const bubble = ensureAssistantBubble(turn, timestamp);
 
-  // Persisted web_search_call entries commonly omit call_id. Use transcript line index
-  // so live tailing and history reload reconstruct the same visible tool sequence.
-  const callId = payload.call_id || `tail-ws-${lineIndex}`;
-
-  if (bubble.toolIndexesById.has(callId)) return;
+  // Native web_search_call entries have no call_id. Use transcript line index
+  // for stable, distinct IDs across repeated history loads.
+  const callId = `tail-ws-${lineIndex}`;
 
   const input = normalizeCodexWebSearchInput({ action: payload.action });
   const isError = isCodexFailedToolStatus(payload.status);
@@ -1045,43 +1020,6 @@ function processPersistedWebSearchCall(
   };
 
   pushToolInvocation(bubble, toolCall);
-
-  ctx.toolCallToTurn.set(callId, {
-    turnId: turn.id,
-    bubbleIndex: turn.assistantBubbles.indexOf(bubble),
-  });
-}
-
-function processPersistedMCPToolCall(
-  payload: PersistedMCPToolCallPayload,
-  timestamp: number,
-  ctx: PersistedParseContext,
-): void {
-  const callId = payload.call_id;
-  if (!callId) return;
-
-  const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
-  const bubble = ensureAssistantBubble(turn, timestamp);
-
-  if (bubble.toolIndexesById.has(callId)) return;
-
-  const normalizedInput = normalizeCodexMCPToolInput(payload.arguments);
-  const normalizedState = normalizeCodexMCPToolState(payload.status, payload.result, payload.error);
-
-  const toolCall: ToolCallInfo = {
-    id: callId,
-    name: normalizeCodexMCPToolName(payload.server, payload.tool),
-    input: normalizedInput,
-    status: normalizedState.status,
-    ...(normalizedState.result ? { result: normalizedState.result } : {}),
-  };
-
-  pushToolInvocation(bubble, toolCall);
-
-  ctx.toolCallToTurn.set(callId, {
-    turnId: turn.id,
-    bubbleIndex: turn.activeBubbleIndex!,
-  });
 }
 
 function applyQuestionReplies(text: string, ctx: PersistedParseContext): boolean {
@@ -1167,10 +1105,6 @@ function processPersistedPayload(
 
     case 'web_search_call':
       processPersistedWebSearchCall(payload as PersistedWebSearchCallPayload, timestamp, lineIndex, ctx);
-      break;
-
-    case 'mcp_tool_call':
-      processPersistedMCPToolCall(payload as PersistedMCPToolCallPayload, timestamp, ctx);
       break;
 
     case 'compaction':
@@ -1266,7 +1200,9 @@ function processEventMsg(
 
     case 'user_message': {
       const turn = ensureTurn(ctx.turns, ctx.turnOrder, nextTurnId(ctx), ctx.currentTurnId, timestamp);
-      const msg = payload.message;
+      const msg = typeof payload.message === 'string'
+        ? unwrapRecoveryPrompt(payload.message)
+        : payload.message;
       if (typeof msg === 'string') {
         const isQuestionReply = applyQuestionReplies(msg, ctx);
         const visibleText = extractCodexUserVisibleText(msg);
@@ -1346,11 +1282,13 @@ function flushBubbleTurnMessages(
   const visibleUserText = extractCodexUserVisibleText(rawUserText);
   const userImages = turn.userImages.length > 0 ? turn.userImages : undefined;
   if (visibleUserText || userImages || isQuestionReply) {
+    const sessionMessage = decodeSessionMessage(rawUserText);
     const extractedDisplay = visibleUserText ? extractUserDisplayContent(visibleUserText) : undefined;
     const displayContent = extractedDisplay ?? (isQuestionReply ? visibleUserText ?? '' : undefined);
     messages.push({
       id: `codex-msg-${msgIndex}`,
       role: 'user',
+      ...(sessionMessage ? { sessionMessage: { from: sessionMessage.from, sessionId: sessionMessage.sessionId } } : {}),
       content: isQuestionReply ? rawUserText : visibleUserText ?? '',
       ...(displayContent !== undefined ? { displayContent } : {}),
       ...(userImages ? { images: userImages } : {}),
@@ -1415,6 +1353,9 @@ function flushBubbleTurnMessages(
     const lastMsg = assistantMessages[assistantMessages.length - 1];
     lastMsg.durationSeconds = Math.round(durationMs / 1000);
   }
+  // A turn's bubbles share its native turn ID; an interrupted one has no completion.
+  for (const message of messages) if (message.role === 'assistant') message.turnId = turn.id;
+  if (turn.assistantBubbles.some(bubble => bubble.interrupted)) settleInterruptedTurn(assistantMessages);
 
   if (turn.completed && assistantMessages.length > 0) {
     const lastNonInterrupt = [...assistantMessages].reverse().find(m => !m.isInterrupt);
@@ -1435,7 +1376,8 @@ function flushBubbleTurnMessages(
 const SAFE_SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 function getPathModuleForSessionPath(sessionPath: string): typeof path.posix {
-  return sessionPath.includes('\\') || /^[A-Za-z]:/.test(sessionPath)
+  return (!path.posix.isAbsolute(sessionPath) || sessionPath.startsWith('//'))
+    && (sessionPath.includes('\\') || /^[A-Za-z]:/.test(sessionPath))
     ? path.win32
     : path.posix;
 }
@@ -1472,6 +1414,8 @@ export async function findCodexSessionFileAsync(
     return null;
   }
 
+  // Codex compresses older rollouts in place.
+  const rolloutNames = [`-${threadId}.jsonl`, `-${threadId}.jsonl.zst`];
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const pathExists = dependencies.pathExists ?? defaultPathExists;
   const readDirectory = dependencies.readDirectory
@@ -1496,8 +1440,8 @@ export async function findCodexSessionFileAsync(
     let entries: fs.Dirent[];
     try {
       entries = await runBeforeDeadline(() => readDirectory(current), deadline);
-    } catch {
-      if (Date.now() >= deadline) {
+    } catch (error) {
+      if (error instanceof CodexHistoryDeadlineError) {
         return null;
       }
       continue;
@@ -1506,7 +1450,7 @@ export async function findCodexSessionFileAsync(
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(fullPath);
-      } else if (entry.isFile() && entry.name.endsWith(`-${threadId}.jsonl`)) {
+      } else if (entry.isFile() && rolloutNames.some(name => entry.name.endsWith(name))) {
         return fullPath;
       }
     }
@@ -1519,18 +1463,30 @@ export interface CodexSessionFileLookupDependencies {
   readDirectory?: (value: string) => Promise<fs.Dirent[]>;
 }
 
-async function runBeforeDeadline<T>(
+/**
+ * The bounded lookup's deadline passed. Callers branch on this error rather than the clock, because
+ * the deadline timer can fire slightly before `Date.now()` reaches the deadline.
+ */
+export class CodexHistoryDeadlineError extends Error {
+  constructor() {
+    super('Codex history lookup deadline exceeded.');
+    this.name = 'CodexHistoryDeadlineError';
+  }
+}
+
+/** Rejects once the deadline passes, so a stalled filesystem cannot hold a bounded lookup open. */
+export async function runBeforeDeadline<T>(
   operation: () => Promise<T>,
   deadline: number,
 ): Promise<T> {
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) {
-    throw new Error('Codex history lookup deadline exceeded.');
+    throw new CodexHistoryDeadlineError();
   }
 
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => {
-      reject(new Error('Codex history lookup deadline exceeded.'));
+      reject(new CodexHistoryDeadlineError());
     }, remainingMs);
     operation().then(
       (value) => {
@@ -1539,7 +1495,8 @@ async function runBeforeDeadline<T>(
       },
       (error) => {
         window.clearTimeout(timer);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        // Keep error objects intact; callers branch on codes such as ENOENT.
+        reject(typeof error === 'object' && error !== null ? error as Error : new Error(String(error)));
       },
     );
   });
@@ -1584,12 +1541,9 @@ export interface CodexParsedTurn {
   messages: ChatMessage[];
 }
 
-export function parseCodexSessionContent(content: string): ChatMessage[] {
-  const turns = parseCodexSessionTurns(content);
-  return turns.flatMap(t => t.messages);
-}
-
 /** Shared checkpoint rules for in-memory and streaming model recovery. */
+const MODEL_RECOVERY_CHUNK_BYTES = 64 * 1024;
+
 class SessionModelReader {
   model: string | null = null;
   reached = false;
@@ -1610,21 +1564,12 @@ class SessionModelReader {
 
 /** Stream model metadata; checkpoint recovery does not read the remainder of the file. */
 export async function readCodexSessionModel(file: string, resumeAtTurnId?: string): Promise<string | null> {
-  const input = createReadStream(file, { encoding: 'utf8' });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  const timer = window.setTimeout(() => input.destroy(new Error('Codex model recovery timed out.')), 10_000);
   const reader = new SessionModelReader(resumeAtTurnId);
-  try {
-    for await (const line of lines) {
-      reader.accept(line);
-      if (reader.reached) break;
-    }
-    return reader.result();
-  } finally {
-    window.clearTimeout(timer);
-    lines.close();
-    input.destroy();
-  }
+  await forEachJSONLLine(file, (line) => {
+    reader.accept(line);
+    return !reader.reached;
+  }, { chunkBytes: MODEL_RECOVERY_CHUNK_BYTES });
+  return reader.result();
 }
 
 export function parseCodexSessionRecordLines(lines: readonly string[]): CodexSessionRecord[] {

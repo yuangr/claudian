@@ -1,6 +1,7 @@
 import { findClaudeModelOption, getClaudeModelOptions } from '@/providers/claude/modelOptions';
+import { getClaudeModelSource } from '@/providers/claude/settings';
 
-const settings = (config: Record<string, unknown>) => ({ providerConfigs: { claude: config } });
+const settings = (config: Record<string, unknown>) => getClaudeModelSource({ providerConfigs: { claude: config } });
 
 describe('Claude SDK model catalog', () => {
   it.each([
@@ -82,4 +83,10 @@ describe('Claude SDK model catalog', () => {
       visibleModels: [],
     }))).toEqual([]);
   });
+});
+
+it.each(['constructor', 'toString', '__proto__'])('keeps the native label when %s has no own alias', id => {
+  expect(getClaudeModelOptions(settings({
+    discoveredModels: [{ value: id, label: 'Gateway model', description: '' }], visibleModels: [id],
+  }))).toEqual([expect.objectContaining({ label: 'Gateway model' })]);
 });

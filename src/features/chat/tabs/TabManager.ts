@@ -1,11 +1,12 @@
-import { Notice } from 'obsidian';
+import { type App, Notice } from 'obsidian';
 
 import { type AppTabManagerState, normalizeTabLabel } from '@/core/bootstrap/tabManagerState';
 import type { ProviderId } from '@/core/providers/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
-import { type DraftSessionHold, SessionAlreadyAttached } from '@/features/chat/sessions/SessionRuntimePool';
+import { type DraftSessionHold, SessionAlreadyAttached, type SessionRevealOptions } from '@/features/chat/sessions/SessionRuntimePool';
 import type { TabBarItem, TabId, TabManagerInterface, TabManagerViewHost } from '@/features/chat/tabs/ChatTab';
+import { inheritedDraftSeed } from '@/features/chat/tabs/draftSeed';
 import type { ForkTargetHost } from '@/features/chat/tabs/forking/ForkTarget';
 import { ParkedDrafts } from '@/features/chat/tabs/ParkedDrafts';
 import { TabActivation } from '@/features/chat/tabs/TabActivation';
@@ -36,10 +37,11 @@ import { createTabRuntimeCallbacks, type TabRuntimeCallbackHost } from '@/featur
 import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type {
   AssembledTabRuntime,
+  DraftSeed,
   TabLayoutPolicy,
   TabManagerCallbacks,
 } from '@/features/chat/tabs/types';
-import { ViewerSlot } from '@/features/chat/tabs/ViewerSlot';
+import { linkedContentExists, ViewerSlot } from '@/features/chat/tabs/ViewerSlot';
 import type { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 import { revealWorkspaceLeaf } from '@/utils/obsidianCompat';
 
@@ -47,12 +49,27 @@ type CreateTabOptions = {
   activate?: boolean;
   draftModel?: string;
   providerId?: ProviderId | null;
+  /** Applied to a blank draft before it is published. */
+  seed?: DraftSeed;
 };
 
 type AdmissionOptions = CreateTabOptions & {
   lifecycleState?: Extract<AssembledTabRuntime['lifecycleState'], 'provisional' | 'open'>;
   draftSessionKey?: string;
 };
+
+/**
+ * Seeds a blank draft before publication; the caller rolls back the unpublished tab if this throws, including for
+ * Linked content deleted while the draft was assembled.
+ */
+function applyDraftSeed(app: Pick<App, 'vault'>, tab: AssembledTabRuntime, seed: DraftSeed | undefined): void {
+  if (!seed || tab.conversationId) return;
+  if (seed.linkedContentPath !== undefined) {
+    if (!linkedContentExists(app, seed.linkedContentPath)) throw new Error('Linked content is no longer available');
+    tab.linkedContent.selectExplicit(seed.linkedContentPath);
+  }
+  if (seed.projectId !== undefined) tab.controllers.conversationController.seedDraftProject(seed.projectId);
+}
 
 /** In the narrow layout a saved preview of a session that has a narrow tab returns to that tab. */
 function returnPreviewToNarrowTab(state: AppTabManagerState): AppTabManagerState {
@@ -98,7 +115,6 @@ export class TabManager implements TabManagerInterface {
   readonly viewerSlot: ViewerSlot;
   private destructionPromise: Promise<void> | null = null;
   private shutdownDrainPromise: Promise<void> | null = null;
-  private shutdownSnapshotOpen = false;
 
   constructor(
     plugin: ChatFeatureHost,
@@ -139,6 +155,12 @@ export class TabManager implements TabManagerInterface {
       ensureWorkspaceServices: (tab, providerId, reason) => (
         this.providerPresence.ensureWorkspaceServices(tab, providerId, reason)
       ),
+      revalidateSession: tab => {
+        const { conversationId } = tab;
+        if (!conversationId) return null;
+        const attachment = plugin.sessionRuntimes.getAttachment(conversationId);
+        return attachment?.runtime === tab.session.runtime ? plugin.sessionRuntimes.revalidate(conversationId, attachment) : null;
+      },
     });
     this.navigation = new TabConversationNavigation({
       plugin,
@@ -172,16 +194,19 @@ export class TabManager implements TabManagerInterface {
       navigation: this.navigation,
       layoutPolicy,
       forkTargetHost,
-      isShutdownSnapshotOpen: () => this.shutdownSnapshotOpen,
-      startNew: tab => this.navigation.enqueue(tab, async isCurrent => { await this.rebindTab(tab, null, isCurrent); }),
+      inheritedSeed: tab => inheritedDraftSeed(this.plugin.projects, tab),
+      startNew: (tab, seed) => this.navigation.enqueue(tab, async (isCurrent) => {
+        await this.rebindTab(tab, null, isCurrent, { seed });
+      }),
     };
     this.viewerSlot = new ViewerSlot({
       app: plugin.app,
       membership,
       navigation: this.navigation,
       // A held session keeps its own selection; only a new draft takes the saved one.
-      createPreview: (conversationId, draft) => this.#createTab(conversationId, undefined, {
+      createPreview: (conversationId, draft, seed) => this.#createTab(conversationId, undefined, {
         lifecycleState: 'provisional',
+        ...(seed ? { seed } : {}),
         ...(draft?.draftSessionKey ? { draftSessionKey: draft.draftSessionKey }
           : draft?.draftModel ? { draftModel: draft.draftModel, providerId: draft.providerId ?? null }
             : {}),
@@ -267,6 +292,7 @@ export class TabManager implements TabManagerInterface {
       providerId,
       lifecycleState = 'open',
       draftSessionKey,
+      seed,
     } = options;
 
     const conversation = conversationId
@@ -287,7 +313,7 @@ export class TabManager implements TabManagerInterface {
         ...(providerId !== undefined ? { providerId } : {}),
         lifecycleState,
         ...(draftSessionKey ? { draftSessionKey } : {}),
-        revealSession: isCurrent => this.revealTab(runtimeTabId, isCurrent),
+        revealSession: (isCurrent, options) => this.revealTab(runtimeTabId, isCurrent, options),
         ...createTabRuntimeCallbacks(this.runtimeCallbackHost, () => tab),
       });
 
@@ -319,6 +345,8 @@ export class TabManager implements TabManagerInterface {
       if (restoredIdentity) tab.session.setLabel(restoredIdentity.label ?? null);
       this.commandDiscovery.registerTab(tab.id);
       this.parkedDrafts.restoreInto(tab);
+      // A reattached held draft keeps its own seed, which its pending first turn may have frozen.
+      if (!draftSessionKey) applyDraftSeed(this.plugin.app, tab, seed);
     } catch (error) {
       const rollbackErrors = await this.#discardUnpublished(tab, runtimeTabId);
       if (rollbackErrors.length > 0) {
@@ -377,7 +405,7 @@ export class TabManager implements TabManagerInterface {
     } catch (error) {
       errors.push(error);
     }
-    errors.push(...this.commandDiscovery.releaseTab(tabId));
+    this.commandDiscovery.releaseTab(tabId);
     return errors;
   }
 
@@ -386,15 +414,14 @@ export class TabManager implements TabManagerInterface {
     previousActiveTabId: TabId | null,
   ): Promise<unknown[]> {
     const { membership } = this;
-    const rollbackErrors: unknown[] = [];
     if (membership.getTab(tab.id) !== tab) {
-      rollbackErrors.push(...this.commandDiscovery.releaseTab(tab.id));
-      return rollbackErrors;
+      this.commandDiscovery.releaseTab(tab.id);
+      return [];
     }
 
     membership.beginClose(tab.id);
-    rollbackErrors.push(...this.commandDiscovery.releaseTab(tab.id));
-    rollbackErrors.push(...this.activation.rollbackAdmission(tab, previousActiveTabId));
+    this.commandDiscovery.releaseTab(tab.id);
+    const rollbackErrors = this.activation.rollbackAdmission(tab, previousActiveTabId);
 
     membership.remove(tab.id);
     try {
@@ -430,11 +457,16 @@ export class TabManager implements TabManagerInterface {
     await this.activation.switchTo(tabId);
   }
 
-  private async revealTab(tabId: TabId, isCurrent: () => boolean = () => true): Promise<void> {
+  private async revealTab(tabId: TabId, isCurrent: () => boolean = () => true, options: SessionRevealOptions = {}): Promise<void> {
     const identity = this.membership.getIdentity(tabId);
     await revealWorkspaceLeaf(this.plugin.app.workspace, this.view.leaf);
+    if (!isCurrent()) return;
+    // Navigation joins teardown so it can choose another owner after attachment release.
+    // Duplicate-owner lookup during assembly must not join: it may itself be the close's successor.
+    if (options.awaitClose && this.membership.isCloseClaimed(tabId)) await this.closePolicy.drain();
     if (!isCurrent() || !identity || !this.membership.isTabAlive(identity)) return;
     await this.switchToTab(tabId);
+    if (options.awaitClose && this.membership.isCloseClaimed(tabId)) await this.closePolicy.drain();
   }
 
   /** Replaces presentation in place; the prior session stays independently owned by the pool. */
@@ -442,7 +474,7 @@ export class TabManager implements TabManagerInterface {
     source: AssembledTabRuntime,
     conversationId: string | null,
     isCurrent: () => boolean = () => this.membership.isTabAlive(source),
-    options: { parkSourceDrafts?: boolean } = {},
+    options: { parkSourceDrafts?: boolean; seed?: DraftSeed } = {},
   ): Promise<AssembledTabRuntime | null> {
     if (!isCurrent() || !this.membership.isTabStateMutable(source)) return null;
     if (conversationId && source.conversationId === conversationId) return source;
@@ -458,7 +490,7 @@ export class TabManager implements TabManagerInterface {
         plugin: this.plugin, containerEl: this.containerEl, component: this.view,
         mentionDataProvider: this.mentionDataProvider, initialState: identity, tabId: source.id,
         conversation: conversation ?? undefined,
-        revealSession: isCurrent => this.revealTab(source.id, isCurrent),
+        revealSession: (isCurrent, options) => this.revealTab(source.id, isCurrent, options),
         ...createTabRuntimeCallbacks(this.runtimeCallbackHost, () => target),
       });
       await target.session.runtime.model.hydrate();
@@ -476,6 +508,7 @@ export class TabManager implements TabManagerInterface {
         }
       }
       this.parkedDrafts.restoreInto(target);
+      applyDraftSeed(this.plugin.app, target, options.seed);
       const wasActive = this.membership.getActiveTabId() === source.id;
       if (wasActive) deactivateTab(source);
       this.membership.install(target);
@@ -502,10 +535,6 @@ export class TabManager implements TabManagerInterface {
       if (error instanceof SessionAlreadyAttached) { await error.attachment.owner.reveal(); return null; }
       throw error;
     }
-  }
-
-  getTabSwitchRequestRevision(): number {
-    return this.activation.requestRevision;
   }
 
   async waitForTabSwitchIdle(): Promise<void> {
@@ -640,10 +669,10 @@ export class TabManager implements TabManagerInterface {
     const { membership } = this;
     const state = this.layoutPolicy.showsPreviews() ? savedState : returnPreviewToNarrowTab(savedState);
     for (const tabState of state.openTabs) {
-      if (
-        tabState.conversationId
-        && !this.plugin.getCachedConversation(tabState.conversationId)
-      ) {
+      const conversation = tabState.conversationId
+        ? this.plugin.getConversationSummary(tabState.conversationId)
+        : null;
+      if (tabState.conversationId && !conversation) {
         continue;
       }
       if (membership.isDestroyed()) return;
@@ -657,7 +686,7 @@ export class TabManager implements TabManagerInterface {
       // A draft preview stays replaceable only where a viewer slot can replace it.
       const lifecycleState = tabState.preview && this.layoutPolicy.showsPreviews() ? 'provisional' : 'open';
       const identity = createTabIdentity(this.plugin.settings,
-        tabState.conversationId ? this.plugin.getCachedConversation(tabState.conversationId) : null,
+        conversation,
         { ...tabState, lifecycleState });
       membership.addRestored(identity);
       this.providerPresence.startForTab(identity);
@@ -702,6 +731,7 @@ export class TabManager implements TabManagerInterface {
       return;
     }
     await this.switchToTab(tabId);
+    if (this.membership.isCloseClaimed(tabId)) await this.closePolicy.drain();
   }
 
   /** Unloads an assembled narrow tab to its identity; its session keeps running unattached. */
@@ -723,7 +753,7 @@ export class TabManager implements TabManagerInterface {
       lifecycleState: 'open',
       ...(tab.label ? { label: tab.label } : {}),
     });
-    throwCollectedErrors(this.commandDiscovery.releaseTab(tab.id), `Failed to release tab ${tab.id} metadata`);
+    this.commandDiscovery.releaseTab(tab.id);
     await destroyTab(tab);
   }
 
@@ -817,12 +847,13 @@ export class TabManager implements TabManagerInterface {
   }
 
   /**
-   * Creates a new conversation in the active tab.
+   * Creates a new conversation in the active tab; its blank draft carries `seed` from before it is published. By
+   * default New stays in the active session's project.
    */
-  async createNewConversation(): Promise<void> {
+  async createNewConversation(seed?: DraftSeed): Promise<void> {
     const activeTab = this.getActiveTab();
     if (activeTab) {
-      await this.runtimeCallbackHost.startNew(activeTab);
+      await this.runtimeCallbackHost.startNew(activeTab, seed ?? inheritedDraftSeed(this.plugin.projects, activeTab));
     }
   }
 
@@ -843,14 +874,11 @@ export class TabManager implements TabManagerInterface {
 
   /** Synchronously fences new work while preserving state for the shutdown snapshot. */
   beginShutdown(): void {
-    if (this.membership.isDestroyed()) return;
-    this.membership.markDestroyed();
-    this.shutdownSnapshotOpen = true;
+    this.membership.beginShutdown();
   }
 
   /** Seals the final identity snapshot so late runtime callbacks cannot mutate tab state. */
   sealShutdownSnapshot(): void {
-    this.shutdownSnapshotOpen = false;
     this.membership.sealIdentities();
   }
 
@@ -883,19 +911,11 @@ export class TabManager implements TabManagerInterface {
     throwCollectedErrors(drainErrors, 'Failed to drain every tab for shutdown persistence');
   }
 
-  /** Joins admitted closes, navigation, and tab switches; returns their failures. */
+  /** Joins admitted closes, navigation, and tab switches; returns close failures. */
   async #joinAdmittedWork(): Promise<unknown[]> {
     const errors = await this.closePolicy.drain();
-    try {
-      await this.navigation.invalidateAndDrain();
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await this.waitForTabSwitchIdle();
-    } catch (error) {
-      errors.push(error);
-    }
+    await this.navigation.invalidateAndDrain();
+    await this.waitForTabSwitchIdle();
     return errors;
   }
 
@@ -930,7 +950,7 @@ export class TabManager implements TabManagerInterface {
       destroyErrors.push(error);
     }
     // Destroyed tabs cannot recreate discovery metadata, so it is released once, before teardown.
-    destroyErrors.push(...this.commandDiscovery.releaseAll());
+    this.commandDiscovery.releaseAll();
 
     // Each tab drains background work and persists its final state during teardown.
     const teardownResults = await Promise.allSettled(this.getAllTabs().map(tab => destroyTab(tab)));

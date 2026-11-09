@@ -1,7 +1,16 @@
 import { Menu, Notice, setIcon } from 'obsidian';
 
-import type { ConversationMeta } from '@/core/types';
+import type { ConversationMeta, ProjectRecord } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import {
+  createProject,
+  deleteProject,
+  editProject,
+  openProjectMemory,
+} from '@/features/chat/projects/projectActions';
+import { projectIconId } from '@/features/chat/projects/projectIcon';
+import { projectsForPicker } from '@/features/chat/projects/projectOrder';
+import type { SessionDropTarget } from '@/features/chat/session-manager/SessionDrag';
 import type { SessionListSectionKind } from '@/features/chat/session-manager/SessionListOrganizer';
 import type { SessionMultiSelection } from '@/features/chat/session-manager/SessionMultiSelection';
 import {
@@ -10,22 +19,11 @@ import {
   isCompletedReview,
   type SessionStatusDisplay,
 } from '@/features/chat/session-manager/SessionStatusPresentation';
+import { runSessionAction, showMenuAt } from '@/features/chat/session-manager/SessionSurfaceShared';
 import type { TabAttention } from '@/features/chat/state/types';
+import { t } from '@/i18n/i18n';
+import type { TranslationKey } from '@/i18n/types';
 import { confirmDelete } from '@/shared/modals/ConfirmModal';
-
-/** Runs a session action, reporting any failure once as a notice. */
-export function runSessionAction(
-  action: () => unknown,
-  failureMessage: string,
-): void {
-  void (async () => {
-    try {
-      await action();
-    } catch {
-      new Notice(failureMessage);
-    }
-  })();
-}
 
 /**
  * Surface flags and callbacks that decide which session actions are offered. `active` manages
@@ -40,6 +38,8 @@ export interface SessionActionOptions {
   onOpenConversationInNewTab?: (id: string, activate?: boolean) => Promise<void>;
   onAssignConversationToDevice?: (id: string) => Promise<void>;
   onSetLinkedContentPinned?: (contentPath: string, isPinned: boolean) => Promise<void>;
+  /** Starts a draft that joins the project when it becomes a session. */
+  onStartProjectConversation?: (projectId: string) => Promise<void>;
   onRerender: () => void;
 }
 
@@ -47,12 +47,16 @@ export type SessionRowActionKind =
   | 'open-in-new-tab'
   | 'open-in-background-tab'
   | 'switch-to-open'
+  | 'open-parent'
   | 'assign-device'
   | 'pin'
   | 'unpin'
   | 'mark-unread'
   | 'mark-read'
   | 'rename'
+  | 'copy-session-id'
+  | 'move-to-project'
+  | 'remove-from-project'
   | 'archive'
   | 'restore'
   | 'delete';
@@ -73,48 +77,89 @@ export interface SessionRowActionInput {
   attention: TabAttention | null;
   /** The surface presents attention, so the user can change its unread state. */
   tracksAttention?: boolean;
+  /** The session's live project; a stale `projectId` resolves to none. */
+  project?: ProjectRecord | null;
+  /** The active session that started this one, if it still exists. */
+  parentId?: string | null;
 }
 
 /** A rendered row; its surface decides where the rename editor appears. */
 export interface SessionRow extends SessionRowActionInput {
   beginRename: () => void;
+  /** Sessions folded under this row, which archive and restore with it. */
+  folded?: readonly { readonly id: string; readonly isRunning: boolean }[];
 }
 
-const ROW_ACTION_TITLES: Readonly<Record<SessionRowActionKind, string>> = {
+/** Project texts are localized when shown; session texts are not localized yet. */
+type ActionText = string | { key: TranslationKey };
+
+function actionText(text: ActionText): string {
+  return typeof text === 'string' ? text : t(text.key);
+}
+
+const ROW_ACTION_TITLES: Readonly<Record<SessionRowActionKind, ActionText>> = {
   'open-in-new-tab': 'Open in new tab',
   'open-in-background-tab': 'Open in background tab',
   'switch-to-open': 'Switch to open session',
+  'open-parent': 'Open parent session',
   'assign-device': 'Assign to this device',
   pin: 'Pin',
   unpin: 'Unpin',
   'mark-unread': 'Mark as unread',
   'mark-read': 'Mark as read',
   rename: 'Rename',
+  'copy-session-id': 'Copy session ID',
+  'move-to-project': { key: 'chat.projects.menu.moveTo' },
+  'remove-from-project': { key: 'chat.projects.menu.removeFrom' },
   archive: 'Archive',
   restore: 'Restore',
   delete: 'Delete',
 };
 
-const INLINE_BUTTONS: Readonly<Partial<Record<SessionRowActionKind, { cls: string; icon: string }>>> = {
-  'open-in-new-tab': { cls: 'claudian-open-new-tab-btn', icon: 'square-plus' },
-  'assign-device': { cls: 'claudian-assign-device-btn', icon: 'monitor-down' },
-  pin: { cls: 'claudian-pin-btn', icon: 'pin' },
-  unpin: { cls: 'claudian-pin-btn', icon: 'pin-off' },
-  rename: { cls: '', icon: 'pencil' },
-  archive: { cls: 'claudian-archive-btn', icon: 'archive' },
-  restore: { cls: 'claudian-restore-btn', icon: 'undo-2' },
-  delete: { cls: 'claudian-delete-btn', icon: 'trash-2' },
+/** Lucide ids shared by row buttons and menu items, so an action looks the same on both surfaces. */
+const ROW_ACTION_ICONS: Readonly<Record<SessionRowActionKind, string>> = {
+  'open-in-new-tab': 'square-plus',
+  'open-in-background-tab': 'app-window',
+  'switch-to-open': 'arrow-right-left',
+  'open-parent': 'corner-left-up',
+  'assign-device': 'monitor-down',
+  pin: 'pin',
+  unpin: 'pin-off',
+  'mark-unread': 'mail',
+  'mark-read': 'mail-open',
+  rename: 'pencil',
+  'copy-session-id': 'copy',
+  'move-to-project': 'folder-input',
+  'remove-from-project': 'folder-minus',
+  archive: 'archive',
+  restore: 'undo-2',
+  delete: 'trash-2',
 };
 
-type SynchronousRowActionKind = 'rename' | 'mark-unread' | 'mark-read';
+/** Row button classes for the kinds that render inline. */
+const INLINE_BUTTON_CLASSES: Readonly<Partial<Record<SessionRowActionKind, string>>> = {
+  'open-in-new-tab': 'claudian-open-new-tab-btn',
+  'assign-device': 'claudian-assign-device-btn',
+  pin: 'claudian-pin-btn',
+  unpin: 'claudian-pin-btn',
+  rename: '',
+  archive: 'claudian-archive-btn',
+  restore: 'claudian-restore-btn',
+  delete: 'claudian-delete-btn',
+};
 
-const ROW_ACTION_FAILURES: Readonly<Record<Exclude<SessionRowActionKind, SynchronousRowActionKind>, string>> = {
+type SynchronousRowActionKind = 'rename' | 'mark-unread' | 'mark-read' | 'move-to-project';
+
+const ROW_ACTION_FAILURES: Readonly<Record<Exclude<SessionRowActionKind, SynchronousRowActionKind>, ActionText>> = {
   'open-in-new-tab': 'Failed to load conversation',
   'open-in-background-tab': 'Failed to load conversation',
   'switch-to-open': 'Failed to load conversation',
+  'open-parent': 'Failed to load conversation',
+  'copy-session-id': 'Failed to copy session ID',
   'assign-device': 'Failed to assign session to this device',
   pin: 'Failed to pin session',
   unpin: 'Failed to unpin session',
+  'remove-from-project': { key: 'chat.projects.errors.remove' },
   archive: 'Failed to archive session',
   restore: 'Failed to restore session',
   delete: 'Failed to delete conversation',
@@ -122,6 +167,21 @@ const ROW_ACTION_FAILURES: Readonly<Record<Exclude<SessionRowActionKind, Synchro
 
 function action(kind: SessionRowActionKind, disabled = false): SessionRowAction {
   return { kind, disabled };
+}
+
+/** The folded sessions archiving (idle ones) or restoring (all) a row also moves. */
+function foldedIdsFor(row: Pick<SessionRow, 'folded'>, isArchiving: boolean): string[] {
+  return (row.folded ?? [])
+    .filter(child => !isArchiving || !child.isRunning)
+    .map(child => child.id);
+}
+
+/** Names what an action moves besides its own row, so archiving a collapsed parent is never silent. */
+function rowActionTitle(kind: SessionRowActionKind, row: Pick<SessionRow, 'folded'>): string {
+  const title = actionText(ROW_ACTION_TITLES[kind]);
+  if (kind !== 'archive' && kind !== 'restore') return title;
+  const count = foldedIdsFor(row, kind === 'archive').length;
+  return count === 0 ? title : `${title} with ${count} folded ${count === 1 ? 'session' : 'sessions'}`;
 }
 
 /** Only the unread dot or no badge can be toggled; every other badge keeps its own state. */
@@ -173,6 +233,7 @@ export function resolveRowActions(
       actions.push(action('switch-to-open'));
     }
   }
+  if (input.parentId && mode === 'active') actions.push(action('open-parent'));
   if (mode === 'archived') {
     actions.push(action('restore'), action('delete'));
     return actions;
@@ -182,7 +243,13 @@ export function resolveRowActions(
     const readAction = readStateAction(input);
     if (readAction) actions.push(readAction);
   }
-  actions.push(action('rename'), mode === 'active' ? archiveAction : action('delete'));
+  // The ID lets the user point an agent's claudian_send_message at this session.
+  actions.push(action('rename'), action('copy-session-id'));
+  if (mode === 'active') {
+    actions.push(action('move-to-project'));
+    if (input.project) actions.push(action('remove-from-project'));
+  }
+  actions.push(mode === 'active' ? archiveAction : action('delete'));
   return actions;
 }
 
@@ -202,7 +269,7 @@ export interface SessionGroupActionTarget {
 }
 
 export interface SessionActionsDeps {
-  plugin: Pick<ChatFeatureHost, 'app' | 'getConversationList' | 'conversationLifecycle' | 'sessionRuntimes'>;
+  plugin: Pick<ChatFeatureHost, 'app' | 'getConversationList' | 'conversationLifecycle' | 'sessionRuntimes' | 'projects'>;
   selection: SessionMultiSelection;
 }
 
@@ -220,18 +287,18 @@ export class SessionActions {
     options: SessionActionOptions,
   ): void {
     for (const rowAction of resolveRowActions('inline', row, options)) {
-      const presentation = INLINE_BUTTONS[rowAction.kind];
-      if (!presentation) continue;
+      const cls = INLINE_BUTTON_CLASSES[rowAction.kind];
+      if (cls === undefined) continue;
       const button = actionsEl.createEl('button', {
-        cls: ['claudian-action-btn', presentation.cls].filter(Boolean).join(' '),
+        cls: ['claudian-action-btn', cls].filter(Boolean).join(' '),
         attr: { type: 'button' },
       });
-      setIcon(button, presentation.icon);
+      setIcon(button, ROW_ACTION_ICONS[rowAction.kind]);
       button.setAttribute(
         'aria-label',
         rowAction.kind === 'archive' && rowAction.disabled
           ? 'Cannot archive a running session'
-          : ROW_ACTION_TITLES[rowAction.kind],
+          : rowActionTitle(rowAction.kind, row),
       );
       if (rowAction.disabled) {
         button.setAttribute('disabled', '');
@@ -239,23 +306,32 @@ export class SessionActions {
       }
       button.addEventListener('click', (event) => {
         event.stopPropagation();
-        this.#runRowAction(rowAction.kind, row, options);
+        this.#runRowAction(rowAction.kind, row, options, button, event);
       });
     }
   }
 
-  rowMenu(row: SessionRow, options: SessionActionOptions & SessionStatusDisplay): Menu {
+  /** `anchorEl` is the row the menu opened on; follow-up menus open beside it. */
+  rowMenu(row: SessionRow, options: SessionActionOptions & SessionStatusDisplay, anchorEl: HTMLElement): Menu {
     const menu = new Menu().setUseNativeMenu(false);
     const tracksAttention = canShowAttention(options);
-    for (const rowAction of resolveRowActions('menu', { ...row, tracksAttention }, options)) {
+    const project = this.deps.plugin.projects.get(row.conversation.projectId);
+    // Archived sessions are not opened; the archive offers only restore and delete.
+    const parentId = row.conversation.origin?.conversationId;
+    const parent = parentId
+      ? this.deps.plugin.getConversationList().find(candidate => candidate.id === parentId && !candidate.isArchived)
+      : undefined;
+    for (const rowAction of resolveRowActions('menu', { ...row, tracksAttention, project, parentId: parent?.id }, options)) {
       menu.addItem((menuItem) => {
-        menuItem.setTitle(ROW_ACTION_TITLES[rowAction.kind]);
+        menuItem
+          .setTitle(rowActionTitle(rowAction.kind, row))
+          .setIcon(ROW_ACTION_ICONS[rowAction.kind]);
         if (rowAction.disabled) {
           menuItem.setDisabled(true);
           return;
         }
-        menuItem.onClick(() => {
-          this.#runRowAction(rowAction.kind, row, options);
+        menuItem.onClick((event) => {
+          this.#runRowAction(rowAction.kind, row, options, anchorEl, event);
         });
       });
     }
@@ -266,6 +342,7 @@ export class SessionActions {
   selectionMenu(
     options: SessionActionOptions,
     isRunning: (conversation: ConversationMeta) => boolean,
+    anchorEl: HTMLElement,
   ): Menu {
     const { selection } = this.deps;
     const lifecycle = this.deps.plugin.conversationLifecycle;
@@ -281,12 +358,14 @@ export class SessionActions {
       const ids = selected.map(conversation => conversation.id);
       menu.addItem(menuItem => menuItem
         .setTitle(`Restore ${sessionCount(ids.length)}`)
+        .setIcon(ROW_ACTION_ICONS.restore)
         .onClick(() => {
           selection.clear();
           runSessionAction(() => lifecycle.restore(ids), 'Failed to restore sessions');
         }));
       menu.addItem(menuItem => menuItem
         .setTitle(`Delete ${sessionCount(ids.length)}`)
+        .setIcon(ROW_ACTION_ICONS.delete)
         .onClick(() => {
           selection.clear();
           runSessionAction(
@@ -305,6 +384,7 @@ export class SessionActions {
       const pinIds = isPinning ? unpinnedIds : selected.map(conversation => conversation.id);
       menu.addItem(menuItem => menuItem
         .setTitle(`${isPinning ? 'Pin' : 'Unpin'} ${sessionCount(pinIds.length)}`)
+        .setIcon(ROW_ACTION_ICONS[isPinning ? 'pin' : 'unpin'])
         .onClick(() => {
           selection.clear();
           runSessionAction(
@@ -312,6 +392,35 @@ export class SessionActions {
             isPinning ? 'Failed to pin sessions' : 'Failed to unpin sessions',
           );
         }));
+
+      const { projects } = this.deps.plugin;
+      const ids = selected.map(conversation => conversation.id);
+      const projectIds = new Set(selected.map(conversation => projects.get(conversation.projectId)?.id ?? null));
+      const sharedProjectId = projectIds.size === 1 ? [...projectIds][0] : null;
+      menu.addItem(menuItem => menuItem
+        .setTitle(t('chat.projects.menu.moveSelectionTo', { count: ids.length }))
+        .setIcon(ROW_ACTION_ICONS['move-to-project'])
+        .onClick((event) => {
+          this.#showProjectPicker(ids, sharedProjectId, event, anchorEl);
+        }));
+      const memberIds = selected
+        .filter(conversation => projects.get(conversation.projectId) !== null)
+        .map(conversation => conversation.id);
+      if (memberIds.length > 0) {
+        menu.addItem(menuItem => menuItem
+          .setTitle(t(
+            memberIds.length === 1 ? 'chat.projects.menu.removeSelectionFrom' : 'chat.projects.menu.removeSelectionFromPlural',
+            { count: memberIds.length },
+          ))
+          .setIcon(ROW_ACTION_ICONS['remove-from-project'])
+          .onClick(() => {
+            selection.clear();
+            runSessionAction(
+              () => lifecycle.setPlacement(memberIds, { projectId: null }),
+              t('chat.projects.errors.remove'),
+            );
+          }));
+      }
     }
 
     const archivableIds = selected
@@ -320,6 +429,7 @@ export class SessionActions {
     menu.addItem((menuItem) => {
       menuItem
         .setTitle(`Archive ${sessionCount(archivableIds.length)}`)
+        .setIcon(ROW_ACTION_ICONS.archive)
         .setDisabled(archivableIds.length === 0);
       if (archivableIds.length > 0 && options.sessionActionMode === 'active') {
         menuItem.onClick(() => {
@@ -335,9 +445,8 @@ export class SessionActions {
   }
 
   /**
-   * Builds the group's action menu on demand, or returns null when the group offers none.
-   * Linked content may be pinned; active groups archive their idle sessions; archived groups
-   * restore or permanently delete every session.
+   * Builds the group's action menu on demand, or returns null when the group offers none. Linked content may be
+   * pinned; active groups archive their idle sessions; archived groups restore or permanently delete every session.
    */
   groupMenu(
     target: SessionGroupActionTarget,
@@ -346,7 +455,6 @@ export class SessionActions {
   ): (() => Menu) | null {
     const { conversations, linkedContent } = target;
     const { onSetLinkedContentPinned } = options;
-    const lifecycle = this.deps.plugin.conversationLifecycle;
     const isArchivedView = options.sessionActionMode === 'archived';
     const canTogglePin = !!(
       linkedContent
@@ -363,6 +471,7 @@ export class SessionActions {
         const { path, isPinned } = linkedContent;
         menu.addItem(menuItem => menuItem
           .setTitle(isPinned ? 'Unpin Linked content' : 'Pin Linked content')
+          .setIcon(ROW_ACTION_ICONS[isPinned ? 'unpin' : 'pin'])
           .onClick(() => {
             runSessionAction(
               () => onSetLinkedContentPinned(path, !isPinned),
@@ -372,28 +481,170 @@ export class SessionActions {
       }
       if (canArchive) {
         if (canTogglePin) menu.addSeparator();
-        const archivableIds = conversations
-          .filter(conversation => !isRunning(conversation))
-          .map(conversation => conversation.id);
-        const failureMessage = linkedContent
-          ? 'Failed to archive Linked content sessions'
-          : 'Failed to archive sessions';
-        menu.addItem((menuItem) => {
-          menuItem
-            .setTitle('Archive all sessions')
-            .setDisabled(archivableIds.length === 0);
-          if (archivableIds.length > 0) {
-            menuItem.onClick(() => {
-              runSessionAction(() => lifecycle.archive(archivableIds), failureMessage);
-            });
-          }
-        });
+        this.#addArchiveIdle(
+          menu,
+          conversations,
+          isRunning,
+          'Archive all sessions',
+          linkedContent ? 'Failed to archive Linked content sessions' : 'Failed to archive sessions',
+        );
       }
       if (isArchivedView) {
         this.#addRestoreAndDeleteAll(menu, conversations, options);
       }
       return menu;
     };
+  }
+
+  /**
+   * A project's actions. An active project is archived whole, which waits for its members to stop running; an
+   * archived one is restored with its members or deleted.
+   */
+  projectMenu(
+    project: ProjectRecord,
+    conversations: readonly ConversationMeta[],
+    isRunning: (conversation: ConversationMeta) => boolean,
+  ): Menu {
+    const { plugin } = this.deps;
+    const menu = new Menu().setUseNativeMenu(false);
+    if (project.isArchived) {
+      menu.addItem(menuItem => menuItem
+        .setTitle(t('chat.projects.menu.restore'))
+        .setIcon(ROW_ACTION_ICONS.restore)
+        .onClick(() => {
+          runSessionAction(
+            () => plugin.conversationLifecycle.restoreProject(project.id),
+            t('chat.projects.errors.restore'),
+          );
+        }));
+      this.#addDeleteProject(menu, project);
+      return menu;
+    }
+    menu.addItem(menuItem => menuItem
+      .setTitle(project.isPinned ? t('chat.projects.menu.unpin') : t('chat.projects.menu.pin'))
+      .setIcon(ROW_ACTION_ICONS[project.isPinned ? 'unpin' : 'pin'])
+      .onClick(() => {
+        runSessionAction(
+          () => plugin.projects.setPinned(project.id, !project.isPinned),
+          t('chat.projects.errors.pin'),
+        );
+      }));
+    menu.addItem(menuItem => menuItem
+      .setTitle(t('chat.projects.menu.edit'))
+      .setIcon('pencil')
+      .onClick(() => editProject(plugin, project)));
+    menu.addItem(menuItem => menuItem
+      .setTitle(t('chat.projects.menu.openMemory'))
+      .setIcon('brain')
+      .onClick(() => openProjectMemory(plugin, project)));
+    menu.addSeparator();
+    menu.addItem((menuItem) => {
+      menuItem.setTitle(t('chat.projects.menu.archive')).setIcon(ROW_ACTION_ICONS.archive);
+      if (conversations.some(isRunning)) {
+        menuItem.setDisabled(true);
+        return;
+      }
+      menuItem.onClick(() => {
+        runSessionAction(
+          () => plugin.conversationLifecycle.archiveProject(project.id),
+          t('chat.projects.errors.archive'),
+        );
+      });
+    });
+    menu.addSeparator();
+    this.#addDeleteProject(menu, project);
+    return menu;
+  }
+
+  #addDeleteProject(menu: Menu, project: ProjectRecord): void {
+    const { plugin } = this.deps;
+    menu.addItem(menuItem => menuItem
+      .setTitle(t('chat.projects.menu.delete'))
+      .setIcon(ROW_ACTION_ICONS.delete)
+      .setWarning(true)
+      .onClick(() => {
+        runSessionAction(() => deleteProject(plugin, project), t('chat.projects.errors.delete'));
+      }));
+  }
+
+  #addArchiveIdle(
+    menu: Menu,
+    conversations: readonly ConversationMeta[],
+    isRunning: (conversation: ConversationMeta) => boolean,
+    title: string,
+    failureMessage: string,
+  ): void {
+    const archivableIds = conversations
+      .filter(conversation => !isRunning(conversation))
+      .map(conversation => conversation.id);
+    menu.addItem((menuItem) => {
+      menuItem
+        .setTitle(title)
+        .setIcon(ROW_ACTION_ICONS.archive)
+        .setDisabled(archivableIds.length === 0);
+      if (archivableIds.length > 0) {
+        menuItem.onClick(() => {
+          runSessionAction(() => this.deps.plugin.conversationLifecycle.archive(archivableIds), failureMessage);
+        });
+      }
+    });
+  }
+
+  /**
+   * Places dragged sessions where they were dropped: Pinned pins and keeps the project; a project joins it and
+   * unpins; the session list leaves any project and unpins. The conversation owner writes each change once and
+   * leaves sessions already there alone.
+   */
+  placeSessions(conversationIds: readonly string[], target: SessionDropTarget): void {
+    const { plugin, selection } = this.deps;
+    selection.clear();
+    if (target.kind === 'pinned') {
+      runSessionAction(() => plugin.conversationLifecycle.setPinned(conversationIds, true), 'Failed to pin sessions');
+      return;
+    }
+    const projectId = target.kind === 'project' ? target.projectId : null;
+    runSessionAction(
+      () => plugin.conversationLifecycle.setPlacement(conversationIds, { projectId, isPinned: false }),
+      projectId ? t('chat.projects.errors.move') : 'Failed to move sessions',
+    );
+  }
+
+  /** Projects to move the sessions into, plus creating one for them. */
+  #showProjectPicker(
+    conversationIds: readonly string[],
+    currentProjectId: string | null,
+    event: MouseEvent | KeyboardEvent | undefined,
+    anchorEl: HTMLElement,
+  ): void {
+    const { plugin, selection } = this.deps;
+    const moveFailure = t('chat.projects.errors.move');
+    const projects = projectsForPicker(plugin.projects.list());
+    const menu = new Menu().setUseNativeMenu(false);
+    for (const project of projects) {
+      menu.addItem((menuItem) => {
+        menuItem.setTitle(project.name).setIcon(projectIconId(project));
+        if (project.id === currentProjectId) menuItem.setChecked(true);
+        menuItem.onClick(() => {
+          selection.clear();
+          runSessionAction(
+            () => plugin.conversationLifecycle.setPlacement(conversationIds, { projectId: project.id }),
+            moveFailure,
+          );
+        });
+      });
+    }
+    if (projects.length > 0) menu.addSeparator();
+    menu.addItem(menuItem => menuItem
+      .setTitle(t('chat.projects.menu.newProject'))
+      .setIcon('folder-plus')
+      .onClick(() => {
+        selection.clear();
+        createProject(plugin, {
+          run: project => plugin.conversationLifecycle.setPlacement(conversationIds, { projectId: project.id }),
+          failureMessage: moveFailure,
+        });
+      }));
+    showMenuAt(menu, anchorEl, event);
   }
 
   /**
@@ -434,12 +685,14 @@ export class SessionActions {
     const lifecycle = this.deps.plugin.conversationLifecycle;
     menu.addItem(menuItem => menuItem
       .setTitle('Restore all sessions')
+      .setIcon(ROW_ACTION_ICONS.restore)
       .setDisabled(ids.length === 0)
       .onClick(() => {
         runSessionAction(() => lifecycle.restore(ids), 'Failed to restore sessions');
       }));
     menu.addItem(menuItem => menuItem
       .setTitle('Delete all sessions')
+      .setIcon(ROW_ACTION_ICONS.delete)
       .setDisabled(ids.length === 0)
       .onClick(() => {
         runSessionAction(
@@ -449,7 +702,27 @@ export class SessionActions {
       }));
   }
 
-  #runRowAction(kind: SessionRowActionKind, row: SessionRow, options: SessionActionOptions): void {
+  /**
+   * A row archives and restores the sessions folded under it, so what it shows moves as one; running ones stay,
+   * as group archiving leaves them.
+   */
+  #setArchivedWithFolded(row: SessionRow, isArchived: boolean): Promise<void> {
+    const lifecycle = this.deps.plugin.conversationLifecycle;
+    const { id } = row.conversation;
+    const foldedIds = foldedIdsFor(row, isArchived);
+    if (foldedIds.length === 0) return lifecycle.setArchived(id, isArchived);
+    return isArchived ? lifecycle.archive([id, ...foldedIds]) : lifecycle.restore([id, ...foldedIds]);
+  }
+
+  /** `anchorEl` is where a follow-up menu opens for keyboard use. */
+
+  #runRowAction(
+    kind: SessionRowActionKind,
+    row: SessionRow,
+    options: SessionActionOptions,
+    anchorEl: HTMLElement,
+    event?: MouseEvent | KeyboardEvent,
+  ): void {
     const { id } = row.conversation;
     if (kind === 'rename') {
       row.beginRename();
@@ -466,7 +739,12 @@ export class SessionActions {
       this.deps.plugin.sessionRuntimes.get(id)?.attention.acknowledgeReview();
       return;
     }
-    const failureMessage = ROW_ACTION_FAILURES[kind];
+    if (kind === 'move-to-project') {
+      const currentProjectId = this.deps.plugin.projects.get(row.conversation.projectId)?.id ?? null;
+      this.#showProjectPicker([id], currentProjectId, event, anchorEl);
+      return;
+    }
+    const failureMessage = actionText(ROW_ACTION_FAILURES[kind]);
     runSessionAction((): Promise<void> | undefined => {
       switch (kind) {
         case 'open-in-new-tab':
@@ -475,16 +753,22 @@ export class SessionActions {
           return options.onOpenConversationInNewTab?.(id, false);
         case 'switch-to-open':
           return options.onSelectConversation(id);
+        case 'open-parent':
+          return row.conversation.origin ? options.onSelectConversation(row.conversation.origin.conversationId) : undefined;
         case 'assign-device':
           return options.onAssignConversationToDevice?.(id);
+        case 'copy-session-id':
+          return navigator.clipboard.writeText(id).then(() => { new Notice('Session ID copied'); });
         case 'pin':
         case 'unpin':
           return this.deps.plugin.conversationLifecycle.setPinned([id], kind === 'pin');
         case 'archive':
         case 'restore':
-          return this.deps.plugin.conversationLifecycle.setArchived(id, kind === 'archive');
+          return this.#setArchivedWithFolded(row, kind === 'archive');
         case 'delete':
           return this.deleteSessions([id], { confirm: false, rerender: options.onRerender });
+        case 'remove-from-project':
+          return this.deps.plugin.conversationLifecycle.setPlacement([id], { projectId: null });
       }
     }, failureMessage);
   }

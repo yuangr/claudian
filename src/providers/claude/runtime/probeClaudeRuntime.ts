@@ -5,12 +5,14 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { getEnhancedPath, parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTarget, resolveExecutionTargetAsync } from '@/core/process/execution-target/ExecutionTargetResolver';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+import { createExecutionPathMapper } from '@/core/process/execution-target/WSLPathMapper';
 
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
+import type { ProviderRuntimeHost } from '../../../core/providers/ProviderRuntimeHost';
 import { throwIfAborted, toAbortError } from '../../../utils/abort';
-import { getVaultPath } from '../../../utils/path';
+import { decodeClaudeConfig, resolveClaudeSettingSources } from '../config';
 import { loadClaudeAgentQuery } from '../loadClaudeAgentSDK';
-import { getClaudeProviderSettings, resolveClaudeSettingSources } from '../settings';
 import { createCustomSpawnFunction } from './customSpawn';
 
 const PROBE_CANCELLED = 'Claude Code runtime discovery cancelled';
@@ -24,28 +26,43 @@ export type ClaudeLaunchOptions = Required<Pick<
 >>;
 
 export interface ClaudeLaunchOptionOverrides {
-  /** Settings snapshot that decides Claude setting sources; defaults to the host settings. */
-  readonly settings?: Record<string, unknown>;
+  readonly executionTarget?: ExecutionTarget;
   /** Environment defaults that the process environment and configured variables override. */
   readonly envDefaults?: Record<string, string>;
 }
 
+/** The path generated instructions must expose to Claude's filesystem tools. */
+export async function resolveClaudeExecutionWorkingDirectory(
+  host: Pick<ProviderRuntimeHost, 'config'>,
+  hostWorkingDirectory: string,
+): Promise<string> {
+  const target = await resolveExecutionTargetAsync({ settings: decodeClaudeConfig(host.config), hostVaultPath: hostWorkingDirectory });
+  if (target.method !== 'wsl') return hostWorkingDirectory;
+  const targetPath = createExecutionPathMapper(target).toTargetPath(hostWorkingDirectory);
+  if (!targetPath) throw new Error('Claude Code cannot map the workspace to its execution target');
+  return targetPath;
+}
+
 /** Launch inputs every Claude Code process shares: working folder, executable, environment and settings sources. */
 export function buildClaudeLaunchOptions(
-  host: Pick<ProviderHost, 'settings' | 'getActiveEnvironmentVariables'>,
+  host: Pick<ProviderRuntimeHost, 'config' | 'environmentText'>,
   cwd: string,
   cliPath: string,
   overrides: ClaudeLaunchOptionOverrides = {},
 ): ClaudeLaunchOptions {
-  const customEnv = parseEnvironmentVariables(host.getActiveEnvironmentVariables('claude'));
-  const enhancedPath = getEnhancedPath(customEnv.PATH, cliPath);
-  const { loadUserSettings } = getClaudeProviderSettings(overrides.settings ?? host.settings);
+  const customEnv = parseEnvironmentVariables(host.environmentText);
+  const config = decodeClaudeConfig(host.config);
+  const target = overrides.executionTarget ?? resolveExecutionTarget({ settings: config, hostVaultPath: cwd });
+  const enhancedPath = target.method === 'wsl' ? (customEnv.PATH ?? '') : getEnhancedPath(customEnv.PATH, cliPath);
+  const targetCwd = target.method === 'wsl' ? createExecutionPathMapper(target).toTargetPath(cwd) : cwd;
+  if (!targetCwd) throw new Error('Claude Code cannot map the workspace to its execution target');
+  const { loadUserSettings } = config;
   return {
-    cwd,
+    cwd: targetCwd,
     pathToClaudeCodeExecutable: cliPath,
-    env: { ...overrides.envDefaults, ...process.env, ...customEnv, PATH: enhancedPath },
+    env: { ...overrides.envDefaults, ...process.env, ...customEnv, ...(target.method === 'wsl' ? {} : { PATH: enhancedPath }) },
     settingSources: resolveClaudeSettingSources(loadUserSettings),
-    spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath),
+    spawnClaudeCodeProcess: createCustomSpawnFunction(enhancedPath, { target, hostCwd: cwd, environmentText: host.environmentText }),
   };
 }
 
@@ -66,7 +83,7 @@ export class ClaudeRuntimeUnavailableError extends Error {
  * session init from local configuration without an inference call.
  */
 export async function probeClaudeRuntime(
-  host: ProviderHost,
+  host: ProviderRuntimeHost,
   signal?: AbortSignal,
 ): Promise<ClaudeRuntimeInitialization> {
   throwIfAborted(signal, PROBE_CANCELLED);
@@ -84,14 +101,15 @@ export async function probeClaudeRuntime(
     controller.signal.addEventListener('abort', onAbort, { once: true });
   });
   const initialize = async (): Promise<ClaudeRuntimeInitialization> => {
-    const cwd = getVaultPath(host.app);
+    const cwd = host.workingDirectory;
     if (!cwd) throw new ClaudeRuntimeUnavailableError('Claude Code discovery requires a local vault');
-    const cliPath = await host.getResolvedProviderCliPath('claude');
+    const target = await resolveExecutionTargetAsync({ settings: decodeClaudeConfig(host.config), hostVaultPath: cwd });
+    const cliPath = await host.resolveCliPath({ executionTarget: target });
     throwIfAborted(controller.signal, PROBE_CANCELLED);
     if (!cliPath) throw new ClaudeRuntimeUnavailableError('Claude Code installation not found');
     const agentQuery = await loadClaudeAgentQuery();
     throwIfAborted(controller.signal, PROBE_CANCELLED);
-    const config = getClaudeProviderSettings(host.settings);
+    const config = decodeClaudeConfig(host.config);
     // Match chat launches, which always enable auto mode.
     const extraArgs = {
       'enable-auto-mode': null,
@@ -100,7 +118,7 @@ export async function probeClaudeRuntime(
     conversation = agentQuery({
       prompt: '',
       options: {
-        ...buildClaudeLaunchOptions(host, cwd, cliPath, { envDefaults: { MCP_TIMEOUT: PROBE_MCP_TIMEOUT_MS } }),
+        ...buildClaudeLaunchOptions(host, cwd, cliPath, { envDefaults: { MCP_TIMEOUT: PROBE_MCP_TIMEOUT_MS }, executionTarget: target }),
         extraArgs,
         abortController: controller,
         persistSession: false,

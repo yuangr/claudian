@@ -1,23 +1,27 @@
 import '@/providers';
 
-import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
 import { modelCatalogCases as cases } from '@test/helpers/providerModelCatalogs';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
 
-import { ClaudianSettingsStorage } from '@/app/settings/ClaudianSettingsStorage';
 import { migrateSelectedModelMetadata } from '@/app/settings/SelectedModelMetadataMigration';
-import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
+import { CLAUDIAN_SETTINGS_PATH } from '@/core/bootstrap/storagePaths';
 import { findProviderModelOption, resolveConversationModel, resolveNewConversationModel } from '@/core/providers/conversationModel';
-import { ProviderModelCatalogController } from '@/core/providers/models/ProviderModelCatalog';
+import {
+  ProviderModelCatalogController,
+  type ProviderModelCatalogPatch,
+  type ProviderModelCatalogState,
+  type ProviderModelCatalogStore,
+} from '@/core/providers/models/ProviderModelCatalog';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
-import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import { getClaudeModelOptions, getClaudeSupportedEffortLevels } from '@/providers/claude/modelOptions';
 import { createClaudeModels, discoverClaudeModels } from '@/providers/claude/runtime/ClaudeModels';
-import { updateClaudeProviderSettings } from '@/providers/claude/settings';
+import { getClaudeModelSource, updateClaudeProviderSettings } from '@/providers/claude/settings';
 import { updateCodexProviderSettings } from '@/providers/codex/settings';
 import { updateDeepSeekProviderSettings } from '@/providers/deepseek/settings';
-import { updateCurrentGrokCatalog, updateGrokProviderSettings } from '@/providers/grok/settings';
+import { updateGrokProviderSettings } from '@/providers/grok/settings';
 import { updateOpencodeProviderSettings } from '@/providers/opencode/settings';
 import { updatePiProviderSettings } from '@/providers/pi/settings';
 
@@ -27,33 +31,38 @@ const update = {
   grok: updateGrokProviderSettings, opencode: updateOpencodeProviderSettings, pi: updatePiProviderSettings,
 };
 
-function makeHost() {
-  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
-  for (const id of ProviderRegistry.getRegisteredProviderIds()) ProviderRegistry.setEnabled(id, settings, false);
-  let content = '';
-  const storage = new ClaudianSettingsStorage({
-    exists: async () => Boolean(content), read: async () => content,
-    write: async (_path: string, value: string) => { content = value; }, delete: async () => undefined,
-  } as unknown as VaultFileAdapter, DEFAULT_CLAUDIAN_SETTINGS);
-  const coordinator = new SettingsCoordinator(settings, value => storage.save(value));
-  const host = {
-    settings, mutateSettings: coordinator.mutate.bind(coordinator),
-    mutateSettingsConditionally: coordinator.mutateConditionally.bind(coordinator),
-    notifyProviderChatOptionsChanged: jest.fn(),
-  } as unknown as ProviderHost;
-  return { host, storage, read: () => JSON.parse(content) };
+/** A catalog store persisting selections through the settings document, as the migration sees them. */
+function documentStore(
+  host: ProviderHost,
+  read: (settings: ProviderHost['settings']) => ProviderModelCatalogState,
+  update: (settings: import('@/core/types').ClaudianSettings, patch: ProviderModelCatalogPatch) => void,
+): ProviderModelCatalogStore {
+  return {
+    read: () => read(host.settings),
+    write: change => host.mutateSettings(settings => { update(settings, change(read(settings))); }),
+    notifyChatOptionsChanged: () => undefined,
+  };
+}
+
+async function makeHost() {
+  const fixture = await createProviderHostFixture();
+  for (const id of ProviderRegistry.getRegisteredProviderIds()) ProviderRegistry.setEnabled(id, fixture.settings, false);
+  return {
+    host: fixture.host, storage: fixture.settingsStorage,
+    read: async () => JSON.parse(await fixture.vault.read(CLAUDIAN_SETTINGS_PATH)),
+  };
 }
 
 beforeEach(() => {
-  jest.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized').mockResolvedValue();
+  vi.spyOn(ProviderWorkspaceRegistry, 'ensureInitialized').mockResolvedValue();
 });
 afterEach(() => {
   for (const { id } of cases) ProviderWorkspaceRegistry.setServices(id, undefined);
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
 });
 
 it.each([false, true])('repairs saved Claude family aliases through startup discovery and reload (cached: %s)', async cached => {
-  const { host, storage, read } = makeHost();
+  const { host, storage, read } = await makeHost();
   const rows = [
     { value: 'default', label: 'Default', description: '', resolvedModel: 'claude-opus-4-1-20250805[1m]', reasoningMetadataResolved: true },
     { value: 'claude-opus-4-20250514', label: 'Older Opus', description: '', reasoningMetadataResolved: true },
@@ -70,21 +79,22 @@ it.each([false, true])('repairs saved Claude family aliases through startup disc
     modelAliases: { fable: 'My Fable' },
   });
   await storage.save(host.settings);
-  expect(read().providerConfigs.claude.selectedModels.map((model: { value: string }) => model.value))
+  expect((await read()).providerConfigs.claude.selectedModels.map((model: { value: string }) => model.value))
     .toEqual(cached ? ['opus[1m]', 'claude-fable-5-10', 'sonnet', 'haiku'] : []);
   Object.assign(host.settings, await storage.load());
-  const probe = jest.fn(async () => ({ models: rows, outputStyles: [] }));
-  const catalog = createClaudeModels(host, signal => discoverClaudeModels(host, signal, probe));
+  const probe = vi.fn(async () => ({ models: rows, outputStyles: [] }));
+  const claudeHost = host.getRuntimeHost('claude');
+  const catalog = createClaudeModels(claudeHost, signal => discoverClaudeModels(claudeHost, signal, probe));
   ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: catalog });
 
   await migrateSelectedModelMetadata(host, new AbortController().signal);
 
   const expected = ['claude-fable-5-10', 'haiku', 'opus[1m]', 'sonnet'];
-  expect(read().providerConfigs.claude.visibleModels).toEqual(expected);
-  expect(read().providerConfigs.claude.selectedModels.map((model: { value: string }) => model.value))
+  expect((await read()).providerConfigs.claude.visibleModels).toEqual(expected);
+  expect((await read()).providerConfigs.claude.selectedModels.map((model: { value: string }) => model.value))
     .toEqual(['opus[1m]', 'claude-fable-5-10', 'sonnet', 'haiku']);
   const restored = await storage.load();
-  expect(getClaudeModelOptions(restored).map(model => [model.value, model.label])).toEqual([
+  expect(getClaudeModelOptions(getClaudeModelSource(restored)).map(model => [model.value, model.label])).toEqual([
     ['claude-code/claude-fable-5-10', 'My Fable'], ['haiku', 'Haiku'],
     ['claude-code/opus[1m]', 'Opus'], ['sonnet', 'Sonnet'],
   ]);
@@ -96,8 +106,19 @@ it.each([false, true])('repairs saved Claude family aliases through startup disc
   await catalog.dispose();
 });
 
+function catalogWith(overrides: Partial<import('@/core/providers/models/ProviderModelCatalog').ProviderModelCatalog>) {
+  return Object.assign(new ProviderModelCatalogController({
+    providerName: 'Test',
+    store: {
+      read: () => ({ enabled: true, models: [], selectedIds: [], aliases: {} }),
+      write: async () => {}, notifyChatOptionsChanged: () => {},
+    },
+    discover: async () => ({ changed: false }),
+  }), overrides);
+}
+
 it('keeps saved family aliases enabled after discovering a newer unselected version', async () => {
-  const { host, storage } = makeHost();
+  const { host, storage } = await makeHost();
   await host.mutateSettings(settings => {
     settings.titleGenerationModel = 'fable';
     settings.lastSelectedChatModel = { providerId: 'claude', model: 'fable' };
@@ -106,12 +127,13 @@ it('keeps saved family aliases enabled after discovering a newer unselected vers
     });
   });
   const selected = { value: 'claude-fable-5-10', label: 'Selected Fable', description: '', supportedEffortLevels: ['high'] as const };
-  const probe = jest.fn()
+  const probe = vi.fn()
     .mockResolvedValueOnce({ models: [selected], outputStyles: [] })
     .mockResolvedValueOnce({ models: [selected, {
       value: 'claude-fable-6-0', label: 'New Fable', description: '', resolvedModel: 'claude-fable-6-0', supportedEffortLevels: ['low'],
     }], outputStyles: [] });
-  const catalog = createClaudeModels(host, signal => discoverClaudeModels(host, signal, probe));
+  const claudeHost = host.getRuntimeHost('claude');
+  const catalog = createClaudeModels(claudeHost, signal => discoverClaudeModels(claudeHost, signal, probe));
   ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: catalog });
   await migrateSelectedModelMetadata(host, new AbortController().signal);
   expect(ProviderRegistry.resolveTitleGenerationSelection(host.settings)?.model).toBe('claude-code/claude-fable-5-10');
@@ -128,7 +150,7 @@ it('keeps saved family aliases enabled after discovering a newer unselected vers
     expect(resolveNewConversationModel(settings)?.model).toBe('claude-code/claude-fable-5-10');
     expect(ProviderRegistry.getModelPolicy('claude').normalizeModelVariant('fable', settings))
       .toBe('claude-code/claude-fable-5-10');
-    expect(getClaudeSupportedEffortLevels(settings, 'fable')).toEqual(['high']);
+    expect(getClaudeSupportedEffortLevels(getClaudeModelSource(settings), 'fable')).toEqual(['high']);
     // A retired explicit ID follows the enabled family member.
     expect(findProviderModelOption('claude', 'claude-fable-4-0', settings)).toBe('claude-code/claude-fable-5-10');
   }
@@ -144,22 +166,22 @@ it('keeps saved family aliases enabled after discovering a newer unselected vers
 
 it.each(cases.flatMap(entry => [false, true].map(deselectDuringQuery => ({ ...entry, deselectDuringQuery }))))(
   '$id fills missing metadata and respects deselection during query: $deselectDuringQuery', async ({ id, populate, deselectDuringQuery }) => {
-  const { host, storage, read } = makeHost();
+  const { host, storage, read } = await makeHost();
   populate(host.settings);
   const config = host.settings.providerConfigs[id]!;
   const selectedIds = [...config.visibleModels as string[]];
   const complete = structuredClone(host.settings);
-  if (id === 'claude') (complete.providerConfigs.claude!.discoveredModels as any[])[0].supportedEffortLevels = ['low', 'high'];
+  if (id === 'claude') (complete.providerConfigs.claude!.discoveredModels as Array<Record<string, unknown>>)[0].supportedEffortLevels = ['low', 'high'];
   if (id === 'opencode') complete.providerConfigs.opencode!.thinkingOptionsByModel = {
     [selectedIds[0]]: [{ value: 'high', label: 'High' }],
   };
   if (id === 'grok') {
-    updateCurrentGrokCatalog(complete, { defaultModelId: selectedIds[0], fingerprint: 'test', refreshedAt: 1,
+    writeGrokCatalog(complete, { defaultModelId: selectedIds[0], fingerprint: 'test', refreshedAt: 1,
       models: [{ rawId: selectedIds[0], displayName: 'Selected', reasoningMetadataResolved: true,
         supportsReasoning: true, reasoningEfforts: [{ value: 'high', label: 'High' }] }] });
-    updateCurrentGrokCatalog(host.settings, { defaultModelId: selectedIds[0], fingerprint: 'old', refreshedAt: 0, models: [] });
+    writeGrokCatalog(host.settings, { defaultModelId: selectedIds[0], fingerprint: 'old', refreshedAt: 0, models: [] });
   } else config.discoveredModels = [];
-  const discover = jest.fn(async () => {
+  const discover = vi.fn(async () => {
     await host.mutateSettings(settings => {
       if (deselectDuringQuery) update[id](settings, { visibleModels: [] });
       const currentSelection = settings.providerConfigs[id]!.visibleModels;
@@ -168,9 +190,10 @@ it.each(cases.flatMap(entry => [false, true].map(deselectDuringQuery => ({ ...en
     return { changed: true };
   });
   const catalog = new ProviderModelCatalogController({
-    providerId: id, providerName: id, host,
-    read: () => ({ enabled: true, selectedIds: host.settings.providerConfigs[id]!.visibleModels as string[], models: [], aliases: {} }),
-    update: (settings, patch) => update[id](settings, patch), discover,
+    providerName: id, discover,
+    store: documentStore(host, settings => ({
+      enabled: true, selectedIds: settings.providerConfigs[id]!.visibleModels as string[], models: [], aliases: {},
+    }), (settings, patch) => update[id](settings, patch)),
   });
   ProviderWorkspaceRegistry.setServices(id, { modelCatalog: catalog });
   expect(ProviderRegistry.getSettingsStorageAdapter(id).needsReasoningMetadata!(host.settings)).toBe(true);
@@ -178,8 +201,8 @@ it.each(cases.flatMap(entry => [false, true].map(deselectDuringQuery => ({ ...en
   await migrateSelectedModelMetadata(host, new AbortController().signal);
 
   expect(discover).toHaveBeenCalledTimes(1);
-  expect(read().providerConfigs[id].visibleModels).toEqual(deselectDuringQuery ? [] : selectedIds);
-  expect(JSON.stringify(read())).not.toContain('unselected-catalog-entry');
+  expect((await read()).providerConfigs[id].visibleModels).toEqual(deselectDuringQuery ? [] : selectedIds);
+  expect(JSON.stringify(await read())).not.toContain('unselected-catalog-entry');
   const restored = await storage.load();
   expect(ProviderRegistry.getChatUIConfig(id).getModelOptions(restored)).toHaveLength(deselectDuringQuery ? 0 : 1);
   expect(ProviderRegistry.getSettingsStorageAdapter(id).needsReasoningMetadata!(restored)).toBe(false);
@@ -192,7 +215,7 @@ it.each([
   { label: 'enabled providers with no selected models', enabled: true, selected: false },
   { label: 'disabled providers with incomplete selected metadata', enabled: false, selected: true },
 ])('does not initialize $label', async ({ enabled, selected }) => {
-  const { host } = makeHost();
+  const { host } = await makeHost();
   updateClaudeProviderSettings(host.settings, {
     enabled, visibleModels: selected ? ['sonnet'] : [], discoveredModels: [],
   });
@@ -203,12 +226,12 @@ it.each([
 });
 
 it.each(['deselected', 'disabled', 'cancelled'] as const)('rechecks %s state after workspace initialization', async change => {
-  const { host } = makeHost();
+  const { host } = await makeHost();
   cases[0].populate(host.settings);
   const controller = new AbortController();
-  const refresh = jest.fn();
-  ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: { refresh } as any });
-  jest.mocked(ProviderWorkspaceRegistry.ensureInitialized).mockImplementation(async () => {
+  const refresh = vi.fn();
+  ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: catalogWith({ refresh }) });
+  vi.mocked(ProviderWorkspaceRegistry.ensureInitialized).mockImplementation(async () => {
     if (change === 'deselected') updateClaudeProviderSettings(host.settings, { visibleModels: [] });
     if (change === 'disabled') updateClaudeProviderSettings(host.settings, { enabled: false });
     if (change === 'cancelled') controller.abort();
@@ -218,51 +241,51 @@ it.each(['deselected', 'disabled', 'cancelled'] as const)('rechecks %s state aft
 });
 
 it('preserves incomplete selections after a failed query and retries on a later startup', async () => {
-  const { host } = makeHost();
+  const { host } = await makeHost();
   cases[0].populate(host.settings);
   const before = structuredClone(host.settings);
-  const refresh = jest.fn().mockRejectedValue(new Error('CLI unavailable'));
-  ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: { refresh } as any });
+  const refresh = vi.fn().mockRejectedValue(new Error('CLI unavailable'));
+  ProviderWorkspaceRegistry.setServices('claude', { modelCatalog: catalogWith({ refresh }) });
   await migrateSelectedModelMetadata(host, new AbortController().signal);
   await migrateSelectedModelMetadata(host, new AbortController().signal);
   expect(refresh).toHaveBeenCalledTimes(2);
   expect(host.settings).toEqual(before);
 });
 
-it.each(cases)('$id detects missing effort fields in an otherwise present selected record', ({ id, populate }) => {
-  const { host } = makeHost();
+it.each(cases)('$id detects missing effort fields in an otherwise present selected record', async ({ id, populate }) => {
+  const { host } = await makeHost();
   populate(host.settings);
   const config = host.settings.providerConfigs[id]!;
-  if (id === 'deepseek') delete (config.discoveredModels as any[])[0].reasoning;
-  if (id === 'codex') delete (config.discoveredModels as any[])[0].supportedReasoningEfforts;
-  if (id === 'pi') delete (config.discoveredModels as any[])[0].thinkingLevels;
+  if (id === 'deepseek') delete (config.discoveredModels as Array<Record<string, unknown>>)[0].reasoning;
+  if (id === 'codex') delete (config.discoveredModels as Array<Record<string, unknown>>)[0].supportedReasoningEfforts;
+  if (id === 'pi') delete (config.discoveredModels as Array<Record<string, unknown>>)[0].thinkingLevels;
   expect(ProviderRegistry.getSettingsStorageAdapter(id).needsReasoningMetadata!(host.settings)).toBe(true);
 });
 
-it.each(cases)('$id detects a selected model missing from the catalog despite resolved effort metadata', ({ id, populate }) => {
-  const { host } = makeHost();
+it.each(cases)('$id detects a selected model missing from the catalog despite resolved effort metadata', async ({ id, populate }) => {
+  const { host } = await makeHost();
   populate(host.settings);
   const config = host.settings.providerConfigs[id]!;
   const selected = (config.visibleModels as string[])[0];
   if (id === 'opencode') config.thinkingOptionsByModel = { [selected]: [] };
-  if (id === 'grok') updateCurrentGrokCatalog(host.settings, { defaultModelId: selected, fingerprint: 'native', refreshedAt: 1, models: [] });
+  if (id === 'grok') writeGrokCatalog(host.settings, { defaultModelId: selected, fingerprint: 'native', refreshedAt: 1, models: [] });
   else config.discoveredModels = [];
   expect(ProviderRegistry.getSettingsStorageAdapter(id).needsReasoningMetadata!(host.settings)).toBe(true);
 });
 
 it.each(['claude', 'grok', 'opencode', 'pi'] as const)('%s retains confirmed non-reasoning metadata without querying on every reload', async id => {
-  const { host, storage } = makeHost();
+  const { host, storage } = await makeHost();
   cases.find(entry => entry.id === id)!.populate(host.settings);
   const config = host.settings.providerConfigs[id]!;
   const selected = (config.visibleModels as string[])[0];
-  if (id === 'claude') Object.assign((config.discoveredModels as any[])[0], {
+  if (id === 'claude') Object.assign((config.discoveredModels as Array<Record<string, unknown>>)[0], {
     supportedEffortLevels: [], reasoningMetadataResolved: true,
   });
-  if (id === 'pi') Object.assign((config.discoveredModels as any[])[0], {
+  if (id === 'pi') Object.assign((config.discoveredModels as Array<Record<string, unknown>>)[0], {
     thinkingLevels: ['off'], reasoning: false,
   });
   if (id === 'opencode') config.thinkingOptionsByModel = { [selected]: [] };
-  if (id === 'grok') updateCurrentGrokCatalog(host.settings, {
+  if (id === 'grok') writeGrokCatalog(host.settings, {
     defaultModelId: selected, fingerprint: 'native', refreshedAt: 1,
     models: [{ rawId: selected, displayName: selected, reasoningEfforts: [], supportsReasoning: false, reasoningMetadataResolved: true }],
   });
@@ -272,15 +295,15 @@ it.each(['claude', 'grok', 'opencode', 'pi'] as const)('%s retains confirmed non
 });
 
 it('cancels an active native query on unload', async () => {
-  const { host } = makeHost();
+  const { host } = await makeHost();
   cases[0].populate(host.settings);
   const controller = new AbortController();
   let started!: () => void;
   const ready = new Promise<void>(resolve => { started = resolve; });
   let aborted = false;
   const catalog = new ProviderModelCatalogController({
-    providerId: 'claude', providerName: 'Claude', host,
-    read: () => ({ enabled: true, selectedIds: ['sonnet'], models: [], aliases: {} }), update: jest.fn(),
+    providerName: 'Claude',
+    store: documentStore(host, () => ({ enabled: true, selectedIds: ['sonnet'], models: [], aliases: {} }), vi.fn()),
     discover: signal => new Promise(resolve => {
       signal.addEventListener('abort', () => { aborted = true; resolve({ changed: false }); }, { once: true });
       started();

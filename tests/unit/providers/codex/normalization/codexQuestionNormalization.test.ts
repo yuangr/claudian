@@ -1,3 +1,4 @@
+import type { AskUserAnswers } from '@/core/types/tools';
 import { formatCodexQuestionReply, parseCodexQuestionReply,stripCodexQuestionReplies } from '@/providers/codex/normalization/codexQuestionNormalization';
 
 it('serializes each answer with its native call and question index and restores the reply', () => {
@@ -34,6 +35,69 @@ it('uses the question index when a native question ID is not a scalar', () => {
   expect(parseCodexQuestionReply(reply!.content)).toEqual([
     { callId: 'call', index: 0, question: 'Continue?', answer: 'Yes' },
   ]);
+});
+
+it('falls back to the own question-text answer when a prototype-named id has no own answer', () => {
+  for (const id of ['toString', 'constructor', '__proto__', 'valueOf']) {
+    const reply = formatCodexQuestionReply({
+      id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+      input: { replyMode: 'user-message', questions: [{ id, question: 'Color?' }] },
+    }, JSON.parse('{"Color?":"Blue"}'));
+    expect(reply).toEqual({
+      content: '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"call_q\\",0]","question":"Color?","answer":"Blue"}]\n</send_user_message_question_reply>',
+      displayContent: '',
+    });
+  }
+});
+
+it('never answers from inherited-only entries', () => {
+  const inheritedText = Object.create(JSON.parse('{"Color?":"Blue"}'));
+  expect(formatCodexQuestionReply({
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+    input: { replyMode: 'user-message', questions: [{ id: {}, question: 'Color?' }] },
+  }, inheritedText)).toBeNull();
+  expect(formatCodexQuestionReply({
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+    input: { replyMode: 'user-message', questions: [{ id: 'toString', question: 'Color?' }] },
+  }, Object.create({ 'Color?': 'Blue' }))).toBeNull();
+});
+
+it('prefers own id answers over own question text, including a literal own __proto__ id', () => {
+  const reply = formatCodexQuestionReply({
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+    input: { replyMode: 'user-message', questions: [{ id: '__proto__', question: 'Color?' }, { id: 'color', question: 'Color?' }] },
+  }, JSON.parse('{"__proto__":"Blue","color":"Red","Color?":"Green"}'));
+  expect(JSON.stringify(parseCodexQuestionReply(reply!.content))).toBe('[{"callId":"call_q","index":0,"question":"Color?","answer":"Blue"},{"callId":"call_q","index":1,"question":"Color?","answer":"Red"}]');
+});
+
+it('retains the nullish fallback from an own id answer to the own question-text answer', () => {
+  const tool = {
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed' as const,
+    input: { replyMode: 'user-message', questions: [{ id: 'color', question: 'Color?' }] },
+  };
+  const expected = {
+    content: '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"call_q\\",0]","question":"Color?","answer":"Blue"}]\n</send_user_message_question_reply>',
+    displayContent: '',
+  };
+  const nullOwn: AskUserAnswers = JSON.parse('{"color":null,"Color?":"Blue"}');
+  expect(formatCodexQuestionReply(tool, nullOwn)).toEqual(expected);
+  const undefinedOwn: AskUserAnswers = JSON.parse('{"Color?":"Blue"}');
+  Object.defineProperty(undefinedOwn, 'color', { value: undefined, enumerable: true, writable: true, configurable: true });
+  expect(formatCodexQuestionReply(tool, undefinedOwn)).toEqual(expected);
+  // Observed control shape: an absent scalar id keys the index, and its own null entry still falls back.
+  const observedIndexKey: AskUserAnswers = JSON.parse('{"0":null,"Color?":"Blue"}');
+  expect(formatCodexQuestionReply({
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+    input: { replyMode: 'user-message', questions: [{ question: 'Color?' }] },
+  }, observedIndexKey)).toEqual(expected);
+});
+
+it('rejects an own empty-string id answer instead of falling back to question text', () => {
+  const emptyOwn: AskUserAnswers = JSON.parse('{"color":"","Color?":"Blue"}');
+  expect(formatCodexQuestionReply({
+    id: 'call_q', name: 'AskUserQuestion', status: 'completed',
+    input: { replyMode: 'user-message', questions: [{ id: 'color', question: 'Color?' }] },
+  }, emptyOwn)).toBeNull();
 });
 
 

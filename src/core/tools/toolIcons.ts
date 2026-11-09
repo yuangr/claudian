@@ -5,6 +5,9 @@ import {
   TOOL_ASK_USER_QUESTION,
   TOOL_BASH,
   TOOL_BASH_OUTPUT,
+  TOOL_CLAUDIAN_LIST_DESTINATIONS,
+  TOOL_CLAUDIAN_READ_SESSION,
+  TOOL_CLAUDIAN_SEND_MESSAGE,
   TOOL_CLOSE_AGENT,
   TOOL_EDIT,
   TOOL_EDIT_IMAGE,
@@ -20,6 +23,7 @@ import {
   TOOL_LIST_AGENTS,
   TOOL_LIST_MCP_RESOURCES,
   TOOL_LS,
+  TOOL_MANAGE_TASKS,
   TOOL_MCP,
   TOOL_NOTEBOOK_EDIT,
   TOOL_READ,
@@ -48,6 +52,7 @@ const TOOL_ICONS: Record<string, string> = {
   [TOOL_NOTEBOOK_EDIT]: 'file-pen',
   [TOOL_BASH]: 'terminal',
   [TOOL_BASH_OUTPUT]: 'terminal',
+  [TOOL_MANAGE_TASKS]: 'terminal',
   [TOOL_KILL_SHELL]: 'terminal',
   [TOOL_GLOB]: 'folder-search',
   [TOOL_GREP]: 'search',
@@ -82,15 +87,20 @@ const TOOL_ICONS: Record<string, string> = {
   [TOOL_GENERATE_IMAGE]: 'image',
   [TOOL_EDIT_IMAGE]: 'image-plus',
   [TOOL_GENERATE_VIDEO]: 'clapperboard',
+  [TOOL_CLAUDIAN_LIST_DESTINATIONS]: 'messages-square',
+  [TOOL_CLAUDIAN_SEND_MESSAGE]: 'send',
+  [TOOL_CLAUDIAN_READ_SESSION]: 'book-open',
 };
 
 /** Special marker for MCP tools - signals to use custom SVG. */
 export const MCP_ICON_MARKER = '__mcp_icon__';
 
 export function getToolIcon(toolName: string): string {
-  if (isScriptTool(toolName)) return TOOL_ICONS[toolName] ?? 'code';
+  // Own entries only: prototype keys (e.g. constructor) are unknown tool names.
+  const icon = Object.hasOwn(TOOL_ICONS, toolName) ? TOOL_ICONS[toolName] : undefined;
+  if (isScriptTool(toolName)) return icon ?? 'code';
   if (toolName.startsWith('mcp__')) {
     return MCP_ICON_MARKER;
   }
-  return TOOL_ICONS[toolName] || 'wrench';
+  return icon || 'wrench';
 }

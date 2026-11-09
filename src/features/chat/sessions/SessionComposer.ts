@@ -1,6 +1,5 @@
 import type { ChatMessage } from '@/core/types';
-import type { ComposerDestination, ComposerDraft, ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
-import { appendMarkdownSnippet } from '@/features/chat/composer/markdownSnippet';
+import { appendRawDraftSuffix, type ComposerDestination, type ComposerDraft, type ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
 
 export type SessionComposerPort = Pick<ComposerDraftController, 'destination' | 'capture' | 'consume' | 'restore' | 'changeDestination'>;
 
@@ -29,8 +28,7 @@ export class SessionComposer implements SessionComposerPort {
       return;
     }
     const previous = options.merge ? this.recovered.get(destination) : undefined;
-    const content = previous?.content.trim()
-      ? appendMarkdownSnippet(draft.content, previous.content.trim()) : draft.content;
+    const content = appendRawDraftSuffix(draft.content, previous?.content ?? '');
     const images = [...(draft.images ?? []), ...(previous?.images ?? [])];
     if (content || images.length) this.recovered.set(destination, { content, images });
     else this.recovered.delete(destination);

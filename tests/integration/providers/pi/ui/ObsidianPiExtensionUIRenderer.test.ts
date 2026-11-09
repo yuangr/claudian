@@ -1,36 +1,36 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 
-import { fireEvent, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
-import type { App } from 'obsidian';
+import { axe } from '@test/helpers/accessibility';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
+import { App } from 'obsidian';
 
-jest.mock('obsidian', () => {
-  const actual = jest.requireActual('obsidian');
-  class Modal {
-    contentEl = document.createElement('section');
-    open() {
-      this.contentEl.setAttribute('aria-label', 'Pi extension');
-      document.body.appendChild(this.contentEl);
-      (this as unknown as { onOpen(): void }).onOpen();
-    }
-    close() {
-      (this as unknown as { onClose(): void }).onClose();
-      this.contentEl.remove();
-    }
-  }
-  return { ...actual, Modal };
-});
 import { setLocale } from '@/i18n/i18n';
+import { PiExtensionUIBridge } from '@/providers/pi/runtime/PiExtensionUIBridge';
+import type { PiRPCTransport } from '@/providers/pi/runtime/PiRPCTransport';
 import { ObsidianPiExtensionUIRenderer } from '@/providers/pi/ui/ObsidianPiExtensionUIRenderer';
-HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-HTMLElement.prototype.addClass = function (...names) { this.classList.add(...names); };
+
+it.each(['select', 'confirm', 'input', 'editor'] as const)('names the native %s modal for assistive technology', async method => {
+  const controller = new AbortController();
+  const renderer = new ObsidianPiExtensionUIRenderer(new App());
+  const result = renderer[method]({ id: 'named', title: ' Review deployment ', options: ['Proceed'] }, controller.signal);
+  try {
+    const dialog = within(document.body).getByRole('dialog', { name: 'Review deployment' });
+    expect(await axe(dialog)).toHaveNoViolations();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    await expect(result).resolves.toEqual(method === 'confirm' ? { confirmed: false } : { cancelled: true });
+  } finally {
+    controller.abort();
+    await result;
+    document.body.replaceChildren();
+  }
+});
 
 it.each(['input', 'editor'] as const)('submits an accessible %s field', async method => {
   const controller = new AbortController();
-  const renderer = new ObsidianPiExtensionUIRenderer({} as App);
+  const renderer = new ObsidianPiExtensionUIRenderer(new App());
   const result = renderer[method]({ id: 'request-1', method, type: 'extension_ui_request', title: 'Your answer', defaultValue: 'Initial answer' }, controller.signal);
   try {
-    const region = within(document.body).getByRole('region', { name: 'Pi extension' });
+    const region = within(document.body).getByRole('dialog');
     const field = within(region).getByRole('textbox', { name: 'Your answer' }) as HTMLInputElement;
     expect(field.value).toBe('Initial answer');
     const violations = await axe(region);
@@ -47,14 +47,14 @@ it.each(['input', 'editor'] as const)('submits an accessible %s field', async me
 
 it.each(['input', 'editor'] as const)('cancels the %s dialog without submitting edited text', async method => {
   const controller = new AbortController();
-  const renderer = new ObsidianPiExtensionUIRenderer({} as App);
+  const renderer = new ObsidianPiExtensionUIRenderer(new App());
   const result = renderer[method]({ id: 'request-1', title: 'Your answer' }, controller.signal);
   try {
-    const region = within(document.body).getByRole('region', { name: 'Pi extension' });
+    const region = within(document.body).getByRole('dialog');
     fireEvent.input(within(region).getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Unsaved answer' } });
     fireEvent.click(within(region).getByRole('button', { name: 'Cancel' }));
     await expect(result).resolves.toEqual({ cancelled: true });
-    expect(within(document.body).queryByRole('region', { name: 'Pi extension' })).toBeNull();
+    expect(within(document.body).queryByRole('dialog')).toBeNull();
   } finally {
     controller.abort();
     await result;
@@ -64,13 +64,13 @@ it.each(['input', 'editor'] as const)('cancels the %s dialog without submitting 
 
 it.each(['input', 'editor'] as const)('closes an active %s dialog when its request is aborted', async method => {
   const controller = new AbortController();
-  const renderer = new ObsidianPiExtensionUIRenderer({} as App);
+  const renderer = new ObsidianPiExtensionUIRenderer(new App());
   const result = renderer[method]({ id: 'request-1', title: 'Your answer' }, controller.signal);
   try {
     expect(within(document.body).getByRole('textbox', { name: 'Your answer' })).toBeTruthy();
     controller.abort();
     await expect(result).resolves.toEqual({ cancelled: true });
-    expect(within(document.body).queryByRole('region', { name: 'Pi extension' })).toBeNull();
+    expect(within(document.body).queryByRole('dialog')).toBeNull();
   } finally {
     controller.abort();
     await result;
@@ -78,15 +78,14 @@ it.each(['input', 'editor'] as const)('closes an active %s dialog when its reque
   }
 });
 
-
 it.each(['input', 'editor'] as const)('localizes fallback %s titles and controls without altering submitted text', async method => {
   setLocale('zh-CN');
   const controller = new AbortController();
-  const renderer = new ObsidianPiExtensionUIRenderer({} as App);
+  const renderer = new ObsidianPiExtensionUIRenderer(new App());
   const result = renderer[method]({ id: 'localized', defaultValue: 'Provider text' }, controller.signal);
   try {
-    const region = within(document.body).getByRole('region', { name: 'Pi extension' });
-    expect(within(region).getByRole('heading', { name: 'Pi 扩展' })).toBeDefined();
+    const region = within(document.body).getByRole('dialog');
+    expect(within(document.body).getByRole('dialog', { name: 'Pi 扩展' })).toBeDefined();
     expect(within(region).getByRole('textbox', { name: 'Pi 扩展' })).toHaveProperty('value', 'Provider text');
     expect(within(region).getByRole('button', { name: '取消' })).toBeDefined();
     fireEvent.click(within(region).getByRole('button', { name: '提交' }));
@@ -96,5 +95,45 @@ it.each(['input', 'editor'] as const)('localizes fallback %s titles and controls
     await result;
     document.body.replaceChildren();
     setLocale('en');
+  }
+});
+
+it.each([false, true])('keeps native editor prefill through submission (edited: %s)', async edited => {
+  const send = vi.fn();
+  const bridge = new PiExtensionUIBridge({ send } as unknown as PiRPCTransport, new ObsidianPiExtensionUIRenderer(new App()));
+  const prefill = '  Initial text\nSecond line  ';
+  try {
+    bridge.handleRequest({ type: 'extension_ui_request', id: 'editor-prefill', method: 'editor', title: 'Edit draft', prefill });
+    const region = within(document.body).getByRole('dialog');
+    const field = within(region).getByRole('textbox', { name: 'Edit draft' });
+    expect(field).toHaveProperty('value', prefill);
+    const violations = await axe(region);
+    const value = edited ? prefill + '\nAdded line' : prefill;
+    if (edited) fireEvent.input(field, { target: { value } });
+    fireEvent.click(within(region).getByRole('button', { name: 'Submit' }));
+    await waitFor(() => expect(send).toHaveBeenCalledWith({ type: 'extension_ui_response', id: 'editor-prefill', value }));
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(violations).toHaveNoViolations();
+  } finally {
+    bridge.cleanup();
+    document.body.replaceChildren();
+  }
+});
+
+it.each(['  Keep indentation', 'Keep trailing space  ', '\tKeep both  '])('returns the original native select option %j', async value => {
+  const send = vi.fn();
+  const bridge = new PiExtensionUIBridge({ send } as unknown as PiRPCTransport, new ObsidianPiExtensionUIRenderer(new App()));
+  try {
+    bridge.handleRequest({ type: 'extension_ui_request', id: 'select-value', method: 'select', title: 'Choose text', options: [value, 'Other'] });
+    const region = within(document.body).getByRole('dialog');
+    const violations = await axe(region);
+    fireEvent.click(within(region).getByRole('button', { name: value.trim() }));
+    await waitFor(() => expect(send).toHaveBeenCalledWith({ type: 'extension_ui_response', id: 'select-value', value }));
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(within(document.body).queryByRole('dialog')).toBeNull();
+    expect(violations).toHaveNoViolations();
+  } finally {
+    bridge.cleanup();
+    document.body.replaceChildren();
   }
 });

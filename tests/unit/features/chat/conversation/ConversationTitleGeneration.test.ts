@@ -1,9 +1,13 @@
 import '@/providers';
 
 import { claudeCatalogFixture } from '@test/helpers/claudeModels';
+import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
+import { testDate } from '@test/helpers/testClock';
 import { Notice } from 'obsidian';
+import type { Mock } from 'vitest';
 
 import type { TitleGenerationService } from '@/core/providers/types';
+import type { ClaudianSettings } from '@/core/types';
 import {
   ConversationTitleGeneration,
   fallbackConversationTitle,
@@ -14,11 +18,16 @@ describe('fallbackConversationTitle', () => {
     expect(fallbackConversationTitle('How do I set up React? I need help.')).toBe('How do I set up React');
   });
 
-  it('truncates long titles to 50 chars', () => {
-    const title = fallbackConversationTitle('A'.repeat(100));
-
-    expect(title.length).toBeLessThanOrEqual(53); // 50 + '...'
-    expect(title).toContain('...');
+  it.each([
+    ['A'.repeat(100), 'A'.repeat(50) + '...'],
+    ['A'.repeat(50), 'A'.repeat(50)],
+    ['A'.repeat(49) + '\uD83D\uDE00tail', 'A'.repeat(49) + '...'],
+    ['A'.repeat(48) + '\uD83D\uDE00tail', 'A'.repeat(48) + '\uD83D\uDE00...'],
+    ['A'.repeat(48) + '\uD83D\uDE00', 'A'.repeat(48) + '\uD83D\uDE00'],
+    ['  ' + 'A'.repeat(49) + '\uD83D\uDE00tail? Later sentence', 'A'.repeat(49) + '...'],
+    ['A'.repeat(49) + '\u4E2Dtail', 'A'.repeat(49) + '\u4E2D...'],
+  ])('preserves the 50-unit prefix and suffix without splitting pairs (%#)', (input, expected) => {
+    expect(fallbackConversationTitle(input)).toBe(expected);
   });
 
   it('keeps messages without sentence breaks', () => {
@@ -26,36 +35,52 @@ describe('fallbackConversationTitle', () => {
   });
 });
 
-describe('ConversationTitleGeneration.regenerate', () => {
+describe('ConversationTitleGeneration', () => {
   let host: {
-    settings: Record<string, unknown>;
-    getConversationById: jest.Mock;
-    renameConversation: jest.Mock;
-    completeConversationTitleGeneration: jest.Mock;
-    updateConversation: jest.Mock;
+    settings: ClaudianSettings;
+    getConversationById: Mock;
+    renameConversation: Mock;
+    completeConversationTitleGeneration: Mock;
+    updateConversation: Mock;
   };
-  let service: { generateTitle: jest.Mock; cancel: jest.Mock };
+  let service: { generateTitle: Mock; cancel: Mock };
   let titles: ConversationTitleGeneration;
 
   function createTitles(getService: () => TitleGenerationService | null): ConversationTitleGeneration {
-    return new ConversationTitleGeneration({ host: host as any, getService });
+    return new ConversationTitleGeneration({ host: host, getService });
   }
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     host = {
       settings: {
+        ...DEFAULT_CLAUDIAN_SETTINGS,
         enableAutoTitleGeneration: true,
         titleGenerationModel: 'haiku',
         providerConfigs: { claude: claudeCatalogFixture(['haiku']) },
       },
-      getConversationById: jest.fn().mockResolvedValue(null),
-      renameConversation: jest.fn().mockResolvedValue(undefined),
-      completeConversationTitleGeneration: jest.fn().mockResolvedValue(undefined),
-      updateConversation: jest.fn().mockResolvedValue(undefined),
+      getConversationById: vi.fn().mockResolvedValue(null),
+      renameConversation: vi.fn().mockResolvedValue(undefined),
+      completeConversationTitleGeneration: vi.fn().mockResolvedValue(undefined),
+      updateConversation: vi.fn().mockResolvedValue(undefined),
     };
-    service = { generateTitle: jest.fn().mockResolvedValue(undefined), cancel: jest.fn() };
+    service = { generateTitle: vi.fn().mockResolvedValue(undefined), cancel: vi.fn() };
     titles = createTitles(() => service as unknown as TitleGenerationService);
+  });
+
+  it('uses a pair-safe first-turn fallback when automatic title generation is disabled', async () => {
+    host.settings.enableAutoTitleGeneration = false;
+
+    await titles.titleFirstTurn('conv-1', {
+      id: 'user-1', role: 'user', content: 'A'.repeat(49) + '\uD83D\uDE00tail',
+      timestamp: testDate().getTime(),
+    });
+
+    expect(host.renameConversation).toHaveBeenCalledTimes(1);
+    expect(host.renameConversation).toHaveBeenCalledWith('conv-1', 'A'.repeat(49) + '...');
+    expect(service.generateTitle).not.toHaveBeenCalled();
+    expect(host.updateConversation).not.toHaveBeenCalled();
+    expect(host.completeConversationTitleGeneration).not.toHaveBeenCalled();
   });
 
   it.each(['', 'removed-model'])('gives settings guidance without pending status for title model %s', async model => {
@@ -178,7 +203,7 @@ describe('ConversationTitleGeneration.regenerate', () => {
       ],
     });
     service.generateTitle.mockImplementation(
-      async (convId: string, _user: string, callback: any) => {
+      async (convId: string, _user: string, callback: Parameters<TitleGenerationService['generateTitle']>[2]) => {
         await callback(convId, { success: true, title: 'New Generated Title' });
       },
     );
@@ -203,7 +228,7 @@ describe('ConversationTitleGeneration.regenerate', () => {
 
     it('commits a failed generation against the captured title', async () => {
       service.generateTitle.mockImplementation(
-        async (_convId: string, _user: string, callback: any) => {
+        async (_convId: string, _user: string, callback: Parameters<TitleGenerationService['generateTitle']>[2]) => {
           await callback('conv-1', { success: false, error: 'Unavailable' });
         },
       );

@@ -1,3 +1,5 @@
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+import { createExecutionPathMapper } from '@/core/process/execution-target/WSLPathMapper';
 import { diffFromUnifiedText } from '@/core/tools/toolDiff';
 
 import {
@@ -23,10 +25,6 @@ import type {
   ToolResultDetails,
   WebSearchResultItem,
 } from '../../../core/types';
-import {
-  type ACPResolvedToolRawName,
-  ACPToolStreamAdapter,
-} from '../../acp';
 
 const TOOL_NAME_MAP: Record<string, string> = {
   apply_patch: TOOL_APPLY_PATCH,
@@ -60,7 +58,8 @@ function isKnownToolName(value: unknown): value is OpencodeKnownToolName {
     return false;
   }
 
-  return value.trim().toLowerCase() in TOOL_NAME_MAP;
+  // Own entries only: prototype keys (e.g. constructor) are not known tool names.
+  return Object.hasOwn(TOOL_NAME_MAP, value.trim().toLowerCase());
 }
 
 function toKnownToolName(value: string | undefined): OpencodeKnownToolName | null {
@@ -239,9 +238,19 @@ function normalizeQuestionAnswers(
     }
 
     const normalizedValue = values.length === 1 ? values[0] : values;
-    answers[question.question] = normalizedValue;
+    Object.defineProperty(answers, question.question, {
+      value: normalizedValue,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
     if (question.id) {
-      answers[question.id] = normalizedValue;
+      Object.defineProperty(answers, question.id, {
+        value: normalizedValue,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
   }
 
@@ -254,50 +263,6 @@ function extractToolMetadata(rawOutput: unknown): Record<string, unknown> | null
   }
 
   return isPlainObject(rawOutput.metadata) ? rawOutput.metadata : null;
-}
-
-export function resolveOpencodeRawToolName(
-  currentRawName: ACPResolvedToolRawName | undefined,
-  update: {
-    kind?: string | null;
-    title?: string | null;
-  },
-): ACPResolvedToolRawName {
-  const titleName = firstTrimmedString(update.title);
-  const knownTitleName = titleName && isKnownToolName(titleName)
-    ? titleName.trim().toLowerCase()
-    : undefined;
-
-  if (knownTitleName) {
-    return { provenance: 'title', rawName: knownTitleName };
-  }
-
-  if (
-    titleName
-    && (
-      currentRawName?.provenance !== 'mapped-kind'
-      && (
-        currentRawName?.provenance !== 'title'
-        || !isKnownToolName(currentRawName.rawName)
-      )
-    )
-  ) {
-    return { provenance: 'title', rawName: titleName };
-  }
-  if (currentRawName) {
-    return currentRawName;
-  }
-
-  switch (update.kind) {
-    case 'execute':
-      return { provenance: 'mapped-kind', rawName: 'bash' };
-    case 'fetch':
-      return { provenance: 'mapped-kind', rawName: 'webfetch' };
-    case 'read':
-      return { provenance: 'mapped-kind', rawName: 'read' };
-    default:
-      return { provenance: 'fallback', rawName: 'tool' };
-  }
 }
 
 function normalizeWebSearchInput(input: Record<string, unknown>): Record<string, unknown> {
@@ -343,7 +308,28 @@ export function normalizeOpencodeToolName(rawName: string | undefined): string {
   return TOOL_NAME_MAP[knownName];
 }
 
-export function normalizeOpencodeToolInput(
+/** Native paths become host paths only at the normalized UI/I/O boundary. */
+export function normalizeOpencodeToolInput(rawName: string | undefined, input: Record<string, unknown>, target?: ExecutionTarget): Record<string, unknown> {
+  const normalized = normalizeNativeToolInput(rawName, input);
+  if (target?.method !== 'wsl') return normalized;
+  const result = { ...normalized };
+  const name = toKnownToolName(rawName);
+  const pathKeys = name && ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'shell'].includes(name)
+    ? ['file_path', 'path', 'workdir', 'cwd'] : [];
+  for (const key of pathKeys) if (typeof result[key] === 'string') result[key] = hostToolPath(result[key], target);
+  if ((name === 'apply_patch' || name === 'patch') && typeof result.patch === 'string') {
+    result.patch = result.patch.replace(/^(\*\*\* (?:Add File|Update File|Delete File|Move to): )(.+)$/gm,
+      (_line, prefix: string, file: string) => prefix + hostToolPath(file, target));
+  }
+  return result;
+}
+
+function hostToolPath(value: string, target?: ExecutionTarget): string {
+  return target?.method === 'wsl' && value.startsWith('/')
+    ? createExecutionPathMapper(target).toHostPath(value) ?? value : value;
+}
+
+function normalizeNativeToolInput(
   rawName: string | undefined,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -430,6 +416,7 @@ export function normalizeOpencodeToolResultDetails(
   rawName: string | undefined,
   input: Record<string, unknown>,
   rawOutput: unknown,
+  target?: ExecutionTarget,
 ): ToolResultDetails | undefined {
   const knownName = toKnownToolName(rawName);
   const metadata = extractToolMetadata(rawOutput);
@@ -445,7 +432,7 @@ export function normalizeOpencodeToolResultDetails(
     const filePath = firstString(input.file_path, input.filePath, input.path, metadata?.filepath, metadata?.filePath);
     const diff = patch ? diffFromUnifiedText(patch, filePath) : undefined;
     if (diff) {
-      normalized.diff = diff;
+      normalized.diff = { ...diff, ...(diff.filePath ? { filePath: hostToolPath(diff.filePath, target) } : {}) };
     }
   }
 
@@ -478,6 +465,7 @@ function isOpencodeToolOutcomeFailure(
   switch (knownName) {
     case 'execute':
       return metadata?.error === true;
+    case 'bash':
     case 'shell':
       return (typeof metadata?.exit === 'number' && metadata.exit !== 0)
         || Boolean(firstTrimmedString(metadata?.signal))
@@ -507,13 +495,4 @@ export function normalizeOpencodeToolResult(
     default:
       return { content, isError };
   }
-}
-
-export function createOpencodeToolStreamAdapter(): ACPToolStreamAdapter {
-  return new ACPToolStreamAdapter({
-    normalizeToolInput: normalizeOpencodeToolInput,
-    normalizeToolName: normalizeOpencodeToolName,
-    normalizeToolResultDetails: normalizeOpencodeToolResultDetails,
-    resolveRawToolName: resolveOpencodeRawToolName,
-  });
 }

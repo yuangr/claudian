@@ -127,3 +127,17 @@ describe('parseContextLimit with comma-formatted input', () => {
     expect(parseContextLimit('1,234,567')).toBe(1234567);
   });
 });
+
+describe('parseContextLimit comma grouping validation', () => {
+  it.each(['1,5k', '12,34', '1,,000', ',1000', '1000,', '1.5,0k'])(
+    'rejects misplaced separators instead of changing the requested limit: %s', input => {
+      expect(parseContextLimit(input)).toBeNull();
+    },
+  );
+
+  it.each([['1,024', 1024], ['1,024.5k', 1024500], ['10,000,000', 10000000]] as const)(
+    'retains correctly grouped counts and decimal suffixes: %s', (input, expected) => {
+      expect(parseContextLimit(input)).toBe(expected);
+    },
+  );
+});

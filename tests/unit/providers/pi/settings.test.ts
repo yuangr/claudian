@@ -1,19 +1,15 @@
-const mockGetHostnameKey = jest.fn(() => 'host-a');
-
-import '@/providers';
-
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
+import { normalizePiVisibleModels } from '@/providers/pi/config';
 import { piSettingsReconciler } from '@/providers/pi/env/PiSettingsReconciler';
+import { piProviderRegistration } from '@/providers/pi/registration';
 import {
   getPiProviderSettings,
-  normalizePiVisibleModels,
   updatePiProviderSettings
 } from '@/providers/pi/settings';
 
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => mockGetHostnameKey(),
-}));
+registerProviderModules([claudeProviderRegistration, piProviderRegistration]);
 
 describe('Pi settings normalization', () => {
   const discoveredModels = [
@@ -38,12 +34,10 @@ describe('Pi settings normalization', () => {
   ];
 
   beforeEach(() => {
-    jest.clearAllMocks();
-    mockGetHostnameKey.mockReturnValue('host-a');
+    vi.clearAllMocks();
   });
 
   it('preserves hostname-scoped CLI paths without assigning them to the current device', () => {
-    mockGetHostnameKey.mockReturnValue('device:current');
 
     expect(getPiProviderSettings({
       providerConfigs: {
@@ -79,7 +73,7 @@ describe('Pi settings normalization', () => {
       'pi:anthropic/claude-sonnet-4',
       'pi:missing/model',
       'openai/gpt-5',
-    ], discoveredModels)).toEqual(['pi:anthropic/claude-sonnet-4', 'pi:missing/model']);
+    ])).toEqual(['pi:anthropic/claude-sonnet-4', 'pi:missing/model']);
   });
 
   it('normalizes aliases and defaults unsupported preferred thinking to High', () => {

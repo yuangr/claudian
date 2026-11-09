@@ -1,11 +1,12 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { isExistingFile, resolveConfiguredCLIPath } from '@/core/process/cliBinaryLocator';
 import { normalizeConfiguredCLIPath } from '@/core/process/cliPath';
-import { cliPathRequiresNode } from '@/core/process/env';
-import { readWindowsCommandShimTarget, resolveOwningPackageBin } from '@/core/process/windowsCmdShim';
+import { cliPathRequiresNode, findNodeExecutable } from '@/core/process/env';
+import type { ManagedStdioProcessOptions } from '@/core/process/ManagedStdioProcess';
+import { readPackageBin, readWindowsCommandShimTarget, resolveOwningPackageBin } from '@/core/process/windowsCmdShim';
 
 export interface DeepSeekDesktopInstallation {
   /** The bundled `dsh` command; it locates the installation and is never spawned. */
@@ -70,4 +71,18 @@ export function resolveDeepSeekNodeEntry(cliPath: string): string | undefined {
     return entry;
   }
   return cliPathRequiresNode(cliPath) ? cliPath : undefined;
+}
+
+/** Inspect the native CLI through its supported Node runtime, never its locator wrapper. */
+export function prepareDeepSeekVersionProbe(spec: ManagedStdioProcessOptions): ManagedStdioProcessOptions {
+  const desktop = getDeepSeekDesktopInstallation(spec.command);
+  if (desktop) {
+    const entry = readPackageBin(dirname(desktop.installAnchor), '@deepseek-ai/dsh', 'dsh');
+    if (!entry) throw new Error('The bundled DeepSeek CLI entry is unavailable.');
+    return { ...spec, command: desktop.executable, args: ['--expose-internals', entry, ...spec.args],
+      env: { ...spec.env, ELECTRON_RUN_AS_NODE: '1' }, directSpawn: true };
+  }
+  const entry = resolveDeepSeekNodeEntry(spec.command);
+  return { ...spec, command: entry ? findNodeExecutable(spec.env.PATH) ?? 'node' : spec.command,
+    args: entry ? [entry, ...spec.args] : spec.args, directSpawn: true };
 }

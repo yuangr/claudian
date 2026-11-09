@@ -73,7 +73,7 @@ export class PiExtensionUIBridge {
         this.emit?.({
           type: 'notice',
           content: getString(request.message) ?? getString(request.title) ?? 'Pi extension notification.',
-          level: 'info',
+          level: request.notifyType === 'warning' || request.notifyType === 'error' ? 'warning' : 'info',
         });
         return true;
       case 'setStatus':

@@ -1,25 +1,32 @@
-import { buildOpencodePromptBlocks, buildOpencodePromptText } from '@/providers/opencode/runtime/buildOpencodePrompt';
+import { decodeRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
+import { buildOpencodePrompt } from '@/providers/opencode/runtime/buildOpencodePrompt';
 
-describe('buildOpencodePromptText', () => {
+describe('buildOpencodePrompt text', () => {
   it('appends Claudian XML context to the user query', () => {
-    const prompt = buildOpencodePromptText({
-      browserSelection: {
-        selectedText: 'Browser quote',
-        source: 'browser:https://example.com',
-        title: 'Example',
-        url: 'https://example.com',
-      },
-      linkedContent: { path: 'notes/"today" & draft.md' },
-      editorSelection: {
-        mode: 'selection',
-        notePath: 'notes/"today" & draft.md',
-        selectedText: 'Selected text',
-        startLine: 4,
-        lineCount: 2,
+    const result = buildOpencodePrompt({
+      context: {
+        linkedContent: { path: 'notes/"today" & draft.md' },
+        selections: [
+          { kind: 'editor', selection: {
+            mode: 'selection',
+            notePath: 'notes/"today" & draft.md',
+            selectedText: 'Selected text',
+            startLine: 4,
+            lineCount: 2,
+          } },
+          { kind: 'browser', selection: {
+            selectedText: 'Browser quote',
+            source: 'browser:https://example.com',
+            title: 'Example',
+            url: 'https://example.com',
+          } },
+        ],
       },
       text: 'Summarize this',
     });
 
+    const prompt = result.text;
+    expect(result.userText).toEqual({ start: 0, end: 'Summarize this'.length });
     expect(prompt).toContain('Summarize this');
     expect(prompt).toContain('<linked_content path="notes/&quot;today&quot; &amp; draft.md" />');
     expect(prompt).not.toMatch(/<(?:linked_note|current_note)\b/);
@@ -27,23 +34,8 @@ describe('buildOpencodePromptText', () => {
     expect(prompt).toContain('<browser_selection source="browser:https://example.com" title="Example" url="https://example.com">');
   });
 
-  it('encodes Linked content without allowing CDATA to close early', () => {
-    const prompt = buildOpencodePromptText({
-      linkedContent: {
-        content: 'Before\n]]>\nAfter',
-        path: 'notes/"draft".md',
-      },
-      text: 'Review this',
-    });
-
-    expect(prompt).toContain(
-      '<linked_content path="notes/&quot;draft&quot;.md">\n<![CDATA[Before\n]]]]><![CDATA[>\nAfter]]>\n</linked_content>',
-    );
-    expect(prompt).not.toMatch(/<(?:linked_note|current_note)\b/);
-  });
-
   it('rebuilds prior conversation context when a native session must be recreated', () => {
-    const prompt = buildOpencodePromptText(
+    const result = buildOpencodePrompt(
       {
         text: 'Continue with the fix',
       },
@@ -63,15 +55,30 @@ describe('buildOpencodePromptText', () => {
       ],
     );
 
+    const prompt = result.text;
+    expect(result.userText).toEqual({ start: prompt.length - 'Continue with the fix'.length, end: prompt.length });
     expect(prompt).toContain('User: Inspect the bug');
     expect(prompt).toContain('Assistant: I found the failing path');
-    expect(prompt).toContain('User: Continue with the fix');
+    // History readers strip the replayed history and keep only this turn's input.
+    expect(decodeRecoveryPrompt(prompt)).toEqual({ currentInput: 'Continue with the fix' });
+  });
+
+  it('replays an unanswered final query without repeating it as current input', () => {
+    const result = buildOpencodePrompt(
+      { text: 'Retry this' },
+      [{ content: 'Retry this', id: 'user-1', role: 'user', timestamp: 1 }],
+    );
+
+    const prompt = result.text;
+    expect(result.userText).toBeNull();
+    expect(prompt).toContain('User: Retry this');
+    expect(decodeRecoveryPrompt(prompt)).toEqual({ currentInput: null });
   });
 });
 
-describe('buildOpencodePromptBlocks', () => {
-  it('includes image attachments after the main text block', () => {
-    const blocks = buildOpencodePromptBlocks({
+describe('buildOpencodePrompt images', () => {
+  it('attaches images as native data URIs beside the text', () => {
+    const { text, files } = buildOpencodePrompt({
       images: [{
         data: 'base64-image',
         id: 'img-1',
@@ -83,9 +90,9 @@ describe('buildOpencodePromptBlocks', () => {
       text: 'Inspect this image',
     });
 
-    expect(blocks).toEqual([
-      { type: 'text', text: 'Inspect this image' },
-      { type: 'image', mimeType: 'image/png', data: 'base64-image' },
-    ]);
+    expect({ text, files }).toEqual({
+      text: 'Inspect this image',
+      files: [{ uri: 'data:image/png;base64,base64-image' }],
+    });
   });
 });

@@ -2,9 +2,10 @@ import { setIcon } from 'obsidian';
 
 import type { ProviderServiceTierToggleConfig } from '@/core/providers/types';
 import { toggleServiceTier } from '@/features/chat/composer/toggleServiceTier';
-import type { ModelMenuPart, ModelSelector } from '@/features/chat/composer/toolbar/ModelSelector';
-import { runToolbarAction } from '@/features/chat/composer/toolbar/ToolbarMenu';
 import type { ToolbarCallbacks } from '@/features/chat/composer/toolbar/types';
+import { t } from '@/i18n/i18n';
+import type { ModelMenuPart, ModelSelector } from '@/shared/toolbar/ModelSelector';
+import { runToolbarAction } from '@/shared/toolbar/ToolbarMenu';
 
 /** Fast-mode switch in the model menu, with an indicator on the model button while active. */
 export class ServiceTierToggle {
@@ -33,26 +34,28 @@ export class ServiceTierToggle {
     const sectionEl = this.part.sectionEl;
     sectionEl.empty();
     this.part.chipEl.toggleClass('claudian-hidden', !toggleConfig?.isActive);
-    this.part.describe(toggleConfig?.isActive ? 'fast mode on' : null);
-    if (!toggleConfig) {
-      sectionEl.addClass('claudian-hidden');
+    this.part.describe(toggleConfig?.isActive ? t('chat.modelPicker.fastActive') : null);
+    // While the menu browses another provider no model is chosen there, so, as for a model
+    // without fast mode, the switch is not offered. The button still shows the current model's state.
+    if (!toggleConfig || !this.part.showsCurrentModel()) {
+      this.part.showSection(false);
       return;
     }
 
-    sectionEl.removeClass('claudian-hidden');
+    this.part.showSection(true);
     const currentLabel = toggleConfig.isActive ? toggleConfig.activeLabel : toggleConfig.inactiveLabel;
     const itemEl = this.part.menu.createItem(sectionEl, {
       role: 'switch',
       checked: toggleConfig.isActive,
       tabbable: true,
-      label: 'Fast mode',
+      label: t('chat.modelPicker.fast'),
       cls: 'claudian-toolbar-popover-switch-row',
-      title: [`Fast mode: ${currentLabel}`, toggleConfig.description].filter(Boolean).join('\n'),
+      title: [t('chat.modelPicker.fastLabel', { label: currentLabel }), toggleConfig.description].filter(Boolean).join('\n'),
       leadingIcon: 'zap',
       onSelect: () => {
         runToolbarAction(async () => {
           await this.toggle();
-        }, 'Failed to change service tier');
+        }, t('chat.modelPicker.changeTierFailed'));
       },
     });
     itemEl.createSpan({ cls: `claudian-toggle-switch${toggleConfig.isActive ? ' active' : ''}` });

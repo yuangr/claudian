@@ -11,6 +11,7 @@ import type { ProviderSettingsCoordinator } from '@/core/providers/ProviderSetti
 import type { ProviderId } from '@/core/providers/types';
 import type { ClaudianSettings } from '@/core/types';
 import type { EnvironmentScope } from '@/core/types/settings';
+import { SerialQueue } from '@/utils/SerialQueue';
 
 import type { RuntimeSettingsCoordinator } from './RuntimeSettingsCoordinator';
 import type { SettingsMutation } from './SettingsCoordinator';
@@ -36,11 +37,14 @@ export interface EnvironmentSettingsServiceDeps {
  * only then publishes the change; updates are serialized in submission order.
  */
 export class EnvironmentSettingsService {
-  private updateTail: Promise<void> = Promise.resolve();
+  private readonly updates = new SerialQueue();
 
   constructor(private readonly deps: EnvironmentSettingsServiceDeps) {}
 
-  /** Returns the runtime environment variables (fixed at plugin load). */
+  /**
+   * Returns shared and provider environment text from the current committed
+   * settings, read on each call.
+   */
   getActiveEnvironmentVariables(
     providerId: ProviderId = this.deps.providers.resolveSettingsProviderId(this.deps.getSettings()),
   ): string {
@@ -51,18 +55,17 @@ export class EnvironmentSettingsService {
     return getEnvironmentVariablesForScope(this.deps.getSettings(), scope);
   }
 
-  /** Updates and persists environment variables, restarting processes to apply changes. */
+  /**
+   * Applies and persists scoped environment changes through the serialized
+   * provider transition.
+   */
   applyEnvironmentVariables(scope: EnvironmentScope, envText: string): Promise<void> {
     return this.applyEnvironmentVariablesBatch([{ scope, envText }]);
   }
 
   async applyEnvironmentVariablesBatch(updates: readonly EnvironmentUpdate[]): Promise<void> {
     const queuedUpdates = updates.map(update => ({ ...update }));
-    const apply = this.updateTail.then(
-      () => this.#applyEnvironmentVariablesBatchNow(queuedUpdates),
-    );
-    this.updateTail = apply.catch(() => undefined);
-    await apply;
+    await this.updates.run(() => this.#applyEnvironmentVariablesBatchNow(queuedUpdates));
   }
 
   async applyProviderRuntimeSettings(

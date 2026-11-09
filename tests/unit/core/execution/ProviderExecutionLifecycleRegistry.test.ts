@@ -129,12 +129,39 @@ it('invalidates retained leases when the transition disables their provider', as
     beforeTransition: () => undefined,
   });
   const lease = registry.acquire(backend, createSessionConfig(), 'chat');
-  const invalidated = jest.fn();
+  const invalidated = vi.fn();
   lease.onInvalidated(invalidated);
   await registry.runTransition(['shared-provider'], async () => { enabled = false; });
   expect(lease.isCurrent()).toBe(false);
   expect(invalidated).toHaveBeenCalledTimes(1);
   expect(backend.sessions[0].disposeCalls).toBe(1);
+  await registry.dispose();
+});
+
+it('tells preservation hooks whether the transition invalidated their provider\'s sessions', async () => {
+  const registry = new ProviderExecutionLifecycleRegistry();
+  const backend = new TestBackend('shared-provider');
+  const decisions: boolean[] = [];
+  registry.registerTransitionHook('shared-provider', {
+    preserveSessions: (_session, { sessionsInvalidated }) => {
+      decisions.push(sessionsInvalidated);
+      return !sessionsInvalidated;
+    },
+    beforeTransition: () => undefined,
+  });
+  const lease = registry.acquire(backend, createSessionConfig(), 'chat');
+
+  await registry.runTransition(['shared-provider'], async () => {
+    registry.markSessionsInvalidated(['shared-provider']);
+  });
+  expect(decisions).toEqual([false, true]);
+  expect(lease.isCurrent()).toBe(false);
+  expect(backend.sessions[0].disposeCalls).toBe(1);
+
+  // The fact belongs to one transition; the next one starts without it.
+  const next = registry.acquire(backend, createSessionConfig(), 'chat');
+  await registry.runTransition(['shared-provider'], async () => undefined);
+  expect(next.isCurrent()).toBe(true);
   await registry.dispose();
 });
 
@@ -144,11 +171,11 @@ function createSessionConfig(
   return {
     lifecycle,
     nativePersistence: 'provider-default',
-    vaultWorkingDirectory: '/vault',
+    workingDirectory: '/vault',
     interactionPort: {
-      requestApproval: jest.fn(),
-      askUserQuestion: jest.fn(),
-      dismissInteraction: jest.fn(),
+      requestApproval: vi.fn(),
+      askUserQuestion: vi.fn(),
+      dismissInteraction: vi.fn(),
     },
   };
 }
@@ -221,7 +248,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     const backend = new TestBackend('claude');
     const lease = registry.acquire(backend, createSessionConfig(), 'chat');
     const failure = { code: 'dispose-failed' };
-    jest.spyOn(lease.session, 'dispose').mockImplementation(() => {
+    vi.spyOn(lease.session, 'dispose').mockImplementation(() => {
       throw failure;
     });
 
@@ -237,7 +264,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     const registry = new ProviderExecutionLifecycleRegistry();
     const backend = new TestBackend('claude', barrier.promise);
     const lease = registry.acquire(backend, createSessionConfig(), 'chat');
-    const mutation = jest.fn(async () => undefined);
+    const mutation = vi.fn(async () => undefined);
 
     const release = lease.release();
     const transition = registry.runTransition(['claude'], mutation);
@@ -283,7 +310,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     const registry = new ProviderExecutionLifecycleRegistry();
     const backend = new TestBackend('codex', barrier.promise);
     const lease = registry.acquire(backend, createSessionConfig(), 'chat');
-    const mutation = jest.fn(async () => undefined);
+    const mutation = vi.fn(async () => undefined);
 
     const transition = registry.runTransition(['codex'], mutation);
     expect(() => registry.acquire(backend, createSessionConfig(), 'title')).toThrow(
@@ -364,7 +391,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     });
     await flushTransitionStart();
 
-    const listener = jest.fn();
+    const listener = vi.fn();
     lease.onInvalidated(listener);
 
     expect(listener).toHaveBeenCalledTimes(1);
@@ -443,7 +470,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
 
   it('provides an explicit scope for rejecting nested transitions after async boundaries', async () => {
     const registry = new ProviderExecutionLifecycleRegistry();
-    const nestedMutation = jest.fn(async () => undefined);
+    const nestedMutation = vi.fn(async () => undefined);
 
     await registry.runTransition(['pi'], async (scope) => {
       expect(scope.providerIds).toEqual(['pi']);
@@ -463,7 +490,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
 
   it('provides transition hooks with the active scope', async () => {
     const registry = new ProviderExecutionLifecycleRegistry();
-    const nestedMutation = jest.fn(async () => undefined);
+    const nestedMutation = vi.fn(async () => undefined);
 
     registry.registerTransitionHook('claude', {
       beforeTransition: async (context) => {
@@ -503,7 +530,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
 
   it('rejects a nested same-provider transition instead of deadlocking', async () => {
     const registry = new ProviderExecutionLifecycleRegistry();
-    const nestedMutation = jest.fn(async () => undefined);
+    const nestedMutation = vi.fn(async () => undefined);
 
     const transition = registry.runTransition(['claude'], async (scope) => {
       await registry.runTransition(['claude'], nestedMutation, scope);
@@ -537,8 +564,8 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     const registry = new ProviderExecutionLifecycleRegistry();
     const outerMutationStarted = deferred();
     const beginNestedTransition = deferred();
-    const nestedMutation = jest.fn(async () => undefined);
-    const independentMutation = jest.fn(async () => undefined);
+    const nestedMutation = vi.fn(async () => undefined);
+    const independentMutation = vi.fn(async () => undefined);
 
     const outer = registry.runTransition(['pi'], async (scope) => {
       outerMutationStarted.resolve();
@@ -631,7 +658,7 @@ describe('ProviderExecutionLifecycleRegistry', () => {
 
   it('deduplicates provider IDs and invokes the mutation only once', async () => {
     const registry = new ProviderExecutionLifecycleRegistry();
-    const mutation = jest.fn(async () => 'result');
+    const mutation = vi.fn(async () => 'result');
 
     await expect(
       registry.runTransition(['claude', 'claude'], mutation),
@@ -663,8 +690,8 @@ describe('ProviderExecutionLifecycleRegistry', () => {
     );
     expect(() =>
       registry.registerTransitionHook('claude', {
-        beforeTransition: jest.fn(),
-        afterTransition: jest.fn(),
+        beforeTransition: vi.fn(),
+        afterTransition: vi.fn(),
       }),
     ).toThrow(ProviderExecutionRegistryDisposedError);
   });

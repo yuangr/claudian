@@ -1,3 +1,4 @@
+import { decodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import { resolveToolDiffData } from '@/core/tools/toolDiff';
 import { isWriteEditTool } from '@/core/tools/toolNames';
 import { applyToolResultPresentation } from '@/core/tools/toolResultDetails';
@@ -10,7 +11,7 @@ import { encodeDeepSeekCheckpoint } from '../types';
 import { materializeDeepSeekToolImages, readDeepSeekImages } from './DeepSeekImages';
 import { type DeepSeekRecord, readDeepSeekJournal, readDeepSeekProjection } from './DeepSeekJournal';
 
-export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: string, throughSeq: number): Promise<ChatMessage[]> {
+export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: string, throughSeq: number, hostPath: (path: string) => string = path => path): Promise<ChatMessage[]> {
   const records: DeepSeekRecord[] = [];
   for await (const page of readDeepSeekJournal(client, sessionId, throughSeq)) records.unshift(...page);
   const messages: ChatMessage[] = [];
@@ -18,6 +19,8 @@ export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: str
   let turnStart = 0;
   let output: DeepSeekOutput | undefined;
   let automatic = true;
+  // The journal's turn number; records before any `turn/start` belong to no turn.
+  let turnId: string | undefined;
   // Output events belong to the record being replayed; a steer starts a new reply mid-turn.
   let current: DeepSeekRecord | undefined;
   const pendingNotices: Array<{ type: 'task_notification'; content: string }> = [];
@@ -26,6 +29,7 @@ export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: str
     if (!assistant) {
       assistant = { id: `deepseek:${sessionId}:assistant:${record.seq}`, role: 'assistant', content: '', timestamp: record.time,
         contentBlocks: pendingNotices.splice(0), toolCalls: [], ...(automatic ? { isAutomaticResponse: true } : {}),
+        ...(turnId !== undefined ? { turnId } : {}),
       };
       messages.push(assistant);
     }
@@ -39,7 +43,8 @@ export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: str
     if (record.type === 'assistant/attempt') continue;
     if (record.type === 'turn/start') {
       assistant = undefined; automatic = true; turnStart = record.time; pendingNotices.length = 0;
-      output = new DeepSeekOutput(event => applyOutput(ensureAssistant(current!), tools, event));
+      turnId = `deepseek:${sessionId}:turn:${typeof record.data.turn === 'number' ? record.data.turn : record.seq}`;
+      output = new DeepSeekOutput(event => applyOutput(ensureAssistant(current!), tools, event), hostPath);
       continue;
     }
     if (record.type === 'user/message') {
@@ -49,8 +54,10 @@ export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: str
         // User input claimed mid-turn is a steer: what follows is a new reply, as live steering renders it.
         assistant = undefined;
         const images = await readDeepSeekImages(client, sessionId, record.data.content);
+        const sender = decodeSessionMessage(deepseekText(record.data.content));
         messages.push({ id: `deepseek:${sessionId}:user:${record.seq}`, role: 'user', timestamp: record.time,
           content: deepseekText(record.data.content), userMessageId: typeof record.data.id === 'string' ? record.data.id : undefined,
+          ...(sender ? { sessionMessage: { from: sender.from, sessionId: sender.sessionId } } : {}),
           ...(images.length ? { images } : {}),
         });
       } else if (source.kind === 'tool-jobs' || source.kind === 'subagent-settled') {
@@ -61,24 +68,43 @@ export async function loadDeepSeekHistory(client: DeepSeekReader, sessionId: str
       continue;
     }
     if (record.type === 'turn/end') {
-      if (pendingNotices.length) ensureAssistant(record);
-      if (assistant) {
+      const reason = isRecord(record.data.reason) ? record.data.reason.kind : undefined;
+      // A stopped turn is interrupted, as live execution treats it: no completion timing or stats.
+      const stopped = reason === 'aborted' || reason === 'cancelled';
+      const failed = reason === 'error' || reason === 'blocked';
+      // Unconsumed notices, or requested input stopped before any output, still end in a reply.
+      if (pendingNotices.length || (stopped && !automatic)) ensureAssistant(record);
+      // Failed turns keep committed output, but live execution gives them no completed checkpoint.
+      if (assistant && !failed) {
         assistant.assistantMessageId = encodeDeepSeekCheckpoint(record.seq);
-        assistant.completedAt = record.time;
-        const durationMs = Math.max(0, record.time - turnStart);
-        assistant.durationSeconds = Math.floor(durationMs / 1000);
-        assistant.turnStats = { outputTokens: output?.outputTokens ?? 0, durationMs };
+        if (stopped) {
+          assistant.isInterrupt = true;
+        } else {
+          assistant.completedAt = record.time;
+          const durationMs = Math.max(0, record.time - turnStart);
+          assistant.durationSeconds = Math.floor(durationMs / 1000);
+          assistant.turnStats = { outputTokens: output?.outputTokens ?? 0, durationMs };
+        }
+      }
+      if (stopped) {
+        // Steers split a turn into replies, but cancellation settles all its foreground calls.
+        for (const message of messages) {
+          if (message.role !== 'assistant' || message.turnId !== turnId) continue;
+          for (const tool of message.toolCalls ?? []) {
+            if (tool.status === 'running') tool.status = 'error';
+          }
+        }
       }
       output = undefined; assistant = undefined;
       continue;
     }
     if (record.type.startsWith('assistant/') || record.type.startsWith('tool/') || record.type === 'compaction/end' || record.type === 'request/context') {
-      output ??= new DeepSeekOutput(event => applyOutput(ensureAssistant(current!), tools, event));
+      output ??= new DeepSeekOutput(event => applyOutput(ensureAssistant(current!), tools, event), hostPath);
       output.record(await materializeDeepSeekToolImages(client, sessionId, record));
     }
   }
   if (pendingNotices.length && records.length) ensureAssistant(records.at(-1)!);
-  await hydrateChildren(client, sessionId, records, messages);
+  await hydrateChildren(client, sessionId, records, messages, hostPath);
   return messages;
 }
 
@@ -99,6 +125,7 @@ function applyOutput(message: ChatMessage, tools: Map<string, ToolCallInfo>, eve
         tool.status = event.isError ? 'error' : 'completed'; tool.result = event.content;
         // A failed edit changed nothing; live turns likewise attach a diff only on success.
         if (!event.isError && isWriteEditTool(tool.name)) tool.diffData = resolveToolDiffData(event.resultDetails?.diff, tool);
+        if (event.resultDetails?.resolvedAnswers) tool.resolvedAnswers = event.resultDetails.resolvedAnswers;
       }
       applyToolResultPresentation(tool, event.resultDetails);
     }
@@ -109,9 +136,9 @@ function applyOutput(message: ChatMessage, tools: Map<string, ToolCallInfo>, eve
 }
 
 
-async function hydrateChildren(client: DeepSeekReader, root: string, records: DeepSeekRecord[], messages: ChatMessage[]): Promise<void> {
+async function hydrateChildren(client: DeepSeekReader, root: string, records: DeepSeekRecord[], messages: ChatMessage[], hostPath: (path: string) => string): Promise<void> {
   const snapshots = new Map<string, SubagentInfo>();
-  const tracker = new DeepSeekSubagents(info => snapshots.set(info.id, info));
+  const tracker = new DeepSeekSubagents(info => snapshots.set(info.id, info), hostPath);
   const queue = [{ id: root, records, depth: 0 }];
   const seen = new Set([root]);
   while (queue.length) {

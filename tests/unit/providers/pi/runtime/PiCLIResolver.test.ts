@@ -1,20 +1,26 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { Mock } from 'vitest';
 
+import { getInstallationKey } from '@/core/device/InstallationKey';
 import { PiCLIResolver } from '@/providers/pi/runtime/PiCLIResolver';
 
-jest.mock('fs');
-const mockedStat = fs.statSync as jest.Mock;
-
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => 'current-host',
-}));
+vi.mock('fs');
+const mockedStat = fs.statSync as Mock;
 
 describe('PiCLIResolver', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    vi.clearAllMocks();
+    (fs.existsSync as Mock).mockReturnValue(false);
+  });
+
+  it('resolves a Linux CLI without inspecting Windows shims for WSL', () => {
+    const resolver = new PiCLIResolver();
+    expect(resolver.resolveFromSettings({ providerConfigs: { pi: {
+      cliPathsByHost: { [getInstallationKey()]: '/home/me/.local/bin/pi' }, cliPath: 'C:\\Tools\\pi.cmd',
+    } } }, { executionTarget: { method: 'wsl', platformFamily: 'unix', platformOs: 'linux', distroName: 'Ubuntu' } }))
+      .toBe('/home/me/.local/bin/pi');
+    expect(mockedStat).not.toHaveBeenCalled();
   });
 
   it('resolves the current host path before the legacy Pi CLI path', () => {
@@ -31,7 +37,7 @@ describe('PiCLIResolver', () => {
       providerConfigs: {
         pi: {
           cliPathsByHost: {
-            'current-host': '/current/pi',
+            [getInstallationKey()]: '/current/pi',
             'other-host': '/other/pi',
           },
           cliPath: '/legacy/pi',
@@ -98,7 +104,7 @@ describe('PiCLIResolver', () => {
       providerConfigs: {
         pi: {
           cliPathsByHost: {
-            'current-host': '/current/pi',
+            [getInstallationKey()]: '/current/pi',
           },
           environmentVariables: 'PI_OFFLINE=0',
         },
@@ -108,7 +114,7 @@ describe('PiCLIResolver', () => {
       providerConfigs: {
         pi: {
           cliPathsByHost: {
-            'current-host': '/current/pi',
+            [getInstallationKey()]: '/current/pi',
           },
           environmentVariables: 'PI_OFFLINE=1',
         },

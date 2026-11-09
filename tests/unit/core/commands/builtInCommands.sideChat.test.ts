@@ -50,5 +50,15 @@ describe('detectSideChatCommand', () => {
       .toMatchObject({ args: 'explore', command: { action: 'side' } });
     expect(detectBuiltInCommand('/side line one\nline two', forkCapable)).toBeNull();
     expect(detectBuiltInCommand(`/clear line one${separator}line two`, forkCapable)).toBeNull();
+    expect(detectBuiltInCommand(`/clear${separator}Explain this command`, forkCapable)).toBeNull();
+  });
+
+  it('admits a command whose separator is ordinary whitespace and tolerates outer line breaks', () => {
+    expect(detectBuiltInCommand('/clear Explain this command', forkCapable))
+      .toMatchObject({ args: 'Explain this command', command: { action: 'clear' } });
+    expect(detectBuiltInCommand('/clear\tExplain this command', forkCapable))
+      .toMatchObject({ args: 'Explain this command', command: { action: 'clear' } });
+    expect(detectBuiltInCommand('\n/clear\n'))
+      .toMatchObject({ args: '', command: { action: 'clear' } });
   });
 });

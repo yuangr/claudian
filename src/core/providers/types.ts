@@ -1,4 +1,4 @@
-import type { CursorContext } from '@/core/prompt/editorContext';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 
 import type {
   ProviderExecutionBackend,
@@ -6,7 +6,6 @@ import type {
 } from '../execution';
 import type {
   AskUserAnswers,
-  AuxiliaryContinuityReset,
   Conversation,
   SessionMetadata,
   SlashCommand,
@@ -35,8 +34,8 @@ export interface ProviderCapabilities {
   supportsConversationBranches?: boolean;
   /** Whether forked children can be non-persistent; defaults to supportsEphemeralSessions. */
   supportsEphemeralFork?: boolean;
-  /** Omitted means checkpoint forking; full-session providers can fork only the latest reply. */
-  forkMode?: 'checkpoint' | 'full-session';
+  /** Whether a checkpoint fork may start while the source runs a turn; defaults to true. */
+  supportsForkDuringTurn?: boolean;
   supportsProviderCommands: boolean;
   supportsImageAttachments: boolean;
   supportsTurnSteer?: boolean;
@@ -69,11 +68,14 @@ export interface ProviderRegistration {
   isEnabled: (settings: Record<string, unknown>) => boolean;
   setEnabled?: (settings: Record<string, unknown>, enabled: boolean) => void;
   capabilities: ProviderCapabilities;
-  getConversationCapabilities?: (providerState?: Record<string, unknown>) => ProviderCapabilities;
   environmentKeyPatterns?: RegExp[];
   modelPolicy: ProviderModelPolicy;
   chatUIConfig: ProviderChatUIConfig;
   settingsReconciler: ProviderSettingsReconciler;
+  /** Project the host Vault root for generated runtime context; omitted means identity.
+   * Resolve with the same target/settings as launch. Do not start a session or rewrite prompts.
+   */
+  resolveExecutionWorkingDirectory?: (plugin: ProviderHost, hostWorkingDirectory: string) => string | Promise<string>;
   createExecutionBackend: (plugin: ProviderHost) => ProviderExecutionBackend;
   createSubagentHistoryService?: (plugin: ProviderHost) => ProviderSubagentHistoryService;
   historyService: ProviderConversationHistoryService;
@@ -103,20 +105,36 @@ export interface ProviderSettingsStorageAdapter {
 
 export type ProviderEnvironmentSessionPolicy = 'invalidate' | 'reload';
 
-export interface ProviderSettingsReconciler {
-  /** Defaults to `invalidate` for backward compatibility. */
-  environmentSessionPolicy?: ProviderEnvironmentSessionPolicy;
+export interface ProviderEnvironmentReconciliation {
+  changed: boolean;
+  /** How this change treats conversation bindings; `invalidate` when omitted. */
+  sessionPolicy?: ProviderEnvironmentSessionPolicy;
+}
 
+export interface ProviderSettingsReconciliationContext {
+  /** Host workspace used by the provider's launch and native history. */
+  vaultPath?: string | null;
+}
+
+export interface ProviderSettingsReconciler {
   handleEnvironmentChange?(settings: Record<string, unknown>): boolean;
 
+  /**
+   * Clears resumable native bindings only. History locators must survive as
+   * recovery-only state, readable while their native store remains trusted.
+   */
   invalidateConversationSessions(conversations: Conversation[]): Conversation[];
 
-  reconcileModelWithEnvironment(
-    settings: Record<string, unknown>,
-    conversations: Conversation[],
-  ): { changed: boolean; invalidatedConversations: Conversation[] };
+  /**
+   * Whether invalidation deliberately keeps this conversation's binding live (its native
+   * store is unaffected), so a session still running for it keeps its execution authority.
+   * `invalidateConversationSessions` must leave exactly these conversations untouched.
+   */
+  preservesConversationSession?(conversation: Conversation): boolean;
 
-  normalizeModelVariantSettings?(settings: Record<string, unknown>): boolean;
+  reconcileModelWithEnvironment(settings: Record<string, unknown>, context?: ProviderSettingsReconciliationContext): ProviderEnvironmentReconciliation;
+
+  normalizeModelVariantSettings?(settings: Record<string, unknown>, context?: ProviderSettingsReconciliationContext): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,25 +157,6 @@ export interface SessionMetadataScanResult {
 }
 
 // ---------------------------------------------------------------------------
-// Provider-owned workspace sub-interfaces
-//
-// These remain here as standalone types so app-level settings/chat code can
-// depend on stable provider workspace contracts without importing concrete
-// provider implementations. They are NOT part of the provider-facing host
-// storage contract (`ProviderHostStorage`).
-// ---------------------------------------------------------------------------
-
-export interface AppCommandStorage {
-  save(command: SlashCommand): Promise<void>;
-  delete(name: string): Promise<void>;
-}
-
-export interface AppSkillStorage {
-  save(skill: SlashCommand): Promise<void>;
-  delete(name: string): Promise<void>;
-}
-
-// ---------------------------------------------------------------------------
 // Provider-owned chat UI configuration
 // ---------------------------------------------------------------------------
 
@@ -172,6 +171,8 @@ export interface ProviderUIOption {
   providerIcon?: ProviderIconSvg;
   /** Owning provider when several providers share one dropdown, so the option can carry its brand. */
   providerId?: ProviderId;
+  /** The owning provider's display name when several providers share one dropdown. */
+  providerLabel?: string;
 }
 
 export interface ProviderPathIconSvg {
@@ -188,10 +189,17 @@ export interface ProviderSvgPathChild {
 export interface ProviderSvgGroupChild {
   tag: 'g';
   attributes: Record<string, string>;
-  children: ProviderSvgPathChild[];
+  children: ProviderSvgChild[];
 }
 
-export type ProviderSvgChild = ProviderSvgGroupChild | ProviderSvgPathChild;
+/** Shapes and paint servers for full-colour marks; renderers scope their ids to each rendered copy. */
+export interface ProviderSvgElementChild {
+  tag: 'defs' | 'ellipse' | 'feGaussianBlur' | 'filter' | 'mask';
+  attributes: Record<string, string>;
+  children?: ProviderSvgChild[];
+}
+
+export type ProviderSvgChild = ProviderSvgElementChild | ProviderSvgGroupChild | ProviderSvgPathChild;
 
 export interface ProviderCompositeIconSvg {
   kind: 'composite';
@@ -313,6 +321,8 @@ export interface ProviderModelPolicy {
 
 /** UI composition may reuse policy, but application code consumes ProviderModelPolicy. */
 export interface ProviderChatUIConfig extends Omit<ProviderModelPolicy, 'permissionModes' | 'getServiceTierPolicy'> {
+  /** Presentation-only formatting of assistant Markdown; native history remains unchanged. */
+  prepareAssistantMarkdown?(markdown: string): string;
   getPermissionModeOptions?(settings?: Record<string, unknown>): readonly ProviderPermissionModeOption[] | null;
   getServiceTierToggle?(settings: Record<string, unknown>): ProviderServiceTierToggleConfig | null;
   getModeSelector?(settings: Record<string, unknown>): ProviderModeSelectorConfig | null;
@@ -328,7 +338,7 @@ export interface ProviderTransitionOwnerContext {
 }
 
 export interface ProviderCLIResolutionContext extends ProviderTransitionOwnerContext {
-  executionTarget?: unknown;
+  executionTarget?: ExecutionTarget;
 }
 
 export interface ProviderCLIResolver {
@@ -358,6 +368,8 @@ export interface ProviderCommandLoader {
   loadCommands(
     context: ProviderCommandLoaderContext,
   ): Promise<ProviderCommandDiscoveryResult<SlashCommand>>;
+  /** Notify an active picker to reread its existing command owner; the signal owns the subscription. */
+  watchCommands?(context: ProviderCommandLoaderContext, onChange: () => void): Promise<void>;
 }
 
 export interface ProviderWorkspaceServices {
@@ -490,6 +502,17 @@ export interface ProviderConversationHistoryService {
     vaultPath: string | null,
     pathContext?: ProviderHistoryPathContext,
   ): Promise<ProviderHistoryUpdate>;
+  /**
+   * An opaque token that changes whenever the conversation's live native history changes, including
+   * writes by processes other than Claudian. Callers only compare tokens for equality. Returns null when
+   * the history cannot be observed cheaply (no live native session, unreadable store, or a store that is
+   * not running), and must never start provider processes or create sessions to answer.
+   */
+  readNativeHistoryRevision(
+    conversation: ProviderHistoryInput,
+    vaultPath: string | null,
+    pathContext?: ProviderHistoryPathContext,
+  ): Promise<string | null>;
   resolveSessionIdForConversation(conversation: ProviderHistoryInput | null): string | null;
   isPendingForkConversation(conversation: ProviderHistoryInput): boolean;
   /** Builds opaque fork state; ephemeral creation may be deferred to its execution owner. */
@@ -504,9 +527,19 @@ export interface ProviderConversationHistoryService {
   /** Projects provider state for storage without changing live state or native history. */
   buildPersistedProviderState?(
     conversation: ProviderHistoryInput,
-    /** Preserve existing history state instead of rebuilding it from unloaded messages. */
-    options?: { preserveProviderState?: boolean },
+    options?: {
+      /** Preserve existing history state instead of rebuilding it from unloaded messages. */
+      preserveProviderState?: boolean;
+      /** Locates native history so the projection can omit what it already holds; resolve only when needed. */
+      getNativeHistory?: () => { vaultPath: string | null; pathContext?: ProviderHistoryPathContext };
+    },
   ): Record<string, unknown> | undefined;
+  /** Whether stored state duplicates native history, so rewriting its projection would shrink it. */
+  hasRedundantPersistedState?(
+    conversation: ProviderHistoryInput,
+    vaultPath: string | null,
+    pathContext?: ProviderHistoryPathContext,
+  ): boolean;
 }
 
 export interface ProviderSubagentHistoryRequest {
@@ -521,13 +554,20 @@ export interface ProviderSubagentHistoryService {
   loadFinalResult(request: ProviderSubagentHistoryRequest): Promise<string | null>;
 }
 
-export interface ProviderHistoryPathContext {
-  /** Initialize provider-owned resources lazily when native history needs them. */
-  ensureWorkspace?: () => Promise<void>;
+/** The process environment a provider resolves native history paths from. */
+export interface ProviderHistoryEnvironment {
   environment: NodeJS.ProcessEnv;
   hostPlatform?: NodeJS.Platform;
-  settings?: Record<string, unknown>;
   vaultPath?: string | null;
+}
+
+export interface ProviderHistoryPathContext extends ProviderHistoryEnvironment {
+  /** Initialize provider-owned resources lazily when native history needs them. */
+  ensureWorkspace?: () => Promise<void>;
+  /** The provider's own stored configuration. */
+  config: Readonly<Record<string, unknown>>;
+  /** Shared plus provider-scoped environment variable text, as `environment` applies it. */
+  environmentText: string;
 }
 
 export type ProviderConversationSessionAvailability =
@@ -659,48 +699,5 @@ export interface TitleGenerationService {
     userMessage: string,
     callback: TitleGenerationCallback
   ): Promise<void>;
-  cancel(): void;
-}
-
-// -- Inline edit --
-
-export type InlineEditMode = 'selection' | 'cursor';
-
-export interface InlineEditSelectionRequest {
-  mode: 'selection';
-  instruction: string;
-  notePath: string;
-  selectedText: string;
-  startLine?: number;
-  lineCount?: number;
-  contextFiles?: string[];
-}
-
-export interface InlineEditCursorRequest {
-  mode: 'cursor';
-  instruction: string;
-  notePath: string;
-  cursorContext: CursorContext;
-  contextFiles?: string[];
-}
-
-export type InlineEditRequest = InlineEditSelectionRequest | InlineEditCursorRequest;
-
-export interface InlineEditOutcome {
-  success: boolean;
-  resetRequired?: false;
-  editedText?: string;
-  insertedText?: string;
-  clarification?: string;
-  error?: string;
-}
-
-export type InlineEditResult = InlineEditOutcome | AuxiliaryContinuityReset;
-
-export interface InlineEditService {
-  setModelOverride?(model?: string): void;
-  resetConversation(): void;
-  editText(request: InlineEditRequest): Promise<InlineEditResult>;
-  continueConversation(message: string, contextFiles?: string[]): Promise<InlineEditResult>;
   cancel(): void;
 }

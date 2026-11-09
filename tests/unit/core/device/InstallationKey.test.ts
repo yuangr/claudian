@@ -2,10 +2,16 @@ import type * as InstallationIdentity from '@/core/device/InstallationKey';
 import {
   getInstallationKey,
   isInstallationKey,
-  parseInstallationKey,
 } from '@/core/device/InstallationKey';
 
 describe('InstallationKey', () => {
+  it('uses the deterministic persisted seed from shared setup without mocking identity', async () => {
+    vi.resetModules();
+    const identity = await import('@/core/device/InstallationKey');
+    expect(window.localStorage.getItem('claudian.deviceSettingsKey')).toBe('claudian-test-installation');
+    expect(identity.getInstallationKey()).toBe('device-ecada47dd9e2bec5e15fc4b4c2943be6b293b19bcc4a8c48cfd8bc571aa28065');
+  });
+
   const valid = `device-${'a'.repeat(64)}`;
 
   it('accepts only the existing opaque per-installation key shape', () => {
@@ -22,13 +28,6 @@ describe('InstallationKey', () => {
     ]) {
       expect(isInstallationKey(candidate)).toBe(false);
     }
-  });
-
-  it('fails closed before an invalid key can enter a filesystem path', () => {
-    expect(parseInstallationKey(valid)).toBe(valid);
-    expect(() => parseInstallationKey('device-invalid')).toThrow(
-      'A valid installation key is required',
-    );
   });
 });
 
@@ -68,10 +67,10 @@ describe('getInstallationKey', () => {
     expect(first).toBe(second);
   });
 
-  it('fails closed instead of caching a volatile key when localStorage rejects the seed', () => {
+  it('fails closed instead of caching a volatile key when localStorage rejects the seed', async () => {
     const originalStorage = Object.getOwnPropertyDescriptor(globalThis.window, 'localStorage');
     const values = new Map<string, string>();
-    const setItem = jest.fn()
+    const setItem = vi.fn()
       .mockImplementationOnce(() => {
         throw new Error('storage unavailable');
       })
@@ -87,10 +86,9 @@ describe('getInstallationKey', () => {
     });
 
     try {
-      jest.resetModules();
-      // Dynamic require re-evaluates the module-level device-key cache.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const isolatedIdentity = require('@/core/device/InstallationKey') as typeof InstallationIdentity;
+      vi.resetModules();
+      // Dynamic import re-evaluates the module-level device-key cache.
+      const isolatedIdentity = await import('@/core/device/InstallationKey') as typeof InstallationIdentity;
 
       expect(() => isolatedIdentity.getInstallationKey()).toThrow('persist');
       const durableKey = isolatedIdentity.getInstallationKey();
@@ -101,7 +99,7 @@ describe('getInstallationKey', () => {
       if (originalStorage) {
         Object.defineProperty(globalThis.window, 'localStorage', originalStorage);
       }
-      jest.resetModules();
+      vi.resetModules();
     }
   });
 

@@ -6,11 +6,22 @@
 
 import type { ChatMessage, ImageAttachment, ToolCallInfo } from '@/core/types';
 
-import { appendLinkedContent, appendLinkedContentBody, appendSelectionContexts, appendSessionReferences, extractUserQuery, formatLinkedContent } from './promptContext';
+import { appendExecutionContext, extractUserPromptContext, extractUserQuery, formatLinkedContent } from './promptContext';
 
 // ============================================
 // History Reconstruction
 // ============================================
+
+function sliceAtCodeUnitLimit(value: string, limit: number): string {
+  const cut = value.slice(0, limit);
+  if (
+    /[\uD800-\uDBFF]$/.test(cut)
+    && /^[\uDC00-\uDFFF]/.test(value.slice(limit))
+  ) {
+    return cut.slice(0, -1);
+  }
+  return cut;
+}
 
 /**
  * Formats tool input for inclusion in rebuilt context.
@@ -26,7 +37,7 @@ function formatToolInput(input: Record<string, unknown>, maxLength = 200): strin
 
       let valueStr: string;
       if (typeof value === 'string') {
-        valueStr = value.length > 100 ? `${value.slice(0, 100)}...` : value;
+        valueStr = value.length > 100 ? `${sliceAtCodeUnitLimit(value, 100)}...` : value;
       } else if (typeof value === 'object') {
         valueStr = '[object]';
       } else if (typeof value === 'function') {
@@ -42,7 +53,7 @@ function formatToolInput(input: Record<string, unknown>, maxLength = 200): strin
     }
 
     const result = parts.join(', ');
-    return result.length > maxLength ? `${result.slice(0, maxLength)}...` : result;
+    return result.length > maxLength ? `${sliceAtCodeUnitLimit(result, maxLength)}...` : result;
   } catch {
     return '[input formatting error]';
   }
@@ -86,7 +97,7 @@ export function formatToolCallForContext(
 function truncateToolResult(result: string): string {
   const maxLength = 500;
   if (result.length > maxLength) {
-    return `${result.slice(0, maxLength)}... (truncated)`;
+    return `${sliceAtCodeUnitLimit(result, maxLength)}... (truncated)`;
   }
   return result;
 }
@@ -132,15 +143,7 @@ export function getHistoryImages(messages: readonly ChatMessage[]): ImageAttachm
 function formatCapturedUserContent(message: ChatMessage): string {
   const snapshot = message.executionInput;
   if (!snapshot) return message.content?.trim() ?? '';
-  let content = snapshot.canonicalText;
-  const context = snapshot.context;
-  if (context?.linkedContent) {
-    content = context.linkedContent.content === undefined
-      ? appendLinkedContent(content, context.linkedContent.path)
-      : appendLinkedContentBody(content, context.linkedContent.path, context.linkedContent.content);
-  }
-  content = appendSelectionContexts(content, context);
-  return appendSessionReferences(content, context?.sessionReferences);
+  return appendExecutionContext(snapshot.canonicalText, snapshot.context);
 }
 
 export function buildContextFromHistory(
@@ -240,7 +243,9 @@ export function buildPromptWithHistoryContext(
     ? buildContextFromHistory(conversationHistory.slice(conversationHistory.lastIndexOf(lastUserMessage) + 1))
     : '';
   const shouldAppendPrompt = !lastUserMessage || laterContext.length > 0 ||
-    lastUserQuery.trim() !== currentUserQuery.trim();
+    lastUserQuery.trim() !== currentUserQuery.trim()
+    || extractUserPromptContext(lastUserMessage ? formatCapturedUserContent(lastUserMessage) : '')
+      !== extractUserPromptContext(actualPrompt);
 
   return shouldAppendPrompt
     ? `${historyContext}\n\nUser: ${prompt}`

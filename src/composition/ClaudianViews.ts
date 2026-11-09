@@ -8,6 +8,8 @@ import {
 import { VIEW_TYPE_CLAUDIAN } from '@/core/types';
 import type { ChatViewPlacement } from '@/core/types/settings';
 import type { ClaudianView } from '@/features/chat/ClaudianView';
+import type { TabComposerPort } from '@/features/chat/tabs/ChatTab';
+import type { ZenModeController } from '@/features/chat/zen/ZenModeController';
 import { revealWorkspaceLeaf } from '@/utils/obsidianCompat';
 
 /** Identifies a mounted chat view without relying on class identity across reloads. */
@@ -19,6 +21,9 @@ export function isClaudianView(value: unknown): value is ClaudianView {
 
 /** Locates and opens the chat views mounted in the Obsidian workspace. */
 export class ClaudianViews {
+  /** The chat the toggle last hid, restored by its next show; only a preference, never a guard. */
+  #toggleHiddenLeaf: WorkspaceLeaf | null = null;
+
   constructor(
     private readonly workspace: Workspace,
     private readonly getPlacement: () => ChatViewPlacement,
@@ -27,11 +32,12 @@ export class ClaudianViews {
   /** The focused chat view, else the first mounted one. */
   getView(): ClaudianView | null {
     const leaves = this.workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN);
+    return this.#getActiveView(leaves) ?? leaves.map(leaf => leaf.view).find(isClaudianView) ?? null;
+  }
+
+  #getActiveView(leaves: readonly WorkspaceLeaf[]): ClaudianView | null {
     const activeView = this.workspace.getActiveViewOfType(ItemView);
-    if (isClaudianView(activeView) && leaves.some(leaf => leaf.view === activeView)) {
-      return activeView;
-    }
-    return leaves.map(leaf => leaf.view).find(isClaudianView) ?? null;
+    return isClaudianView(activeView) && leaves.some(leaf => leaf.view === activeView) ? activeView : null;
   }
 
   getAllViews(): ClaudianView[] {
@@ -48,6 +54,15 @@ export class ClaudianViews {
       ?? views.find(view => view === preferred)
       ?? views[0]
       ?? null;
+  }
+
+  /** A chat tucked behind another tab of an expanded sidebar, preferring the current chat view. */
+  getBackgroundSidebarLeaf(): WorkspaceLeaf | null {
+    const hidden = this.workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN).filter(leaf => (
+      this.#getExpandedSidebar(leaf) && !(isClaudianView(leaf.view) && leaf.view.containerEl.isShown())
+    ));
+    const preferred = this.getView();
+    return hidden.find(leaf => leaf.view === preferred) ?? hidden[0] ?? null;
   }
 
   findConversationAcrossViews(conversationId: string): { view: ClaudianView; tabId: string } | null {
@@ -81,9 +96,49 @@ export class ClaudianViews {
     return ids;
   }
 
-  async activateView(): Promise<void> {
+  /**
+   * Hides a chat the user can see, else shows one. A shown zen panel hides itself; a
+   * sidebar chat yields to a sibling tab so the sidebar stays open.
+   */
+  async toggleView(zen: Pick<ZenModeController, 'toggleVisibility' | 'hide' | 'getActiveLeaf'>): Promise<void> {
+    if (zen.toggleVisibility()) {
+      const leaf = zen.getActiveLeaf();
+      if (leaf && isClaudianView(leaf.view)) leaf.view.focusActiveInput();
+      return;
+    }
+    const leaves = this.workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN);
+    // Main-area chats are revealed rather than closed, since closing shuts down their sessions.
+    const shown = leaves.filter(candidate => (
+      isClaudianView(candidate.view) && candidate.view.containerEl.isShown() && this.#getExpandedSidebar(candidate)
+    ));
+    const preferred = this.getView();
+    const leaf = shown.find(candidate => candidate.view === preferred) ?? shown[0];
+    const sidebar = leaf ? this.#getExpandedSidebar(leaf) : null;
+    if (!leaf || !sidebar) {
+      const hidden = this.#toggleHiddenLeaf;
+      this.#toggleHiddenLeaf = null;
+      await this.activateView(hidden && leaves.includes(hidden) ? hidden : undefined);
+      return;
+    }
+    this.#toggleHiddenLeaf = leaf;
+    const sibling = this.#findMostRecentSibling(leaf);
+    if (sibling) {
+      await revealWorkspaceLeaf(this.workspace, sibling);
+      return;
+    }
+    // A chat-only tab group can only hide with its sidebar; zen must not replace it.
+    sidebar.collapse();
+    zen.hide(leaf);
+  }
+
+  /**
+   * Reveals and focuses the preferred or active chat leaf, else the first one, else opens one.
+   * `focusComposer` replaces the default input focus once the chat is shown.
+   */
+  async activateView(preferred?: WorkspaceLeaf, focusComposer?: (composer: TabComposerPort) => void): Promise<void> {
     const { workspace } = this;
-    const existingLeaf = workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN)[0];
+    const leaves = workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN);
+    const existingLeaf = preferred ?? this.#getActiveView(leaves)?.leaf ?? leaves[0];
     const leaf = existingLeaf
       ?? this.#getLeafForPlacement(this.getPlacement());
     if (!leaf) return;
@@ -105,11 +160,39 @@ export class ClaudianViews {
 
       await revealWorkspaceLeaf(workspace, leaf);
       if (!focusSuperseded && isClaudianView(leaf.view)) {
-        leaf.view.focusActiveInput();
+        if (!focusComposer) {
+          leaf.view.focusActiveInput();
+        } else {
+          const composer = leaf.view.getActiveTab()?.composer;
+          if (composer) focusComposer(composer);
+        }
       }
     } finally {
       workspace.offref(focusIntentRef);
     }
+  }
+
+  #getExpandedSidebar(leaf: WorkspaceLeaf): { collapse(): void } | null {
+    const root = leaf.getRoot();
+    const { leftSplit, rightSplit } = this.workspace;
+    if (root === leftSplit && !leftSplit.collapsed) return leftSplit;
+    if (root === rightSplit && !rightSplit.collapsed) return rightSplit;
+    return null;
+  }
+
+  #findMostRecentSibling(leaf: WorkspaceLeaf): WorkspaceLeaf | null {
+    const siblings: WorkspaceLeaf[] = [];
+    // The workspace identifies deferred chat leaves before their views are mounted.
+    const chatLeaves = this.workspace.getLeavesOfType(VIEW_TYPE_CLAUDIAN);
+    this.workspace.iterateAllLeaves((candidate) => {
+      if (candidate !== leaf && candidate.parent === leaf.parent && !chatLeaves.includes(candidate)) siblings.push(candidate);
+    });
+    // activeTime is Obsidian's unexposed focus timestamp; without it, tab order decides.
+    const activeTime = (candidate: WorkspaceLeaf) => (candidate as { activeTime?: number }).activeTime ?? 0;
+    return siblings.reduce<WorkspaceLeaf | null>(
+      (best, candidate) => (!best || activeTime(candidate) > activeTime(best) ? candidate : best),
+      null,
+    );
   }
 
   #getLeafForPlacement(placement: ChatViewPlacement): WorkspaceLeaf | null {

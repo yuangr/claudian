@@ -2,9 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { type IncomingMessage, request } from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 
+import { resolveExecutionTarget } from '@/core/process/execution-target/ExecutionTargetResolver';
+import { buildTargetLaunchSpec } from '@/core/process/execution-target/TargetLaunchSpec';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 import { ManagedStdioProcess } from '@/core/process/ManagedStdioProcess';
 import { toAbortError } from '@/utils/abort';
 import { LineBuffer } from '@/utils/LineBuffer';
+
+import { getOpencodeWSLForwardedEnvironment, opencodeEnvironment } from '../runtime/OpencodeExecutionTarget';
 
 export interface OpencodeHTTPEvent {
   readonly type: string;
@@ -15,6 +20,9 @@ export class OpencodeHTTPError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
+// Native exits within milliseconds of EOF; the bound covers a slow WSL interop teardown.
+const STDIN_CLOSE_GRACE_MS = 3_000;
+
 /** One authenticated loopback server, owned through the native stdin lease. */
 export class OpencodeHTTPClient {
   private readonly controller = new AbortController();
@@ -22,11 +30,17 @@ export class OpencodeHTTPClient {
   private readonly process: ManagedStdioProcess;
   private endpoint: Promise<string> | null = null;
 
-  constructor(cliPath: string, private readonly cwd: string, environment: NodeJS.ProcessEnv) {
-    this.process = new ManagedStdioProcess({
+  readonly cwd: string;
+
+  constructor(cliPath: string, cwd: string, environment: NodeJS.ProcessEnv, readonly target: ExecutionTarget = resolveExecutionTarget({ settings: { installationMethod: 'native-windows', wslDistroOverride: '' } })) {
+    const env = opencodeEnvironment({ ...environment, OPENCODE_PASSWORD: this.password });
+    const spec = buildTargetLaunchSpec({
+      target, hostCwd: cwd, env, forwardEnvironment: getOpencodeWSLForwardedEnvironment(env),
       command: cliPath, args: ['serve', '--stdio', '--hostname', '127.0.0.1', '--port', '0'],
-      cwd, env: { ...environment, OPENCODE_PASSWORD: this.password },
     });
+    this.cwd = spec.targetCwd;
+    // `serve --stdio` exits on EOF; a signal would stop only the launcher of a WSL server still holding vault files.
+    this.process = new ManagedStdioProcess({ ...spec, cwd: spec.spawnCwd, stdinCloseGraceMs: STDIN_CLOSE_GRACE_MS });
   }
 
   signal(signal?: AbortSignal): AbortSignal {
@@ -35,6 +49,11 @@ export class OpencodeHTTPClient {
 
   isReusable(): boolean {
     return !this.controller.signal.aborted && this.process.getExitState() === null;
+  }
+
+  /** A request has started the server process; until then a reusable client has spawned nothing. */
+  isStarted(): boolean {
+    return this.endpoint !== null && this.isReusable();
   }
 
   async request<T = unknown>(route: string, options: {
@@ -54,7 +73,12 @@ export class OpencodeHTTPClient {
     }
     const text = Buffer.concat(chunks).toString('utf8');
     if (response.statusCode! < 200 || response.statusCode! >= 300) {
-      throw new OpencodeHTTPError(response.statusCode!, `OpenCode HTTP request failed (${response.statusCode}): ${text.slice(0, 1000)}`);
+      let reference = '';
+      try {
+        const error: unknown = JSON.parse(text);
+        if (isRecord(error) && typeof error.ref === 'string' && error.ref) reference = ` ref=${error.ref.slice(0, 1000)}`;
+      } catch { /* Non-JSON errors still retain the HTTP status and response text. */ }
+      throw new OpencodeHTTPError(response.statusCode!, `OpenCode HTTP request failed (${response.statusCode}): ${text.slice(0, 1000)}${reference}`);
     }
     return (text ? JSON.parse(text) : undefined) as T;
   }
@@ -137,7 +161,8 @@ export class OpencodeHTTPClient {
         if (options.streaming) window.clearTimeout(timer);
         resolve(response);
       });
-      req.on('error', reject);
+      req.on('error', error => reject(this.target.method === 'wsl' && !signal.aborted
+        ? new Error(`Cannot reach OpenCode in WSL on localhost. Enable localhostForwarding=true in [wsl2] in %UserProfile%\\.wslconfig and restart WSL, or use mirrored networking. ${error.message}`) : error));
       const timer = options.timeoutMs === 0 ? undefined : window.setTimeout(() => req.destroy(new Error('OpenCode HTTP request timed out.')), options.timeoutMs ?? 30_000);
       req.on('close', () => window.clearTimeout(timer));
       req.end(options.body === undefined ? undefined : JSON.stringify(options.body));

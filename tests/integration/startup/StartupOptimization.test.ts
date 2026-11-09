@@ -1,15 +1,15 @@
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
+
 import { StartupProfiler } from '@/core/performance/StartupProfiler';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
-import type { ProviderId, ProviderWorkspaceServices } from '@/core/providers/types';
+import { createCodexModelCatalogCommit } from '@/providers/codex/app/CodexWorkspaceServices';
+import { DEFAULT_CODEX_PROVIDER_SETTINGS } from '@/providers/codex/config';
 import type { CodexDiscoveredModel } from '@/providers/codex/models';
 import { CodexModelCatalogCoordinator } from '@/providers/codex/runtime/CodexModelCatalogCoordinator';
 import type {
   CodexModelDiscoveryResult,
   CodexModelDiscoveryServiceLike,
 } from '@/providers/codex/runtime/CodexModelDiscoveryService';
-import { DEFAULT_CODEX_PROVIDER_SETTINGS } from '@/providers/codex/settings';
 
 function makeModel(model: string, displayName = model): CodexDiscoveredModel {
   return {
@@ -25,66 +25,40 @@ function makeModel(model: string, displayName = model): CodexDiscoveredModel {
   };
 }
 
-function createFakeHost(): ProviderHost {
-  const executionLifecycleRegistry = new ProviderExecutionLifecycleRegistry();
-  return {
-    app: {
-      vault: { adapter: { basePath: '/vault' } },
-      workspace: {
-        onLayoutReady: jest.fn(),
-      },
-    },
-    executionLifecycleRegistry,
-    settings: {
-      providerConfigs: {
-        codex: {
-          ...DEFAULT_CODEX_PROVIDER_SETTINGS,
-          enabled: true,
-        },
-      },
-      environmentVariables: {},
-    },
-    storage: {
-      getAdapter: jest.fn(),
-    } as unknown as ProviderHost['storage'],
-    getResolvedProviderCliPath: jest.fn(() => '/usr/bin/codex'),
-    getActiveEnvironmentVariables: jest.fn(() => 'OPENAI_API_KEY=test'),
-    mutateSettingsConditionally: jest.fn(async () => false),
-    runProviderExecutionTransition: <T>(
-      providerIds: ProviderId[],
-      mutation: () => Promise<T>,
-    ) => (
-      executionLifecycleRegistry.runTransition(providerIds, mutation)
-    ),
-  } as unknown as ProviderHost;
-}
-
 describe('Startup optimization', () => {
   beforeEach(() => {
     StartupProfiler.reset();
     ProviderWorkspaceRegistry.clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await ProviderWorkspaceRegistry.disposeInitialized();
     ProviderWorkspaceRegistry.clear();
     StartupProfiler.reset();
   });
 
   it('initializes the workspace without discovering Codex models until explicit refresh', async () => {
     const discovery: CodexModelDiscoveryServiceLike = {
-      discoverModels: jest.fn(async () => ({
+      discoverModels: vi.fn(async () => ({
         kind: 'completed',
         models: [makeModel('gpt-4o')],
       } as CodexModelDiscoveryResult)),
     };
 
+    let catalog!: CodexModelCatalogCoordinator;
     ProviderWorkspaceRegistry.register('codex', {
-      initialize: async ({ plugin }) => ({
-        modelCatalogCoordinator: new CodexModelCatalogCoordinator(plugin, discovery),
-      } as unknown as ProviderWorkspaceServices),
+      initialize: async ({ plugin }) => {
+        catalog = new CodexModelCatalogCoordinator(
+          plugin.getRuntimeHost('codex'), discovery, createCodexModelCatalogCommit(plugin),
+        );
+        return { dispose: () => catalog.dispose() };
+      },
     });
 
-    const host = createFakeHost();
+    const { host } = await createProviderHostFixture({
+      settings: { providerConfigs: { codex: { ...DEFAULT_CODEX_PROVIDER_SETTINGS, enabled: true } } },
+      overrides: { getResolvedProviderCliPath: async () => '/usr/bin/codex' },
+    });
     const initPromise = ProviderWorkspaceRegistry.ensureInitialized(host, 'codex', 'startup-test');
     expect(discovery.discoverModels).not.toHaveBeenCalled();
 
@@ -93,10 +67,7 @@ describe('Startup optimization', () => {
     const report = StartupProfiler.getReport();
     expect(report.spans.some((span) => span.name === 'provider-init:codex')).toBe(true);
 
-    const services = ProviderWorkspaceRegistry.getServices('codex') as {
-      modelCatalogCoordinator: CodexModelCatalogCoordinator;
-    };
-    await services.modelCatalogCoordinator.refresh();
+    await catalog.refresh();
     expect(discovery.discoverModels).toHaveBeenCalledTimes(1);
   });
 });

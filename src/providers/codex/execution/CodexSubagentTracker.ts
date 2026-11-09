@@ -25,10 +25,6 @@ export class CodexSubagentTracker {
     private readonly workingDirectory?: () => string,
   ) {}
 
-  hasBackgroundWork(): boolean {
-    return [...this.agents.values()].some(agent => agent.info.status === 'running');
-  }
-
   threadClosed(threadId: string): void {
     const agent = this.agents.get(threadId);
     if (!agent) return;
@@ -42,7 +38,8 @@ export class CodexSubagentTracker {
   seed(thread: Thread): void {
     for (const turn of thread.turns) {
       for (const item of turn.items) {
-        if (item.type === 'subAgentActivity') this.activity(item, turn.id, false);
+        // A child's message back to this thread targets the parent, not a new child.
+        if (item.type === 'subAgentActivity' && item.agentThreadId !== thread.id) this.activity(item, turn.id, false);
       }
     }
   }
@@ -205,8 +202,13 @@ export class CodexSubagentTracker {
 }
 
 export function getCodexChildTurnOutcome(turn: Turn): Pick<SubagentInfo, 'status' | 'result'> {
-  const result = turn.items.filter(item => item.type === 'agentMessage'
+  const finalText = turn.items.filter(item => item.type === 'agentMessage'
     && item.phase === 'final_answer').map(item => item.type === 'agentMessage' ? item.text : '').join('\n\n');
+  // Native clients also accept an unphased last message when the turn completed.
+  const unphased = turn.status === 'completed'
+    ? turn.items.filter(item => item.type === 'agentMessage' && item.phase == null).at(-1)
+    : undefined;
+  const result = finalText || (unphased?.type === 'agentMessage' ? unphased.text : undefined);
   return {
     status: turn.status === 'inProgress' ? 'running' : turn.status === 'completed' ? 'completed' : 'error',
     result: result || turn.error?.message || undefined,

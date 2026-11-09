@@ -1,31 +1,28 @@
 import { FakeAuxiliaryBackend, waitFor } from '@test/helpers/core/auxiliary/AuxiliaryExecutionTestHarness';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import type { ProviderRegistration } from '@/core/providers/types';
+import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
 
 it.each([true, false])('selects auxiliary persistence from ephemeral support (%s)', async (supported) => {
   const backend = new FakeAuxiliaryBackend();
-  const lifecycle = new ProviderExecutionLifecycleRegistry();
   ProviderRegistry.register('claude', {
-    capabilities: { supportsEphemeralSessions: supported },
+    ...claudeProviderRegistration,
+    capabilities: { ...claudeProviderRegistration.capabilities, supportsEphemeralSessions: supported },
     createExecutionBackend: () => backend,
     displayName: 'Claude',
     isEnabled: () => true,
-    modelPolicy: { getModelOptions: () => [{ value: 'explicit-title-model', label: 'Title' }] },
-  } as unknown as ProviderRegistration);
-  const host = {
-    settings: { titleGenerationModel: 'explicit-title-model' },
-    app: { vault: { adapter: { basePath: '/vault' } } },
-    executionLifecycleRegistry: lifecycle,
-  } as unknown as ProviderHost;
-  const title = ProviderRegistry.createTitleGenerationService(host, 'claude');
+    modelPolicy: { ...claudeProviderRegistration.modelPolicy, getModelOptions: () => [{ value: 'explicit-title-model', label: 'Title' }] },
+  });
+  const { host, lifecycle } = await createProviderHostFixture({ settings: { titleGenerationModel: 'explicit-title-model' } });
+  ProviderWorkspaceRegistry.setServices('claude', {});
+  const title = ProviderRegistry.createTitleGenerationService(host);
   const inlineEdit = ProviderRegistry.createInlineEditService(host, 'claude');
   try {
     const results = [
-      title.generateTitle('conversation', 'Draft', jest.fn()),
-      inlineEdit.editText({ instruction: 'Improve', mode: 'selection', notePath: 'note.md', selectedText: 'Draft' }),
+      title.generateTitle('conversation', 'Draft', vi.fn()),
+      inlineEdit.send({ instruction: 'Improve', mode: 'selection', notePath: 'note.md', selectedText: 'Draft' }),
     ];
     await waitFor(() => backend.sessions.length === 2 && backend.sessions.every(session => session.requests.length === 1));
     const configs = [...backend.configs];
@@ -40,7 +37,8 @@ it.each([true, false])('selects auxiliary persistence from ephemeral support (%s
     })));
   } finally {
     title.cancel();
-    inlineEdit.cancel();
+    inlineEdit.end();
     await lifecycle.dispose();
+    ProviderWorkspaceRegistry.clear();
   }
 });

@@ -11,8 +11,9 @@ export function bindCopyFeedback(
 ): void {
   let feedbackTimeout: number | null = null;
   target.addEventListener('click', () => {
-    if (!navigator.clipboard?.writeText) return;
-    void navigator.clipboard.writeText(text()).then(() => {
+    const clipboard = (target.ownerDocument?.defaultView ?? window).navigator.clipboard;
+    if (!clipboard?.writeText) return;
+    void clipboard.writeText(text()).then(() => {
       if (feedbackTimeout !== null) {
         window.clearTimeout(feedbackTimeout);
       }
@@ -36,7 +37,9 @@ export function enhanceRenderedCodeFence(pre: HTMLPreElement): HTMLElement {
   wrapper.appendChild(pre);
 
   const code = pre.querySelector<HTMLElement>('code[class*="language-"]');
-  const language = code?.className.match(/language-(\w+)/)?.[1];
+  const language = Array.from(code?.classList ?? [])
+    .find(token => token.startsWith('language-') && token.length > 'language-'.length)
+    ?.slice('language-'.length);
   if (code && language) {
     wrapper.classList.add('has-language');
     const copyLabel = t('chat.codeBlock.copyAriaLabel', { language });

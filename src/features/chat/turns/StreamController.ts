@@ -1,3 +1,4 @@
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderId } from '@/core/providers/types';
 import type {
   ChatMessage,
@@ -11,6 +12,7 @@ import {
   hasDeferredDiagramFence,
 } from '@/features/chat/rendering/markdown/DisplayOnlyCodeFences';
 import type { RenderContentOptions } from '@/features/chat/rendering/markdown/MarkdownContentRenderer';
+import { escapeRawHTMLTags } from '@/features/chat/rendering/markdown/markdownHTML';
 import type { LiveTranscriptOptions, MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { createResponseTextBlock } from '@/features/chat/rendering/ResponseLayout';
 import {
@@ -100,7 +102,8 @@ export class StreamController {
       scrollToBottom,
     });
     this.textRenderCoordinator = this.#createRenderCoordinator(
-      () => this.#getStreamingRenderWindow()
+      () => this.#getStreamingRenderWindow(),
+      content => ProviderRegistry.prepareAssistantMarkdown(this.deps.getProviderId?.() ?? DEFAULT_CHAT_PROVIDER_ID, content),
     );
     this.thinkingRenderCoordinator = this.#createRenderCoordinator(
       () => this.#getThinkingRenderWindow()
@@ -167,15 +170,21 @@ export class StreamController {
   }
 
   #createRenderCoordinator(
-    getOwnerWindow: () => Window | null
+    getOwnerWindow: () => Window | null,
+    prepareContent: (content: string) => string = content => content,
   ): StreamingRenderCoordinator<StreamingContentSnapshot> {
     return new StreamingRenderCoordinator({
       getOwnerWindow,
       minIntervalMs: STREAMING_RENDER_MIN_INTERVAL_MS,
       maxIntervalMs: 500,
       render: async ({ el, content, final }) => {
-        // Derive options only when a render runs so hidden or throttled deltas skip the scans.
-        const options = final ? undefined : this.#getStreamingRenderOptions(content);
+        content = prepareContent(content);
+        // Defer by policy; the render pipeline already recognizes protected math and fences.
+        // Parsing once here merely to select flags repeats that work on every snapshot.
+        const options = final ? undefined : {
+          deferMath: this.#shouldDeferMathRendering(),
+          deferDiagrams: true,
+        };
         if (options) {
           await this.deps.renderer?.renderContent(el, content, options);
         } else {
@@ -264,7 +273,7 @@ export class StreamController {
 
       case 'notice':
         this.#tools.flush();
-        await this.appendText(`\n\n⚠️ **${chunk.level === 'warning' ? 'Blocked' : 'Notice'}:** ${chunk.content}`);
+        await this.appendText(`\n\n⚠️ **${chunk.level === 'warning' ? 'Warning' : 'Notice'}:** ${chunk.content}`);
         break;
 
       case 'error':
@@ -309,7 +318,8 @@ export class StreamController {
       if (tool) state.recordActivity({ kind: 'tool', tool });
     }
 
-    this.scrollToBottom();
+    // Text changes layout only when its throttled Markdown render completes.
+    if (chunk.type !== 'text' && chunk.type !== 'thinking') this.scrollToBottom();
   }
 
   /** Renders buffered tools and finalizes open thinking and text before a standalone block. */
@@ -326,7 +336,7 @@ export class StreamController {
   }
 
   #getStreamingRenderOptions(content: string): RenderContentOptions | undefined {
-    const deferMath = this.#shouldDeferMathRendering() && hasStreamingMathDelimiters(content);
+    const deferMath = this.#shouldDeferMathRendering() && hasStreamingMathDelimiters(escapeRawHTMLTags(content));
     const deferDiagrams = hasDeferredDiagramFence(
       content,
       getPluginFenceLanguageSet(this.deps.plugin.settings.pluginRenderedFenceLanguages),
@@ -405,6 +415,7 @@ export class StreamController {
       });
       state.currentThinkingState = thinkingState;
       this.#syncThinkingRenderAvailability();
+      this.scrollToBottom();
     }
 
     this.thinkingRenderCoordinator.request({
@@ -426,6 +437,16 @@ export class StreamController {
     }
     state.currentThinkingBlock = null;
     state.currentThinkingState = null;
+    // Keep an in-flight host render serialized with its final snapshot.
+    if (thinkingState && !thinkingState.isExpanded && !this.thinkingRenderCoordinator.isRendering) {
+      this.thinkingRenderCoordinator.cancel();
+      const renderer = this.deps.renderer;
+      const content = block.content;
+      finalizeThinkingBlock(thinkingState, durationSeconds, () => {
+        void renderer?.renderContent(thinkingState.contentEl, content);
+      });
+      return;
+    }
     if (thinkingState && this.#getStreamingRenderOptions(block.content)) {
       this.thinkingRenderCoordinator.request({ el: thinkingState.contentEl, content: block.content, final: true });
     }

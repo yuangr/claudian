@@ -1,15 +1,12 @@
 export const ACP_PROTOCOL_VERSION = 1 as const;
 
 export type ACPProtocolVersion = typeof ACP_PROTOCOL_VERSION;
-export type ACPRequestId = number | string | null;
 export type ACPSessionId = string;
 export type ACPSessionModeId = string;
 export type ACPSessionConfigId = string;
 export type ACPSessionConfigValueId = string;
 export type ACPToolCallId = string;
 export type ACPPermissionOptionId = string;
-export type ACPPositionEncodingKind = 'utf-16' | 'utf-32' | 'utf-8';
-export type ACPRole = 'assistant' | 'user';
 export type ACPStopReason = string;
 export type ACPMetadata = Record<string, unknown>;
 
@@ -19,88 +16,36 @@ export interface ACPImplementation {
   title?: string | null;
 }
 
-export interface ACPAuthEnvVar {
-  name: string;
-  label?: string | null;
-  optional?: boolean;
-  secret?: boolean;
-}
-
-export type ACPAuthMethod = {
-  description?: string | null;
-  id: string;
-  name?: string | null;
-} & (
-  | { type?: 'agent' }
-  | { envVars: ACPAuthEnvVar[]; type: 'env_var' }
-  | { args?: string[]; command: string; type: 'terminal' }
-);
-
-export interface ACPFileSystemCapabilities {
-  readTextFile?: boolean;
-  writeTextFile?: boolean;
-}
-
-export interface ACPClientAuthCapabilities {
-  terminal?: boolean;
-}
-
+/** Optional client features a provider chooses to advertise. */
 export interface ACPClientCapabilities {
-  auth?: ACPClientAuthCapabilities;
-  fs?: ACPFileSystemCapabilities;
-  terminal?: boolean;
-  positionEncodings?: ACPPositionEncodingKind[];
-}
-
-export interface ACPPromptCapabilities {
-  audio?: boolean;
-  embeddedContext?: boolean;
-  image?: boolean;
-}
-
-export interface ACPMCPCapabilities {
-  http?: boolean;
-  sse?: boolean;
-}
-
-export interface ACPSessionCapabilities {
-  close?: Record<string, never> | null;
-  fork?: Record<string, never> | null;
-  list?: Record<string, never> | null;
-  resume?: Record<string, never> | null;
-}
-
-export interface ACPAgentCapabilities {
-  auth?: {
-    logout?: Record<string, never> | null;
-  };
-  loadSession?: boolean;
-  mcpCapabilities?: ACPMCPCapabilities;
-  positionEncoding?: ACPPositionEncodingKind | null;
-  promptCapabilities?: ACPPromptCapabilities;
-  sessionCapabilities?: ACPSessionCapabilities;
+  /** Form-mode `elicitation/create` requests answered by the client. */
+  elicitation?: { form?: Record<string, never> } | null;
 }
 
 export interface ACPInitializeRequest {
-  _meta?: ACPMetadata | null;
   clientCapabilities?: ACPClientCapabilities;
   clientInfo?: ACPImplementation | null;
   protocolVersion: ACPProtocolVersion;
 }
 
+/** Each listed capability object marks support; omitted entries are unsupported. */
+export interface ACPSessionCapabilities {
+  close?: Record<string, unknown> | null;
+  list?: Record<string, unknown> | null;
+  resume?: Record<string, unknown> | null;
+}
+
+export interface ACPAgentCapabilities {
+  _meta?: ACPMetadata | null;
+  loadSession?: boolean;
+  sessionCapabilities?: ACPSessionCapabilities | null;
+}
+
 export interface ACPInitializeResponse {
   _meta?: ACPMetadata | null;
   agentCapabilities?: ACPAgentCapabilities;
-  agentInfo?: ACPImplementation | null;
-  authMethods?: ACPAuthMethod[];
   protocolVersion: ACPProtocolVersion;
 }
-
-export interface ACPAuthenticateRequest {
-  methodId: string;
-}
-
-export type ACPAuthenticateResponse = Record<string, never>;
 
 export interface ACPEnvVariable {
   name: string;
@@ -204,21 +149,6 @@ export interface ACPNewSessionResponse {
   sessionId: ACPSessionId;
 }
 
-export interface ACPForkSessionRequest {
-  _meta?: ACPMetadata | null;
-  additionalDirectories?: string[];
-  cwd: string;
-  mcpServers?: ACPMCPServer[];
-  sessionId: ACPSessionId;
-}
-
-export interface ACPForkSessionResponse {
-  _meta?: ACPMetadata | null;
-  configOptions?: ACPSessionConfigOption[] | null;
-  modes?: ACPSessionModeState | null;
-  sessionId: ACPSessionId;
-}
-
 export interface ACPLoadSessionRequest {
   _meta?: ACPMetadata | null;
   additionalDirectories?: string[];
@@ -235,22 +165,60 @@ export interface ACPLoadSessionResponse {
   sessionId?: ACPSessionId | null;
 }
 
-export interface ACPListSessionsRequest {
-  additionalDirectories?: string[];
-  cursor?: string | null;
-  cwd?: string | null;
-}
+export type ACPResumeSessionRequest = ACPLoadSessionRequest;
 
-export interface ACPSessionInfo {
+export type ACPResumeSessionResponse = ACPLoadSessionResponse;
+
+export interface ACPCloseSessionRequest {
   sessionId: ACPSessionId;
-  title?: string | null;
-  updatedAt?: string | null;
 }
 
-export interface ACPListSessionsResponse {
-  nextCursor?: string | null;
-  sessions: ACPSessionInfo[];
+export type ACPCloseSessionResponse = Record<string, never>;
+
+export interface ACPSetSessionConfigOptionRequest {
+  configId: ACPSessionConfigId;
+  sessionId: ACPSessionId;
+  value: ACPSessionConfigValueId;
 }
+
+export interface ACPSetSessionConfigOptionResponse {
+  configOptions?: ACPSessionConfigOption[] | null;
+}
+
+export interface ACPElicitationEnumOption {
+  const: string;
+  title?: string | null;
+}
+
+/** Form field schema: a single choice, a multi-choice array, or free text. */
+export interface ACPElicitationProperty {
+  description?: string | null;
+  items?: {
+    anyOf?: ACPElicitationEnumOption[] | null;
+    enum?: string[] | null;
+    oneOf?: ACPElicitationEnumOption[] | null;
+  } | null;
+  oneOf?: ACPElicitationEnumOption[] | null;
+  enum?: string[] | null;
+  title?: string | null;
+  type: 'array' | 'boolean' | 'integer' | 'number' | 'string';
+}
+
+export interface ACPCreateElicitationRequest {
+  message: string;
+  mode: 'form';
+  requestedSchema: {
+    properties: Record<string, ACPElicitationProperty>;
+    required?: string[] | null;
+    type: 'object';
+  };
+  sessionId: ACPSessionId;
+  toolCallId?: ACPToolCallId | null;
+}
+
+export type ACPCreateElicitationResponse =
+  | { action: 'accept'; content: Record<string, string | string[] | number | boolean> }
+  | { action: 'cancel' | 'decline' };
 
 export interface ACPTextContent {
   type: 'text';
@@ -345,24 +313,6 @@ export interface ACPSetSessionModelRequest {
 
 export interface ACPSetSessionModelResponse {
   _meta?: ACPMetadata | null;
-}
-
-export type ACPSetSessionConfigOptionRequest =
-  | {
-    configId: ACPSessionConfigId;
-    sessionId: ACPSessionId;
-    type: 'boolean';
-    value: boolean;
-  }
-  | {
-    configId: ACPSessionConfigId;
-    sessionId: ACPSessionId;
-    type: 'select';
-    value: ACPSessionConfigValueId;
-  };
-
-export interface ACPSetSessionConfigOptionResponse {
-  configOptions: ACPSessionConfigOption[];
 }
 
 export interface ACPContentChunk {
@@ -531,75 +481,3 @@ export type ACPRequestPermissionResponse = {
       outcome: 'selected';
     };
 };
-
-export interface ACPReadTextFileRequest {
-  limit?: number | null;
-  line?: number | null;
-  path: string;
-  sessionId: ACPSessionId;
-}
-
-export interface ACPReadTextFileResponse {
-  content: string;
-}
-
-export interface ACPWriteTextFileRequest {
-  content: string;
-  path: string;
-  sessionId: ACPSessionId;
-}
-
-export type ACPWriteTextFileResponse = Record<string, never>;
-
-export interface ACPCreateTerminalRequest {
-  args?: string[];
-  command: string;
-  cwd?: string | null;
-  env?: ACPEnvVariable[];
-  outputByteLimit?: number | null;
-  sessionId: ACPSessionId;
-}
-
-export interface ACPCreateTerminalResponse {
-  terminalId: string;
-}
-
-export interface ACPTerminalOutputRequest {
-  sessionId: ACPSessionId;
-  terminalId: string;
-}
-
-export interface ACPTerminalExitStatus {
-  exitCode?: number | null;
-  signal?: string | null;
-}
-
-export interface ACPTerminalOutputResponse {
-  exitStatus?: ACPTerminalExitStatus | null;
-  output: string;
-  truncated: boolean;
-}
-
-export interface ACPWaitForTerminalExitRequest {
-  sessionId: ACPSessionId;
-  terminalId: string;
-}
-
-export interface ACPWaitForTerminalExitResponse {
-  exitCode?: number | null;
-  signal?: string | null;
-}
-
-export interface ACPKillTerminalRequest {
-  sessionId: ACPSessionId;
-  terminalId: string;
-}
-
-export type ACPKillTerminalResponse = Record<string, never>;
-
-export interface ACPReleaseTerminalRequest {
-  sessionId: ACPSessionId;
-  terminalId: string;
-}
-
-export type ACPReleaseTerminalResponse = Record<string, never>;

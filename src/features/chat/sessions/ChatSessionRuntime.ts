@@ -1,5 +1,6 @@
 import type { ProviderId } from '@/core/providers/types';
 import type { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import type { SessionMailbox } from '@/features/chat/session-messaging/SessionMailbox';
 import type { SessionChange, SessionModel } from '@/features/chat/sessions/SessionModel';
 import type { SideChatController } from '@/features/chat/side-chat/SideChatController';
 import { SessionAttention } from '@/features/chat/state/SessionAttention';
@@ -17,6 +18,8 @@ let nextSessionKey = 0;
 
 export interface TurnCancelOptions {
   dismissInteractions?: boolean;
+  /** Another session's interrupt keeps the pending session messages it is delivered with. */
+  keepMailbox?: boolean;
 }
 
 export class ChatSessionRuntime {
@@ -24,9 +27,11 @@ export class ChatSessionRuntime {
   readonly sessionKey = `session-${++nextSessionKey}`;
   readonly attention = new SessionAttention();
   private currentModel: SessionModel | null = null;
+  private mailboxOwner: SessionMailbox | null = null;
   private childOwner: SideChatController | null = null;
   private lifetime: 'open' | 'closing' | 'disposed' = 'open';
   private readonly listeners = new Set<() => void>();
+  private readonly hydrationListeners = new Set<() => void>();
   private pendingBackgroundWork = 0;
   private readonly modelWork = new Set<Promise<unknown>>();
   private disposal: Promise<void> | null = null;
@@ -85,6 +90,14 @@ export class ChatSessionRuntime {
     await this.currentModel?.conversationController.awaitCreation();
   }
 
+  get mailbox(): SessionMailbox | null { return this.mailboxOwner; }
+
+  installMailbox(mailbox: SessionMailbox): void {
+    if (this.mailboxOwner) throw new Error('Mailbox already installed');
+    this.mailboxOwner = mailbox;
+    this.subscribe(() => mailbox.wake());
+  }
+
   installSideChat(side: SideChatController): void {
     if (this.childOwner) throw new Error('Side chat owner already installed');
     this.childOwner = side;
@@ -98,6 +111,15 @@ export class ChatSessionRuntime {
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeHydrated(listener: () => void): () => void {
+    this.hydrationListeners.add(listener);
+    return () => this.hydrationListeners.delete(listener);
+  }
+
+  notifyHydrated(): void {
+    for (const listener of this.hydrationListeners) listener();
   }
 
   notifyChanged(): void {
@@ -116,7 +138,6 @@ export class ChatSessionRuntime {
   /** The single owner of this session's foreground turn activity. */
   readonly turns = new TurnCoordinator(() => this.admitsConversationOperations);
   private backgroundWork: Promise<void> = Promise.resolve();
-  private coordinatorDisposal: Promise<void> | null = null;
   private identityRevisionValue = 0;
 
   constructor(
@@ -154,7 +175,7 @@ export class ChatSessionRuntime {
    */
   get isIdle(): boolean {
     return !this.turns.isActive && this.pendingBackgroundWork === 0 && this.modelWork.size === 0 && !this.hasBackgroundWork && !this.isConversationBusy
-      && !this.hasPendingInteraction;
+      && !this.hasPendingInteraction && !this.mailboxOwner?.hasPending;
   }
 
   private get isConversationBusy(): boolean {
@@ -162,7 +183,7 @@ export class ChatSessionRuntime {
   }
 
   /** An approval or question awaits the user. */
-  private get hasPendingInteraction(): boolean {
+  get hasPendingInteraction(): boolean {
     return !!this.currentModel?.hasPendingInteraction;
   }
 
@@ -183,9 +204,14 @@ export class ChatSessionRuntime {
   /** Main-destination work already published to the user, excluding detached side work. */
   get hasMainBackgroundWork(): boolean { return this.coordinator.publishedBackgroundWork; }
 
+  /** Main transcript work, excluding the independently owned side chat. */
+  get isMainWorking(): boolean {
+    return this.hasActiveTurn || this.hasMainBackgroundWork || !!this.currentModel?.hasPendingWork;
+  }
+
   /** Any foreground or background work a user can see. */
   get isWorking(): boolean {
-    return this.hasActiveTurn || this.hasMainBackgroundWork || !!this.currentModel?.hasPendingWork || !!this.childOwner?.isWorking;
+    return this.isMainWorking || !!this.childOwner?.isWorking;
   }
 
   /**
@@ -193,6 +219,7 @@ export class ChatSessionRuntime {
    * then cancels provider execution. Non-user reasons also release the turn's presentation.
    */
   cancelTurn(reason: TurnCancelReason, options: TurnCancelOptions = {}): boolean {
+    if (!options.keepMailbox) this.mailboxOwner?.clear();
     const cancelled = this.turns.cancel(reason);
     try {
       if (options.dismissInteractions) this.currentModel?.dismissInteractions();
@@ -215,6 +242,7 @@ export class ChatSessionRuntime {
   beginShutdown(): void {
     if (this.lifetime !== 'open') return;
     this.lifetime = 'closing';
+    this.mailboxOwner?.clear();
     this.turns.cancel('shutdown');
     this.childOwner?.beginShutdown();
   }
@@ -246,13 +274,6 @@ export class ChatSessionRuntime {
       Object.assign(this.identity, { conversationId, providerId, draftModel });
       this.publish('identity');
     }
-  }
-
-  private async disposeExecutionCoordinator(): Promise<void> {
-    if (!this.coordinatorDisposal) {
-      this.coordinatorDisposal = Promise.resolve().then(() => this.coordinator.dispose());
-    }
-    await this.coordinatorDisposal;
   }
 
   enqueueBackgroundWork(work: () => Promise<void>, independent = false): Promise<void> | null {
@@ -296,12 +317,13 @@ export class ChatSessionRuntime {
       results.push(await model.conversationController.save(false)
         .then(value => ({ status: 'fulfilled' as const, value }), (reason: unknown) => ({ status: 'rejected' as const, reason })));
     }
-    results.push(await this.disposeExecutionCoordinator()
+    results.push(await this.coordinator.dispose()
       .then(value => ({ status: 'fulfilled' as const, value }), (reason: unknown) => ({ status: 'rejected' as const, reason })));
     model?.dispose();
     this.currentModel = null;
     this.lifetime = 'disposed';
     this.listeners.clear();
+    this.hydrationListeners.clear();
     const failures = results.filter(result => result.status === 'rejected');
     if (failures.length) throw new AggregateError(failures.map(result => result.reason as unknown), 'Failed to drain session');
   }

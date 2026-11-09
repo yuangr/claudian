@@ -1,21 +1,29 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { DEEPSEEK_PRESETS, type DeepSeekPreset } from '../types';
-import { DEEPSEEK_COMPATIBILITY_SOURCE, DEEPSEEK_EPHEMERAL_SOURCE, DEEPSEEK_LIFECYCLE_SOURCE } from './DeepSeekCompatibility';
+import type { ExecutionPathMapper } from '@/core/process/execution-target/types';
+import type { SessionToolRoute } from '@/core/session-tools/SessionToolEndpoint';
+import { replaceFile } from '@/utils/fileReplace';
+
+import { DEEPSEEK_PRESETS } from '../types';
+import { DEEPSEEK_COMPATIBILITY_SOURCE, DEEPSEEK_EPHEMERAL_SOURCE, DEEPSEEK_LIFECYCLE_SOURCE, DEEPSEEK_SESSIONS_SOURCE } from './DeepSeekCompatibility';
 import { buildDeepSeekPresetPlugins, type DeepSeekPresetPlugin } from './DeepSeekPresetPlugins';
 
 /** Launch-only overlay for one shared Host: every Claudian preset, the lifecycle tether and ephemeral sessions. */
 export interface DeepSeekLaunchArtifacts {
   readonly patchPath: string;
   readonly desktopRunnerPath: string;
-  /** Replaces a preset's literal prompt; native applies it at the next prompt assembly. */
-  writePrompt(preset: DeepSeekPreset, text: string): Promise<void>;
+  /** Replaces one native session's literal prompt; native applies it from that session's next turn. */
+  writePrompt(sessionId: string, text: string): Promise<void>;
+  /** Removes a released session's prompt; a turn already running keeps the prompt it started with. */
+  removePrompt(sessionId: string): Promise<void>;
   /** Chat agents read it at creation and at each turn start, so a change never lands mid-turn. */
   writeCodeMode(enabled: boolean): Promise<void>;
+  /** Atomically publishes an endpoint replacement without restarting the native Host. */
+  writeSessionToolRoute(route: Pick<SessionToolRoute, 'url' | 'routeId'>): Promise<void>;
   /**
    * Makes the next native fork of `parent` at `atSeq` ephemeral until the returned withdrawal runs. Callers serialize
    * forks so no other fork of the same parent can claim it.
@@ -28,11 +36,16 @@ export interface DeepSeekLaunchArtifacts {
 
 export async function prepareDeepSeekLaunchArtifacts(
   directory = tmpdir(), presetPlugins: readonly DeepSeekPresetPlugin[] = [],
+  sessionToolRoute?: Pick<SessionToolRoute, 'url' | 'routeId'>,
+  pathMapper?: ExecutionPathMapper,
 ): Promise<DeepSeekLaunchArtifacts> {
   const root = await mkdtemp(join(directory, 'claudian-deepseek-'));
   const compatibilityPath = join(root, 'claudian-compatibility.mjs');
+  const sessionsPath = join(root, 'claudian-sessions.mjs');
+  const sessionToolsFile = join(root, 'session-tools.json');
   const lifecyclePath = join(root, 'claudian-lifecycle.mjs');
-  const promptPath = (preset: DeepSeekPreset): string => join(root, 'prompts', `${preset}.txt`);
+  const promptDirectory = join(root, 'prompts');
+  const promptPath = (sessionId: string): string => join(promptDirectory, deepseekPromptFileName(sessionId));
   const codeModePath = join(root, 'code-mode');
   const ephemeralPath = join(root, 'claudian-ephemeral.mjs');
   const ephemeralStatePath = join(root, 'ephemeral-forks.json');
@@ -55,8 +68,19 @@ export async function prepareDeepSeekLaunchArtifacts(
     writes = task.catch(() => {});
     return task;
   };
-  const writePrompt = (preset: DeepSeekPreset, text: string): Promise<void> => replace(promptPath(preset), text);
+  const remove = (path: string): Promise<void> => {
+    const task = writes.then(async () => {
+      await rm(path, { force: true, maxRetries: 5 });
+      written.delete(path);
+    });
+    writes = task.catch(() => {});
+    return task;
+  };
+  const writePrompt = (sessionId: string, text: string): Promise<void> => replace(promptPath(sessionId), text);
+  const removePrompt = (sessionId: string): Promise<void> => remove(promptPath(sessionId));
   const writeCodeMode = (enabled: boolean): Promise<void> => replace(codeModePath, enabled ? 'both' : 'native');
+  const writeSessionToolRoute = (route: Pick<SessionToolRoute, 'url' | 'routeId'>): Promise<void> =>
+    replace(sessionToolsFile, JSON.stringify({ url: route.url, routeId: route.routeId }));
   const offers = new Map<string, { parent: string; atSeq: number; token: string }>();
   const writeOffers = (): Promise<void> => replace(ephemeralStatePath, JSON.stringify({ forks: [...offers.values()] }));
   const offerEphemeralFork = async (parent: string, atSeq: number): Promise<() => Promise<void>> => {
@@ -69,63 +93,64 @@ export async function prepareDeepSeekLaunchArtifacts(
   const readEphemeralReady = async (): Promise<boolean> => {
     try {
       const ready = JSON.parse(await readFile(ephemeralReadyPath, 'utf8')) as Record<string, unknown>;
-      return ready.persistence === true && ready.projectionGuard === true && ready.workspaceGuard === true
+      return ready.persistence === true && ready.forkGuard === true && ready.projectionGuard === true && ready.workspaceGuard === true
         && ready.spillGuard === true && ready.attachmentGuard === true;
     } catch { return false; }
   };
-  const paths = { compatibility: compatibilityPath, codeModeFile: codeModePath, promptFile: promptPath };
+  const targetPath = (path: string): string => {
+    if (!pathMapper || pathMapper.target.method !== 'wsl') return path;
+    const mapped = pathMapper.toTargetPath(path);
+    if (!mapped) throw new Error('DeepSeek launch files must be accessible inside the selected WSL distro.');
+    return mapped;
+  };
+  const platform = pathMapper?.target.platformOs === 'linux' ? 'linux' : process.platform;
   try {
-    await mkdir(join(root, 'prompts'), { mode: 0o700 });
+    const paths = { sessions: targetPath(sessionsPath), sessionToolsFile: targetPath(sessionToolsFile), compatibility: targetPath(compatibilityPath), codeModeFile: targetPath(codeModePath), promptDirectory: targetPath(promptDirectory) };
+    await mkdir(promptDirectory, { mode: 0o700 });
     const patch = [
       { id: 'config-editor', disabled: true },
       { id: 'settings', disabled: true },
       { id: 'hmr', disabled: true },
       { id: 'session-title-llm', disabled: true },
       { insert: [
-        { id: 'claudian-lifecycle', name: lifecyclePath },
+        { id: 'claudian-lifecycle', name: targetPath(lifecyclePath) },
         ...DEEPSEEK_PRESETS.map(preset => ({
           id: `preset-${preset}`, name: '@deepseek-ai/dsh-agent-preset',
-          config: { id: preset, name: 'Claudian', plugins: buildDeepSeekPresetPlugins(preset, paths, presetPlugins).map(anchorModuleName) },
+          config: { id: preset, name: 'Claudian', plugins: buildDeepSeekPresetPlugins(preset, paths, presetPlugins, platform).map(row => anchorModuleName(row, platform)) },
         })),
       ] },
-      { insert: [{ id: 'claudian-ephemeral', name: ephemeralPath, config: { stateFile: ephemeralStatePath, readyFile: ephemeralReadyPath, spillRoot: ephemeralSpillPath, attachmentRoot: ephemeralAttachmentPath } }] },
+      { insert: [{ id: 'claudian-ephemeral', name: targetPath(ephemeralPath), config: { stateFile: targetPath(ephemeralStatePath), readyFile: targetPath(ephemeralReadyPath), spillRoot: targetPath(ephemeralSpillPath), attachmentRoot: targetPath(ephemeralAttachmentPath) } }] },
     ];
     await Promise.all([
+      replace(sessionsPath, DEEPSEEK_SESSIONS_SOURCE),
+      sessionToolRoute ? writeSessionToolRoute(sessionToolRoute) : replace(sessionToolsFile, '{}'),
       writeFile(compatibilityPath, DEEPSEEK_COMPATIBILITY_SOURCE, { mode: 0o600 }),
       writeFile(lifecyclePath, DEEPSEEK_LIFECYCLE_SOURCE, { mode: 0o600 }),
       writeFile(ephemeralPath, DEEPSEEK_EPHEMERAL_SOURCE, { mode: 0o600 }),
       writeOffers(),
       writeFile(patchPath, JSON.stringify(patch), { mode: 0o600 }),
       writeFile(desktopRunnerPath, DESKTOP_RUNNER_SOURCE, { mode: 0o600 }),
-      ...DEEPSEEK_PRESETS.map(preset => writePrompt(preset, '')),
       writeCodeMode(false),
     ]);
   } catch (error) {
     await removeRoot(root);
     throw error;
   }
-  return { patchPath, desktopRunnerPath, writePrompt, writeCodeMode, offerEphemeralFork, readEphemeralReady, dispose: () => removeRoot(root) };
+  return { patchPath, desktopRunnerPath, writeSessionToolRoute, writePrompt, removePrompt, writeCodeMode, offerEphemeralFork, readEphemeralReady, dispose: () => removeRoot(root) };
+}
+
+/** Native session ids are not file names on every platform; the compatibility plugin derives the same name. */
+function deepseekPromptFileName(sessionId: string): string {
+  return `${createHash('sha256').update(sessionId).digest('hex')}.txt`;
 }
 
 /**
  * Native converts absolute `insert` row names (and their group children) to file URLs, but imports names nested in a
  * preset's `plugins` literally, where a Windows drive letter reads as a URL scheme and `#` as a fragment.
  */
-function anchorModuleName<Row extends { readonly name?: unknown; readonly group?: unknown; readonly config?: unknown }>(row: Row): Row {
-  const name = typeof row.name === 'string' && isAbsolute(row.name) ? pathToFileURL(row.name).href : row.name;
-  return { ...row, name, ...(row.group && Array.isArray(row.config) ? { config: row.config.map(anchorModuleName) } : {}) };
-}
-
-// Windows refuses a replacement or removal while a reader, scanner or exiting Host briefly holds a file.
-const TRANSIENT_LOCK_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
-
-async function replaceFile(temporary: string, path: string): Promise<void> {
-  for (let attempt = 1; ; attempt++) {
-    try { return await rename(temporary, path); } catch (error) {
-      if (attempt >= 5 || !TRANSIENT_LOCK_CODES.has((error as NodeJS.ErrnoException).code ?? '')) throw error;
-      await new Promise(resolve => window.setTimeout(resolve, 20 * attempt));
-    }
-  }
+function anchorModuleName<Row extends { readonly name?: unknown; readonly group?: unknown; readonly config?: unknown }>(row: Row, platform: NodeJS.Platform): Row {
+  const name = typeof row.name === 'string' && (platform === 'linux' ? row.name.startsWith('/') : isAbsolute(row.name)) ? pathToFileURL(row.name, { windows: platform === 'win32' }).href : row.name;
+  return { ...row, name, ...(row.group && Array.isArray(row.config) ? { config: row.config.map(child => anchorModuleName(child as Record<string, unknown>, platform)) } : {}) };
 }
 
 function removeRoot(root: string): Promise<void> { return rm(root, { recursive: true, force: true, maxRetries: 5 }); }

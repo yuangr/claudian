@@ -24,6 +24,7 @@ import { MainChatComposerDropdown } from '@/features/chat/composer/MainChatCompo
 import { installTextareaSizing } from '@/features/chat/composer/textareaSizing';
 import { createInputToolbar } from '@/features/chat/composer/toolbar/InputToolbar';
 import { NavigationSidebar } from '@/features/chat/navigation/NavigationSidebar';
+import { ProjectChip } from '@/features/chat/projects/ProjectChip';
 import { getSessionProviderId } from '@/features/chat/sessions/sessionProvider';
 import { getSessionCapabilities, getSessionChatUIConfig, getSessionSelectedModel, getSessionSettingsSnapshot, type SessionSettingsSnapshot, updateSessionProviderSettings, updateSessionReasoning } from '@/features/chat/sessions/sessionSettings';
 import type { SideChatController } from '@/features/chat/side-chat/SideChatController';
@@ -34,12 +35,12 @@ import type {
 } from '@/features/chat/tabs/runtime/TabRuntimeConstruction';
 import { TabModelSelectionCoordinator } from '@/features/chat/tabs/TabModelSelectionCoordinator';
 import { syncTabProviderServices } from '@/features/chat/tabs/tabProviderLifecycle';
-import { getBlankTabModelOptions } from '@/features/chat/tabs/tabProviderSettings';
 import { applyProviderUIGating, refreshTabProviderUI, syncComposerDropdownForProvider, updateTabPermissionMode, updateTabServiceTier } from '@/features/chat/tabs/tabProviderUI';
 import type {
   ProviderCatalogInfo,
   TabUIComponents,
 } from '@/features/chat/tabs/types';
+import { getProviderPickerModelOptions } from '@/shared/toolbar/providerPickerModelOptions';
 
 function buildContextManagers(
   options: TabRuntimeConstructionContext,
@@ -67,6 +68,7 @@ function buildContextManagers(
   linkedContentController.mountInfoRow(infoRow);
   if (dom.welcomeEl) linkedContentController.mountWelcome(dom.welcomeEl);
   const imageContextManager = new ImageContextManager(
+    plugin.app.keymap,
     dom.inputContainerEl,
     dom.inputEl,
     { onUserImagesChanged: onUserModified },
@@ -119,7 +121,7 @@ function buildInputToolbar(
     return {
       ...baseConfig,
       getModelOptions: (settings: Record<string, unknown>) =>
-        getBlankTabModelOptions(settings),
+        getProviderPickerModelOptions(() => settings),
     };
   };
 
@@ -291,7 +293,7 @@ function buildInputToolbar(
       );
       if (!isSelectionTargetCurrent()) return;
 
-      // Sole writer of a bound conversation's model; blank-tab models change through session identity.
+      // A bound conversation's model is its persisted selectedModel (also switched by session messages); blank-tab models change through session identity.
       if (normalizedModel !== getSessionSelectedModel(tab, plugin)) tab.ui.promptSuggestion.discard();
       await plugin.updateConversation(conversationId, {
         selectedModel: normalizedModel,
@@ -381,6 +383,13 @@ export function buildTabRuntimeUI(
   options.registerCleanup('tab composer context tray', () => contextTray.destroy());
   const infoRow = new ComposerInfoRow(dom.infoRowEl);
   options.registerCleanup('tab composer info row', () => infoRow.destroy());
+  // The session's own conversation owner, so the chip is right before the runtime is published (draft handoff).
+  const projectChip = new ProjectChip(infoRow, {
+    projects: plugin.projects,
+    conversation: core.session.runtime.model.conversationController,
+  });
+  options.registerCleanup('tab project chip', () => projectChip.destroy());
+  projectChip.refresh();
 
   const toolbar = buildInputToolbar(core, options, runtimeRef, onUserModified);
   const contextManagers = buildContextManagers(
@@ -404,6 +413,7 @@ export function buildTabRuntimeUI(
   const navigationSidebar = new NavigationSidebar(
     dom.messagesWrapperEl,
     dom.messagesEl,
+    () => runtimeRef.current()?.renderer.getDirectoryEntries() ?? [],
   );
   options.registerCleanup('tab navigation sidebar', () => navigationSidebar.destroy());
 
@@ -426,6 +436,7 @@ export function buildTabRuntimeUI(
     contextUsageMeter: toolbar.contextUsageMeter,
     toolbarMenus: toolbar.menus,
     navigationSidebar,
+    projectChip,
   };
   options.registerCleanup('tab prompt suggestion', () => ui.promptSuggestion.destroy());
 

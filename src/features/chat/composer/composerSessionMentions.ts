@@ -9,7 +9,7 @@ export interface ComposerSessionMention {
 }
 
 export function formatComposerSessionMention(title: string, conversationId: string): string {
-  const escaped = title.replace(/\\/g, '\\\\').replace(/\]/g, '\\]');
+  const escaped = title.replace(/\r\n|[\r\n]/g, ' ').replace(/\\/g, '\\\\').replace(/\]/g, '\\]');
   return `@[${escaped}](claudian-session:${conversationId}) `;
 }
 

@@ -14,27 +14,41 @@ export function setLoginShellPathEntries(entries: readonly string[]): void {
   loginShellPathEntries = entries;
 }
 
+export function getNpmConfigPrefix(): string | undefined {
+  // npm's script-provided lowercase value takes precedence over inherited variants.
+  if (process.env.npm_config_prefix !== undefined) return process.env.npm_config_prefix || undefined;
+  const key = Object.keys(process.env).find(name => name.toLowerCase() === 'npm_config_prefix');
+  return key ? process.env[key] || undefined : undefined;
+}
+
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || '';
+}
+
+function getUnixXdgDataHome(): string | undefined {
+  const configured = process.env.XDG_DATA_HOME;
+  return configured && path.isAbsolute(configured) ? configured : undefined;
 }
 
 function getMiseShimsDir(home: string): string | null {
   if (process.env.MISE_SHIMS_DIR) return process.env.MISE_SHIMS_DIR;
   if (process.env.MISE_DATA_DIR) return path.join(process.env.MISE_DATA_DIR, 'shims');
-  if (process.env.XDG_DATA_HOME) return path.join(process.env.XDG_DATA_HOME, 'mise', 'shims');
-
   if (isWindows) {
+    if (process.env.XDG_DATA_HOME) return path.join(process.env.XDG_DATA_HOME, 'mise', 'shims');
     const localAppData = process.env.LOCALAPPDATA
       || (home ? path.join(home, 'AppData', 'Local') : null);
     return localAppData ? path.join(localAppData, 'mise', 'shims') : null;
   }
 
-  return home ? path.join(home, '.local', 'share', 'mise', 'shims') : null;
+  const dataHome = getUnixXdgDataHome();
+  return dataHome ? path.join(dataHome, 'mise', 'shims')
+    : home ? path.join(home, '.local', 'share', 'mise', 'shims') : null;
 }
 
 /** fnm's default Node.js alias, reachable without the shell or PowerShell profile hook. */
 function getFnmDefaultBinPaths(home: string): string[] {
   const fnmDir = process.env.FNM_DIR;
+  const dataHome = isWindows ? undefined : getUnixXdgDataHome();
   const roots = isWindows
     ? [
       fnmDir,
@@ -43,7 +57,7 @@ function getFnmDefaultBinPaths(home: string): string[] {
     ]
     : [
       fnmDir,
-      process.env.XDG_DATA_HOME && path.join(process.env.XDG_DATA_HOME, 'fnm'),
+      dataHome && path.join(dataHome, 'fnm'),
       home && path.join(home, '.local', 'share', 'fnm'),
       home && process.platform === 'darwin' && path.join(home, 'Library', 'Application Support', 'fnm'),
       home && path.join(home, '.fnm'),
@@ -81,7 +95,7 @@ function getManagerBinPaths(home: string): string[] {
 
 function getUnixManagerBinPaths(home: string): Array<string | null> {
   const env = process.env;
-  const dataHome = env.XDG_DATA_HOME ?? joinIfRoot(home, '.local', 'share') ?? undefined;
+  const dataHome = getUnixXdgDataHome() ?? joinIfRoot(home, '.local', 'share') ?? undefined;
   return [
     // Node.js installed by Pi's managed installer.
     joinIfRoot(dataHome, 'pi-node', 'current', 'bin'),
@@ -240,7 +254,7 @@ function getExtraBinaryPaths(): string[] {
 
   paths.push(...getManagerBinPaths(home));
 
-  const npmPrefix = process.env.npm_config_prefix;
+  const npmPrefix = getNpmConfigPrefix();
   if (npmPrefix) {
     paths.push(isWindows ? npmPrefix : path.join(npmPrefix, 'bin'));
   }
@@ -250,6 +264,22 @@ function getExtraBinaryPaths(): string[] {
   paths.push(...getAppProvidedCLIPaths());
 
   return paths;
+}
+
+/**
+ * Node candidate admission shared by discovery and the CLI-directory shortcut.
+ * POSIX launchability requires execute access; Windows keeps its own executable
+ * semantics. An unusable candidate skips only that candidate.
+ */
+function isRunnableNodeFile(nodePath: string): boolean {
+  try {
+    if (!fs.existsSync(nodePath)) return false;
+    if (!fs.statSync(nodePath).isFile()) return false;
+    if (!isWindows) fs.accessSync(nodePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function* findNodeDirectories(additionalPaths?: string, searchPaths = getExtraBinaryPaths()): Generator<string, undefined> {
@@ -262,23 +292,12 @@ function* findNodeDirectories(additionalPaths?: string, searchPaths = getExtraBi
 
   for (const dir of allPaths) {
     if (!dir) continue;
-    try {
-      const nodePath = path.join(dir, NODE_EXECUTABLE);
-      if (fs.existsSync(nodePath)) {
-        const stat = fs.statSync(nodePath);
-        if (stat.isFile() && !executables.has(nodePath)) {
-          executables.add(nodePath);
-          yield dir;
-        }
-      }
-    } catch {
-      // Inaccessible directory
+    const nodePath = path.join(dir, NODE_EXECUTABLE);
+    if (!executables.has(nodePath) && isRunnableNodeFile(nodePath)) {
+      executables.add(nodePath);
+      yield dir;
     }
   }
-}
-
-export function findNodeExecutables(additionalPaths?: string): string[] {
-  return [...findNodeDirectories(additionalPaths)].map(dir => path.join(dir, NODE_EXECUTABLE));
 }
 
 export function findNodeDirectory(additionalPaths?: string): string | null {
@@ -337,12 +356,9 @@ export function getEnhancedPath(additionalPaths?: string, cliPath?: string): str
     try {
       const cliDir = path.dirname(cliPath);
       const nodeInCliDir = path.join(cliDir, NODE_EXECUTABLE);
-      if (fs.existsSync(nodeInCliDir)) {
-        const stat = fs.statSync(nodeInCliDir);
-        if (stat.isFile()) {
-          segments.push(cliDir);
-          cliDirHasNode = true;
-        }
+      if (isRunnableNodeFile(nodeInCliDir)) {
+        segments.push(cliDir);
+        cliDirHasNode = true;
       }
     } catch {
       // Ignore errors checking CLI directory
@@ -373,12 +389,16 @@ export function getEnhancedPath(additionalPaths?: string, cliPath?: string): str
   return unique.join(PATH_SEPARATOR);
 }
 
+export function stripEnvironmentExportPrefix(line: string): string {
+  return line.replace(/^export[ \t]+/, '');
+}
+
 export function parseEnvironmentVariables(input: string): Record<string, string> {
   const result: Record<string, string> = {};
   for (const line of input.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
-    const normalized = trimmed.startsWith('export ') ? trimmed.slice(7) : trimmed;
+    const normalized = stripEnvironmentExportPrefix(trimmed);
     const eqIndex = normalized.indexOf('=');
     if (eqIndex > 0) {
       const key = normalized.substring(0, eqIndex).trim();
@@ -388,7 +408,12 @@ export function parseEnvironmentVariables(input: string): Record<string, string>
         value = value.slice(1, -1);
       }
       if (key) {
-        result[key] = value;
+        Object.defineProperty(result, key, {
+          value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
     }
   }

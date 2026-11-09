@@ -1,6 +1,7 @@
 import type { ProviderBackgroundOutputEvent, WithoutEventScope } from '@/core/execution/ProviderExecutionEvent';
+import { normalizeResolvedAnswers } from '@/core/tools/toolInput';
 import * as ToolNames from '@/core/tools/toolNames';
-import type { DiffLine, ScriptToolCallItem, ToolResultDiff, ToolResultImage } from '@/core/types';
+import type { AskUserAnswers, DiffLine, ScriptToolCallItem, ToolResultDiff, ToolResultImage } from '@/core/types';
 
 import { encodeDeepSeekModelId } from '../models';
 import { isRecord } from '../remote/DeepSeekRemoteClient';
@@ -30,7 +31,6 @@ export class DeepSeekOutput {
   private readonly attempts = new Map<string, Attempt>();
   /** Attempts by the seq of their durable settlement, so late records reach a superseded attempt. */
   private readonly committed = new Map<number, Attempt>();
-  private readonly records = new Set<number>();
   private readonly calls = new Map<string, DeepSeekToolCall>();
   private readonly completedTools = new Set<string>();
   private readonly scriptCalls = new Map<string, Map<string, ScriptToolCallItem>>();
@@ -40,7 +40,7 @@ export class DeepSeekOutput {
   private contextWindow = 0;
   private model?: string;
 
-  constructor(private readonly emit: (event: DeepSeekOutputEvent) => void) {}
+  constructor(private readonly emit: (event: DeepSeekOutputEvent) => void, private readonly hostPath: (path: string) => string = path => path) {}
 
   frame(value: unknown): void {
     if (!isRecord(value) || typeof value.attemptId !== 'string' || typeof value.revision !== 'number') throw new Error('Malformed DeepSeek assistant stream.');
@@ -83,8 +83,6 @@ export class DeepSeekOutput {
     if (!isRecord(value) || typeof value.seq !== 'number' || typeof value.type !== 'string' || !isRecord(value.data)) {
       throw new Error('Malformed DeepSeek durable event.');
     }
-    if (this.records.has(value.seq)) return;
-    this.records.add(value.seq);
     if (value.surfaceOp !== undefined && value.surfaceOp !== 'append') return;
     const data = value.data;
     if (value.type === 'request/context') {
@@ -156,15 +154,14 @@ export class DeepSeekOutput {
     // Validate the complete prefix before emitting any suffix.
     for (const [index, previous] of attempt.blocks) {
       const next = blocks.get(index);
-      if (!next || previous.kind !== next.kind || !next.text.startsWith(previous.text)) throw new DeepSeekReplayError();
+      if (!next) throw new DeepSeekReplayError();
+      blockSuffix(previous, next);
     }
     for (const [index, block] of blocks) this.block(attempt, index, block);
   }
 
   private block(attempt: Attempt, index: number, block: Block): void {
-    const previous = attempt.blocks.get(index);
-    if (previous && (previous.kind !== block.kind || !block.text.startsWith(previous.text))) throw new DeepSeekReplayError();
-    const suffix = block.text.slice(previous?.text.length ?? 0);
+    const suffix = blockSuffix(attempt.blocks.get(index), block);
     attempt.blocks.set(index, block);
     if (!suffix) return;
     this.begin();
@@ -179,7 +176,7 @@ export class DeepSeekOutput {
   private toolStart(id: unknown, name: unknown, args: unknown, parent?: unknown): void {
     if (typeof id !== 'string' || typeof name !== 'string') throw new Error('Malformed DeepSeek tool call.');
     if (this.calls.has(id)) return;
-    const call = { name: deepseekToolName(name), input: toolInput(name, args) };
+    const call = { name: deepseekToolName(name), input: toolInput(name, args, this.hostPath) };
     this.calls.set(id, call); this.begin();
     const input = { ...call.input };
     this.emit({ type: 'tool_started', toolCallId: id, name: call.name, input,
@@ -200,10 +197,11 @@ export class DeepSeekOutput {
     const name = isError === true ? undefined : this.calls.get(id)?.name;
     const text = deepseekText(content);
     const presented = name === ToolNames.TOOL_READ ? readWindow(meta) : name === ToolNames.TOOL_SKILL ? skillInstructions(text) : undefined;
-    const diff = name === ToolNames.TOOL_EDIT || name === ToolNames.TOOL_WRITE ? appliedDiff(meta) : undefined;
+    const diff = name === ToolNames.TOOL_EDIT || name === ToolNames.TOOL_WRITE ? appliedDiff(meta, this.hostPath) : undefined;
+    const resolvedAnswers = name === ToolNames.TOOL_ASK_USER_QUESTION ? questionAnswers(text) : undefined;
     this.emit({ type: 'tool_completed', toolCallId: id, content: presented ?? text, isError: isError === true,
       toolScope: { kind: 'main' }, ...(typeof parent === 'string' ? { parentToolCallId: parent } : {}),
-      resultDetails: { resultFormat: 'plain', ...(diff ? { diff } : {}), ...(resultImages.length ? { resultImages } : {}), ...(calls ? { scriptToolCalls: [...calls.values()] } : {}) },
+      resultDetails: { resultFormat: 'plain', ...(diff ? { diff } : {}), ...(resultImages.length ? { resultImages } : {}), ...(calls ? { scriptToolCalls: [...calls.values()] } : {}), ...(resolvedAnswers ? { resolvedAnswers } : {}) },
     });
   }
 
@@ -218,7 +216,7 @@ export class DeepSeekOutput {
     const calls = this.scriptCalls.get(data.rootCallId) ?? new Map<string, ScriptToolCallItem>();
     const previous = calls.get(data.subCallId);
     if (previous && previous.status !== 'running' && !completed) return;
-    calls.set(data.subCallId, { name: deepseekToolName(data.name), input: toolInput(data.name, data.arguments),
+    calls.set(data.subCallId, { name: deepseekToolName(data.name), input: toolInput(data.name, data.arguments, this.hostPath),
       status: completed ? data.isError === true ? 'error' : 'completed' : 'running',
       ...(completed && data.isError === true ? { error: deepseekText(data.content) } : {}),
     });
@@ -240,7 +238,7 @@ export class DeepSeekOutput {
   }
 }
 
-export function deepseekToolName(name: string): string { return TOOL_NAMES[name] ?? name; }
+export function deepseekToolName(name: string): string { return Object.hasOwn(TOOL_NAMES, name) ? TOOL_NAMES[name] : name; }
 
 export function deepseekText(content: unknown): string {
   return Array.isArray(content) ? content.flatMap(block => isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n') : '';
@@ -253,6 +251,15 @@ function attemptKey(value: Record<string, unknown>): string {
 function decodeBlock(value: Record<string, unknown>): Block | undefined {
   return (value.type === 'text' || value.type === 'reasoning') && typeof value.text === 'string'
     ? { kind: value.type, text: value.text } : undefined;
+}
+
+function blockSuffix(previous: Block | undefined, next: Block): string {
+  // Native may normalize trailing reasoning whitespace at settlement. Keep raw text in
+  // the block for later deltas, but emit whitespace only once more substantive text follows.
+  const text = next.kind === 'reasoning' ? next.text.trimEnd() : next.text;
+  const prefix = previous ? previous.kind === 'reasoning' ? previous.text.trimEnd() : previous.text : '';
+  if (previous && (previous.kind !== next.kind || !text.startsWith(prefix))) throw new DeepSeekReplayError();
+  return text.slice(prefix.length);
 }
 
 function contentBlocks(content: unknown[]): Map<number, Block> {
@@ -280,15 +287,24 @@ function compactBlocks(stream: unknown[]): Map<number, Block> {
   return blocks;
 }
 
-function toolInput(name: string, value: unknown): Record<string, unknown> {
+function toolInput(name: string, value: unknown, hostPath: (path: string) => string): Record<string, unknown> {
   let parsed = value;
   if (typeof value === 'string') { try { parsed = JSON.parse(value); } catch { parsed = { arguments: value }; } }
   const input = isRecord(parsed) ? { ...parsed } : {};
   if (['read', 'read_image', 'write', 'edit'].includes(name) && typeof input.path === 'string') {
-    input.file_path = input.path; delete input.path;
+    input.file_path = hostPath(input.path); delete input.path;
   }
+  if (['glob', 'grep'].includes(name) && typeof input.path === 'string') input.path = hostPath(input.path);
+  if (name === 'apply_patch' && typeof input.input === 'string') { input.patch = input.input; delete input.input; }
   if (name === 'skill' && typeof input.name === 'string') { input.skill = input.name; delete input.name; }
   if (name === 'send_message' && typeof input.agent_id === 'string') { input.target = input.agent_id; delete input.agent_id; }
+  if (name === 'ask_user_question' && Array.isArray(input.questions)) {
+    input.questions = (input.questions as unknown[]).map(question => {
+      if (!isRecord(question) || !('multi_select' in question)) return question;
+      const { multi_select: multiSelect, ...rest } = question;
+      return { ...rest, multiSelect };
+    });
+  }
   return input;
 }
 
@@ -304,15 +320,37 @@ function skillInstructions(text: string): string | undefined {
   return /^<skill_content name="[^"\n]*">\n<skill_resources>\n[\s\S]*?\n<\/skill_resources>\n\n<skill_instructions>\n([\s\S]*)\n<\/skill_instructions>\n<\/skill_content>$/.exec(text)?.[1];
 }
 
+/**
+ * Answers of a native `ask_user_question` batch keyed by question ID: selected labels plus any custom text.
+ * A skipped item, a pending timed call or an unparseable result stays unanswered.
+ */
+function questionAnswers(text: string): AskUserAnswers | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return undefined; }
+  if (!isRecord(parsed) || !Array.isArray(parsed.answers)) return undefined;
+  const answers: Record<string, string[]> = {};
+  for (const answer of parsed.answers) {
+    if (!isRecord(answer) || typeof answer.id !== 'string') continue;
+    const selected = Array.isArray(answer.selected) ? answer.selected.filter((label): label is string => typeof label === 'string' && label.length > 0) : [];
+    Object.defineProperty(answers, answer.id, {
+      value: typeof answer.custom === 'string' && answer.custom ? [...selected, answer.custom] : selected,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return normalizeResolvedAnswers(answers);
+}
+
 /** Native applied hunks, each with surrounding context lines; a created file has none. */
-function appliedDiff(meta: unknown): ToolResultDiff | undefined {
+function appliedDiff(meta: unknown, hostPath: (path: string) => string): ToolResultDiff | undefined {
   if (!isRecord(meta) || !Array.isArray(meta.diffs)) return undefined;
   const hunks = meta.diffs.filter(isRecord);
   if (hunks.length === 0 || hunks.length !== meta.diffs.length) return undefined;
   const diffLines: DiffLine[] = [];
   for (const hunk of hunks) {
     if (typeof hunk.newText !== 'string' || (hunk.oldText !== null && typeof hunk.oldText !== 'string')) return undefined;
-    const before = hunk.oldText ? hunk.oldText.split('\n') : [];
+    const before = hunk.oldText === null ? [] : hunk.oldText.split('\n');
     const after = hunk.newText ? hunk.newText.split('\n') : [];
     let prefix = 0;
     while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++;
@@ -325,7 +363,7 @@ function appliedDiff(meta: unknown): ToolResultDiff | undefined {
       ...after.slice(after.length - suffix).map((text): DiffLine => ({ type: 'equal', text })),
     );
   }
-  const filePath = typeof hunks[0].path === 'string' ? hunks[0].path : undefined;
+  const filePath = typeof hunks[0].path === 'string' ? hostPath(hunks[0].path) : undefined;
   return { ...(filePath ? { filePath } : {}), diffLines, stats: {
     added: diffLines.filter(line => line.type === 'insert').length, removed: diffLines.filter(line => line.type === 'delete').length,
   } };
@@ -333,7 +371,7 @@ function appliedDiff(meta: unknown): ToolResultDiff | undefined {
 
 const TOOL_NAMES: Readonly<Record<string, string>> = {
   read: ToolNames.TOOL_READ, read_image: ToolNames.TOOL_READ, write: ToolNames.TOOL_WRITE, edit: ToolNames.TOOL_EDIT,
-  glob: ToolNames.TOOL_GLOB, grep: ToolNames.TOOL_GREP, bash: ToolNames.TOOL_BASH, pwsh: ToolNames.TOOL_BASH, run_code: ToolNames.TOOL_EXEC,
+  apply_patch: ToolNames.TOOL_APPLY_PATCH, glob: ToolNames.TOOL_GLOB, grep: ToolNames.TOOL_GREP, bash: ToolNames.TOOL_BASH, pwsh: ToolNames.TOOL_BASH, run_code: ToolNames.TOOL_EXEC,
   job_output: ToolNames.TOOL_BASH_OUTPUT, job_kill: ToolNames.TOOL_KILL_SHELL, skill: ToolNames.TOOL_SKILL,
   ask_user_question: ToolNames.TOOL_ASK_USER_QUESTION, web_search: ToolNames.TOOL_WEB_SEARCH, web_fetch: ToolNames.TOOL_WEB_FETCH,
   subagent: ToolNames.TOOL_SPAWN_AGENT, subagent_fork: ToolNames.TOOL_SPAWN_AGENT,

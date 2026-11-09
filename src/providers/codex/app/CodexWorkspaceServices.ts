@@ -1,5 +1,9 @@
+import { Notice } from 'obsidian';
+
 import type { ProviderCommandCatalog } from '../../../core/providers/commands/ProviderCommandCatalog';
+import { getProviderConfig, setProviderConfig } from '../../../core/providers/providerConfig';
 import type { ProviderHost } from '../../../core/providers/ProviderHost';
+import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
 import { ProviderWorkspaceRegistry } from '../../../core/providers/ProviderWorkspaceRegistry';
 import type {
   ProviderCLIResolver,
@@ -7,13 +11,16 @@ import type {
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
 import { CodexCommandCatalog } from '../commands/CodexCommandCatalog';
+import { decodeCodexConfig } from '../config';
 import { CodexThreadArchiveService } from '../history/CodexThreadArchiveService';
 import { CodexAppServerRuntime } from '../runtime/CodexAppServerRuntime';
 import { CodexCLIResolver } from '../runtime/CodexCLIResolver';
-import { CodexModelCatalogCoordinator } from '../runtime/CodexModelCatalogCoordinator';
+import {
+  type CodexModelCatalogCommit,
+  CodexModelCatalogCoordinator,
+} from '../runtime/CodexModelCatalogCoordinator';
 import { CodexModelDiscoveryService } from '../runtime/CodexModelDiscoveryService';
 import { createCodexModels } from '../runtime/CodexModels';
-import { getCodexProviderSettings } from '../settings';
 import { CodexSkillListingService } from '../skills/CodexSkillListingService';
 import { createCodexSettingsTabRenderer } from '../ui/CodexSettingsTab';
 
@@ -30,24 +37,54 @@ export interface CodexWorkspaceServicesOptions {
   readonly skillListingService?: CodexSkillListingService;
 }
 
+/**
+ * Commits a Codex catalog update in one settings transaction with the application's
+ * model-selection normalization, which may change any provider's selections. A
+ * rejected update discards the transaction draft, so nothing is written.
+ */
+export function createCodexModelCatalogCommit(
+  plugin: Pick<ProviderHost, 'mutateSettingsConditionally'>,
+): CodexModelCatalogCommit {
+  return async (update) => {
+    let outcome: { selectionChanged: boolean } | null = null;
+    await plugin.mutateSettingsConditionally(async (draft) => {
+      const settings = draft as unknown as Record<string, unknown>;
+      const config = getProviderConfig(settings, 'codex');
+      const configChanged = await update(config);
+      if (configChanged === null) return false;
+      if (configChanged) setProviderConfig(settings, 'codex', config);
+      const selectionChanged = ProviderSettingsCoordinator.normalizeAllModelVariants(settings);
+      outcome = { selectionChanged };
+      return configChanged || selectionChanged;
+    });
+    return outcome;
+  };
+}
+
 export async function createCodexWorkspaceServices(
   plugin: ProviderHost,
   options: CodexWorkspaceServicesOptions = {},
 ): Promise<CodexWorkspaceServices> {
-  const runtime = new CodexAppServerRuntime(plugin);
+  const runtimeHost = plugin.getRuntimeHost('codex');
+  const runtime = new CodexAppServerRuntime(runtimeHost, message => { new Notice(message); });
   const skillListProvider = options.skillListingService
     ?? new CodexSkillListingService(runtime);
   const modelCatalogCoordinator = options.modelCatalogCoordinator
     ?? new CodexModelCatalogCoordinator(
-      plugin,
-      new CodexModelDiscoveryService(plugin, runtime),
+      runtimeHost,
+      new CodexModelDiscoveryService(runtimeHost, runtime),
+      createCodexModelCatalogCommit(plugin),
     );
   const commandCatalog = new CodexCommandCatalog(skillListProvider);
-  const modelCatalog = createCodexModels(plugin, modelCatalogCoordinator);
+  const modelCatalog = createCodexModels(runtimeHost, modelCatalogCoordinator);
   const sessionArchive = new CodexThreadArchiveService(runtime);
   const unregisterTransitionHook = plugin.executionLifecycleRegistry
     .registerTransitionHook('codex', {
-      preserveSessions: () => getCodexProviderSettings(plugin.settings).enabled,
+      // Running sessions survive launch-only changes on the replacement server. A change that
+      // invalidates Codex sessions retires their bindings, so the sessions end with them.
+      preserveSessions: (_session, { sessionsInvalidated }) => (
+        decodeCodexConfig(runtimeHost.config).enabled && !sessionsInvalidated
+      ),
       beforeTransition: async () => {
         modelCatalog.beginTransition();
         modelCatalogCoordinator.beginEnvironmentTransition();
@@ -103,10 +140,6 @@ export const codexWorkspaceRegistration: ProviderWorkspaceRegistration<CodexWork
   providesSessionArchive: true,
   initialize: async ({ plugin }) => createCodexWorkspaceServices(plugin),
 };
-
-export function maybeGetCodexWorkspaceServices(): CodexWorkspaceServices | null {
-  return ProviderWorkspaceRegistry.getServices('codex') as CodexWorkspaceServices | null;
-}
 
 export function getCodexWorkspaceServices(): CodexWorkspaceServices {
   return ProviderWorkspaceRegistry.requireServices('codex') as CodexWorkspaceServices;

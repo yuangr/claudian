@@ -1,8 +1,10 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
+import { axe } from '@test/helpers/accessibility';
 import { holdResponse } from '@test/helpers/ConversationPorts';
-import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { fireEvent, getByRole, waitFor } from '@testing-library/dom';
 import { App, Component } from 'obsidian';
@@ -14,41 +16,41 @@ import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
-const originalResizeObserver = globalThis.ResizeObserver;
 let tab: AssembledTabRuntime;
 let plugin: ChatFeatureHost;
-let harness: ReturnType<typeof createHarness>;
+let harness: Awaited<ReturnType<typeof createHarness>>;
 let releaseResponse: () => Promise<void>;
 
 beforeEach(async () => {
-  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
-  harness = createHarness();
+  harness = await createHarness();
   const app = new App();
   Object.assign(app.vault.adapter, { basePath: '/vault' });
-  Object.assign(app.vault, { on: () => ({}), offref: () => undefined });
   const conversation = {
     id: 'conversation-1', providerId: 'claude', selectedModel: 'claude-sonnet-4-5',
     sessionId: 'main-session', messages: [],
   } as unknown as Conversation;
-  plugin = {
-    ...(harness.plugin as ChatFeatureHost), app,
+  const pool = createSessionRuntimePool(() => plugin);
+  plugin = await createChatFeatureHost({
+    providerHost: harness.plugin.providerHost, bindSessionTools: harness.plugin.bindSessionTools, projects: harness.plugin.projects, sessionRuntimes: pool, app,
     getCommittedSettings: () => plugin.settings,
     settings: {
       model: 'claude-sonnet-4-5', permissionMode: 'normal',
       keyboardNavigation: { focusInputKey: 'i', scrollUpKey: 'w', scrollDownKey: 's' },
-      providerConfigs: { claude: { enabled: true } },
+      providerConfigs: { claude: { enabled: true, visibleModels: ['claude-sonnet-4-5'],
+        discoveredModels: [{ value: 'claude-sonnet-4-5', label: 'Sonnet' }] } },
     },
     getActiveEnvironmentVariables: () => '',
     getConversationSummary: () => conversation,
     getConversationSync: () => conversation,
-    getConversationList: () => [conversation],
+    getConversationList: () => [{ ...conversation, messageCount: conversation.messages.length, preview: '' }],
+    renameConversation: async () => undefined,
+    updateConversation: async () => undefined,
     executionPersistence: {
       registerExecutionBinding: () => {}, releaseExecutionBinding: () => {},
       persistExecutionSnapshot: async () => true, assertConversationExecutionAuthority: async () => {},
       recordConversationActivity: async () => {},
     },
-  } as unknown as ChatFeatureHost;
-  installSessionRuntimePool(plugin);
+  });
   tab = await createTabRuntime({
     plugin, conversation, component: new Component(),
     containerEl: document.body.createDiv(),
@@ -56,7 +58,7 @@ beforeEach(async () => {
     getProviderCatalogConfig: () => null, isRuntimeLive: () => true,
     openConversation: async () => {}, startNewConversation: async () => {},
   });
-  jest.useFakeTimers();
+  vi.useFakeTimers();
   releaseResponse = holdResponse(tab.session.turns);
   Object.defineProperties(tab.dom.messagesEl, {
     clientHeight: { configurable: true, value: 500 },
@@ -67,8 +69,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await destroyTab(tab);
-  jest.useRealTimers();
-  globalThis.ResizeObserver = originalResizeObserver;
+  vi.useRealTimers();
   await releaseSideChatHarnesses();
 });
 
@@ -77,6 +78,7 @@ function setScrollHeight(height: number): void {
 }
 
 async function streamText(): Promise<void> {
+  tab.state.currentContentEl ??= tab.dom.messagesEl.createDiv();
   await tab.controllers.streamController.handleStreamChunk(
     { type: 'text', content: 'continued' },
     { content: '', role: 'assistant' } as ChatMessage,
@@ -97,13 +99,13 @@ it('routes Escape through the selected main session for published jobs-only work
   const input = getByRole(tab.dom.inputComposerEl, 'textbox');
   expect(tab.controllers.sideChatController.destination).toBe('main');
   expect(tab.ui.composerDropdown.isVisible()).toBe(false);
-  // An earlier capture listener (e.g. an open menu) that consumed Escape owns it.
+  // A previous consumer can mark Escape handled without stopping propagation.
   const consumeEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') event.preventDefault(); };
-  document.addEventListener('keydown', consumeEscape, true);
+  window.addEventListener('keydown', consumeEscape, true);
   try {
     fireEvent.keyDown(input, { key: 'Escape' });
   } finally {
-    document.removeEventListener('keydown', consumeEscape, true);
+    window.removeEventListener('keydown', consumeEscape, true);
   }
   expect(native.cancelCalls).toBe(0);
   expect(tab.session.hasMainBackgroundWork).toBe(true);
@@ -148,7 +150,7 @@ it('stops main background work with Escape without aborting a settling foregroun
 
 it.each([false, true])('routes Escape to a working side chat when main background work is %s', async (mainBackground) => {
   await releaseResponse();
-  jest.useRealTimers();
+  vi.useRealTimers();
   // A completed main reply is the fork point the side chat starts from.
   tab.state.messages = [
     { id: 'u1', role: 'user', content: 'Remember A', timestamp: 1 },
@@ -190,7 +192,7 @@ it.each([
   tab.dom.messagesEl.scrollTop += movement;
   await streamText();
   fireEvent.scroll(tab.dom.messagesEl);
-  jest.advanceTimersByTime(16);
+  await vi.advanceTimersByTimeAsync(200);
 
   expect(tab.state.autoScrollEnabled).toBe(true);
   expect(tab.dom.messagesEl.scrollTop).toBe(1000 + growth);
@@ -198,7 +200,7 @@ it.each([
   // Later frames must continue following, not only the frame already queued before scroll.
   setScrollHeight(1200 + growth);
   await streamText();
-  jest.advanceTimersByTime(16);
+  await vi.advanceTimersByTimeAsync(200);
   expect(tab.dom.messagesEl.scrollTop).toBe(1200 + growth);
 });
 
@@ -217,7 +219,7 @@ it.each([
       offsetWidth: { configurable: true, value: 510 },
       clientWidth: { configurable: true, value: 500 },
     });
-    jest.spyOn(messagesEl, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 510, 500));
+    vi.spyOn(messagesEl, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 510, 500));
     fireEvent(messagesEl, new MouseEvent('pointerdown', { clientX: 505, bubbles: true }));
   }],
   ['middle-button autoscroll', () => pressContent(1)],
@@ -231,7 +233,7 @@ it.each([
     fireEvent.scroll(messagesEl);
     setScrollHeight(1200);
     await streamText();
-    jest.advanceTimersByTime(16);
+    await vi.advanceTimersByTimeAsync(200);
     expect(tab.state.autoScrollEnabled).toBe(false);
     expect(messagesEl.scrollTop).toBe(250);
 
@@ -239,7 +241,7 @@ it.each([
     fireEvent.scroll(messagesEl);
     setScrollHeight(1400);
     await streamText();
-    jest.advanceTimersByTime(16);
+    await vi.advanceTimersByTimeAsync(200);
     expect(tab.state.autoScrollEnabled).toBe(true);
     expect(messagesEl.scrollTop).toBe(1400);
   },
@@ -252,7 +254,7 @@ it.each(['pointerup', 'pointercancel'])('keeps following through layout scrolls 
   tab.dom.messagesEl.scrollTop += 1;
   fireEvent.scroll(tab.dom.messagesEl);
   await streamText();
-  jest.advanceTimersByTime(16);
+  await vi.advanceTimersByTimeAsync(200);
 
   expect(tab.state.autoScrollEnabled).toBe(true);
   expect(tab.dom.messagesEl.scrollTop).toBe(1036);
@@ -271,7 +273,7 @@ it.each([
   }
   expect(tab.dom.inputEl.value).toBe('');
   await releaseResponse();
-  jest.useRealTimers();
+  vi.useRealTimers();
   expect(tab.session.turns.isActive).toBe(false);
   await tab.executionCoordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
   await tab.executionCoordinator.prepare();
@@ -280,7 +282,7 @@ it.each([
   native.emitSessionEvent({ type: 'session_state_changed', snapshot: native.getSnapshot() });
   let resolveHistory!: (value: Conversation | null) => void;
   const history = new Promise<Conversation | null>(resolve => { resolveHistory = resolve; });
-  const read = jest.fn(() => history);
+  const read = vi.fn(() => history);
   Object.assign(plugin, { getConversationById: read });
   const draft = '@[Source](claudian-session:conv-1-source)';
   const input = getByRole(tab.dom.inputComposerEl, 'textbox');
@@ -301,4 +303,81 @@ it.each([
     fireEvent.keyDown(input, { key: 'Escape' });
     expect(native.cancelCalls).toBe(1);
   } finally { resolveHistory(null); await sending; }
+});
+
+
+it('lets Escape Stop discard a pending mailbox while no response is active', async () => {
+  await releaseResponse();
+  vi.useRealTimers();
+  const mailbox = tab.session.runtime.mailbox!;
+  // Navigation blocks dispatch without publishing a running response.
+  let finishNavigation!: () => void;
+  const navigation = tab.session.runtime.runConversationNavigation(() => new Promise<void>(resolve => { finishNavigation = resolve; }));
+  expect(await mailbox.deliver({ message: { from: 'Other session', sessionId: 'other', text: 'Pending request' }, signal: new AbortController().signal })).toBe('queued');
+  expect(tab.session.isWorking).toBe(false);
+  expect(mailbox.hasPending).toBe(true);
+  const input = getByRole(tab.dom.inputComposerEl, 'textbox');
+  expect(await axe(input)).toHaveNoViolations();
+  fireEvent.keyDown(input, { key: 'Escape' });
+  try {
+    expect(mailbox.hasPending).toBe(false);
+    expect(harness.backend.sessions.every(session => session.requests.length === 0)).toBe(true);
+  } finally { mailbox.clear(); finishNavigation(); await navigation; }
+});
+
+
+it('dispatches pending mailbox work after the last busy-main reference preparation releases admission', async () => {
+  await tab.executionCoordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
+  await tab.executionCoordinator.prepare();
+  const mailbox = tab.session.runtime.mailbox!;
+  let rejectHistory!: (error: Error) => void;
+  const history = new Promise<Conversation | null>((_resolve, reject) => { rejectHistory = reject; });
+  const read = vi.fn((id: string) => id === 'conv-1-source' ? history : Promise.resolve(plugin.getConversationSync(id)));
+  Object.assign(plugin, { getConversationById: read });
+  tab.dom.inputEl.value = '@[Source](claudian-session:conv-1-source)';
+  const preparing = tab.controllers.inputController.sendMessage();
+  expect(read).toHaveBeenCalled();
+  expect(tab.controllers.inputController.isPreparingMainTurn).toBe(true);
+  expect(await mailbox.deliver({ message: { from: 'Other session', sessionId: 'other', text: 'Mailbox request' }, signal: new AbortController().signal })).toBe('queued');
+  await releaseResponse();
+  vi.useRealTimers();
+  expect(tab.session.turns.isActive).toBe(false);
+  expect(mailbox.hasPending).toBe(true);
+  rejectHistory(new Error('Reference unavailable'));
+  await preparing;
+  try {
+    await waitFor(() => expect(harness.backend.sessions.flatMap(session => session.requests)).toHaveLength(1), { onTimeout: error => error });
+    expect(mailbox.hasPending).toBe(false);
+    expect(tab.dom.inputEl.value).toBe('@[Source](claudian-session:conv-1-source)');
+  } finally {
+    mailbox.clear();
+    harness.backend.sessions.forEach(session => session.complete());
+    await tab.session.turns.drain();
+  }
+});
+
+
+it('wakes the mailbox when the user withdraws their queued input', async () => {
+  await tab.executionCoordinator.bindConversation({ conversationId: 'conversation-1', providerId: 'claude' });
+  await tab.executionCoordinator.prepare();
+  Object.assign(plugin, { getConversationById: async (id: string) => plugin.getConversationSync(id) });
+  tab.dom.inputEl.value = 'User follow-up';
+  await tab.controllers.inputController.sendMessage();
+  const mailbox = tab.session.runtime.mailbox!;
+  expect(await mailbox.deliver({ message: { from: 'Other session', sessionId: 'other', text: 'Mailbox request' }, signal: new AbortController().signal })).toBe('queued');
+  await releaseResponse();
+  vi.useRealTimers();
+  expect(tab.session.turns.isActive).toBe(false);
+  expect(mailbox.hasPending).toBe(true);
+  expect(harness.backend.sessions.flatMap(session => session.requests)).toHaveLength(0);
+  tab.controllers.inputController.queue.withdrawToComposer();
+  try {
+    await waitFor(() => expect(harness.backend.sessions.flatMap(session => session.requests)).toHaveLength(1));
+    expect(mailbox.hasPending).toBe(false);
+    expect(tab.dom.inputEl.value).toBe('User follow-up');
+  } finally {
+    mailbox.clear();
+    harness.backend.sessions.forEach(session => session.complete());
+    await tab.session.turns.drain();
+  }
 });

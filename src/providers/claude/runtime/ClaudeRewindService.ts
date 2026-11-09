@@ -3,28 +3,16 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+import { createExecutionPathMapper } from '@/core/process/execution-target/WSLPathMapper';
+
 import type { ChatRewindMode, ChatRewindResult } from '../../../core/execution';
 
-interface BackupEntryFile {
+interface BackupEntry {
   originalPath: string;
-  existedBefore: true;
-  kind: 'file' | 'dir';
-  backupPath: string;
+  /** Absent when the path did not exist before the rewind. */
+  backupPath?: string;
 }
-
-interface BackupEntrySymlink {
-  originalPath: string;
-  existedBefore: true;
-  kind: 'symlink';
-  symlinkTarget: string;
-}
-
-interface BackupEntryMissing {
-  originalPath: string;
-  existedBefore: false;
-}
-
-type BackupEntry = BackupEntryFile | BackupEntrySymlink | BackupEntryMissing;
 
 export interface ClaudeRewindBackup {
   restore: () => Promise<void>;
@@ -32,6 +20,7 @@ export interface ClaudeRewindBackup {
 }
 
 export interface ExecuteClaudeRewindDeps {
+  executionTarget?: ExecutionTarget;
   assistantMessageId: string | undefined;
   mode: ChatRewindMode;
   rewindFiles: (userMessageId: string, dryRun?: boolean) => Promise<RewindFilesResult>;
@@ -39,7 +28,15 @@ export interface ExecuteClaudeRewindDeps {
   vaultPath: string | null;
 }
 
-function resolveRewindFilePath(filePath: string, vaultPath: string | null): string {
+function resolveRewindFilePath(filePath: string, vaultPath: string | null, target?: ExecutionTarget): string {
+  if (target?.method === 'wsl') {
+    const mapper = createExecutionPathMapper(target);
+    const cwd = vaultPath && mapper.toTargetPath(vaultPath);
+    if (!path.posix.isAbsolute(filePath) && !cwd) throw new Error('Unable to resolve Claude rewind working directory');
+    const hostPath = mapper.toHostPath(path.posix.resolve(cwd || '/', filePath));
+    if (!hostPath) throw new Error('Unable to map Claude rewind path to the host');
+    return hostPath;
+  }
   if (path.isAbsolute(filePath)) {
     return filePath;
   }
@@ -47,30 +44,6 @@ function resolveRewindFilePath(filePath: string, vaultPath: string | null): stri
     return path.join(vaultPath, filePath);
   }
   return filePath;
-}
-
-async function copyDir(from: string, to: string): Promise<void> {
-  await fs.mkdir(to, { recursive: true });
-  const dirents = await fs.readdir(from, { withFileTypes: true });
-  for (const dirent of dirents) {
-    const srcPath = path.join(from, dirent.name);
-    const destPath = path.join(to, dirent.name);
-
-    if (dirent.isDirectory()) {
-      await copyDir(srcPath, destPath);
-      continue;
-    }
-
-    if (dirent.isSymbolicLink()) {
-      const target = await fs.readlink(srcPath);
-      await fs.symlink(target, destPath);
-      continue;
-    }
-
-    if (dirent.isFile()) {
-      await fs.copyFile(srcPath, destPath);
-    }
-  }
 }
 
 /**
@@ -87,38 +60,20 @@ export async function createClaudeRewindBackup(
 
   const backupRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'claudian-rewind-'));
   const entries: BackupEntry[] = [];
+  let restoreFailed = false;
   const backupPathForIndex = (index: number) => path.join(backupRoot, String(index));
 
   for (let i = 0; i < filesChanged.length; i++) {
     const originalPath = resolveRewindFilePath(filesChanged[i], vaultPath);
-
+    const backupPath = backupPathForIndex(i);
     try {
-      const stats = await fs.lstat(originalPath);
-
-      if (stats.isSymbolicLink()) {
-        const target = await fs.readlink(originalPath);
-        entries.push({ originalPath, existedBefore: true, kind: 'symlink', symlinkTarget: target });
-        continue;
-      }
-
-      const backupPath = backupPathForIndex(i);
-      if (stats.isDirectory()) {
-        await copyDir(originalPath, backupPath);
-        entries.push({ originalPath, existedBefore: true, kind: 'dir', backupPath });
-        continue;
-      }
-
-      if (stats.isFile()) {
-        await fs.copyFile(originalPath, backupPath);
-        entries.push({ originalPath, existedBefore: true, kind: 'file', backupPath });
-        continue;
-      }
-
-      entries.push({ originalPath, existedBefore: false });
+      // The SDK reports tracked regular files; copying follows links so restore writes back through them.
+      await fs.copyFile(originalPath, backupPath);
+      entries.push({ originalPath, backupPath });
     } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code === 'ENOENT') {
-        entries.push({ originalPath, existedBefore: false });
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        // A dangling link cannot be copied; leave it alone instead of deleting it on restore.
+        if (!(await fs.lstat(originalPath).then(() => true, () => false))) entries.push({ originalPath });
         continue;
       }
 
@@ -128,41 +83,32 @@ export async function createClaudeRewindBackup(
   }
 
   const restore = async () => {
-    const errors: unknown[] = [];
+    const errors: string[] = [];
 
     for (const entry of entries) {
       try {
-        if (!entry.existedBefore) {
-          await fs.rm(entry.originalPath, { recursive: true, force: true });
+        if (!entry.backupPath) {
+          await fs.rm(entry.originalPath, { force: true });
           continue;
         }
 
-        await fs.rm(entry.originalPath, { recursive: true, force: true });
         await fs.mkdir(path.dirname(entry.originalPath), { recursive: true });
-
-        if (entry.kind === 'symlink') {
-          await fs.symlink(entry.symlinkTarget, entry.originalPath);
-          continue;
-        }
-
-        if (entry.kind === 'dir') {
-          await copyDir(entry.backupPath, entry.originalPath);
-          continue;
-        }
-
         await fs.copyFile(entry.backupPath, entry.originalPath);
-      } catch (error) {
-        errors.push(error);
+      } catch {
+        errors.push(entry.backupPath
+          ? `Recovery copy: ${entry.backupPath} -> ${entry.originalPath}`
+          : `Restore prior absence by removing: ${entry.originalPath}`);
       }
     }
 
-    if (errors.length > 0) {
-      throw new Error(`Failed to restore ${errors.length} file(s) after rewind failure.`);
+    restoreFailed = errors.length > 0;
+    if (restoreFailed) {
+      throw new Error(`Failed to restore ${errors.length} file(s) after rewind failure.\n${errors.join('\n')}\nBackup retained at: ${backupRoot}`);
     }
   };
 
   const cleanup = async () => {
-    await fs.rm(backupRoot, { recursive: true, force: true });
+    if (!restoreFailed) await fs.rm(backupRoot, { recursive: true, force: true });
   };
 
   return { restore, cleanup };
@@ -182,7 +128,8 @@ export async function executeClaudeRewind(
     return preview;
   }
 
-  const backup = await createClaudeRewindBackup(preview.filesChanged, deps.vaultPath);
+  const filesChanged = preview.filesChanged?.map(file => resolveRewindFilePath(file, deps.vaultPath, deps.executionTarget));
+  const backup = await createClaudeRewindBackup(filesChanged, null);
 
   try {
     const result = await deps.rewindFiles(userMessageId);
@@ -195,7 +142,7 @@ export async function executeClaudeRewind(
     if (deps.assistantMessageId) deps.closePersistentQuery();
     return {
       ...result,
-      filesChanged: preview.filesChanged,
+      filesChanged,
       insertions: preview.insertions,
       deletions: preview.deletions,
     };

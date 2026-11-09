@@ -10,6 +10,7 @@ import type { ProviderCapabilities, ProviderId } from '../providers/types';
 
 export type BuiltInCommandAction =
   | 'clear'
+  | 'compact'
   | 'resume'
   | 'fast'
   | 'side';
@@ -45,6 +46,11 @@ export const BUILT_IN_COMMANDS: BuiltInCommand[] = [
     aliases: ['clear'],
     description: 'Start a new conversation',
     action: 'clear',
+  },
+  {
+    name: 'compact',
+    description: 'Compact conversation history',
+    action: 'compact',
   },
   {
     name: 'sessions',
@@ -112,17 +118,21 @@ export function isBuiltInCommandSupported(
 }
 
 /**
- * Checks if input is a built-in command.
- * Provider-scoped commands are left to other providers' command handling.
+ * Checks if input is a locally handled built-in command.
+ * Compaction goes through normal turn admission and provider execution.
  * Returns the command and arguments if found, null otherwise.
  */
 export function detectBuiltInCommand(
   input: string,
   context?: BuiltInCommandSupportContext,
 ): BuiltInCommandResult | null {
+  // This matcher is deliberately single-line: a line break is never a command
+  // separator, so one anywhere in the trimmed candidate rejects the match.
+  if (/[\r\n\u2028\u2029]/.test(input.trim())) return null;
   const parsed = parseLeadingBuiltInCommand(input);
-  if (!parsed || /[\r\n\u2028\u2029]/.test(parsed.rawArguments)) return null;
+  if (!parsed) return null;
   const { command } = parsed;
+  if (command.action === 'compact') return null;
   if (!isBuiltInCommandSupported(command, context)) return null;
   const args = parsed.rawArguments.trim();
 
@@ -149,11 +159,13 @@ export function detectSideChatCommand(input: string): SideChatCommandMatch | nul
 /**
  * Leading built-in command token that Claudian owns for the main chat only,
  * regardless of provider capability. Side-chat aliases are excluded because
- * they are the side feature's own controls.
+ * they are the side feature's own controls. Compaction keeps its provider
+ * execution path on either destination.
  */
 export function detectMainOnlyBuiltInCommand(input: string): BuiltInCommand | null {
   const parsed = parseLeadingBuiltInCommand(input);
-  return parsed && parsed.command.action !== 'side' ? parsed.command : null;
+  return parsed && parsed.command.action !== 'side' && parsed.command.action !== 'compact'
+    ? parsed.command : null;
 }
 
 /** Whether the current provider exposes the side-chat command at all. */

@@ -1,16 +1,14 @@
+import { conversationRecord } from '@test/helpers/features/chat/ConversationFixture';
+
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { getProviderConfig, setProviderConfig } from '@/core/providers/providerConfig';
 import { isVersionedRuntimeInputFingerprint } from '@/core/providers/settings/RuntimeInputFingerprint';
-import type { Conversation } from '@/core/types';
 import { deepseekSettingsReconciler } from '@/providers/deepseek/env/DeepSeekSettingsReconciler';
 import { getDeepSeekProviderSettings, updateDeepSeekProviderSettings } from '@/providers/deepseek/settings';
 
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => 'device:current',
-}));
-
-const reconcile = (settings: Record<string, unknown>) => deepseekSettingsReconciler.reconcileModelWithEnvironment(settings, []);
-const unchanged = { changed: false, invalidatedConversations: [] };
-const changed = { changed: true, invalidatedConversations: [] };
+const reconcile = (settings: Record<string, unknown>) => deepseekSettingsReconciler.reconcileModelWithEnvironment(settings);
+const unchanged = { changed: false };
+const changed = { changed: true, sessionPolicy: 'reload' };
 
 describe('DeepSeekSettingsReconciler', () => {
   it('leaves pristine defaults untouched during startup reconciliation', () => {
@@ -45,12 +43,12 @@ describe('DeepSeekSettingsReconciler', () => {
     expect(reconcile(settings)).toEqual(changed);
     const legacy = getDeepSeekProviderSettings(settings).environmentHash;
 
-    (settings.providerConfigs as Record<string, any>).deepseek.cliPath = '/legacy/dsh-2';
+    setProviderConfig(settings, 'deepseek', { ...getProviderConfig(settings, 'deepseek'), cliPath: '/legacy/dsh-2' });
     expect(reconcile(settings)).toEqual(changed);
     const legacyChanged = getDeepSeekProviderSettings(settings).environmentHash;
     expect(legacyChanged).not.toBe(legacy);
 
-    (settings.providerConfigs as Record<string, any>).deepseek.cliPathsByHost['device:other'] = '/other/dsh-2';
+    setProviderConfig(settings, 'deepseek', { ...getProviderConfig(settings, 'deepseek'), cliPathsByHost: { 'device:other': '/other/dsh-2' } });
     expect(reconcile(settings)).toEqual(unchanged);
 
     updateDeepSeekProviderSettings(settings, { cliPath: '/opt/dsh' });
@@ -63,20 +61,31 @@ describe('DeepSeekSettingsReconciler', () => {
   });
 
   it('declares reload and preserves every conversation binding', () => {
-    const conversation = {
+    const conversation = conversationRecord('conversation', {
       messages: [], providerId: 'deepseek', sessionId: 'session-1',
       providerState: { schemaVersion: 1, home: '/home', profile: 'web', preset: 'claudian' },
-    } as unknown as Conversation;
+    });
     const settings: Record<string, unknown> = {
       providerConfigs: { deepseek: { environmentHash: 'stale', environmentVariables: 'DSH_HOME=/home' } },
     };
 
-    expect(deepseekSettingsReconciler.environmentSessionPolicy).toBe('reload');
     expect(deepseekSettingsReconciler.invalidateConversationSessions([conversation])).toEqual([]);
-    expect(deepseekSettingsReconciler.reconcileModelWithEnvironment(settings, [conversation])).toEqual(changed);
+    expect(deepseekSettingsReconciler.reconcileModelWithEnvironment(settings)).toEqual(changed);
     expect(conversation).toEqual(expect.objectContaining({
       sessionId: 'session-1',
       providerState: { schemaVersion: 1, home: '/home', profile: 'web', preset: 'claudian' },
     }));
   });
+});
+
+it('reloads on a vault-inferred WSL distro change even without an explicit distro override', () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  try {
+    const settings = { providerConfigs: { deepseek: { enabled: true, installationMethodsByHost: { [getInstallationKey()]: 'wsl' } } } };
+    const run = (distro: string) => deepseekSettingsReconciler.reconcileModelWithEnvironment(settings, { vaultPath: `\\\\wsl$\\${distro}\\home\\me\\vault` });
+    expect(run('Ubuntu')).toEqual(changed);
+    expect(run('Ubuntu')).toEqual(unchanged);
+    expect(run('Debian')).toEqual(changed);
+  } finally { Object.defineProperty(process, 'platform', platform); }
 });

@@ -1,30 +1,25 @@
 import { CODEX_SPARK_MODEL, TEST_CODEX_CATALOG } from '@test/helpers/codexModels';
 
+import { getInstallationKey } from '@/core/device/InstallationKey';
+import { resolveCodexReasoningSummary } from '@/providers/codex/config';
 import {
-  applyCodexModelDefaults,
   DEFAULT_CODEX_PROVIDER_SETTINGS,
-  getCodexProviderSettings,
-  getEffectiveCodexReasoningSummary,
   getVisibleCodexModelIds,
   normalizeCodexModelAliases,
-  normalizeCodexStoredConfig,
   normalizeCodexVisibleModels,
+} from '@/providers/codex/config';
+import {
+  applyCodexModelDefaults,
+  getCodexProviderSettings,
+  normalizeCodexStoredConfig,
   projectCodexModelSettings,
   updateCodexProviderSettings,
 } from '@/providers/codex/settings';
-
-const mockGetHostnameKey = jest.fn(() => 'host-a');
 const originalPlatform = process.platform;
-
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => mockGetHostnameKey(),
-}));
 
 describe('codex settings', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    mockGetHostnameKey.mockReturnValue('host-a');
+    vi.clearAllMocks();
   });
 
   afterEach(() => {
@@ -38,7 +33,7 @@ describe('codex settings', () => {
     expect(settings.providerConfigs.codex).not.toHaveProperty('customModels');
   });
 
-  it.each([undefined, null, '', 'invalid', 42, {}, []])('normalizes invalid response style %p to pragmatic', (responseStyle) => {
+  it.each([undefined, null, '', 'invalid', 42, {}, []])('normalizes invalid response style %o to pragmatic', (responseStyle) => {
     const settings = { providerConfigs: { codex: { responseStyle } } };
     expect(getCodexProviderSettings(settings)).toMatchObject({ responseStyle: 'pragmatic' });
     expect(normalizeCodexStoredConfig(settings).config).toMatchObject({ responseStyle: 'pragmatic' });
@@ -51,7 +46,7 @@ describe('codex settings', () => {
     expect(normalizeCodexStoredConfig(settings).config.responseVerbosity).toBe(responseVerbosity);
   });
 
-  it.each([undefined, null, '', 'invalid', 42, {}, []])('inherits Codex verbosity for invalid saved value %p', (responseVerbosity) => {
+  it.each([undefined, null, '', 'invalid', 42, {}, []])('inherits Codex verbosity for invalid saved value %o', (responseVerbosity) => {
     const settings = { providerConfigs: { codex: { responseVerbosity } } };
     expect(getCodexProviderSettings(settings).responseVerbosity).toBe('default');
     expect(normalizeCodexStoredConfig(settings).config.responseVerbosity).toBe('default');
@@ -76,14 +71,14 @@ describe('codex settings', () => {
         codex: {
           cliPathsByHost: ['/array/codex'],
           wslDistroOverridesByHost: {
-            ' host-a ': ' Ubuntu ',
+            [` ${getInstallationKey()} `]: ' Ubuntu ',
             invalid: 42,
           },
         },
       },
     })).toMatchObject({
       cliPathsByHost: {},
-      wslDistroOverridesByHost: { 'host-a': 'Ubuntu' },
+      wslDistroOverridesByHost: { [getInstallationKey()]: 'Ubuntu' },
     });
   });
 
@@ -119,9 +114,9 @@ describe('codex settings', () => {
 
   it('treats a null visibility filter as all discovered models', () => {
     const discoveredModels = [
-      { model: 'gpt-5.5' },
-      { model: 'gpt-5.4-mini' },
-    ] as any;
+      { ...TEST_CODEX_CATALOG[0], model: 'gpt-5.5' },
+      { ...TEST_CODEX_CATALOG[1], model: 'gpt-5.4-mini' },
+    ];
 
     expect(getVisibleCodexModelIds(null, discoveredModels)).toEqual([
       'gpt-5.5',
@@ -129,28 +124,32 @@ describe('codex settings', () => {
     ]);
   });
 
-  it('normalizes an explicit visibility filter against the discovered catalog', () => {
-    const discoveredModels = [
-      { model: 'gpt-5.5' },
-      { model: 'gpt-5.4-mini' },
-    ] as any;
-
+  it('normalizes explicit visible models while retaining unavailable selections', () => {
     expect(normalizeCodexVisibleModels(
-      [' gpt-5.4-mini ', 'missing-model', 'gpt-5.4-mini', 42],
-      discoveredModels,
+      [' gpt-5.4-mini ', 'missing-model', 'gpt-5.4-mini', 42]
     )).toEqual(['gpt-5.4-mini', 'missing-model']);
-    expect(normalizeCodexVisibleModels(undefined, discoveredModels)).toBeNull();
+    expect(normalizeCodexVisibleModels(undefined)).toBeNull();
   });
 
-  it('normalizes model aliases against the discovered catalog', () => {
-    expect(normalizeCodexModelAliases({
-      ' gpt-5.5 ': '  Primary  ',
-      'gpt-5.4-mini': ' ',
-      missing: 'Missing',
-      invalid: 42,
-    }, TEST_CODEX_CATALOG as any)).toEqual({
-      'gpt-5.5': 'Primary', missing: 'Missing',
+  it('normalizes model aliases while retaining unknown model ids', () => {
+    const input = Object.setPrototypeOf(JSON.parse(
+      '{" gpt-5.5 ":"  Primary  ","gpt-5.4-mini":" ","missing":"Missing","invalid":42," ":"Blank key","__proto__":" Custom Proto ","constructor":"Custom Constructor"}',
+    ), { inherited: 'Ignore' });
+    const aliases = normalizeCodexModelAliases(input);
+
+    expect(aliases).toEqual(JSON.parse(
+      '{"gpt-5.5":"Primary","missing":"Missing","__proto__":"Custom Proto","constructor":"Custom Constructor"}',
+    ));
+    expect(Object.keys(aliases)).toEqual(['gpt-5.5', 'missing', '__proto__', 'constructor']);
+    expect(Object.getPrototypeOf(aliases)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(aliases, '__proto__')).toEqual({
+      value: 'Custom Proto', enumerable: true, writable: true, configurable: true,
     });
+    expect(JSON.parse(JSON.stringify(aliases))).toEqual(aliases);
+  });
+
+  it.each([null, undefined, 'alias', 42, []])('ignores non-record aliases: %o', value => {
+    expect(normalizeCodexModelAliases(value)).toEqual({});
   });
 
   it('persists aliases only for visible models', () => {
@@ -331,7 +330,6 @@ describe('codex settings', () => {
   });
 
   it('preserves hostname-scoped settings without assigning them to the current device', () => {
-    mockGetHostnameKey.mockReturnValue('device:current');
 
     const settings = getCodexProviderSettings({
       providerConfigs: {
@@ -387,10 +385,10 @@ describe('codex settings', () => {
       installationMethod: 'wsl',
       wslDistroOverride: 'Ubuntu-24.04',
       installationMethodsByHost: {
-        'host-a': 'wsl',
+        [getInstallationKey()]: 'wsl',
       },
       wslDistroOverridesByHost: {
-        'host-a': 'Ubuntu-24.04',
+        [getInstallationKey()]: 'Ubuntu-24.04',
       },
     });
   });
@@ -415,9 +413,9 @@ describe('codex settings', () => {
       wslDistroOverride: '  ',
     });
 
+    // The default method is stored as the absence of the current host's entry.
     expect(next.installationMethodsByHost).toEqual({
       'host-b': 'wsl',
-      'host-a': 'native-windows',
     });
     expect(next.wslDistroOverridesByHost).toEqual({
       'host-b': 'Debian',
@@ -430,11 +428,11 @@ describe('codex settings', () => {
       providerConfigs: {
         codex: {
           installationMethodsByHost: {
-            'host-a': 'wsl',
+            [getInstallationKey()]: 'wsl',
             'host-b': 'wsl',
           },
           wslDistroOverridesByHost: {
-            'host-a': 'Ubuntu-24.04',
+            [getInstallationKey()]: 'Ubuntu-24.04',
             'host-b': 'Debian',
           },
         },
@@ -471,11 +469,11 @@ describe('codex settings', () => {
             installationMethod: 'native-windows',
             wslDistroOverride: '',
             installationMethodsByHost: {
-              'host-a': 'wsl',
+              [getInstallationKey()]: 'wsl',
               'host-b': 'wsl',
             },
             wslDistroOverridesByHost: {
-              'host-a': 'Ubuntu-24.04',
+              [getInstallationKey()]: 'Ubuntu-24.04',
               'host-b': 'Debian',
             },
           },
@@ -483,7 +481,7 @@ describe('codex settings', () => {
       },
       {
         platform: 'darwin',
-        hostnameKey: 'host-a',
+        hostnameKey: getInstallationKey(),
       },
     );
 
@@ -513,7 +511,7 @@ describe('codex settings', () => {
       },
       {
         platform: 'win32',
-        hostnameKey: 'host-a',
+        hostnameKey: getInstallationKey(),
       },
     );
 
@@ -533,8 +531,9 @@ describe('codex settings', () => {
       },
     };
 
-    expect(getEffectiveCodexReasoningSummary(settingsBag, CODEX_SPARK_MODEL)).toBe('none');
-    expect(getEffectiveCodexReasoningSummary(settingsBag, 'gpt-5.5')).toBe('detailed');
+    const codexSettings = getCodexProviderSettings(settingsBag);
+    expect(resolveCodexReasoningSummary(codexSettings, CODEX_SPARK_MODEL)).toBe('none');
+    expect(resolveCodexReasoningSummary(codexSettings, 'gpt-5.5')).toBe('detailed');
   });
 
   it('sets reasoning summary off when applying GPT-5.3 Codex Spark model defaults', () => {

@@ -2,6 +2,7 @@ import '@/providers';
 
 import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
 import { modelCatalogCases as cases } from '@test/helpers/providerModelCatalogs';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
 
 import { ClaudianSettingsStorage } from '@/app/settings/ClaudianSettingsStorage';
 import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
@@ -10,7 +11,7 @@ import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import { getClaudeProviderSettings } from '@/providers/claude/settings';
 import { getCodexProviderSettings } from '@/providers/codex/settings';
 import { getDeepSeekProviderSettings } from '@/providers/deepseek/settings';
-import { getGrokProviderSettings, updateCurrentGrokCatalog } from '@/providers/grok/settings';
+import { getGrokProviderSettings } from '@/providers/grok/settings';
 import { getOpencodeProviderSettings } from '@/providers/opencode/settings';
 import { getPiProviderSettings } from '@/providers/pi/settings';
 
@@ -19,10 +20,10 @@ it.each(cases)('$id persists selected metadata without saving the available cata
   populate(settings);
   let content = '';
   const adapter = {
-    exists: jest.fn(async () => Boolean(content)),
-    read: jest.fn(async () => content),
-    write: jest.fn(async (_path: string, value: string) => { content = value; }),
-    delete: jest.fn(async () => undefined),
+    exists: vi.fn(async () => Boolean(content)),
+    read: vi.fn(async () => content),
+    write: vi.fn(async (_path: string, value: string) => { content = value; }),
+    delete: vi.fn(async () => undefined),
   } as unknown as VaultFileAdapter;
   const storage = new ClaudianSettingsStorage(adapter, DEFAULT_CLAUDIAN_SETTINGS);
   const expectedMetadata = read(settings)[0];
@@ -71,7 +72,7 @@ it.each(cases)('$id does not restore removed models from an older selected snaps
   const config = restored.providerConfigs[id]!;
   const selected = config.visibleModels;
   if (id === 'grok') {
-    updateCurrentGrokCatalog(restored, { defaultModelId: null, fingerprint: 'new', refreshedAt: 20, models: [] });
+    writeGrokCatalog(restored, { defaultModelId: null, fingerprint: 'new', refreshedAt: 20, models: [] });
   } else {
     config.discoveredModels = [];
   }
@@ -242,7 +243,6 @@ it('keeps xHigh for an explicitly selected Grok model while its capabilities are
     .toEqual({ 'temporarily-unavailable': 'xhigh' });
 });
 
-
 it('cleans context overrides by provider identity while preserving resolved aliases and snippet templates', async () => {
   const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
   for (const { populate } of cases) populate(settings);
@@ -284,4 +284,22 @@ it('cleans context overrides by provider identity while preserving resolved alia
   expect(restored.customContextLimits).toEqual(expected);
   expect(JSON.parse(content).customContextLimits).toEqual(expected);
   expect(restored.envSnippets).toEqual(settings.envSnippets);
+});
+
+it('keeps a prefixed Antigravity selection and its projections on save', async () => {
+  const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
+  settings.providerConfigs.antigravity = { enabled: true, visibleModels: ['gemini-4-argon'] };
+  settings.savedProviderModel = { antigravity: 'antigravity/gemini-4-argon' };
+  settings.savedProviderEffort = { antigravity: 'high' };
+  settings.customContextLimits = { 'antigravity/gemini-4-argon': 128_000, 'antigravity/removed': 64_000 };
+  let content = '';
+  const storage = new ClaudianSettingsStorage({
+    exists: async () => Boolean(content), read: async () => content,
+    write: async (_path: string, value: string) => { content = value; }, delete: async () => undefined,
+  } as unknown as VaultFileAdapter, DEFAULT_CLAUDIAN_SETTINGS);
+  await storage.save(settings);
+  const saved = JSON.parse(content);
+  expect(saved.savedProviderModel.antigravity).toBe('antigravity/gemini-4-argon');
+  expect(saved.savedProviderEffort.antigravity).toBe('high');
+  expect(saved.customContextLimits).toEqual({ 'antigravity/gemini-4-argon': 128_000 });
 });

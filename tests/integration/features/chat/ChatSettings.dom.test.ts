@@ -1,14 +1,15 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
 import { deserialize, serialize } from 'node:v8';
 
-import { installSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
+import { axe } from '@test/helpers/accessibility';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { createHarness, releaseSideChatHarnesses } from '@test/helpers/features/chat/SideChatDOMHarness';
 import { FakeSideSession } from '@test/helpers/features/chat/SideChatSessionHarness';
 import { modelCatalogCases } from '@test/helpers/providerModelCatalogs';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
 import { fireEvent, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
 import { App, Component, Notice } from 'obsidian';
 
 import { ChatModelSelectionCoordinator } from '@/app/settings/ChatModelSelectionCoordinator';
@@ -28,7 +29,6 @@ import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
 import { setLocale } from '@/i18n/i18n';
 import { getCodexProviderSettings, updateCodexProviderSettings } from '@/providers/codex/settings';
-import { updateCurrentGrokCatalog } from '@/providers/grok/settings';
 import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
 const originalResizeObserver = globalThis.ResizeObserver;
@@ -41,7 +41,7 @@ afterEach(async () => {
   globalThis.ResizeObserver = originalResizeObserver;
   globalThis.structuredClone = originalStructuredClone;
   ProviderWorkspaceRegistry.clear();
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
   await releaseSideChatHarnesses();
 });
 
@@ -59,7 +59,7 @@ function createSettings({ id, populate }: typeof modelCatalogCases[number], adve
   if (id === 'opencode') config.thinkingOptionsByModel = {
     'anthropic/selected': [{ value: 'default', label: 'Default' }, ...levels.map(value => ({ value, label: formatReasoningValueLabel(value) }))],
   };
-  if (id === 'grok') updateCurrentGrokCatalog(settings, {
+  if (id === 'grok') writeGrokCatalog(settings, {
     defaultModelId: 'selected', fingerprint: 'test', refreshedAt: 10,
     models: [{ rawId: 'selected', displayName: 'Selected label', reasoningMetadataResolved: true,
       defaultReasoningEffort: 'medium', supportsReasoning: true,
@@ -71,8 +71,8 @@ function createSettings({ id, populate }: typeof modelCatalogCases[number], adve
   return settings;
 }
 
-function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected: string) {
-  const harness = createHarness({ settings });
+async function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected: string) {
+  const harness = await createHarness({ settings });
   ProviderWorkspaceRegistry.setServices(id, {});
   const app = new App();
   Object.assign(app.vault.adapter, { basePath: '/vault' });
@@ -81,9 +81,9 @@ function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected:
   const conversations: Conversation[] = [];
   const tabs: AssembledTabRuntime[] = [];
   const sessions: FakeSideSession[] = [];
-  const persist = jest.fn(async () => undefined);
+  const persist = vi.fn(async () => undefined);
   const settingsCoordinator = new SettingsCoordinator(settings, persist);
-  jest.spyOn(ProviderRegistry, 'createExecutionBackend').mockImplementation((_host, providerId = 'claude') => ({
+  vi.spyOn(ProviderRegistry, 'createExecutionBackend').mockImplementation((_host, providerId = 'claude') => ({
     providerId,
     createSession: config => {
       const session = new FakeSideSession(config);
@@ -92,8 +92,10 @@ function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected:
       return session;
     },
   }));
-  const plugin = {
-    ...(harness.plugin as ChatFeatureHost), app, settings,
+  const sessionRuntimes = createSessionRuntimePool(() => plugin);
+  const plugin: ChatFeatureHost = Object.create(harness.plugin, Object.getOwnPropertyDescriptors({
+    sessionRuntimes,
+    app, settings,
     chatModelSelection: new ChatModelSelectionCoordinator(settingsCoordinator),
     executionPersistence: {
       registerExecutionBinding: () => undefined,
@@ -103,7 +105,7 @@ function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected:
       recordConversationActivity: async () => undefined,
     },
     getActiveEnvironmentVariables: () => '',
-    getConversationSummary(id: string) { return (this as unknown as { getConversationSync: (id: string) => any }).getConversationSync(id); },
+    getConversationSummary(id: string) { return this.getConversationSync!(id); },
     getConversationSync: (conversationId: string) => conversations.find(entry => entry.id === conversationId),
     getConversationById: async (conversationId: string) => conversations.find(entry => entry.id === conversationId),
     getConversationList: () => conversations,
@@ -111,14 +113,13 @@ function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected:
       Object.assign(conversations.find(entry => entry.id === conversationId)!, patch),
     mutateSettings: settingsCoordinator.mutate.bind(settingsCoordinator),
     getCommittedSettings: settingsCoordinator.getCommittedSettings.bind(settingsCoordinator),
-  } as unknown as ChatFeatureHost;
+  })) as ChatFeatureHost;
   const createTab = async (blank = false, existingId?: string) => {
     const conversation = conversations.find(entry => entry.id === existingId) ?? {
       id: `conversation-${conversations.length}`, providerId: id, selectedModel: selected,
       messages: [...harness.tab.state.messages], sessionId: `session-${conversations.length}`,
     } as unknown as Conversation;
     if (!blank && !existingId) conversations.push(conversation);
-    if (!plugin.sessionRuntimes) installSessionRuntimePool(plugin);
     const tab = await createTabRuntime({
       plugin,
       component: Object.assign(new Component(), { registerDomEvent: () => undefined, registerEvent: () => undefined }) as never,
@@ -137,31 +138,29 @@ function createChatHarness(settings: ClaudianSettings, id: ProviderId, selected:
   return { createTab, tabs, sessions, persist, plugin };
 }
 
-function reasoningSlider(tab: AssembledTabRuntime): HTMLInputElement {
-  // The slider lives in the model popover, which stays closed in these tests.
-  return within(tab.dom.inputComposerEl).getByRole('slider', { hidden: true }) as HTMLInputElement;
+function reasoningList(tab: AssembledTabRuntime): HTMLElement | null {
+  // The levels live in the model popover, which stays closed in these tests.
+  return within(tab.dom.inputComposerEl).queryByRole('listbox', { name: 'Thinking', hidden: true });
 }
 
-/** The labels the slider announces at each stop, read the way assistive technology hears them. */
+function reasoningLevels(tab: AssembledTabRuntime): HTMLElement[] {
+  return within(reasoningList(tab)!).getAllByRole('option', { hidden: true });
+}
+
+function levelLabel(level: HTMLElement): string {
+  return level.querySelector('.claudian-toolbar-popover-option-label')?.textContent ?? '';
+}
+
+/** The levels as assistive technology hears them, from the fastest to the deepest. */
 function reasoningStops(tab: AssembledTabRuntime): string[] {
-  const slider = reasoningSlider(tab);
-  const original = slider.value;
-  const labels: string[] = [];
-  for (let index = Number(slider.min); index <= Number(slider.max); index++) {
-    fireEvent.input(slider, { target: { value: String(index) } });
-    labels.push(slider.getAttribute('aria-valuetext') ?? '');
-  }
-  fireEvent.input(slider, { target: { value: original } });
-  return labels;
+  return reasoningLevels(tab).map(level => levelLabel(level)).reverse();
 }
 
-/** Moves the slider to the stop announcing `label` and releases it, which commits that level. */
+/** Picks the level named `label`, which commits it. */
 function chooseReasoning(tab: AssembledTabRuntime, label: string): void {
-  const index = reasoningStops(tab).indexOf(label);
-  expect(index).toBeGreaterThanOrEqual(0);
-  const slider = reasoningSlider(tab);
-  fireEvent.input(slider, { target: { value: String(index) } });
-  fireEvent.change(slider);
+  const level = reasoningLevels(tab).find(item => levelLabel(item) === label);
+  expect(level).toBeDefined();
+  fireEvent.click(level!);
 }
 
 async function selectReasoning(tab: AssembledTabRuntime, reasoning: string) {
@@ -171,7 +170,7 @@ async function selectReasoning(tab: AssembledTabRuntime, reasoning: string) {
   await waitFor(() => expect(ui.getByText(label, { selector: '.claudian-thinking-current' })).toBeDefined());
   // Let the commit settle even when the level was already selected.
   await new Promise<void>(resolve => setTimeout(resolve, 0));
-  expect(reasoningSlider(tab).getAttribute('aria-valuetext')).toBe(label);
+  expect(reasoningLevels(tab).filter(level => level.getAttribute('aria-selected') === 'true').map(levelLabel)).toEqual([label]);
 }
 
 async function expectSubmission(
@@ -207,7 +206,7 @@ it.each(modelCatalogCases.flatMap(entry => [true, false].map(advertisesHigh => (
   '$id displays and submits the same settings (native High advertised: $advertisesHigh)', async (entry) => {
     const { id, selected, advertisesHigh } = entry;
     const settings = createSettings(entry, advertisesHigh);
-    const { createTab, sessions, tabs } = createChatHarness(settings, id, selected);
+    const { createTab, sessions, tabs } = (await createChatHarness(settings, id, selected));
     try {
       const tab = await createTab();
       expect(getChatSettingsSnapshot(settings, id, selected).reasoning).toBe('high');
@@ -232,7 +231,7 @@ it.each(['en', 'zh-CN'] as const)('defaults Codex to automatic review and persis
   const entry = modelCatalogCases.find(({ id }) => id === 'codex')!;
   const settings = createSettings(entry);
   const initialPermissionMode = settings.permissionMode;
-  const { createTab, sessions, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     const ui = within(tab.dom.inputComposerEl);
@@ -257,7 +256,7 @@ it.each(['en', 'zh-CN'] as const)('defaults Codex to automatic review and persis
 
 it('keeps permission and service tier independent across sessions and parent model eviction', async () => {
   const entry = modelCatalogCases.find(({ id }) => id === 'codex')!;
-  const { createTab, sessions, tabs, plugin } = createChatHarness(createSettings(entry), entry.id, entry.selected);
+  const { createTab, sessions, tabs, plugin } = (await createChatHarness(createSettings(entry), entry.id, entry.selected));
   try {
     const first = await createTab();
     const second = await createTab();
@@ -295,7 +294,7 @@ it('displays and submits High for a saved OpenCode Default preference', async ()
   const settings = createSettings(entry);
   settings.savedProviderEffort.opencode = 'default';
   settings.providerConfigs.opencode!.preferredThinkingByModel = { 'anthropic/selected': 'default' };
-  const { createTab, sessions, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     expect(reasoningStops(tab)).not.toContain('Default');
@@ -316,13 +315,12 @@ it.each([
   (config.discoveredModels as Array<Record<string, unknown>>)[0].reasoning = efforts.map(id => ({ id, name: formatReasoningValueLabel(id) }));
   if (saved) config.preferredReasoningByModel = { [entry.selected]: saved };
   else delete settings.savedProviderEffort.deepseek;
-  const { createTab, sessions, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     const ui = within(tab.dom.inputComposerEl);
     const modelButton = ui.getByRole('button', { name: /^Model: Selected label/ });
-    const slider = ui.queryByRole('slider', { hidden: true });
-    expect(slider && reasoningStops(tab)).toEqual(stops);
+    expect(reasoningList(tab) && reasoningStops(tab)).toEqual(stops);
     expect(modelButton.getAttribute('aria-label')).toBe(`Model: Selected label${stops ? `, effort ${formatReasoningValueLabel(expected)}` : ''}`);
     const text = `Send with ${efforts.join(' and ')}`;
     (ui.getByRole('textbox') as HTMLTextAreaElement).value = text;
@@ -344,7 +342,7 @@ it.each([
 it.each(modelCatalogCases)('$id keeps displayed and submitted reasoning independent across tabs', async (entry) => {
   const { id, selected } = entry;
   const settings = createSettings(entry);
-  const { createTab, sessions, tabs } = createChatHarness(settings, id, selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, id, selected));
   const model = getChatSettingsSnapshot(settings, id, selected).model;
   const otherReasoning = id === 'codex' ? 'medium' : 'low';
   try {
@@ -377,7 +375,7 @@ it('restores the tab effort when returning to a previously selected model', asyn
     visibleModels: [entry.selected, 'gpt-alternate'],
     discoveredModels: [catalog[0], { ...catalog[0], model: 'gpt-alternate', displayName: 'Alternate' }],
   });
-  const { createTab, sessions, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     const ui = within(tab.dom.inputComposerEl);
@@ -404,7 +402,7 @@ it('keeps the displayed SDK report across model selection until the new model re
     visibleModels: [entry.selected, 'gpt-alternate'],
     discoveredModels: [catalog[0], { ...catalog[0], model: 'gpt-alternate', displayName: 'Alternate' }],
   });
-  const { createTab, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     const ui = within(tab.dom.inputComposerEl);
@@ -442,7 +440,7 @@ it('keeps the displayed SDK report across model selection until the new model re
 it('keeps the previous tab effort and future-tab seed when saving a selection fails', async () => {
   const entry = modelCatalogCases.find(candidate => candidate.id === 'codex')!;
   const settings = createSettings(entry);
-  const { createTab, sessions, tabs, persist } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs, persist } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     await selectReasoning(tab, 'medium');
@@ -468,7 +466,7 @@ it('refreshes a cached effort when provider settings remove it from the availabl
       supportedReasoningEfforts: [...catalog[0].supportedReasoningEfforts, { value: 'ultra', description: 'Ultra' }],
     }],
   });
-  const { createTab, sessions, tabs } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs } = (await createChatHarness(settings, entry.id, entry.selected));
   try {
     const tab = await createTab();
     await selectReasoning(tab, 'ultra');
@@ -488,14 +486,14 @@ it('refreshes a cached effort when provider settings remove it from the availabl
 it.each([true, false])('seeds tabs from committed reasoning while a save is pending (succeeds: %s)', async (succeeds) => {
   const entry = modelCatalogCases.find(candidate => candidate.id === 'codex')!;
   const settings = createSettings(entry);
-  const { createTab, sessions, tabs, persist, plugin } = createChatHarness(settings, entry.id, entry.selected);
+  const { createTab, sessions, tabs, persist, plugin } = (await createChatHarness(settings, entry.id, entry.selected));
   let resolveSave!: (value: undefined) => void;
   let rejectSave!: (error: Error) => void;
   const save = new Promise<undefined>((resolve, reject) => {
     resolveSave = resolve;
     rejectSave = reject;
   });
-  const mutate = jest.spyOn(plugin, 'mutateSettings');
+  const mutate = vi.spyOn(plugin, 'mutateSettings');
   const saveError = new Error('disk full');
   try {
     const source = await createTab();
@@ -527,7 +525,7 @@ it.each([true, false])('seeds tabs from committed reasoning while a save is pend
 test.each(['provider switch', 'switch back', 'closing'] as const)('queued toolbar changes retain their session only across closing (%s)', async transition => {
   const entry = modelCatalogCases.find(entry => entry.id === 'claude')!;
   const settings = createSettings(entry);
-  const { plugin, createTab } = createChatHarness(settings, entry.id, entry.selected);
+  const { plugin, createTab } = (await createChatHarness(settings, entry.id, entry.selected));
   const tab = await createTab(true);
   tab.session.selectDraft(entry.id, entry.selected);
   try {

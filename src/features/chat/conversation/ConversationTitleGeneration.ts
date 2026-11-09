@@ -1,6 +1,6 @@
 import { Notice } from 'obsidian';
 
-import { extractUserDisplayContent } from '@/core/prompt/promptContext';
+import { getUserDisplayText } from '@/core/prompt/promptContext';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { TitleGenerationService } from '@/core/providers/types';
 import type { ChatMessage } from '@/core/types';
@@ -17,14 +17,14 @@ export interface ConversationTitleGenerationDeps {
 
 /** The first sentence of the first message, kept when generation is off or fails. */
 export function fallbackConversationTitle(firstMessage: string): string {
-  const firstSentence = firstMessage.split(/[.!?\n]/)[0].trim();
-  const autoTitle = firstSentence.substring(0, 50);
+  const firstLine = firstMessage.trim().split(/[\r\n]/)[0].trim();
+  const firstSentence = firstLine.split(/[.!?]/)[0].trim() || firstLine;
+  let autoTitle = firstSentence.substring(0, 50);
+  if (/[\uD800-\uDBFF]$/.test(autoTitle) && /^[\uDC00-\uDFFF]/.test(firstSentence.slice(50))) {
+    autoTitle = autoTitle.slice(0, -1);
+  }
   const suffix = firstSentence.length > 50 ? '...' : '';
   return `${autoTitle}${suffix}`;
-}
-
-function userContentOf(message: ChatMessage): string {
-  return message.displayContent ?? extractUserDisplayContent(message.content) ?? message.content;
 }
 
 /**
@@ -37,7 +37,7 @@ export class ConversationTitleGeneration {
   /** Names a new Conversation from its first user message, then generates a title in the background. */
   async titleFirstTurn(conversationId: string, firstUserMessage: ChatMessage): Promise<void> {
     const { host } = this.deps;
-    const userContent = userContentOf(firstUserMessage);
+    const userContent = getUserDisplayText(firstUserMessage);
     const fallbackTitle = fallbackConversationTitle(userContent);
     await host.renameConversation(conversationId, fallbackTitle);
 
@@ -70,7 +70,7 @@ export class ConversationTitleGeneration {
     if (!firstUserMessage) return;
 
     await this.#markPending(conversationId);
-    await this.#generate(service, conversationId, userContentOf(firstUserMessage), conversation.title);
+    await this.#generate(service, conversationId, getUserDisplayText(firstUserMessage), conversation.title);
   }
 
   async #markPending(conversationId: string): Promise<void> {

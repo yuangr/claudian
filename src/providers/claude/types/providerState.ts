@@ -5,9 +5,25 @@ import type { SubagentInfo } from '../../../core/types/tools';
 export interface ClaudeProviderState {
   providerSessionId?: string;
   previousProviderSessionIds?: string[];
+  /**
+   * Retired-binding migration (#1647, added 2026-10-16; remove after 2027-01-16). Set whenever Claudian retires the live
+   * binding, so only retirements left by earlier versions get the one-time restore. Remove this
+   * field, its writes, and every block tagged "Retired-binding migration" together.
+   */
+  bindingRetired?: boolean;
   historyReplayPending?: boolean;
   forkSource?: ForkSource;
-  subagentData?: Record<string, SubagentInfo>;
+  /** Only what native history lacks: full records without a native sidecar, otherwise async overlays. */
+  subagentData?: Record<string, SubagentInfo | ClaudeSubagentOverlay>;
+}
+
+/** Async lifecycle state Claudian observed live; the transcript may lack the completion notice. */
+export type ClaudeSubagentOverlay = Pick<SubagentInfo, 'id' | 'mode' | 'agentId' | 'status' | 'asyncStatus' | 'result'>;
+
+export function isFullClaudeSubagent(
+  subagent: SubagentInfo | ClaudeSubagentOverlay,
+): subagent is SubagentInfo {
+  return Array.isArray((subagent as Partial<SubagentInfo>).toolCalls);
 }
 
 /** Extracts typed Claude provider state from the opaque bag. */
@@ -62,6 +78,7 @@ export function clearClaudeResumeState(conversation: Conversation): boolean {
   }
 
   conversation.sessionId = null;
+  providerState.bindingRetired = true;
   delete providerState.providerSessionId;
   delete providerState.forkSource;
   conversation.providerState = Object.keys(providerState).length > 0

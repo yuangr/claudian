@@ -1,14 +1,21 @@
+// @test-ci {"native":true}
+const actualModule0 = await import('node:fs/promises');
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { testTime } from '@test/helpers/testClock';
+
+import { locateSDKSession } from '@/providers/claude/history/ClaudeHistoryPathResolver';
 import { loadSDKSessionMessages } from '@/providers/claude/history/ClaudeHistoryStore';
 import { loadClaudeTurnStats } from '@/providers/claude/history/ClaudeTurnStats';
 import type { SDKNativeMessage } from '@/providers/claude/history/sdkHistoryTypes';
 
+
 it('matches replay across tool-result ancestry and reads a bounded suffix of a long session', async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-turn-'));
-  const directory = path.join(home, 'projects', '-vault');
+  const vaultPath = path.resolve('/vault');
+  const directory = path.join(home, 'projects', vaultPath.replace(/[^a-zA-Z0-9]/g, '-'));
   await fs.mkdir(directory, { recursive: true });
   const filePath = path.join(directory, 'session.jsonl');
   const records: SDKNativeMessage[] = [
@@ -30,10 +37,10 @@ it('matches replay across tool-result ancestry and reads a bounded suffix of a l
   const context = { environment: { CLAUDE_CONFIG_DIR: home } };
   let bytesRead = 0;
   const nativeOpen = fs.open;
-  const spy = jest.spyOn(jest.requireActual<typeof fs>('node:fs/promises'), 'open').mockImplementation(async (...args) => {
+  const spy = vi.spyOn(actualModule0, 'open').mockImplementation(async (...args) => {
     const file = await nativeOpen(...args);
     const read = file.read.bind(file);
-    jest.spyOn(file, 'read').mockImplementation((async (...readArgs: Parameters<typeof file.read>) => {
+    vi.spyOn(file, 'read').mockImplementation((async (...readArgs: Parameters<typeof file.read>) => {
       const result = await read(...readArgs);
       bytesRead += result.bytesRead;
       return result;
@@ -57,7 +64,8 @@ it.each([
   'User: Earlier question\n\nAssistant: Earlier answer',
 ])('does not start native timing from an interrupt or rebuilt context: %s', async content => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-turn-boundary-'));
-  const directory = path.join(home, 'projects', '-vault');
+  const vaultPath = path.resolve('/vault');
+  const directory = path.join(home, 'projects', vaultPath.replace(/[^a-zA-Z0-9]/g, '-'));
   await fs.mkdir(directory, { recursive: true });
   const filePath = path.join(directory, 'session.jsonl');
   await fs.writeFile(filePath, [
@@ -72,3 +80,80 @@ it.each([
     await fs.rm(home, { recursive: true, force: true });
   }
 });
+
+// The active branch drops progress records, which a fold can still follow.
+it.each([
+  [1, 'tool result', 2500],
+  [2, 'tool result', 2500],
+  [1, 'progress record', 2000],
+] as const)('times a turn resumed by %i folded queued prompts after a %s from their consumption, matching replay', async (count, followed, durationMs) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-turn-queued-'));
+  const vaultPath = path.resolve('/vault');
+  const directory = path.join(home, 'projects', vaultPath.replace(/[^a-zA-Z0-9]/g, '-'));
+  await fs.mkdir(directory, { recursive: true });
+  const filePath = path.join(directory, 'session.jsonl');
+  // The attachment keeps its enqueue time; Claude folded it after the tool result.
+  await fs.writeFile(filePath, [
+    { type: 'user', uuid: 'u', timestamp: testTime(), message: { content: 'Work' } },
+    { type: 'assistant', uuid: 'a1', parentUuid: 'u', timestamp: testTime({ seconds: 1 }),
+      message: { id: 'r1', stop_reason: 'tool_use', usage: { output_tokens: 100 }, content: [{ type: 'tool_use', id: 'bash', name: 'Bash', input: {} }] } },
+    { type: 'user', uuid: 'tool', parentUuid: 'a1', timestamp: testTime({ seconds: 10 }), toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'bash', content: 'done' }] } },
+    ...(followed === 'progress record'
+      ? [{ type: 'progress', uuid: 'progress', parentUuid: 'tool', timestamp: testTime({ seconds: 10, milliseconds: 500 }) }]
+      : []),
+    ...Array.from({ length: count }, (_, index) => ({
+      type: 'attachment', uuid: `steer-${index}`,
+      parentUuid: index > 0 ? `steer-${index - 1}` : followed === 'progress record' ? 'progress' : 'tool',
+      timestamp: testTime({ milliseconds: 500 * (index + 1) }),
+      attachment: { type: 'queued_command', prompt: `Steer ${index}`, source_uuid: `steer-input-${index}`, commandMode: 'prompt' },
+    })),
+    { type: 'assistant', uuid: 'final', parentUuid: `steer-${count - 1}`, timestamp: testTime({ seconds: 12, milliseconds: 500 }),
+      message: { id: 'r2', stop_reason: 'end_turn', usage: { output_tokens: 25 }, content: [{ type: 'text', text: 'Done' }] } },
+  ].map(record => JSON.stringify(record)).join('\n'));
+  try {
+    const stats = await loadClaudeTurnStats('/vault', 'session', 'final', { environment: { CLAUDE_CONFIG_DIR: home } });
+    expect(stats).toEqual({ outputTokens: 25, durationMs });
+    const replay = await loadSDKSessionMessages('/vault', 'session', 'final', filePath);
+    expect(replay.messages.at(-1)?.turnStats).toEqual(stats);
+    expect(replay.messages.map(message => message.content || message.contentBlocks?.[0]?.type))
+      .toEqual(['Work', 'tool_use', ...Array.from({ length: count }, (_, index) => `Steer ${index}`), 'Done']);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+// Project directory names captured from the installed Claude Agent SDK 0.3.293 encoder.
+it.each(['archive', 'archive-other'])('reads native history for a long vault path ending in %s', async ending => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-long-vault-'));
+  const posixVault = '/vaults/' + 'research'.repeat(12) + '/' + 'notes'.repeat(25) + '/' + ending;
+  const vaultPath = process.platform === 'win32' ? 'C:' + posixVault.replaceAll('/', '\\') : posixVault;
+  const nativeProject = process.platform === 'win32'
+    ? (ending === 'archive' ? 'C--vaults-researchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearch-notesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnot-xp5q4b' : 'C--vaults-researchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearch-notesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnot-jhs1tk')
+    : (ending === 'archive' ? '-vaults-researchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearch-notesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotes-qufhm0' : '-vaults-researchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearchresearch-notesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotesnotes-utxqt');
+  const directory = path.join(home, 'projects', nativeProject);
+  await fs.mkdir(directory, { recursive: true });
+  const filePath = path.join(directory, 'session.jsonl');
+  await fs.writeFile(filePath, [
+    { type: 'user', uuid: 'u', timestamp: testTime(), message: { content: 'Question' } },
+    { type: 'assistant', uuid: 'a', parentUuid: 'u', timestamp: testTime({ seconds: 2 }),
+      message: { id: 'response', stop_reason: 'end_turn', usage: { output_tokens: 12 }, content: [{ type: 'text', text: ending }] } },
+  ].map(record => JSON.stringify(record)).join('\n'));
+  const context = { environment: { CLAUDE_CONFIG_DIR: home } };
+  try {
+    const [location, replay, stats] = await Promise.all([
+      locateSDKSession(vaultPath, 'session', context),
+      loadSDKSessionMessages(vaultPath, 'session', undefined, undefined, context),
+      loadClaudeTurnStats(vaultPath, 'session', 'a', context).catch((error: NodeJS.ErrnoException) => error.code),
+    ]);
+    expect({ location, contents: replay.messages.map(message => message.content), error: replay.error, stats }).toEqual({
+      location: { availability: 'available', sessionPath: filePath },
+      contents: ['Question', ending], error: undefined,
+      stats: { outputTokens: 12, durationMs: 2000 },
+    });
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+vi.mock('node:fs/promises', async () => ({ ...await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises') }));

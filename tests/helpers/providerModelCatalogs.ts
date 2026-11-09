@@ -1,11 +1,38 @@
 import { TEST_CODEX_CATALOG } from '@test/helpers/codexModels';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
 
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
+import { assertClaudeModelAvailable } from '@/providers/claude/runtime/ClaudeModelAvailability';
 import { getClaudeProviderSettings, updateClaudeProviderSettings } from '@/providers/claude/settings';
+import { assertCodexModelAvailable } from '@/providers/codex/runtime/CodexModelAvailability';
 import { getCodexProviderSettings, updateCodexProviderSettings } from '@/providers/codex/settings';
+import { assertDeepSeekModelAvailable } from '@/providers/deepseek/runtime/DeepSeekModels';
 import { getDeepSeekProviderSettings, updateDeepSeekProviderSettings } from '@/providers/deepseek/settings';
-import { getGrokProviderSettings, updateCurrentGrokCatalog, updateGrokProviderSettings } from '@/providers/grok/settings';
+import { assertGrokModelAvailable } from '@/providers/grok/runtime/GrokModelAvailability';
+import { getGrokProviderSettings, updateGrokProviderSettings } from '@/providers/grok/settings';
+import { assertOpencodeModelAvailable } from '@/providers/opencode/runtime/OpencodeModelAvailability';
 import { getOpencodeProviderSettings, updateOpencodeProviderSettings } from '@/providers/opencode/settings';
+import { assertPiModelAvailable } from '@/providers/pi/runtime/PiModelAvailability';
 import { getPiProviderSettings, updatePiProviderSettings } from '@/providers/pi/settings';
+
+const availabilityGuards = {
+  claude: assertClaudeModelAvailable,
+  codex: assertCodexModelAvailable,
+  deepseek: assertDeepSeekModelAvailable,
+  grok: assertGrokModelAvailable,
+  opencode: assertOpencodeModelAvailable,
+  pi: assertPiModelAvailable,
+};
+
+/** Runs a provider's execution-time model guard against a settings document. */
+export function assertCatalogModelAvailable(
+  providerId: keyof typeof availabilityGuards,
+  host: ProviderRuntimeHost,
+  model: string | undefined,
+): void {
+  availabilityGuards[providerId](host, model);
+}
+
 export const modelCatalogCases = [
   {
     id: 'claude' as const, selected: 'sonnet',
@@ -30,7 +57,7 @@ export const modelCatalogCases = [
     id: 'grok' as const, selected: 'grok/selected',
     populate(settings: Record<string, unknown>) {
       updateGrokProviderSettings(settings, { enabled: true, visibleModels: ['selected'] });
-      updateCurrentGrokCatalog(settings, { defaultModelId: 'selected', fingerprint: 'test', refreshedAt: 10, models: [
+      writeGrokCatalog(settings, { defaultModelId: 'selected', fingerprint: 'test', refreshedAt: 10, models: [
         { rawId: 'selected', displayName: 'Selected label', reasoningEfforts: [], supportsReasoning: false },
         { rawId: 'unselected-catalog-entry', displayName: 'Unselected', reasoningEfforts: [], supportsReasoning: false },
       ] });

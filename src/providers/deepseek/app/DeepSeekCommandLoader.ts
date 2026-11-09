@@ -1,6 +1,5 @@
 import { normalizeProviderCommandDiscoveryItems } from '@/core/providers/commands/ProviderCommandDiscoveryResult';
 import type { ProviderCommandLoader } from '@/core/providers/types';
-import { getVaultPath } from '@/utils/path';
 
 import { readDeepSeekSkills } from '../commands/DeepSeekCommandCatalog';
 import { readDeepSeekProjection } from '../history/DeepSeekJournal';
@@ -25,13 +24,13 @@ export function createDeepSeekCommandLoader(deepseek: DeepSeekHost): ProviderCom
     async loadCommands({ allowIsolatedMetadataCreation, conversation, plugin, readyCommandSnapshot, signal }) {
       signal?.throwIfAborted();
       if (readyCommandSnapshot) return normalizeProviderCommandDiscoveryItems(readyCommandSnapshot);
-      const cwd = getVaultPath(plugin.app);
+      const cwd = plugin.workingDirectory;
       if (!allowIsolatedMetadataCreation || !cwd) return REQUIRES_SESSION;
       try {
         const saved = decodeDeepSeekState(conversation?.providerState);
-        const skills = await deepseek.read(async (reader, home) => {
-          const own = saved && !isSameDeepSeekHome(saved.home, home) ? undefined : conversation?.sessionId ?? saved?.pendingFork?.sessionId;
-          const sessionId = own ?? await findCatalogSession(reader, cwd);
+        const skills = await deepseek.read(async (reader, home, execution) => {
+          const own = saved && !isSameDeepSeekHome(saved.home, home, execution?.target.platformOs === 'linux' ? 'linux' : undefined) ? undefined : conversation?.sessionId ?? saved?.pendingFork?.sessionId;
+          const sessionId = own ?? await findCatalogSession(reader, execution?.targetCwd ?? cwd);
           return sessionId ? readDeepSeekSkills(reader, sessionId) : undefined;
         }, signal);
         return skills ? normalizeProviderCommandDiscoveryItems(skills) : REQUIRES_SESSION;

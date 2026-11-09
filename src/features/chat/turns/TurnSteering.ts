@@ -81,7 +81,7 @@ export class TurnSteering {
       && this.deps.state.currentConversationId !== null
       && this.current === null
       && this.deps.getCapabilities().supportsTurnSteer === true
-      && this.deps.getExecutionCoordinator() !== null;
+      && this.deps.getExecutionCoordinator()?.systemInstructions != null;
   }
 
   async steer(
@@ -93,8 +93,6 @@ export class TurnSteering {
     const coordinator = this.deps.getExecutionCoordinator()!;
     const conversationId = state.currentConversationId!;
     const { displayContent, request } = this.deps.toQueuedChatTurn(queuedMessage);
-    // A steer joins an admitted turn, which already owns any first-turn Linked content.
-    delete request.linkedContentPath;
     const submission = this.deps.createSubmission(displayContent, request);
     const pending: PendingSteerState = {
       conversationId,
@@ -145,6 +143,26 @@ export class TurnSteering {
       this.#markUncertain(pending, reportFailure);
     }
     return pending;
+  }
+
+  /**
+   * Steers and settles definitely unsent input: `drop` discards it, `restore` returns it to the
+   * composer (parking it while its conversation is inactive). Accepted or uncertain delivery stays
+   * pending for provider correlation and is never resent.
+   */
+  async steerMessage(
+    queuedMessage: QueuedMessage,
+    unsent: 'drop' | 'restore',
+    reportFailure?: (message: string) => void,
+    signal?: AbortSignal,
+  ): Promise<'accepted' | 'uncertain' | 'not-sent'> {
+    const pending = await this.steer(queuedMessage, reportFailure, signal);
+    if (pending.providerDisposition === 'definitely-unsent') {
+      if (unsent === 'drop') this.release(pending);
+      else this.restoreIfDefinitelyUnsent(pending);
+      return 'not-sent';
+    }
+    return pending.providerDisposition === 'accepted-awaiting-correlation' ? 'accepted' : 'uncertain';
   }
 
   #markUncertain(pending: PendingSteerState, reportFailure: (message: string) => void): void {

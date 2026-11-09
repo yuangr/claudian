@@ -51,12 +51,9 @@ export function getSessionCapabilities(
   conversation?: Conversation | null,
 ): ProviderCapabilities {
   const providerId = getSessionProviderId(tab, plugin, conversation);
-  if (!providerId) return UNRESOLVED_TAB_CAPABILITIES;
-  if (conversation === undefined && tab.conversationId) {
-    const summary = plugin.getConversationSummary(tab.conversationId);
-    if (summary?.capabilities) return summary.capabilities;
-  }
-  return ProviderRegistry.getCapabilities(providerId, conversation?.providerState);
+  return providerId && ProviderRegistry.getRegisteredProviderIds().includes(providerId)
+    ? ProviderRegistry.getCapabilities(providerId)
+    : UNRESOLVED_TAB_CAPABILITIES;
 }
 
 export function getSessionChatUIConfig(
@@ -86,7 +83,7 @@ export function getSessionSettingsSnapshot(
   }
   Object.assign(snapshot, selections);
   if (snapshot.reasoning !== null) {
-    const key = `${providerId}:${snapshot.model}`;
+    const key = reasoningSelectionKey(providerId, snapshot.model);
     const uiConfig = ProviderRegistry.getChatUIConfig(providerId);
     const selected = tab.reasoningSelections.get(key) ?? snapshot.reasoning;
     const reasoning = uiConfig.getReasoningOptions(snapshot.model, snapshot)
@@ -112,7 +109,21 @@ export async function updateSessionReasoning(
     snapshot.effortLevel = reasoning;
     uiConfig.applyReasoningSelection?.(model, reasoning, snapshot);
   });
-  if (committed) tab.reasoningSelections.set(`${providerId}:${model}`, reasoning);
+  if (committed) tab.reasoningSelections.set(reasoningSelectionKey(providerId, model), reasoning);
+}
+
+/** Selects a session's reasoning for one model without changing the saved preference. */
+export function setSessionReasoningSelection(
+  tab: Pick<ChatSessionRuntime, 'reasoningSelections'>,
+  providerId: string,
+  model: string,
+  reasoning: string,
+): void {
+  tab.reasoningSelections.set(reasoningSelectionKey(providerId, model), reasoning);
+}
+
+function reasoningSelectionKey(providerId: string, model: string): string {
+  return `${providerId}:${model}`;
 }
 
 export function getSessionSelectedModel(

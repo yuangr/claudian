@@ -3,10 +3,12 @@ import { t } from '@/i18n/i18n';
 import type { ProviderChatUIConfig } from '../../../core/providers/types';
 import { OPENAI_PROVIDER_ICON } from '../../../shared/icons';
 import { codexModelPolicy } from '../CodexModelPolicy';
+import { stripCodexFileCitations } from '../normalization/CodexFileCitation';
 import { getCodexProviderSettings } from '../settings';
 
 export const codexChatUIConfig: ProviderChatUIConfig = {
   ...codexModelPolicy,
+  prepareAssistantMarkdown: stripCodexFileCitations,
   getPermissionModeOptions(settings = {}) {
     const readOnly = getCodexProviderSettings(settings).safeMode === 'read-only';
     return [

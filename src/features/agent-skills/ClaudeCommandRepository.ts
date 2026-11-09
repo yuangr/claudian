@@ -3,14 +3,16 @@ import * as path from 'node:path';
 
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import type { AgentSkillDiagnostic, AgentSkillInput } from '@/features/agent-skills/AgentSkill';
-import { serializeMarkdownWithFrontmatter } from '@/features/agent-skills/AgentSkillCodec';
+import { normalizeInstructionMarkdown, serializeMarkdownWithFrontmatter } from '@/features/agent-skills/AgentSkillCodec';
 import {
   AgentSkillRepositoryError,
+  AgentSkillRollbackError,
   CLAUDE_COMMANDS_ROOT,
   type SkillFrontmatterPolicy,
 } from '@/features/agent-skills/AgentSkillRepository';
 import { parseFrontmatter } from '@/features/agent-skills/frontmatter';
 import { AgentSkillValidationError, validateAgentSkillName } from '@/features/agent-skills/validateAgentSkill';
+import { SerialQueue } from '@/utils/SerialQueue';
 
 const COMMAND_EXTENSION = '.md';
 
@@ -61,7 +63,10 @@ function digest(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
-/** Parses a Claude command file; frontmatter is optional and malformed YAML falls back to the raw body. */
+/**
+ * Parses a Claude command file using parsed or recovered frontmatter when available,
+ * otherwise preserving raw input as the body.
+ */
 function parseClaudeCommandMarkdown(raw: string): {
   description: string;
   instructions: string;
@@ -72,14 +77,14 @@ function parseClaudeCommandMarkdown(raw: string): {
   const body = parsed?.body ?? raw;
   return {
     description: typeof frontmatter.description === 'string' ? frontmatter.description.trim() : '',
-    instructions: body.replace(/\r\n/g, '\n').trim(),
+    instructions: normalizeInstructionMarkdown(body),
     frontmatter,
   };
 }
 
 /** Manages vault-level Claude command files under `.claude/commands`. */
 export class ClaudeCommandRepository {
-  private mutationQueue: Promise<void> = Promise.resolve();
+  private readonly mutationQueue = new SerialQueue();
   readonly frontmatterPolicy: SkillFrontmatterPolicy;
 
   constructor(
@@ -98,7 +103,7 @@ export class ClaudeCommandRepository {
 
     const commands: ClaudeCommandDocument[] = [];
     const diagnostics: AgentSkillDiagnostic[] = [];
-    for (const filePath of await this.#listCommandFiles(CLAUDE_COMMANDS_ROOT)) {
+    for (const filePath of await this.#listCommandFiles(CLAUDE_COMMANDS_ROOT, diagnostics)) {
       try {
         commands.push(await this.#readDocument(filePath));
       } catch (error) {
@@ -109,6 +114,7 @@ export class ClaudeCommandRepository {
       }
     }
     commands.sort((left, right) => left.name.localeCompare(right.name));
+    diagnostics.sort((left, right) => left.directoryPath.localeCompare(right.directoryPath));
     return { commands, diagnostics };
   }
 
@@ -136,7 +142,21 @@ export class ClaudeCommandRepository {
       if (await this.#exists(targetPath)) throw new ClaudeCommandCollisionError(input.name);
       await this.files.ensureManagedFolder(path.posix.dirname(targetPath));
       await this.files.writeManagedFile(targetPath, content);
-      await this.files.removeManagedFile(current.filePath);
+      try {
+        await this.files.removeManagedFile(current.filePath);
+      } catch (error) {
+        try {
+          await this.files.removeManagedFile(targetPath);
+        } catch (rollbackError) {
+          throw new AgentSkillRollbackError(
+            `Could not rename command "${previousName}" and rollback was incomplete: "${targetPath}" could not be removed`,
+            error,
+            [rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError))],
+          );
+        }
+        await this.#pruneEmptyFolders(path.posix.dirname(targetPath));
+        throw error;
+      }
       await this.#pruneEmptyFolders(path.posix.dirname(current.filePath));
       return this.#documentFromRaw(targetPath, content);
     });
@@ -171,7 +191,7 @@ export class ClaudeCommandRepository {
     } else {
       delete frontmatter.description;
     }
-    return serializeMarkdownWithFrontmatter(frontmatter, input.instructions.trim());
+    return serializeMarkdownWithFrontmatter(frontmatter, normalizeInstructionMarkdown(input.instructions));
   }
 
   #assertValidName(name: string): void {
@@ -189,17 +209,19 @@ export class ClaudeCommandRepository {
     return `${CLAUDE_COMMANDS_ROOT}/${name}${COMMAND_EXTENSION}`;
   }
 
-  async #listCommandFiles(folder: string): Promise<string[]> {
-    const listing = await this.files.listManagedFolder(folder);
-    const nested = await Promise.all(
-      listing.folders
-        .filter(child => path.posix.dirname(child) === folder)
-        .map(child => this.#listCommandFiles(child)),
-    );
-    return [
-      ...listing.files.filter(file => path.posix.dirname(file) === folder && file.endsWith(COMMAND_EXTENSION)),
-      ...nested.flat(),
-    ];
+  async #listCommandFiles(folder: string, diagnostics: AgentSkillDiagnostic[]): Promise<string[]> {
+    const entries = await this.files.listManagedFolderEntries(folder);
+    const nested = await Promise.all(entries
+      .filter(entry => path.posix.dirname(entry.path) === folder)
+      .map(async entry => {
+        if (entry.type === 'link') {
+          diagnostics.push({ directoryPath: entry.path, message: 'Command paths must not be symbolic links' });
+          return [];
+        }
+        if (entry.type === 'folder') return this.#listCommandFiles(entry.path, diagnostics);
+        return entry.type === 'file' && entry.path.endsWith(COMMAND_EXTENSION) ? [entry.path] : [];
+      }));
+    return nested.flat();
   }
 
   async #exists(filePath: string): Promise<boolean> {
@@ -244,8 +266,6 @@ export class ClaudeCommandRepository {
   }
 
   #withMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.mutationQueue.then(operation, operation);
-    this.mutationQueue = result.then(() => undefined, () => undefined);
-    return result;
+    return this.mutationQueue.run(operation);
   }
 }

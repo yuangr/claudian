@@ -12,7 +12,7 @@ export interface CollapsibleOptions {
   /** Runs once, before the content is first shown (during setup when initially expanded). */
   onFirstExpand?: () => void;
   /** Base label for aria-label (will append "click to expand/collapse") */
-  baseAriaLabel?: string;
+  baseAriaLabel?: string | (() => string);
 }
 
 /**
@@ -21,6 +21,7 @@ export interface CollapsibleOptions {
  * Owns the header's button role and focusability, click and Enter/Space
  * toggling, aria-expanded/aria-label, the wrapper's `expanded` class and the
  * content's visibility. `state` is mutated to mirror the expanded state.
+ * Returns a label-only refresh for callers whose input changes without a toggle.
  */
 export function setupCollapsible(
   wrapperEl: HTMLElement,
@@ -28,12 +29,19 @@ export function setupCollapsible(
   contentEl: HTMLElement,
   state: CollapsibleState,
   options: CollapsibleOptions = {}
-): void {
+): () => void {
   const { initiallyExpanded = false, onToggle, baseAriaLabel } = options;
   let onFirstExpand = options.onFirstExpand;
 
   headerEl.setAttribute('tabindex', '0');
   headerEl.setAttribute('role', 'button');
+
+  const refreshLabel = () => {
+    const label = typeof baseAriaLabel === 'function' ? baseAriaLabel() : baseAriaLabel;
+    if (label) {
+      headerEl.setAttribute('aria-label', t(state.isExpanded ? 'chat.disclosure.collapse' : 'chat.disclosure.expand', { label }));
+    }
+  };
 
   const applyState = (isExpanded: boolean) => {
     if (isExpanded) {
@@ -49,9 +57,7 @@ export function setupCollapsible(
       contentEl.addClass('claudian-hidden');
     }
     headerEl.setAttribute('aria-expanded', String(isExpanded));
-    if (baseAriaLabel) {
-      headerEl.setAttribute('aria-label', t(isExpanded ? 'chat.disclosure.collapse' : 'chat.disclosure.expand', { label: baseAriaLabel }));
-    }
+    refreshLabel();
   };
 
   applyState(initiallyExpanded);
@@ -68,6 +74,7 @@ export function setupCollapsible(
       toggleExpand();
     }
   });
+  return refreshLabel;
 }
 
 /**

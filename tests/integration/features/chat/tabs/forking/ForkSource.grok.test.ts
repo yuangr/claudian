@@ -1,10 +1,13 @@
+import '@/providers';
+
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import initializeFixture from '@test/fixtures/providers/grok/extensions/plan-mode-hook.json';
 
-jest.mock('cross-spawn', () => jest.fn());
+vi.mock('cross-spawn', () => ({ default: vi.fn() }));
 import { createForkTestEnvironment, type ForkTestEnvironment } from '@test/helpers/features/chat/ProviderForkTestHarness';
+import { grokForkRequest, grokTextPromptRequest } from '@test/helpers/providers/grok/GrokRequests';
 import { createNativeRPCProcess } from '@test/helpers/providers/NativeRPCTestProcess';
 import spawn from 'cross-spawn';
 
@@ -12,12 +15,12 @@ import { GrokExecutionBackend } from '@/providers/grok/execution/GrokExecutionBa
 
 function createNativeGrok(env: ForkTestEnvironment, options: { tokenStream?: boolean } = {}) {
   const sessions = new Map<string, string[]>([['grok-source', []]]);
-  const operations: Array<{ method: string; params: Record<string, any> }> = [];
+  const operations: Array<{ method: string; params: Record<string, unknown> }> = [];
   const prompts: Array<{ sessionId: string; context: string[] }> = [];
   const directory = (id: string) => path.join(env.root, 'grok', 'sessions', encodeURIComponent(env.root), id);
   const sourceFile = path.join(directory('grok-source'), 'updates.jsonl');
   let ordinal = 0;
-  jest.mocked(spawn).mockImplementation(() => createNativeRPCProcess(async (method, params, notify) => {
+  vi.mocked(spawn).mockImplementation(() => createNativeRPCProcess(async (method, params, notify) => {
     operations.push({ method, params });
     if (method === 'initialize') return initializeFixture.initializeResult;
     if (method === 'session/new') {
@@ -26,13 +29,14 @@ function createNativeGrok(env: ForkTestEnvironment, options: { tokenStream?: boo
     }
     if (method === 'session/set_mode' || method === 'session/set_model') return {};
     if (method === '_x.ai/session/fork') {
-      sessions.set('grok-child', sessions.get(params.sourceSessionId)!.slice(0, params.targetPromptIndex));
+      const request = grokForkRequest(params);
+      sessions.set('grok-child', sessions.get(request.sourceSessionId)!.slice(0, request.targetPromptIndex));
       await fs.mkdir(directory('grok-child'), { recursive: true });
-      return { newSessionId: 'grok-child', parentSessionId: params.sourceSessionId, newCwd: params.newCwd };
+      return { newSessionId: 'grok-child', parentSessionId: request.sourceSessionId, newCwd: request.newCwd };
     }
     if (method === 'session/load') return {};
     if (method === 'session/prompt') {
-      const sessionId = params.sessionId as string;
+      const { sessionId, prompt } = grokTextPromptRequest(params);
       const context = sessions.get(sessionId)!;
       prompts.push({ sessionId, context: [...context] });
       const turn = ++ordinal;
@@ -45,7 +49,7 @@ function createNativeGrok(env: ForkTestEnvironment, options: { tokenStream?: boo
         }))
         : [{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Reply ${turn}` }, _meta: { eventId: assistantId } }];
       const updates = [
-        { sessionUpdate: 'user_message_chunk', messageId: `grok-user-${turn}`, content: { type: 'text', text: params.prompt[0].text }, _meta: { promptIndex: context.length } },
+        { sessionUpdate: 'user_message_chunk', messageId: `grok-user-${turn}`, content: { type: 'text', text: prompt[0].text }, _meta: { promptIndex: context.length } },
         ...assistantChunks,
         { sessionUpdate: 'turn_completed', ...(options.tokenStream ? { prompt_id: promptId } : {}) },
       ];
@@ -57,13 +61,13 @@ function createNativeGrok(env: ForkTestEnvironment, options: { tokenStream?: boo
     }
     throw new Error(`Unexpected Grok method: ${method}`);
   }));
-  return { backend: new GrokExecutionBackend(env.host), sessions, operations, prompts, sourceFile };
+  return { backend: new GrokExecutionBackend(env.host.getRuntimeHost('grok')), sessions, operations, prompts, sourceFile };
 }
 
 describe('Grok fork integration', () => {
   let env: ForkTestEnvironment;
   beforeEach(async () => { env = await createForkTestEnvironment(); });
-  afterEach(async () => { await env.dispose(); jest.mocked(spawn).mockReset(); });
+  afterEach(async () => { await env.dispose(); vi.mocked(spawn).mockReset(); });
 
   it('translates a live metadata-only ID to the native prompt boundary and loads only the child', async () => {
     const native = createNativeGrok(env);

@@ -38,14 +38,16 @@ function shouldSendMessageFromEnterKey(
 export function handleComposerMenuKeydown(tab: AssembledTabRuntime, event: KeyboardEvent): boolean {
   return tab.controllers.builtInCommandController.handleResumeKeydown(event)
     || tab.ui.composerDropdown.handleKeydown(event)
-    || tab.ui.promptSuggestion.handleKeydown(event);
+    || tab.ui.promptSuggestion.handleKeydown(event)
+    || tab.controllers.promptHistoryNavigation.handleKeydown(event);
 }
 
 /** The composer's selected destination has a turn, preparation, or main background work that Stop would cancel. */
 export function hasCancellableSelectedWork(tab: AssembledTabRuntime): boolean {
   const sideChat = tab.controllers.sideChatController;
   if (sideChat.destination === 'side') return sideChat.runtime?.isWorking ?? false;
-  return tab.state.isStreaming || tab.controllers.inputController.isPreparingMainTurn || tab.session.hasMainBackgroundWork;
+  return tab.state.isStreaming || tab.controllers.inputController.isPreparingMainTurn || tab.session.hasMainBackgroundWork
+    || !!tab.session.runtime.mailbox?.hasPending;
 }
 
 /**

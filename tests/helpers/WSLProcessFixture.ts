@@ -1,0 +1,266 @@
+import { ChildProcess, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
+import * as fs from 'node:fs/promises';
+import { constants, tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { PassThrough } from 'node:stream';
+
+import { readWSLInvocation } from '@test/helpers/WSLLaunch';
+
+const WINDOWS_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+
+export interface WSLProcessRequest {
+  command: string;
+  args: readonly string[];
+  options: SpawnOptions;
+  distro: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  executable: string;
+  argv: string[];
+  /** Text the client wrote to stdin, in order; wsl.exe forwards it to the Linux command. */
+  stdin: string;
+  /** Exits a process whose reply held it; it otherwise runs until killed. */
+  complete(reply: WSLProcessReply): void;
+  /** Writes output from a held process on a later turn, as its Linux command would; throws once output ended. */
+  write(stdout: string): void;
+  /** Calls the listener with each stdin chunk the Linux command receives from now on. */
+  onStdin(listener: (chunk: string) => void): void;
+}
+export interface WSLProcessReply {
+  stdout?: string;
+  stderr?: string;
+  code?: number;
+  /** Writes any output, then keeps running until `request.complete()` or a kill. */
+  hold?: boolean;
+}
+
+/** The OS process boundary; target/probe/CLI modules stay real. Unknown commands fail loudly. */
+export class WSLProcessFixture {
+  readonly requests: WSLProcessRequest[] = [];
+  environment: Record<string, string | undefined> = {};
+  readonly binaries = new Map<string, { path: string; version: string }>();
+  reply: ((request: WSLProcessRequest) => WSLProcessReply | undefined) | undefined;
+  /** Runs a provider-native executable after the shared OS projection, leaving its protocol external. */
+  execute: ((request: Pick<WSLProcessRequest, 'distro' | 'cwd' | 'env' | 'executable' | 'argv' | 'options'>) => ChildProcess | undefined) | undefined;
+  /** Optional real-directory bridge for Windows paths mounted into the fixture's Linux tree. */
+  translatePath: (value: string) => string | null = value => {
+    const drive = /^([a-z]):[\\/](.*)$/iu.exec(value);
+    return drive ? `/mnt/${drive[1].toLowerCase()}/${drive[2].replaceAll('\\', '/')}` : null;
+  };
+  /** WSL interop runs Windows executables mounted under /mnt; false models `[interop] enabled=false`. */
+  interop = true;
+  /** Delay before each launched command's output and exit; a cold or loaded WSL takes seconds per wsl.exe launch. */
+  launchDelayMs = 0;
+  /** Receives requests for behavior this fake does not model; the default fails the running test. */
+  onUnmodeled: (error: Error) => void = failRunningTest;
+
+  readonly spawn = (command: string, args: readonly string[] = [], options: SpawnOptions = {}): ChildProcess => {
+    if (!/(?:^|[\\/])wsl\.exe$/u.test(command)) throw new Error(`Unexpected WSL process: ${command}`);
+    if (!options.windowsVerbatimArguments) throw new Error('WSL launch must preserve Windows argv');
+    // wsl.exe is a Windows process: there is no POSIX process group, and signalling a fake pid's group would hit the test host.
+    if (options.detached) throw new Error('Detached WSL process groups are not modeled');
+    const exec = readWSLInvocation({ args: [...args] });
+    if (exec.command !== '/bin/sh' || exec.args[0] !== '-c') throw new Error('Expected WSL shell launch');
+    const [executable, ...argv] = exec.args.slice(3);
+    const env = { ...this.environment };
+    for (const [key, value] of importedEnvironment(options.env, this.translatePath)) {
+      if (value === null) {
+        const error = new Error(`Path-translated WSLENV value is not modeled: ${key}`);
+        this.onUnmodeled(error);
+        throw error;
+      }
+      env[key] = value;
+    }
+    const simulated = () => {
+      if (!(child instanceof WSLTestProcess)) throw new Error('Use the external peer controls for a native process');
+      return child;
+    };
+    const request: WSLProcessRequest = {
+      command, args, options, executable, argv, stdin: '',
+      distro: exec.distro, cwd: exec.cwd, env,
+      // The OS reports the exit later, never inside the caller's turn.
+      complete: reply => { const process = simulated(); setImmediate(() => process.complete(reply)); },
+      write: stdout => {
+        const child = simulated();
+        if (child.stdout.writableEnded) throw new Error('The WSL process output has ended');
+        setImmediate(() => { if (!child.stdout.writableEnded) child.stdout.write(stdout); });
+      },
+      onStdin: listener => { child.stdin?.on('data', listener); },
+    };
+    this.requests.push(request);
+    const external = this.execute?.(request);
+    const child = external ?? new WSLTestProcess();
+    if (child instanceof WSLTestProcess) child.stdin.setEncoding('utf8');
+    child.stdin?.on('data', (chunk: string) => { request.stdin += chunk; });
+    if (external) return external;
+    const processChild = simulated();
+    const reply = this.reply?.(request) ?? this.respond(request);
+    // Node announces a started child on nextTick; output and exit come from the OS on a later turn.
+    process.nextTick(() => child.emit('spawn'));
+    const deliver = () => {
+      if (!reply.hold) processChild.complete(reply);
+      else {
+        if (reply.stdout) processChild.stdout.write(reply.stdout);
+        if (reply.stderr) processChild.stderr.write(reply.stderr);
+      }
+    };
+    if (this.launchDelayMs > 0) setTimeout(deliver, this.launchDelayMs);
+    else setImmediate(deliver);
+    return child;
+  };
+
+  private respond({ executable, argv, env, options }: WSLProcessRequest): WSLProcessReply {
+    if (executable === WINDOWS_POWERSHELL) return this.runPowerShell(argv, options.env ?? {});
+    if (executable === '/usr/bin/awk') {
+      // Model native environment records, not the owned parser's returned object.
+      return { stdout: argv.slice(1).map(key => {
+        const value = env[key];
+        return value === undefined ? '\0\0' : `x\0${value}\0`;
+      }).join('') };
+    }
+    if (executable === '/bin/sh' && argv[2] === 'claudian-cli-probe') {
+      const binary = this.binaries.get(argv[3]);
+      return binary ? { stdout: `${binary.path}\n` } : { code: 1 };
+    }
+    const binary = [...this.binaries.values()].find(value => value.path === executable);
+    if (binary && argv.includes('--version')) return { stdout: `${binary.version}\n` };
+    throw new Error(`Unsupported WSL command: ${executable} ${JSON.stringify(argv)}`);
+  }
+
+  /** Runs only the relay's credential-free readiness probe; route traffic needs the native CI job. */
+  private runPowerShell(argv: readonly string[], env: NodeJS.ProcessEnv): WSLProcessReply {
+    if (!this.interop) return { code: 126, stderr: `claudian: 1: exec: ${WINDOWS_POWERSHELL}: Exec format error\n` };
+    const encoded = argv.at(-1);
+    const script = argv.at(-2) === '-EncodedCommand' && encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : '';
+    // Interop passes a Linux variable to the Windows process only when WSLENV declares it.
+    const forwarded = (env.WSLENV ?? '').split(':').some(entry => entry.split('/')[0] === 'CLAUDIAN_SESSION_TOOL_MODE');
+    if (!script.includes('if (mode == "probe") { Console.WriteLine("claudian-relay-ready"); return 0; }')) {
+      throw new Error(`Unsupported PowerShell invocation: ${JSON.stringify(argv)}`);
+    }
+    const mode = forwarded ? env.CLAUDIAN_SESSION_TOOL_MODE : undefined;
+    if (mode === 'probe') return { stdout: 'claudian-relay-ready\r\n' };
+    // Without a mode the relay cannot build its URL and its top-level catch exits 1.
+    if (mode === undefined) return { code: 1, stderr: 'Windows PowerShell could not start the session tool relay.\r\n' };
+    throw new Error('Unsupported relay mode: route traffic is covered by the native WSL job');
+  }
+}
+
+function failRunningTest(error: Error): void {
+  try {
+    onTestFinished(() => { throw error; });
+  } catch {
+    // No test is running (e.g. beforeAll): report it as an uncaught error, which fails the run.
+    setImmediate(() => { throw error; });
+  }
+}
+
+/**
+ * wsl.exe imports WSLENV-listed host values, and the launcher re-exports them after shell startup.
+ * WSL init resets HOME, so only the launcher's CLAUDIAN_WSL_HOME copy restores it. Null marks a
+ * `/p` or `/l` value whose Windows path form is not modeled.
+ */
+function importedEnvironment(env: SpawnOptions['env'], translatePath: (value: string) => string | null): Map<string, string | null> {
+  const imported = new Map<string, string | null>();
+  for (const entry of (env?.WSLENV ?? '').split(':')) {
+    const [key, flags = ''] = entry.split('/');
+    const value = env?.[key];
+    // `/w` values only travel from Linux to Windows.
+    if (!key || key === 'HOME' || flags.includes('w') || value === undefined) continue;
+    imported.set(key === 'CLAUDIAN_WSL_HOME' ? 'HOME' : key, translateImportedValue(value, flags, translatePath));
+  }
+  return imported;
+}
+
+/**
+ * wsl.exe sends `/p` and `/l` values through one path-list translator: each `;`-separated absolute drive
+ * path maps to `/mnt/<drive>/…`, joined by `:`.
+ */
+function translateImportedValue(value: string, flags: string, translatePath: (value: string) => string | null): string | null {
+  if (!/[pl]/u.test(flags)) return value;
+  const translated = value.split(';').map(translatePath);
+  // WSL skips relative entries such as a bare `E:`; those and UNC shares are not modeled.
+  return translated.includes(null) ? null : translated.join(':');
+}
+
+// Windows ChildProcess.kill() terminates wsl.exe for these; signal 0 only checks liveness; others throw.
+const TERMINATING_SIGNALS = new Set<NodeJS.Signals>(['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGQUIT']);
+
+class WSLTestProcess extends ChildProcess implements ChildProcessWithoutNullStreams {
+  override readonly stdin = new PassThrough();
+  override readonly stdout = new PassThrough();
+  override readonly stderr = new PassThrough();
+  override readonly stdio: ChildProcessWithoutNullStreams['stdio'] = [this.stdin, this.stdout, this.stderr, null, null];
+  override pid = 12345;
+  override killed = false;
+  override exitCode: number | null = null;
+  override signalCode: NodeJS.Signals | null = null;
+  private exited = false;
+  private pendingSignal: NodeJS.Signals | null = null;
+
+  complete(reply: WSLProcessReply): void {
+    if (this.exited || this.pendingSignal) return;
+    this.stdout.end(reply.stdout ?? '');
+    this.stderr.end(reply.stderr ?? '');
+    this.exit(reply.code ?? 0, null);
+  }
+
+  override kill(signal: NodeJS.Signals | number = 'SIGTERM'): boolean {
+    const name = signalName(signal);
+    if (this.exited) return false;
+    if (name !== null && !TERMINATING_SIGNALS.has(name)) {
+      // Windows libuv rejects other signals with UV_ENOSYS, which Node throws as an ErrnoException.
+      throw Object.assign(new Error('kill ENOSYS'), { code: 'ENOSYS', errno: -constants.errno.ENOSYS, syscall: 'kill' });
+    }
+    // Node marks a delivered signal, including the liveness probe 0, as killed.
+    this.killed = true;
+    if (name === null) return true;
+    // As on Windows, the latest signal before the OS reports the exit is the one published.
+    if (!this.pendingSignal) setImmediate(() => {
+      this.stdout.end();
+      this.stderr.end();
+      this.exit(null, this.pendingSignal);
+    });
+    this.pendingSignal = name;
+    return true;
+  }
+
+  private exit(code: number | null, signal: NodeJS.Signals | null): void {
+    this.exited = true;
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.emit('exit', code, signal);
+    this.emit('close', code, signal);
+  }
+}
+
+/** Returns null for the liveness probe 0; names are case-insensitive and unknown signals throw, as in Node. */
+function signalName(signal: NodeJS.Signals | number): NodeJS.Signals | null {
+  if (signal === 0) return null;
+  const key = typeof signal === 'string' ? signal.toUpperCase() : signal;
+  const name = Object.entries(constants.signals).find(([entry, value]) => entry === key || value === key)?.[0];
+  if (!name) throw Object.assign(new TypeError(`Unknown signal: ${signal}`), { code: 'ERR_UNKNOWN_SIGNAL' });
+  return name as NodeJS.Signals;
+}
+
+/** A real executable for default-distro discovery on POSIX test hosts. */
+export async function createWSLDistroFixture(output: Buffer) {
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'claudian-wsl-list-'));
+  await fs.writeFile(path.join(root, 'output'), output);
+  await fs.writeFile(path.join(root, 'wsl.exe'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(['--list', '--verbose'])) process.exit(2);
+if (fs.existsSync(path.join(__dirname, 'fail'))) process.exit(1);
+const delayFile = path.join(__dirname, 'delay');
+const delay = fs.existsSync(delayFile) ? Number(fs.readFileSync(delayFile, 'utf8')) : 0;
+setTimeout(() => process.stdout.write(fs.readFileSync(path.join(__dirname, 'output'))), delay);
+`, { mode: 0o755 });
+  vi.stubEnv('SystemRoot', '');
+  vi.stubEnv('PATH', `${root}${path.delimiter}${process.env.PATH ?? ''}`);
+  onTestFinished(async () => { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); });
+  return {
+    setOutput: (next: Buffer) => fs.writeFile(path.join(root, 'output'), next),
+    fail: () => fs.writeFile(path.join(root, 'fail'), ''),
+    delay: (milliseconds: number) => fs.writeFile(path.join(root, 'delay'), String(milliseconds)),
+  };
+}

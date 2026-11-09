@@ -1,6 +1,7 @@
-import { type App, Modal, Notice } from 'obsidian';
+import { type App, Notice } from 'obsidian';
 
 import { t } from '@/i18n/i18n';
+import { AccessibleModal } from '@/shared/modals/AccessibleModal';
 
 import type {
   PiExtensionUIConfirmRequest,
@@ -81,7 +82,7 @@ function getSelectOptions(request: Record<string, unknown>): PiSelectOption[] {
   const rawOptions = Array.isArray(request.options) ? request.options : [];
   return rawOptions.flatMap((option): PiSelectOption[] => {
     if (typeof option === 'string' && option.trim()) {
-      return [{ label: option.trim(), value: option.trim() }];
+      return [{ label: option.trim(), value: option }];
     }
     if (!option || typeof option !== 'object' || Array.isArray(option)) {
       return [];
@@ -96,7 +97,7 @@ function getSelectOptions(request: Record<string, unknown>): PiSelectOption[] {
   });
 }
 
-abstract class PiExtensionModal<TResult extends Record<string, unknown>> extends Modal {
+abstract class PiExtensionModal<TResult extends Record<string, unknown>> extends AccessibleModal {
   private done = false;
   private resolve!: (result: TResult) => void;
   private readonly resultPromise = new Promise<TResult>((resolve) => {
@@ -151,7 +152,7 @@ abstract class PiExtensionModal<TResult extends Record<string, unknown>> extends
   }
 
   protected renderHeader(fallbackTitle: string): void {
-    this.contentEl.createEl('h2', { text: getTitle(this.request, fallbackTitle) });
+    this.setTitle(getTitle(this.request, fallbackTitle));
     const message = getMessage(this.request);
     if (message) {
       this.contentEl.createEl('p', { text: message });
@@ -224,7 +225,9 @@ class PiTextModal extends PiExtensionModal<{ cancelled?: boolean; value?: string
 
   protected render(): void {
     this.renderHeader(t('chat.pi.extension'));
-    const initialValue = typeof this.request.value === 'string'
+    const initialValue = this.multiline && typeof this.request.prefill === 'string'
+      ? this.request.prefill
+      : typeof this.request.value === 'string'
       ? this.request.value
       : typeof this.request.defaultValue === 'string'
       ? this.request.defaultValue

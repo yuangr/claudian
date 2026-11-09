@@ -1,15 +1,15 @@
+import { buildTargetLaunchSpec } from '@/core/process/execution-target/TargetLaunchSpec';
 import { OwnedProbeRegistry } from '@/core/providers/metadata/OwnedProbeRegistry';
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 import type { SlashCommand } from '@/core/types';
-import { getVaultPath } from '@/utils/path';
 
 import type {
   GrokExecutionNativeConnection,
   GrokExecutionNativeFactory,
 } from '../execution/GrokExecutionBackend';
 import { GrokExecutionNativeConnectionImpl } from '../execution/GrokExecutionNativeConnection';
-import { buildGrokRuntimeEnv } from '../runtime/GrokRuntimeEnvironment';
+import { resolveGrokExecutionContext } from '../runtime/GrokExecutionContext';
 
 const DEFAULT_NATIVE_FACTORY: GrokExecutionNativeFactory = {
   create: options => new GrokExecutionNativeConnectionImpl(options),
@@ -31,7 +31,7 @@ export class GrokCommandMetadataProbe {
   });
 
   constructor(
-    private readonly plugin: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly nativeFactory: GrokExecutionNativeFactory = DEFAULT_NATIVE_FACTORY,
   ) {
     this.probes = new OwnedProbeRegistry({
@@ -49,18 +49,18 @@ export class GrokCommandMetadataProbe {
 
     return await this.probes.run({
       create: async (ownedSignal) => {
-        const command = await this.plugin.getResolvedProviderCliPath('grok') ?? 'grok';
+        const context = await resolveGrokExecutionContext(this.host);
+        const launch = buildTargetLaunchSpec({ ...context, args: ['agent', '--no-leader', 'stdio'] });
         ownedSignal.throwIfAborted();
-        const cwd = getVaultPath(this.plugin.app) ?? process.cwd();
+        const cwd = launch.targetCwd;
         return {
           cwd,
           native: this.nativeFactory.create({
-            command,
-            cwd,
-            env: buildGrokRuntimeEnv(this.plugin.settings, command),
+            ...launch,
+            cwd: launch.spawnCwd,
             requestExtension: async () => null,
             requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
-            version: this.plugin.manifest?.version ?? '0.0.0',
+            version: this.host.clientVersion ?? '0.0.0',
           }),
         };
       },

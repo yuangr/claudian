@@ -16,7 +16,11 @@ export function formatCodexQuestionReply(tool: ToolCallInfo, answers: AskUserAns
   if (tool.name !== 'AskUserQuestion' || tool.input.replyMode !== 'user-message' || !Array.isArray(tool.input.questions)) return null;
   const replies = tool.input.questions.map((question: Record<string, unknown>, index) => {
     const text = typeof question.question === 'string' ? question.question : '';
-    const value = answers[getCodexQuestionAnswerKey(question.id, index)] ?? answers[text];
+    const answerKey = getCodexQuestionAnswerKey(question.id, index);
+    // Own-key reads keep inherited entries from answering; ?? retains the original
+    // nullish fallback while an own empty string stays owned and rejects below.
+    const value = (Object.hasOwn(answers, answerKey) ? answers[answerKey] : undefined)
+      ?? (Object.hasOwn(answers, text) ? answers[text] : undefined);
     const answer = Array.isArray(value) ? value.join(', ') : value;
     return { questionItemId: JSON.stringify(['request_user_input_async', tool.id, index]), question: text, answer };
   });

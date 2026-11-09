@@ -1,23 +1,31 @@
-import { NativePeer } from '@test/helpers/deepseek/NativePeer';
+import { NativePeer, type NativePeerLifecycle } from '@test/helpers/deepseek/NativePeer';
+import { nativeRequest } from '@test/helpers/deepseek/NativeRequest';
 import { testDate } from '@test/helpers/testClock';
 
+import { extractUserDisplayContent } from '@/core/prompt/promptContext';
+import { encodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import { DeepSeekConversationHistoryService } from '@/providers/deepseek/history/DeepSeekConversationHistoryService';
 import { getDeepSeekHome } from '@/providers/deepseek/runtime/DeepSeekHome';
 import type { DeepSeekHost } from '@/providers/deepseek/runtime/DeepSeekHost';
 
 let peer: NativePeer;
 let deepseek: DeepSeekHost;
+let lifecycle: NativePeerLifecycle;
 let history: DeepSeekConversationHistoryService;
 const time = testDate().getTime();
 const state = { schemaVersion: 1, home: getDeepSeekHome(process.env, process.cwd()), profile: 'web', preset: 'claudian-code' };
 const input = { sessionId: 'root', providerState: state, messages: [] };
+/** The session projection native serves, cut at its last committed record. */
+const projection = (asOfSeq: number) => ({ asOfSeq, values: { agentPreset: 'claudian-code', modelSelection: { lastUsed: { provider: 'native', model: 'old-model' }, next: { provider: 'native', model: 'new-model' } } } });
+// dsh 0.2.2 reads an image by its full log reference; 0.2.1 by its id.
+const IMAGE_REF = { attachmentId: 'image', mediaType: 'image/png', bytes: 5, width: 1, height: 1, name: 'pixel.png' };
 const wire = (seq: number, type: string, data: unknown, surfaceOp: unknown = 'append') => ({ type: 'event', event: { seq, type, time: time + seq, data, surfaceOp } });
 let records: ReturnType<typeof wire>[];
 
 beforeEach(async () => {
   records = [
     wire(1, 'turn/start', { turn: 1 }),
-    wire(2, 'user/message', { id: 'u', source: { kind: 'user', rpcId: 'r' }, content: [{ type: 'text', text: 'read image' }, { type: 'image', attachment: { attachmentId: 'image' } }] }),
+    wire(2, 'user/message', { id: 'u', source: { kind: 'user', rpcId: 'r' }, content: [{ type: 'text', text: 'read image' }, { type: 'image', attachment: IMAGE_REF }] }),
     wire(3, 'assistant/message', { turn: 1, step: 0, message: { content: [{ type: 'reasoning', text: 'thinking' }, { type: 'text', text: 'checking' }] } }),
     wire(4, 'tool/call', { callId: 'read', name: 'read', arguments: '{"path":"note.md"}' }),
     wire(5, 'tool/result', { message: { toolCallId: 'read', content: [{ type: 'text', text: 'note contents' }, { type: 'image', attachment: { attachmentId: 'tool-image' } }], isError: false } }),
@@ -27,18 +35,19 @@ beforeEach(async () => {
   ];
   peer = new NativePeer();
   peer.onCall = (method, args) => {
-    if (method === 'session/projections') return { asOfSeq: 8, values: { agentPreset: 'claudian-code', modelSelection: { lastUsed: { provider: 'native', model: 'old-model' }, next: { provider: 'native', model: 'new-model' } } } };
+    if (method === 'session/projections') return projection(8);
     if (method === 'session/page') {
-      const visible = records.filter(row => row.event.seq <= args.request.throughSeq && (args.request.beforeSeq === undefined || row.event.seq < args.request.beforeSeq));
+      const { throughSeq, beforeSeq } = nativeRequest(args);
+      const visible = records.filter(row => row.event.seq <= throughSeq! && (beforeSeq === undefined || row.event.seq < beforeSeq));
       return { records: visible.slice(-4), hasMore: visible.length > 4 };
     }
-    if (method === 'session/attachment') return { attachment: { attachmentId: args.request.attachmentId, mediaType: 'image/png', name: 'pixel.png' }, data: 'aW1hZ2U=' };
+    if (method === 'session/attachment') return { attachment: { attachmentId: nativeRequest(args).attachmentId, mediaType: 'image/png', name: 'pixel.png' }, data: 'aW1hZ2U=' };
     // The shared Host baselines its roster at startup; history itself stays on cold endpoints.
     if (method === 'session/list') return { items: [] };
     throw new Error(`Forbidden history endpoint ${method}`);
   };
   await peer.open();
-  ({ deepseek } = peer.host());
+  ({ deepseek, lifecycle } = peer.host());
   history = new DeepSeekConversationHistoryService(async () => deepseek);
 });
 afterEach(async () => { await deepseek.dispose(); await peer.close(); });
@@ -48,10 +57,24 @@ it('hydrates fixed-cut native messages, images, tools and exact completed-turn c
   expect(result.messages).toHaveLength(2);
   expect(result.messages?.[0]).toMatchObject({ role: 'user', content: 'read image', userMessageId: 'u', images: [{ id: 'image', data: 'aW1hZ2U=', mediaType: 'image/png' }] });
   expect(result.messages?.[1]).toMatchObject({ role: 'assistant', content: 'checkingdone', assistantMessageId: 'deepseek:seq:7', contentBlocks: [{ type: 'thinking', content: 'thinking' }, { type: 'text', content: 'checking' }, { type: 'tool_use', toolId: 'read' }, { type: 'text', content: 'done' }], toolCalls: [{ name: 'Read', input: { file_path: 'note.md' }, result: 'note contents', resultImages: [{ kind: 'data', data: 'aW1hZ2U=', mediaType: 'image/png' }] }], turnStats: { outputTokens: 7 } });
-  expect(peer.calls.filter(c => c.method === 'session/page').every(c => c.args.request.throughSeq === 8)).toBe(true);
-  expect(peer.calls.find(c => c.method === 'session/attachment')?.args).toEqual({ request: { sessionId: 'root', attachmentId: 'image' } });
+  expect(peer.calls.filter(c => c.method === 'session/page').every(c => nativeRequest(c.args).throughSeq === 8)).toBe(true);
+  expect(peer.calls.find(c => c.method === 'session/attachment')?.args).toEqual({ request: { sessionId: 'root', attachmentId: 'image', attachment: IMAGE_REF } });
   expect(peer.calls.some(c => c.method === 'session/create' || c.method === 'session/follow')).toBe(false);
   expect(history.buildPersistedProviderState({ ...input, messages: result.messages! })).toEqual(state);
+});
+
+it('hydrates a prototype-named custom tool with its original input, payload and result', async () => {
+  records = [
+    wire(1, 'turn/start', { turn: 1 }),
+    wire(2, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'run custom tool' }] }),
+    wire(3, 'tool/call', { callId: 'custom', name: 'constructor', arguments: '{"path":"note.md"}' }),
+    wire(4, 'tool/result', { message: { toolCallId: 'custom', content: [{ type: 'text', text: 'custom result' }], isError: false } }),
+    wire(5, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+  ];
+  const result = await history.hydrateConversationHistory(input, '/vault');
+  expect(result.messages?.[1]).toMatchObject({ role: 'assistant', toolCalls: [
+    { id: 'custom', name: 'constructor', input: { path: 'note.md' }, providerPayload: { rawName: 'constructor' }, result: 'custom result', status: 'completed' },
+  ] });
 });
 
 it('defers native forks to first execution and reads only the selected source prefix', async () => {
@@ -59,7 +82,7 @@ it('defers native forks to first execution and reads only the selected source pr
   expect(fork).toMatchObject({ preset: 'claudian-code', pendingFork: { sessionId: 'root', atSeq: 7 } });
   const result = await history.hydrateConversationHistory({ ...input, sessionId: null, providerState: fork }, '/vault');
   expect(result.messages?.at(-1)?.assistantMessageId).toBe('deepseek:seq:7');
-  expect(peer.calls.filter(c => c.method === 'session/page').every(c => c.args.request.throughSeq === 7)).toBe(true);
+  expect(peer.calls.filter(c => c.method === 'session/page').every(c => nativeRequest(c.args).throughSeq === 7)).toBe(true);
   expect(peer.calls.some(c => c.method === 'session/fork')).toBe(false);
   const pendingFork = { ...input, sessionId: null, providerState: fork };
   expect(history.isPendingForkConversation(pendingFork)).toBe(true);
@@ -69,6 +92,35 @@ it('defers native forks to first execution and reads only the selected source pr
   const beyondSource = history.buildForkProviderState('root', 'deepseek:seq:9', state);
   await expect(history.hydrateConversationHistory({ ...input, sessionId: null, providerState: beyondSource }, '/vault'))
     .rejects.toThrow(/checkpoint is not present/i);
+});
+
+it('reads a native history revision only from an already-running Host, changing as native commits history', async () => {
+  // A cold Host stays cold: the revision never starts the native process.
+  await expect(history.readNativeHistoryRevision(input, '/vault')).resolves.toBeNull();
+  expect(lifecycle.starts).toBe(0);
+
+  await deepseek.start();
+  const revision = await history.readNativeHistoryRevision(input, '/vault');
+  expect(revision).not.toBeNull();
+  await expect(history.readNativeHistoryRevision(input, '/vault')).resolves.toBe(revision);
+
+  // Another native client (dsh web) commits a turn to the same session.
+  const ordinary = peer.onCall;
+  peer.onCall = (method, args) => method === 'session/projections' ? projection(11) : ordinary(method, args);
+  const advanced = await history.readNativeHistoryRevision(input, '/vault');
+  expect(advanced).not.toBeNull();
+  expect(advanced).not.toBe(revision);
+
+  await expect(history.readNativeHistoryRevision({ ...input, sessionId: null }, '/vault')).resolves.toBeNull();
+  const fork = history.buildForkProviderState('root', 'deepseek:seq:7', state);
+  await expect(history.readNativeHistoryRevision({ ...input, sessionId: null, providerState: fork }, '/vault')).resolves.toBeNull();
+  await expect(history.readNativeHistoryRevision({ ...input, providerState: { ...state, home: '/another-machine/.dsh' } }, '/vault')).resolves.toBeNull();
+  peer.onCall = () => null;
+  await expect(history.readNativeHistoryRevision(input, '/vault')).resolves.toBeNull();
+  peer.onCall = () => { throw new Error('Native read failed'); };
+  await expect(history.readNativeHistoryRevision(input, '/vault')).resolves.toBeNull();
+  expect(lifecycle.starts).toBe(1);
+  expect(peer.calls.some(c => c.method === 'session/follow' || c.method === 'session/create')).toBe(false);
 });
 
 it('recovers the native next model and distinguishes relocated stores from missing history', async () => {
@@ -102,8 +154,8 @@ it.each(['direct', 'subagent', 'subagent_fork'])('hydrates %s child tools throug
   }
   const ordinary = peer.onCall;
   peer.onCall = (method, args) => {
-    if (method === 'session/projections' && args.request.sessionId === 'child') return { asOfSeq: 7, values: {} };
-    if (method === 'session/page' && args.request.address.childSessionId === 'child') return { hasMore: false, records: [
+    if (method === 'session/projections' && nativeRequest(args).sessionId === 'child') return { asOfSeq: 7, values: {} };
+    if (method === 'session/page' && nativeRequest(args).address!.childSessionId === 'child') return { hasMore: false, records: [
       wire(0, 'turn/start', { turn: 0 }), wire(1, 'tool/call', { callId: 'read', name: 'read', arguments: '{"path":"note.md"}' }),
       wire(2, 'tool/result', { message: { toolCallId: 'read', content: [{ type: 'text', text: 'note' }, { type: 'image', attachment: { attachmentId: 'child-image' } }] } }),
       wire(3, 'tool/call', { callId: 'edit', name: 'edit', arguments: '{"file_path":"note.md","old_string":"b","new_string":"B"}' }),
@@ -120,7 +172,7 @@ it.each(['direct', 'subagent', 'subagent_fork'])('hydrates %s child tools throug
     { id: 'failed', status: 'error', result: 'old_string not found' }] });
   // A failed edit changed nothing, so it shows no diff built from its requested input.
   expect(result.messages?.[0].toolCalls?.[0].subagent?.toolCalls[2].diffData).toBeUndefined();
-  expect(peer.calls.find(c => c.method === 'session/attachment')?.args).toEqual({ request: { sessionId: 'child', attachmentId: 'child-image' } });
+  expect(peer.calls.find(c => c.method === 'session/attachment')?.args).toEqual({ request: { sessionId: 'child', attachmentId: 'child-image', attachment: { attachmentId: 'child-image' } } });
   expect(peer.calls.some(c => c.method === 'session/follow' || c.method === 'session/create')).toBe(false);
 });
 
@@ -155,6 +207,8 @@ it.each([
 it.each([
   ['a different native identity', { attachmentId: 'other-image', mediaType: 'image/png' }, /image attachment/i],
   ['an unsupported media type', { attachmentId: 'image', mediaType: 'image/svg+xml' }, /unsupported.*media type/i],
+  ['an inherited constructor entry', { attachmentId: 'image', mediaType: 'constructor' }, /unsupported.*media type/i],
+  ['an inherited __proto__ entry', { attachmentId: 'image', mediaType: '__proto__' }, /unsupported.*media type/i],
 ])('rejects an attachment response for %s', async (_case, attachment, error) => {
   const ordinary = peer.onCall;
   peer.onCall = (method, args) => method === 'session/attachment'
@@ -170,7 +224,7 @@ it.each([
     : { records: [wire(5, 'turn/start', { turn: 1 })], hasMore: false }, /invalid.*record/i],
 ])('rejects native history pages with %s', async (_case, page, error) => {
   const ordinary = peer.onCall;
-  peer.onCall = (method, args) => method === 'session/page' ? page(args.request) : ordinary(method, args);
+  peer.onCall = (method, args) => method === 'session/page' ? page(nativeRequest(args)) : ordinary(method, args);
   await expect(history.hydrateConversationHistory(input, '/vault')).rejects.toThrow(error);
 });
 
@@ -237,4 +291,82 @@ it('restores each completed turn\'s work duration so it renders as its own "Work
   const result = await history.hydrateConversationHistory(input, '/vault');
 
   expect(result.messages?.filter(message => message.role === 'assistant').map(message => message.durationSeconds)).toEqual([125, 7]);
+});
+
+it('marks user-aborted turns interrupted without work timing and keeps a following automatic turn normal', async () => {
+  const at = (seq: number, ms: number, type: string, data: unknown) => ({ type: 'event', event: { seq, type, time: time + ms, data, surfaceOp: 'append' } });
+  const aborted = { kind: 'aborted', reason: { kind: 'user' } };
+  records = [
+    at(1, 0, 'turn/start', { turn: 1 }),
+    at(2, 0, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'run the job' }] }),
+    at(3, 1_000, 'assistant/message', { turn: 1, step: 0, message: { content: [{ type: 'text', text: 'starting' }] }, usage: { outputTokens: 3 } }),
+    at(4, 2_000, 'tool/call', { callId: 'job', name: 'read', arguments: '{"path":"note.md"}' }),
+    at(5, 9_000, 'turn/end', { turn: 1, reason: aborted }),
+    at(6, 20_000, 'turn/start', { turn: 2 }),
+    at(7, 20_000, 'user/message', { source: { kind: 'tool-jobs' }, content: [{ type: 'text', text: 'job finished' }] }),
+    at(8, 21_000, 'assistant/message', { turn: 2, step: 0, message: { content: [{ type: 'text', text: 'the job finished' }] } }),
+    at(9, 23_000, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+    at(10, 30_000, 'turn/start', { turn: 3 }),
+    at(11, 30_000, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'never mind' }] }),
+    at(12, 31_000, 'turn/end', { turn: 3, reason: aborted }),
+  ];
+  const onCall = peer.onCall;
+  peer.onCall = (method, args) => method === 'session/projections'
+    ? { ...onCall(method, args) as Record<string, unknown>, asOfSeq: 12 } : onCall(method, args);
+
+  const result = await history.hydrateConversationHistory(input, '/vault');
+
+  expect(result.messages?.map(({ role, content, isInterrupt, isAutomaticResponse, durationSeconds, turnStats, completedAt }) => (
+    { role, content, isInterrupt, isAutomaticResponse, durationSeconds, turnStats, completedAt }))).toEqual([
+    { role: 'user', content: 'run the job' },
+    { role: 'assistant', content: 'starting', isInterrupt: true },
+    { role: 'assistant', content: 'the job finished', isAutomaticResponse: true, durationSeconds: 3,
+      turnStats: { outputTokens: 0, durationMs: 3_000 }, completedAt: time + 23_000 },
+    { role: 'user', content: 'never mind' },
+    // A turn stopped before any output keeps a bare marker, as the live Stop renders it.
+    { role: 'assistant', content: '', isInterrupt: true },
+  ].map(message => Object.fromEntries(Object.entries({ isInterrupt: undefined, isAutomaticResponse: undefined,
+    durationSeconds: undefined, turnStats: undefined, completedAt: undefined, ...message }))));
+  expect(result.messages?.[1].toolCalls).toEqual([expect.objectContaining({ id: 'job', name: 'Read', status: 'error' })]);
+});
+
+it('settles pending tools before and after a steer while retaining completed background launches', async () => {
+  records = [
+    wire(1, 'turn/start', { turn: 1 }),
+    wire(2, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'start work' }] }),
+    wire(3, 'tool/call', { callId: 'background', name: 'bash', arguments: '{"command":"watch"}' }),
+    wire(4, 'tool/result', { message: { toolCallId: 'background', content: [{ type: 'text', text: 'Job started in background' }], isError: false } }),
+    wire(5, 'tool/call', { callId: 'before-steer', name: 'read', arguments: '{"path":"note.md"}' }),
+    wire(6, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'change direction' }] }),
+    wire(7, 'tool/call', { callId: 'after-steer', name: 'read', arguments: '{"path":"other.md"}' }),
+    wire(8, 'turn/end', { turn: 1, reason: { kind: 'cancelled' } }),
+  ];
+  const result = await history.hydrateConversationHistory(input, '/vault');
+  expect(result.messages?.map(message => [message.role, message.content])).toEqual([
+    ['user', 'start work'], ['assistant', ''], ['user', 'change direction'], ['assistant', ''],
+  ]);
+  expect(result.messages?.flatMap(message => message.toolCalls ?? []).map(({ id, status, result: content }) => ({ id, status, content }))).toEqual([
+    { id: 'background', status: 'completed', content: 'Job started in background' },
+    { id: 'before-steer', status: 'error', content: undefined },
+    { id: 'after-steer', status: 'error', content: undefined },
+  ]);
+});
+
+it('hydrates a session-message sender and preserves neutral tool names without colliding with native send_message', async () => {
+  records = [
+    wire(0, 'turn/start', { turn: 0 }),
+    wire(1, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: encodeSessionMessage({ from: 'Planner', sessionId: 'sender', text: 'Please review' }) }] }),
+    wire(2, 'tool/call', { callId: 'list', name: 'claudian_list_destinations', arguments: '{}' }),
+    wire(3, 'tool/call', { callId: 'send', name: 'claudian_send_message', arguments: '{"sessionId":"sender","text":"Reviewed"}' }),
+    wire(4, 'tool/call', { callId: 'native', name: 'send_message', arguments: '{"agent_id":"child","text":"Continue"}' }),
+    wire(5, 'turn/end', { turn: 0, reason: { kind: 'completed' } }),
+  ];
+  const result = await history.hydrateConversationHistory(input, '/vault');
+  expect(result.messages?.[0].sessionMessage).toEqual({ from: 'Planner', sessionId: 'sender' });
+  expect(extractUserDisplayContent(result.messages![0].content)).toBe('Please review');
+  expect(result.messages?.[1].toolCalls).toMatchObject([
+    { name: 'claudian_list_destinations', providerPayload: { rawName: 'claudian_list_destinations' } },
+    { name: 'claudian_send_message', input: { sessionId: 'sender', text: 'Reviewed' }, providerPayload: { rawName: 'claudian_send_message' } },
+    { name: 'send_message', input: { target: 'child', text: 'Continue' } },
+  ]);
 });

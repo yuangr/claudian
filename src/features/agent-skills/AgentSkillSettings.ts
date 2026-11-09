@@ -1,9 +1,8 @@
-import { type App, Modal, Notice, setIcon, Setting } from 'obsidian';
+import { type App, Notice, setIcon } from 'obsidian';
 
 import { extractFirstParagraph } from '@/core/commands/slashCommand';
 import {
   ManagedResourcePathError,
-  ManagedResourceRelocationError,
 } from '@/core/storage/VaultFileAdapter';
 import type { AgentSkillDiagnostic, AgentSkillDocument, AgentSkillInput } from '@/features/agent-skills/AgentSkill';
 import { extraFrontmatterKeys } from '@/features/agent-skills/AgentSkillCodec';
@@ -24,12 +23,13 @@ import {
 } from '@/features/agent-skills/ClaudeCommandRepository';
 import { AgentSkillValidationError } from '@/features/agent-skills/validateAgentSkill';
 import { t } from '@/i18n/i18n';
+import { AccessibleModal } from '@/shared/modals/AccessibleModal';
+import { AccessibleSetting } from '@/shared/settings/AccessibleSetting';
 
 function errorMessage(error: unknown): string {
   if (
     error instanceof AgentSkillRepositoryError
     || error instanceof ManagedResourcePathError
-    || error instanceof ManagedResourceRelocationError
   ) {
     return error.message;
   }
@@ -70,7 +70,7 @@ interface AgentSkillEditorOptions {
   successMessage(name: string): string;
 }
 
-class AgentSkillModal extends Modal {
+class AgentSkillModal extends AccessibleModal {
   private nameInput!: HTMLInputElement;
   private descriptionInput!: HTMLInputElement;
   private instructionsArea!: HTMLTextAreaElement;
@@ -93,7 +93,7 @@ class AgentSkillModal extends Modal {
       });
     }
 
-    new Setting(this.contentEl)
+    new AccessibleSetting(this.contentEl)
       .setName(t('settings.agentSkills.modal.name'))
       .setDesc(this.options.nameDesc ?? t('settings.agentSkills.modal.nameDesc'))
       .addText(text => {
@@ -104,7 +104,7 @@ class AgentSkillModal extends Modal {
           .setPlaceholder(t('settings.agentSkills.modal.namePlaceholder'));
       });
 
-    new Setting(this.contentEl)
+    new AccessibleSetting(this.contentEl)
       .setName(t('settings.agentSkills.modal.description'))
       .setDesc(this.options.descriptionDesc ?? t('settings.agentSkills.modal.descriptionDesc'))
       .addText(text => {
@@ -115,7 +115,7 @@ class AgentSkillModal extends Modal {
           .setPlaceholder(t('settings.agentSkills.modal.descriptionPlaceholder'));
       });
 
-    new Setting(this.contentEl)
+    new AccessibleSetting(this.contentEl)
       .setName(t('settings.agentSkills.modal.instructions'))
       .setDesc(t('settings.agentSkills.modal.instructionsDesc'));
 
@@ -129,7 +129,17 @@ class AgentSkillModal extends Modal {
     });
     this.instructionsArea.value = initial?.instructions ?? '';
 
+    let saving = false;
+    const setSaving = (value: boolean): void => {
+      saving = value;
+      this.nameInput.disabled = value;
+      this.descriptionInput.disabled = value;
+      this.instructionsArea.disabled = value;
+      saveButton.disabled = value;
+    };
     const save = async (): Promise<void> => {
+      if (saving) return;
+      setSaving(true);
       const input: AgentSkillInput = {
         name: this.nameInput.value.trim(),
         description: this.descriptionInput.value.trim(),
@@ -143,6 +153,8 @@ class AgentSkillModal extends Modal {
         this.close();
       } catch (error) {
         showSaveError(error, input.name);
+      } finally {
+        setSaving(false);
       }
     };
 
@@ -176,7 +188,7 @@ interface AgentSkillDeleteOptions {
   successMessage: string;
 }
 
-class AgentSkillDeleteModal extends Modal {
+class AgentSkillDeleteModal extends AccessibleModal {
   constructor(app: App, private readonly options: AgentSkillDeleteOptions) {
     super(app);
   }
@@ -189,7 +201,11 @@ class AgentSkillDeleteModal extends Modal {
     });
     this.contentEl.createEl('code', { text: this.options.path });
 
+    let removing = false;
     const remove = async (): Promise<void> => {
+      if (removing) return;
+      removing = true;
+      deleteButton.disabled = true;
       try {
         const result = await this.options.remove();
         new Notice(result.refreshFailed
@@ -205,6 +221,9 @@ class AgentSkillDeleteModal extends Modal {
           return;
         }
         new Notice(t('settings.agentSkills.deleteFailed', { message: errorMessage(error) }));
+      } finally {
+        removing = false;
+        deleteButton.disabled = false;
       }
     };
 
@@ -439,15 +458,18 @@ export class AgentSkillSettings {
     this.#actionButton(actions, t('settings.agentSkills.fix'), 'wrench', () => {
       void this.#openRepairEditor(name);
     });
-    this.#actionButton(actions, t('common.delete'), 'trash-2', () => {
-      this.#openDelete({
-        title: t('settings.agentSkills.delete.title'),
-        description: t('settings.agentSkills.delete.description'),
-        path: diagnostic.directoryPath,
-        remove: () => this.coordinator.trashBroken(name),
-        successMessage: t('settings.agentSkills.deleted', { name }),
-      });
-    }, 'claudian-settings-delete-btn');
+    const revision = diagnostic.repairRevision;
+    if (revision !== undefined) {
+      this.#actionButton(actions, t('common.delete'), 'trash-2', () => {
+        this.#openDelete({
+          title: t('settings.agentSkills.delete.title'),
+          description: t('settings.agentSkills.delete.description'),
+          path: diagnostic.directoryPath,
+          remove: () => this.coordinator.trashBroken(name, revision),
+          successMessage: t('settings.agentSkills.deleted', { name }),
+        });
+      }, 'claudian-settings-delete-btn');
+    }
   }
 
   async #openRepairEditor(name: string): Promise<void> {
@@ -458,6 +480,7 @@ export class AgentSkillSettings {
       new Notice(t('settings.agentSkills.saveFailed', { message: errorMessage(error) }));
       return;
     }
+    if (this.disposed) return;
     this.#openEditor({
       title: t('settings.agentSkills.modal.titleFix'),
       initial: draft.input,

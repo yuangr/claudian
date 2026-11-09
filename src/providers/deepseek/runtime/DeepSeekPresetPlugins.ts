@@ -1,5 +1,8 @@
 import { parse, type ScalarTag, type SchemaOptions, stringify, YAMLError } from 'yaml';
 
+import { SESSION_TOOL_ROUTE_HEADER } from '@/core/session-tools/SessionToolEndpoint';
+import { SESSION_TOOL_SPECS } from '@/core/session-tools/sessionToolSpecs';
+
 import { type DeepSeekPreset, isDeepSeekAuxiliaryPreset } from '../types';
 
 /** One native Cordis plugin row of an agent preset. */
@@ -13,7 +16,9 @@ export interface DeepSeekPresetPlugin {
 export interface DeepSeekPresetPaths {
   readonly compatibility: string;
   readonly codeModeFile: string;
-  promptFile(preset: DeepSeekPreset): string;
+  readonly sessions: string;
+  readonly sessionToolsFile: string;
+  readonly promptDirectory: string;
 }
 
 /**
@@ -44,7 +49,8 @@ function assertEntryValue(value: unknown, path: string): void {
 }
 
 const PREVIEW_PATHS: DeepSeekPresetPaths = {
-  compatibility: '<claudian-compatibility.mjs>', codeModeFile: '<code mode>', promptFile: () => '<system prompt>',
+  sessions: '<claudian-sessions.mjs>', sessionToolsFile: '<session tools endpoint>',
+  compatibility: '<claudian-compatibility.mjs>', codeModeFile: '<code mode>', promptDirectory: '<session prompts>',
 };
 
 /**
@@ -52,7 +58,7 @@ const PREVIEW_PATHS: DeepSeekPresetPaths = {
  * and only they take the user's additional rows, after Claudian's own.
  */
 export function buildDeepSeekPresetPlugins(
-  preset: DeepSeekPreset, paths: DeepSeekPresetPaths, additional: readonly DeepSeekPresetPlugin[] = [],
+  preset: DeepSeekPreset, paths: DeepSeekPresetPaths, additional: readonly DeepSeekPresetPlugin[] = [], platform: NodeJS.Platform = process.platform,
 ): DeepSeekPresetPlugin[] {
   const auxiliary = isDeepSeekAuxiliaryPreset(preset);
   const allow = preset === 'claudian-passive' ? [] : ['read', 'read_image', 'glob', 'grep'];
@@ -62,25 +68,24 @@ export function buildDeepSeekPresetPlugins(
   return [
     {
       id: 'claudian-compatibility', name: paths.compatibility,
-      config: { promptFile: paths.promptFile(preset), ...(auxiliary ? { allow } : { codeModeFile: paths.codeModeFile }) },
+      config: { promptDirectory: paths.promptDirectory, ...(auxiliary ? { allow } : { codeModeFile: paths.codeModeFile, listAgents: true }) },
     },
-    // Chat presets present tools per agent from the live code-mode preference instead.
-    ...(auxiliary ? [plugin('agent-tool-presentation', { mode: 'native' })] : []),
     plugin('agent-instructions', { maxBytes: 65536 }),
     plugin('time-context'),
-    plugin('tool-fs'),
+    // apply_patch is opt-in; auxiliary presets' `allow` list still hides it.
+    plugin('tool-fs', { applyPatch: true }),
     plugin('tool-fs-search', { sampleOverCapGlobResults: false }),
+    // Read-only tasks (Inline Edit) take a user's `/skill` gestures; their `allow` policy still hides the skill tool.
+    ...(preset !== 'claudian-passive' ? [plugin('skill-filesystem'), plugin('tool-skill')] : []),
     ...(!auxiliary ? [
       // Native mounts only the platform's shell executor (PowerShell on Windows); its tool must match.
-      plugin(process.platform === 'win32' ? 'tool-pwsh' : 'tool-bash'),
+      plugin(platform === 'win32' ? 'tool-pwsh' : 'tool-bash'),
       plugin('tool-jobs'),
-      plugin('skill-filesystem'),
-      plugin('tool-skill'),
       plugin('tool-subagent-control'),
-      { id: 'tool-subagent-list-agents', name: '@deepseek-ai/dsh-tool-subagent-control/list-agents' },
       plugin('tool-subagent', { provider: 'spawn', toolName: 'subagent', backgroundMode: 'continuable', modelSelectionSettings: false }),
       { ...plugin('tool-subagent', { provider: 'fork', toolName: 'subagent_fork', backgroundMode: 'continuable', modelSelectionSettings: false }), id: 'tool-subagent-fork' },
       plugin('tool-ask-user'),
+      { id: 'claudian-sessions', name: paths.sessions, config: { endpointFile: paths.sessionToolsFile, routeHeader: SESSION_TOOL_ROUTE_HEADER, tools: SESSION_TOOL_SPECS } },
       plugin('tool-web', { fetch: true, searchTimeoutMs: 60000 }),
     ] : []),
     {
@@ -96,7 +101,7 @@ export function buildDeepSeekPresetPlugins(
 }
 
 /** Every row id Claudian's chat preset declares, including rows nested in its groups. */
-function ownRowIds(): Set<string> {
+function ownRowIds(platform: NodeJS.Platform): Set<string> {
   const ids = new Set<string>();
   const visit = (rows: readonly unknown[]): void => {
     for (const row of rows) {
@@ -106,7 +111,7 @@ function ownRowIds(): Set<string> {
       if (Array.isArray(config)) visit(config);
     }
   };
-  visit(buildDeepSeekPresetPlugins('claudian', PREVIEW_PATHS));
+  visit(buildDeepSeekPresetPlugins('claudian', PREVIEW_PATHS, [], platform));
   return ids;
 }
 
@@ -114,7 +119,7 @@ function ownRowIds(): Set<string> {
  * Parses the user's additional rows: a YAML list (dsh's dialect, so JSON too) of native plugin rows, each with its
  * own id and module name. Blank text means none. Throws an actionable message for anything else.
  */
-export function parseDeepSeekPresetPlugins(text: string): DeepSeekPresetPlugin[] {
+export function parseDeepSeekPresetPlugins(text: string, platform: NodeJS.Platform = process.platform): DeepSeekPresetPlugin[] {
   let value: unknown;
   try { value = parse(text, YAML_OPTIONS); } catch (error) {
     if (!(error instanceof YAMLError)) throw error;
@@ -124,7 +129,7 @@ export function parseDeepSeekPresetPlugins(text: string): DeepSeekPresetPlugin[]
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error('Additional plugins must be a YAML list of plugin rows.');
   assertEntryValue(value, 'rows');
-  const own = ownRowIds();
+  const own = ownRowIds(platform);
   const seen = new Set<string>();
   return value.map((row: unknown, index) => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error(`Plugin row ${index + 1} must be an object.`);
@@ -139,6 +144,6 @@ export function parseDeepSeekPresetPlugins(text: string): DeepSeekPresetPlugin[]
 }
 
 /** The effective chat preset as it launches, with machine-specific launch paths shown as placeholders. */
-export function renderDeepSeekPresetPreview(additional: readonly DeepSeekPresetPlugin[]): string {
-  return stringify(buildDeepSeekPresetPlugins('claudian', PREVIEW_PATHS, additional), { ...YAML_OPTIONS, lineWidth: 0 });
+export function renderDeepSeekPresetPreview(additional: readonly DeepSeekPresetPlugin[], platform: NodeJS.Platform = process.platform): string {
+  return stringify(buildDeepSeekPresetPlugins('claudian', PREVIEW_PATHS, additional, platform), { ...YAML_OPTIONS, lineWidth: 0 });
 }

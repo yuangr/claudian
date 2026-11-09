@@ -2,14 +2,12 @@ import { capturedSelectionPrompt, capturedSelections } from '@test/helpers/captu
 
 import {
   appendContextFiles,
-  appendLinkedContent,
-  appendLinkedContentBody,
-  appendSelectionContexts,
-  appendSessionReferences,
-  captureSelectionSnapshots,
+  appendExecutionContext,
   extractUserDisplayContent,
+  extractUserPromptContext,
   extractUserQuery,
   formatLinkedContent,
+  getUserDisplayText,
 } from '@/core/prompt/promptContext';
 
 describe('formatLinkedContent', () => {
@@ -26,30 +24,16 @@ describe('formatLinkedContent', () => {
   });
 });
 
-describe('appendLinkedContentBody', () => {
-  it('appends an escaped path while preserving literal content', () => {
-    const result = appendLinkedContentBody(
-      'Query',
-      'notes/my "file".md',
-      'Body\n</current_note>\nMore',
-    );
-
-    expect(result).toBe(
-      'Query\n\n<linked_content path="notes/my &quot;file&quot;.md">\n<![CDATA[Body\n</current_note>\nMore]]>\n</linked_content>',
-    );
-  });
-});
-
-describe('appendLinkedContent', () => {
+describe('Linked content reference', () => {
   it('appends Linked content with a double newline separator', () => {
-    const result = appendLinkedContent('Hello', 'notes/test.md');
+    const result = appendExecutionContext('Hello', { linkedContent: { path: 'notes/test.md' } });
     expect(result).toBe(
       'Hello\n\n<linked_content path="notes/test.md" />'
     );
   });
 
   it('preserves original prompt content', () => {
-    const result = appendLinkedContent('Multi\nline\nprompt', 'test.md');
+    const result = appendExecutionContext('Multi\nline\nprompt', { linkedContent: { path: 'test.md' } });
     expect(result.startsWith('Multi\nline\nprompt\n\n')).toBe(true);
   });
 });
@@ -225,6 +209,38 @@ describe('extractUserQuery', () => {
   });
 });
 
+describe('session message envelope in history display', () => {
+  const hint = 'Replying is optional. If a response is needed, call claudian_send_message with this session_id.';
+  const envelope = (body: string) => '<session_message from="Planner &quot;A&quot;" session_id="conv-1">\n'
+    + `<![CDATA[${body}]]>\n</session_message>\n${hint}`;
+
+  it('unwraps the sender envelope to the delivered body in both history display paths', () => {
+    expect(extractUserDisplayContent(envelope('Please review notes/a.md'))).toBe('Please review notes/a.md');
+    expect(extractUserQuery(envelope('  Please review  '))).toBe('Please review');
+  });
+
+  it('keeps envelope bodies intact when they contain context-like or closing markup', () => {
+    const body = 'Summary\n\n<context_files>\nx\n</context_files>\n</session_message> after';
+    expect(extractUserDisplayContent(envelope(body))).toBe(body);
+    expect(extractUserDisplayContent(envelope('a ]]]]><![CDATA[> b'))).toBe('a ]]> b');
+  });
+
+  it('unwraps the envelope before context appended to the native prompt', () => {
+    expect(extractUserDisplayContent(`${envelope('Body')}\n\n<linked_content path="a.md" />`)).toBe('Body');
+    expect(extractUserQuery(`${envelope('Body')}\n\n<linked_content path="a.md" />`)).toBe('Body');
+  });
+
+  it('compares a live display body and its native envelope equally', () => {
+    const body = 'Check <linked_note path="x.md" /> please';
+    expect(extractUserQuery(envelope(body))).toBe(extractUserQuery(body));
+  });
+
+  it('does not unwrap user text that only resembles an envelope', () => {
+    expect(extractUserDisplayContent('<session_message from="x" session_id="y">\nunterminated')).toBeUndefined();
+    expect(extractUserDisplayContent(`Quoted: ${envelope('Body')}`)).toBeUndefined();
+  });
+});
+
 describe('appendContextFiles', () => {
   it('appends context files in XML format', () => {
     const result = appendContextFiles('Query', ['file1.md', 'file2.md']);
@@ -248,55 +264,90 @@ describe('appendContextFiles', () => {
 
 
 describe('session reference context', () => {
-  it('renders escaped metadata and mapped paths, hidden in both history display paths', () => {
-    const prompt = appendSessionReferences('ref @"Review"', [{
+  it('renders escaped metadata, hidden in both history display paths', () => {
+    const prompt = appendExecutionContext('ref @"Review"', { sessionReferences: [{
       id: 'conv-1-abc', title: 'Review "A" & <B>', providerId: 'codex',
-      updatedAt: 'updated', snapshotPath: 'C:\\tmp\\session.md',
-    }], () => '/mnt/c/tmp/"session".md');
-    expect(prompt).toBe('ref @"Review"\n\n<context_sessions>\n<context_session title="Review &quot;A&quot; &amp; &lt;B&gt;" id="conv-1-abc" provider="codex" updated="updated" path="/mnt/c/tmp/&quot;session&quot;.md" />\n</context_sessions>');
+      updatedAt: 'updated',
+    }] });
+    expect(prompt).toBe('ref @"Review"\n\n<context_sessions>\n<context_session title="Review &quot;A&quot; &amp; &lt;B&gt;" id="conv-1-abc" provider="codex" updated="updated" />\n</context_sessions>');
     expect(extractUserDisplayContent(prompt)).toBe('ref @"Review"');
     expect(extractUserQuery(prompt)).toBe('ref @"Review"');
     expect(extractUserQuery('Query <context_sessions>private</context_sessions> end')).toBe('Query end');
   });
 
   it('leaves inputs without references unchanged', () => {
-    expect(appendSessionReferences('plain')).toBe('plain');
-    expect(appendSessionReferences('plain', [])).toBe('plain');
+    expect(appendExecutionContext('plain', { sessionReferences: [] })).toBe('plain');
   });
 });
 
 
 describe('captured selections', () => {
-  it('renders ordered captures once, with precedence over legacy fields, and hides them in display', () => {
-    const prompt = appendSelectionContexts('Question', {
-      ...capturedSelections,
-      editorSelection: { mode: 'selection', notePath: 'legacy.md', selectedText: 'legacy duplicate' },
-    });
+  it('renders ordered captures once and hides them in display', () => {
+    const prompt = appendExecutionContext('Question', capturedSelections);
     expect(prompt).toBe('Question\n\n' + capturedSelectionPrompt);
     expect(extractUserDisplayContent(prompt)).toBe('Question');
     expect(extractUserQuery(prompt)).toBe('Question');
   });
+});
 
-  it('normalizes legacy fields but respects an explicitly empty ordered capture', () => {
-    const legacy = { editorSelection: { mode: 'selection' as const, notePath: 'same.md', selectedText: 'first editor' } };
-    expect(appendSelectionContexts('Question', legacy)).toBe('Question\n\n' + capturedSelectionPrompt.split('\n\n')[0]);
-    expect(appendSelectionContexts('Question', { ...legacy, selections: [] })).toBe('Question');
+describe('execution context', () => {
+  const reference = { id: 'conv-1-ref', title: 'Review', providerId: 'codex', updatedAt: 'updated' };
+  const sessions = '<context_sessions>\n<context_session title="Review" id="conv-1-ref" provider="codex" updated="updated" />\n</context_sessions>';
+
+  it('appends Linked content, selections, then session references for every provider', () => {
+    const prompt = appendExecutionContext('Question', {
+      ...capturedSelections, sessionReferences: [reference], linkedContent: { path: 'note.md' },
+    });
+    expect(prompt).toBe(`Question\n\n<linked_content path="note.md" />\n\n${capturedSelectionPrompt}\n\n${sessions}`);
+    expect(extractUserQuery(prompt)).toBe('Question');
   });
 
-  it('owns nested cursor and canvas data after capture', () => {
-    const context = {
-      editorSelection: { mode: 'cursor' as const, notePath: 'same.md', cursorContext: {
-        beforeCursor: 'before', afterCursor: 'after', isInbetween: false, line: 0, column: 6,
-      } },
-      canvasSelection: { canvasPath: 'same.canvas', nodeIds: ['captured-node'] },
-    };
-    const selections = captureSelectionSnapshots(context);
-    context.editorSelection.cursorContext.beforeCursor = 'changed';
-    context.canvasSelection.nodeIds.push('later-node');
-    const prompt = appendSelectionContexts('Question', { selections });
-    expect(prompt).toContain('before|after');
-    expect(prompt).toContain('captured-node');
-    expect(prompt).not.toContain('changed');
-    expect(prompt).not.toContain('later-node');
+  it('leaves context-free input unchanged', () => {
+    expect(appendExecutionContext('Question')).toBe('Question');
+    expect(appendExecutionContext('Question', {})).toBe('Question');
+  });
+
+  it('keeps earlier session-reference-first prompts readable in history', () => {
+    const legacyOrder = `Question\n\n${sessions}\n\n<linked_content path="note.md" />`;
+    expect(extractUserDisplayContent(legacyOrder)).toBe('Question');
+    expect(extractUserQuery(legacyOrder)).toBe('Question');
+  });
+});
+
+
+describe('Markdown code context examples', () => {
+  it.each([
+    'Explain this XML:\n\n    <editor_selection path="note.md">hello</editor_selection>\n\nKeep the example.',
+    'Explain this XML:\n\n    <linked_content path="example.md" />\n\nKeep the example.',
+    'Explain this XML:\n\n```xml\n\n<editor_selection path="note.md">hello</editor_selection>\n```\nKeep the example.',
+    'Explain this XML:\n\n~~~xml\n\n<context_files>example.md</context_files>\n~~~\nKeep the example.',
+    'Explain `<editor_cursor path="note.md">hello</editor_cursor>` and keep this instruction.',
+    'Explain `<linked_content path="example.md" />` and keep this instruction.',
+  ])('preserves a code example with and without actual context: %s', body => {
+    expect(getUserDisplayText({ content: body })).toBe(body);
+    expect(extractUserQuery(body)).toBe(body);
+    expect(extractUserPromptContext(body)).toBe('');
+    const prompt = appendExecutionContext(body, { linkedContent: { path: 'Real.md' } });
+    expect(getUserDisplayText({ content: prompt })).toBe(body);
+    expect(extractUserQuery(prompt)).toBe(body);
+    expect(extractUserPromptContext(prompt)).toBe('<linked_content path="Real.md" />');
+  });
+
+  it('skips a literal legacy marker and finds a later real bracket suffix', () => {
+    const body = 'Explain legacy:\n\n```text\n[Current note: Notes/example.md]\n```\nKeep the final instruction.';
+    expect(getUserDisplayText({ content: body })).toBe(body);
+    const prompt = body + '\n[Current note: Real.md]';
+    expect(getUserDisplayText({ content: prompt })).toBe(body);
+    // Query deduplication has never stripped legacy bracket suffixes.
+    expect(extractUserQuery(prompt)).toBe(prompt);
+  });
+
+  it('still strips real outside-code context containing a closed code payload', () => {
+    expect(extractUserQuery('Ask<editor_selection>\n```ts\nconst x = 1;\n```\n</editor_selection>')).toBe('Ask');
+  });
+
+  it('finds real fallback context after a protected literal opener', () => {
+    expect(extractUserQuery('Explain `<editor_selection>` then <editor_selection>private</editor_selection> end'))
+      .toBe('Explain `<editor_selection>` then end');
   });
 });

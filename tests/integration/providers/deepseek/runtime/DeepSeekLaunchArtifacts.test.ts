@@ -1,74 +1,86 @@
+// @test-ci {"native":true,"inputs":["tests/helpers/deepseek/NativePluginHost.mjs"]}
 import { execFile, spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rename, rm, stat } from 'node:fs/promises';
+import * as fs from 'node:fs';
+import * as fsPromises from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
+import type { LaunchPatchEntry, LaunchPlugin } from '@test/helpers/deepseek/LaunchPatch';
+import { createWindowsHostFS } from '@test/helpers/WindowsHostFS';
+
+import { createExecutionPathMapper } from '@/core/process/execution-target/WSLPathMapper';
+import { LoopbackSessionToolServer } from '@/core/session-tools/LoopbackSessionToolServer';
+import { SESSION_TOOL_SPECS } from '@/core/session-tools/sessionToolSpecs';
 import { prepareDeepSeekLaunchArtifacts } from '@/providers/deepseek/runtime/DeepSeekLaunchArtifacts';
 
-// The filesystem stays real; individual tests inject the transient lock errors Windows reports for files in use.
-jest.mock('node:fs/promises', () => {
-  const actual = jest.requireActual('node:fs/promises');
-  return { __esModule: true, ...actual, rename: jest.fn(actual.rename) };
-});
+const NATIVE_PLUGIN_HOST = pathToFileURL(join(__dirname, '../../../../helpers/deepseek/NativePluginHost.mjs')).href;
 
-it('gives every preset a live prompt file and its tool policy while keeping prompt text out of code', async () => {
+// The filesystem stays real; individual tests inject the transient lock errors Windows reports for files in use.
+vi.mock('node:fs/promises', async () => {
+  const actual = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises'));
+  return { __esModule: true, ...actual, rename: vi.fn(actual.rename) };
+});
+// WindowsHostFS serves `C:\Temp` on POSIX hosts for the WSL launch.
+vi.mock('fs', async () => ({ ...await vi.importActual<typeof import('fs')>('fs') }));
+
+it('gives every preset the session prompt directory and its tool policy while keeping prompt text out of code', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek packaged # 文档 '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const inserted = patch.find((entry: { insert?: unknown }) => entry.insert).insert;
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const inserted = patch.find((entry) => entry.insert)!.insert!;
     expect(inserted[0]).toMatchObject({ id: 'claudian-lifecycle' });
-    const presets = Object.fromEntries(inserted.slice(1).map((entry: any) => [entry.config.id, entry.config.plugins.find((plugin: any) => plugin.id === 'claudian-compatibility')]));
+    const presets = Object.fromEntries(inserted.slice(1).map((entry) => [entry.config.id, entry.config.plugins.find((plugin) => plugin.id === 'claudian-compatibility')!]));
     expect(Object.keys(presets)).toEqual(['claudian', 'claudian-code', 'claudian-passive', 'claudian-read-only']);
-    expect(new Set(Object.values(presets).map((plugin: any) => plugin.config.promptFile)).size).toBe(4);
+    expect(new Set(Object.values(presets).map((plugin) => plugin.config.promptDirectory)).size).toBe(1);
     expect(presets['claudian-passive'].config.allow).toEqual([]);
     expect(presets['claudian-read-only'].config.allow).toEqual(['read', 'read_image', 'glob', 'grep']);
     expect(presets.claudian.config.allow).toBeUndefined();
     // One chat preset: the legacy code-mode id stays declared for saved conversations with identical content, and code
     // mode is a live per-agent presentation rather than a preset row. Auxiliary presets keep their fixed native policy.
-    const plugins = Object.fromEntries(inserted.slice(1).map((entry: any) => [entry.config.id, entry.config.plugins]));
-    const withoutPrompt = (rows: any[]) => rows.map(row => row.id === 'claudian-compatibility' ? { ...row, config: { ...row.config, promptFile: undefined } } : row);
-    expect(withoutPrompt(plugins['claudian-code'])).toEqual(withoutPrompt(plugins.claudian));
-    expect(plugins.claudian.some((row: any) => row.id === 'agent-tool-presentation')).toBe(false);
+    const plugins = Object.fromEntries(inserted.slice(1).map((entry) => [entry.config.id, entry.config.plugins]));
+    expect(plugins['claudian-code']).toEqual(plugins.claudian);
     expect(presets.claudian.config.codeModeFile).toEqual(expect.any(String));
     expect(presets['claudian-code'].config.codeModeFile).toBe(presets.claudian.config.codeModeFile);
-    for (const auxiliary of ['claudian-passive', 'claudian-read-only']) {
-      expect(presets[auxiliary].config.codeModeFile).toBeUndefined();
-      expect(plugins[auxiliary].find((row: any) => row.id === 'agent-tool-presentation').config).toEqual({ mode: 'native' });
-    }
+    // The compatibility plugin alone selects every agent's presentation; no preset-wide presentation row competes with it.
+    for (const preset of Object.values(plugins)) expect(preset.some((row) => row.id === 'agent-tool-presentation')).toBe(false);
+    for (const auxiliary of ['claudian-passive', 'claudian-read-only']) expect(presets[auxiliary].config.codeModeFile).toBeUndefined();
 
     const first = 'Literal {{title}} ${process.exit(99)} `quotes`\\n Unicode 笔记';
-    const edited = 'Edited prompt';
-    await artifacts.writePrompt('claudian', first);
+    // Native session ids need not be valid file names.
+    const sessionId = 'C:\\session/../# 文档';
+    await artifacts.writePrompt(sessionId, first);
     const pluginPath = presets.claudian.name;
     // Native imports preset plugin names literally, so the test must not repair Windows paths or URL fragments.
-    // Its prompt section must read the file at each assembly.
     const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
-      import { writeFileSync } from 'node:fs';
       const plugin = await import(process.argv[1]);
       const config = JSON.parse(process.argv[2]);
-      const sections = [];
-      plugin.apply({ effect: fn => fn(), on: () => () => {}, systemPrompt: {
-        section: section => { sections.push(section); return () => {}; },
-        getSectionOrder: name => name,
-      } }, config);
-      for (const bad of [{}, { promptFile: 1 }, { promptFile: 'x', allow: ['write'] }, { promptFile: 'x', codeModeFile: 1 }, { promptFile: 'x', allow: [], codeModeFile: 'mode' }]) {
-        let rejected = false;
-        try { plugin.apply({}, bad); } catch { rejected = true; }
-        if (!rejected) throw new Error('Unsafe bridge configuration accepted');
+      const { createNativePluginHost } = await import(process.argv[4]);
+      // Every preset kind applies cleanly on each supported native version.
+      for (const version of ['0.2.1', '0.2.2']) {
+        for (const presetConfig of [config, { promptDirectory: config.promptDirectory, allow: [] }]) await createNativePluginHost(version).apply(plugin, presetConfig);
       }
-      const persona = sections[0];
-      const before = persona.text();
-      writeFileSync(config.promptFile, process.argv[3]);
-      process.stdout.write(JSON.stringify({ persona, before, after: persona.text(), webSurface: sections.find(section => section.name === 'app:web-surface').text }));
-    `, pluginPath, JSON.stringify(presets.claudian.config), edited], { cwd: root });
+      for (const bad of [{}, { promptDirectory: 1 }]) {
+        let rejected = false;
+        try { plugin.apply(createNativePluginHost('0.2.2').ctx, bad); } catch { rejected = true; }
+        if (!rejected) throw new Error('Configuration without a prompt directory accepted');
+      }
+      const native = createNativePluginHost('0.2.2');
+      await native.apply(plugin, config);
+      const persona = native.sections[0];
+      const { session } = native.agent(process.argv[3]);
+      native.setTurn(session.id, 1);
+      process.stdout.write(JSON.stringify({ persona, text: persona.text({ agent: { id: session.id, session } }), agentless: persona.text({}), webSurface: native.sections.find(section => section.name === 'app:web-surface').text }));
+    `, pluginPath, JSON.stringify(presets.claudian.config), sessionId, NATIVE_PLUGIN_HOST], { cwd: root });
     const result = JSON.parse(stdout);
-    expect(result).toMatchObject({ persona: { interpolate: false, complete: false }, before: first, after: edited, webSurface: '' });
+    expect(result).toMatchObject({ persona: { interpolate: false, complete: false }, text: first, agentless: '', webSurface: '' });
     expect(await readFile(new URL(pluginPath), 'utf8')).not.toContain(first);
 
-    const modes = await Promise.all([artifacts.patchPath, new URL(pluginPath), inserted[0].name, presets.claudian.config.promptFile].map(path => stat(path)));
+    const [promptFile] = await readdir(presets.claudian.config.promptDirectory);
+    const modes = await Promise.all([artifacts.patchPath, new URL(pluginPath), inserted[0].name, join(presets.claudian.config.promptDirectory, promptFile)].map(path => stat(path)));
     expect(process.platform === 'win32' || modes.every(mode => (mode.mode & 0o777) === 0o600)).toBe(true);
     await artifacts.dispose();
     await expect(access(artifacts.patchPath)).rejects.toThrow();
@@ -78,22 +90,35 @@ it('gives every preset a live prompt file and its tool policy while keeping prom
   }
 });
 
-it('applies concurrent prompt edits in call order and leaves an unchanged prompt file in place', async () => {
+/** The one prompt file a session's writes produced. */
+async function sessionPromptFile(artifacts: Awaited<ReturnType<typeof prepareDeepSeekLaunchArtifacts>>): Promise<string> {
+  const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+  const directory = patch.find((entry) => entry.insert)!.insert!
+    .find((entry) => entry.config?.id === 'claudian')!.config.plugins[0].config.promptDirectory;
+  const files = await readdir(directory);
+  expect(files).toHaveLength(1);
+  return join(directory, files[0]);
+}
+
+it('applies concurrent prompt edits and removals in call order and leaves an unchanged prompt file in place', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek prompts '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const promptFile = patch.find((entry: { insert?: unknown }) => entry.insert).insert
-      .find((entry: any) => entry.config?.id === 'claudian').config.plugins[0].config.promptFile;
     const edits = Array.from({ length: 12 }, (_, index) => `edit ${index}`);
-    await Promise.all(edits.map(text => artifacts.writePrompt('claudian', text)));
+    await Promise.all(edits.map(text => artifacts.writePrompt('alpha', text)));
+    const promptFile = await sessionPromptFile(artifacts);
     expect(await readFile(promptFile, 'utf8')).toBe(edits.at(-1));
     const written = await stat(promptFile);
-    // Native re-reads the file at each assembly; an identical edit must not replace it.
-    await artifacts.writePrompt('claudian', edits.at(-1)!);
+    // An identical edit must not replace the file native reads.
+    await artifacts.writePrompt('alpha', edits.at(-1)!);
     expect((await stat(promptFile)).ino).toBe(written.ino);
-    await artifacts.writePrompt('claudian', 'changed');
+    await artifacts.writePrompt('alpha', 'changed');
     expect((await stat(promptFile)).ino).not.toBe(written.ino);
+    expect(await readFile(promptFile, 'utf8')).toBe('changed');
+    // A released session's prompt goes; claiming it again writes the same text anew.
+    await Promise.all([artifacts.removePrompt('alpha'), artifacts.writePrompt('alpha', 'changed'), artifacts.removePrompt('alpha')]);
+    await expect(access(promptFile)).rejects.toThrow();
+    await artifacts.writePrompt('alpha', 'changed');
     expect(await readFile(promptFile, 'utf8')).toBe('changed');
   } finally {
     await artifacts.dispose();
@@ -105,17 +130,15 @@ it('retries a replacement refused by a transient Windows file lock', async () =>
   const root = await mkdtemp(join(tmpdir(), 'deepseek locked prompt '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const promptFile = patch.find((entry: { insert?: unknown }) => entry.insert).insert
-      .find((entry: any) => entry.config?.id === 'claudian').config.plugins[0].config.promptFile;
     for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
-      jest.mocked(rename).mockRejectedValueOnce(Object.assign(new Error(`${code}: file in use`), { code }));
-      await artifacts.writePrompt('claudian', `after ${code}`);
-      expect(await readFile(promptFile, 'utf8')).toBe(`after ${code}`);
+      vi.mocked(rename).mockRejectedValueOnce(Object.assign(new Error(`${code}: file in use`), { code }));
+      await artifacts.writePrompt('alpha', `after ${code}`);
+      expect(await readFile(await sessionPromptFile(artifacts), 'utf8')).toBe(`after ${code}`);
     }
+    const promptFile = await sessionPromptFile(artifacts);
     // Other failures are not locks and surface at once.
-    jest.mocked(rename).mockRejectedValueOnce(Object.assign(new Error('ENOSPC: no space left'), { code: 'ENOSPC' }));
-    await expect(artifacts.writePrompt('claudian', 'full disk')).rejects.toThrow('ENOSPC');
+    vi.mocked(rename).mockRejectedValueOnce(Object.assign(new Error('ENOSPC: no space left'), { code: 'ENOSPC' }));
+    await expect(artifacts.writePrompt('alpha', 'full disk')).rejects.toThrow('ENOSPC');
     expect(await readFile(promptFile, 'utf8')).toBe('after EBUSY');
   } finally {
     await artifacts.dispose();
@@ -127,46 +150,56 @@ it('switches each chat agent between direct tools and code mode at its next turn
   const root = await mkdtemp(join(tmpdir(), 'deepseek code mode '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const compatibility = patch.find((entry: { insert?: unknown }) => entry.insert).insert
-      .find((entry: any) => entry.config?.id === 'claudian').config.plugins.find((row: any) => row.id === 'claudian-compatibility');
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const compatibility = patch.find((entry) => entry.insert)!.insert!
+      .find((entry) => entry.config?.id === 'claudian')!.config.plugins.find((row) => row.id === 'claudian-compatibility')!;
+    const auxiliary = patch.find((entry) => entry.insert)!.insert!
+      .find((entry) => entry.config?.id === 'claudian-read-only')!.config.plugins.find((row) => row.id === 'claudian-compatibility')!;
     // Drive the bundled plugin as native does: agent creation, then turn status changes, with code mode edited in between.
     const script = `
       import { writeFileSync } from 'node:fs';
       const plugin = await import(process.argv[1]);
       const config = JSON.parse(process.argv[2]);
-      const listeners = {};
-      const log = [];
-      plugin.apply({ effect: fn => fn(), systemPrompt: { section: () => () => {}, getSectionOrder: name => name },
-        on: (name, listener) => { (listeners[name] ??= []).push(listener); return () => {}; } }, config);
-      const agent = id => ({ id, ctx: { tools: { presentAs: mode => { log.push(id + ' present ' + mode); return () => log.push(id + ' dispose ' + mode); } } } });
-      const emit = (name, payload) => { for (const listener of listeners[name] ?? []) listener(payload); };
-      const [first, second] = [agent('first'), agent('second')];
+      const { createNativePluginHost } = await import(process.argv[5]);
+      const native = createNativePluginHost(process.argv[4]);
+      await native.apply(plugin, config);
+      const [first, second] = [native.agent('first'), native.agent('second')];
       for (const step of JSON.parse(process.argv[3])) {
         if (step.write !== undefined) writeFileSync(config.codeModeFile, step.write);
-        else if (step.created) emit('agent/created', { agent: step.created === 'first' ? first : second });
-        else emit('agent/status', { agent: step.agent === 'first' ? first : second, status: step.status });
+        else if (step.created) native.emit('agent/created', { agent: step.created === 'first' ? first : second });
+        else native.emit('agent/status', { agent: step.agent === 'first' ? first : second, status: step.status });
       }
-      process.stdout.write(JSON.stringify(log));
+      process.stdout.write(JSON.stringify({ log: native.log, mounted: native.mounted, presentation: native.presentation }));
     `;
-    const run = async (steps: unknown[]): Promise<string[]> => JSON.parse((await promisify(execFile)(process.execPath,
-      ['--input-type=module', '-e', script, compatibility.name, JSON.stringify(compatibility.config), JSON.stringify(steps)], { cwd: root })).stdout);
+    for (const version of ['0.2.1', '0.2.2']) {
+      const drive = async (steps: unknown[], row = compatibility): Promise<{ log: string[]; mounted: string[]; presentation: { direct: string; code: string } }> =>
+        JSON.parse((await promisify(execFile)(process.execPath,
+          ['--input-type=module', '-e', script, row.name, JSON.stringify(row.config), JSON.stringify(steps), version, NATIVE_PLUGIN_HOST], { cwd: root })).stdout);
+      const run = async (steps: unknown[]): Promise<string[]> => (await drive(steps)).log;
+      const { mounted, presentation: { direct, code } } = await drive([]);
+      // The chat preset mounts 0.2.1's separate list_agents entry; 0.2.2 registers it with subagent control.
+      expect(mounted).toEqual(version === '0.2.1' ? ['list-agents'] : []);
+      // Auxiliary agents always reach their fixed allow list directly, whatever the code-mode preference.
+      await artifacts.writeCodeMode(true);
+      expect((await drive([{ created: 'first' }], auxiliary)).log).toEqual([`first present ${direct}`, 'first allow read,read_image,glob,grep']);
 
-    // A fresh Host starts in direct-tool mode until Claudian writes the preference.
-    expect(await run([{ created: 'first' }])).toEqual(['first present native']);
-    await artifacts.writeCodeMode(true);
-    expect(await run([
-      { created: 'first' },
-      { agent: 'first', status: 'running' },
-      // Edits during a turn wait for the next one; idle transitions and unchanged turns redeclare nothing.
-      { write: 'native' }, { agent: 'first', status: 'idle' },
-      { write: 'both' }, { agent: 'first', status: 'running' },
-      { created: 'second' },
-    ])).toEqual(['first present both', 'second present both']);
-    expect(await run([
-      { created: 'first' }, { created: 'second' },
-      { write: 'native' }, { agent: 'first', status: 'running' },
-    ])).toEqual(['first present both', 'second present both', 'first dispose both', 'first present native']);
+      // A fresh Host starts in direct-tool mode until Claudian writes the preference.
+      await artifacts.writeCodeMode(false);
+      expect(await run([{ created: 'first' }])).toEqual([`first present ${direct}`]);
+      await artifacts.writeCodeMode(true);
+      expect(await run([
+        { created: 'first' },
+        { agent: 'first', status: 'running' },
+        // Edits during a turn wait for the next one; idle transitions and unchanged turns redeclare nothing.
+        { write: 'native' }, { agent: 'first', status: 'idle' },
+        { write: 'both' }, { agent: 'first', status: 'running' },
+        { created: 'second' },
+      ])).toEqual([`first present ${code}`, `second present ${code}`]);
+      expect(await run([
+        { created: 'first' }, { created: 'second' },
+        { write: 'native' }, { agent: 'first', status: 'running' },
+      ])).toEqual([`first present ${code}`, `second present ${code}`, `first dispose ${code}`, `first present ${direct}`]);
+    }
 
     await artifacts.writeCodeMode(false);
     expect(await readFile(compatibility.config.codeModeFile, 'utf8')).toBe('native');
@@ -181,8 +214,8 @@ it('reports ready only once every durable store an ephemeral session could reach
   const root = await mkdtemp(join(tmpdir(), 'deepseek ephemeral readiness '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const row = patch.flatMap((entry: { insert?: any[] }) => entry.insert ?? []).find((entry: any) => entry.id === 'claudian-ephemeral');
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const row = patch.flatMap((entry) => entry.insert ?? []).find((entry) => entry.id === 'claudian-ephemeral')!;
     // Native without workspaces open: persistence, projections and spill are guarded, workspace membership is not.
     // The first readiness replacement meets a transient Windows file lock.
     await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
@@ -198,11 +231,11 @@ it('reports ready only once every durable store an ephemeral session could reach
       const domains = { session_projcache: { table: () => ({ put: async () => {} }) } };
       const ctx = {
         get: () => backend, on: () => () => {}, effect: () => {}, logger: { warn() {} },
-        inject: (deps, apply) => { if (!deps.includes('attachments')) apply({ storageDomain: { get: name => domains[name] }, get: () => ({ saveText: async () => ({}) }), logger: { warn() {} }, effect: () => {} }); },
+        inject: (deps, apply) => { if (!deps.includes('attachments')) apply({ storageDomain: { get: name => domains[name] }, get: () => ({ saveText: async () => ({}) }), sessionController: { fork: async () => ({}) }, logger: { warn() {} }, effect: () => {} }); },
       };
       plugin.apply(ctx, JSON.parse(process.argv[2]));
     `, row.name, JSON.stringify(row.config)], { cwd: root });
-    expect(JSON.parse(await readFile(row.config.readyFile, 'utf8'))).toMatchObject({ persistence: true, projectionGuard: true, spillGuard: true, workspaceGuard: false });
+    expect(JSON.parse(await readFile(row.config.readyFile, 'utf8'))).toMatchObject({ persistence: true, forkGuard: true, projectionGuard: true, spillGuard: true, workspaceGuard: false });
     expect(await artifacts.readEphemeralReady()).toBe(false);
   } finally {
     await artifacts.dispose();
@@ -214,15 +247,15 @@ it('never republishes a fork token whose publication failed', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek fork tokens '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const { stateFile } = patch.flatMap((entry: { insert?: any[] }) => entry.insert ?? []).find((entry: any) => entry.id === 'claudian-ephemeral').config;
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const { stateFile } = patch.flatMap((entry) => entry.insert ?? []).find((entry) => entry.id === 'claudian-ephemeral')!.config;
     // A non-empty directory cannot be replaced on any platform, so the offer fails and its caller never receives a withdrawal.
     await rm(stateFile, { force: true });
     await mkdir(join(stateFile, 'blocker'), { recursive: true });
     await expect(artifacts.offerEphemeralFork('saved', 4)).rejects.toThrow();
     await rm(stateFile, { recursive: true, force: true });
     const withdraw = await artifacts.offerEphemeralFork('other', 2);
-    expect(JSON.parse(await readFile(stateFile, 'utf8')).forks.map((fork: any) => fork.parent)).toEqual(['other']);
+    expect(JSON.parse(await readFile(stateFile, 'utf8')).forks.map((fork: { parent: string }) => fork.parent)).toEqual(['other']);
     await withdraw();
     // A later durable fork of `saved` at that checkpoint must find nothing to claim.
     expect(JSON.parse(await readFile(stateFile, 'utf8'))).toEqual({ forks: [] });
@@ -245,10 +278,10 @@ it('appends user plugin rows to the chat presets after Claudian\'s own rows, nev
   const own = await prepareDeepSeekLaunchArtifacts(root);
   const extended = await prepareDeepSeekLaunchArtifacts(root, extra);
   try {
-    const presetRows = async (patchPath: string): Promise<Record<string, any[]>> => Object.fromEntries(JSON.parse(await readFile(patchPath, 'utf8'))
-      .find((entry: { insert?: unknown }) => entry.insert).insert.slice(1).map((entry: any) => [entry.config.id, entry.config.plugins]));
+    const presetRows = async (patchPath: string): Promise<Record<string, LaunchPlugin[]>> => Object.fromEntries((JSON.parse(await readFile(patchPath, 'utf8')) as LaunchPatchEntry[])
+      .find((entry) => entry.insert)!.insert!.slice(1).map((entry) => [entry.config.id, entry.config.plugins]));
     const [ownRows, extendedRows] = await Promise.all([presetRows(own.patchPath), presetRows(extended.patchPath)]);
-    const ids = (rows: any[]) => rows.map(row => row.id);
+    const ids = (rows: LaunchPlugin[]) => rows.map(row => row.id);
     for (const chat of ['claudian', 'claudian-code']) {
       expect(extendedRows[chat].slice(-extra.length)).toEqual(launched);
       expect(ids(extendedRows[chat].slice(0, -extra.length))).toEqual(ids(ownRows[chat]));
@@ -260,15 +293,16 @@ it('appends user plugin rows to the chat presets after Claudian\'s own rows, nev
   }
 });
 
-it('keeps ephemeral sessions in process memory and out of every durable dsh store, leaving other sessions to native', async () => {
+// dsh 0.2.1 names a fork's source in its header; 0.2.2 omits it for ordinary forks.
+it.each([['0.2.1', true], ['0.2.2', false]])('keeps ephemeral sessions in process memory and out of every durable dsh store, leaving other sessions to native (dsh %s)', async (_version, forkLineage) => {
   const root = await mkdtemp(join(tmpdir(), 'deepseek ephemeral '));
   const artifacts = await prepareDeepSeekLaunchArtifacts(root);
   try {
-    const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-    const row = patch.flatMap((entry: { insert?: any[] }) => entry.insert ?? []).find((entry: any) => entry.id === 'claudian-ephemeral');
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const row = patch.flatMap((entry) => entry.insert ?? []).find((entry) => entry.id === 'claudian-ephemeral')!;
     expect(row).toMatchObject({ config: { stateFile: expect.any(String), readyFile: expect.any(String), spillRoot: expect.any(String) } });
     // Native's own JSONL backend stays mounted; the plugin only decorates it.
-    expect(patch.some((entry: any) => entry.id === 'session-persistence-jsonl')).toBe(false);
+    expect(patch.some((entry) => entry.id === 'session-persistence-jsonl')).toBe(false);
     expect(process.platform === 'win32' || ((await stat(row.config.stateFile)).mode & 0o777) === 0o600).toBe(true);
     expect(await artifacts.readEphemeralReady()).toBe(false);
 
@@ -277,7 +311,7 @@ it('keeps ephemeral sessions in process memory and out of every durable dsh stor
       import { pathToFileURL } from 'node:url';
       import { AsyncLocalStorage } from 'node:async_hooks';
       import { mkdir, readFile, writeFile } from 'node:fs/promises';
-      import { dirname, join } from 'node:path';
+      import { dirname, join, sep } from 'node:path';
       const plugin = await import(pathToFileURL(process.argv[1]).href);
       const config = JSON.parse(process.argv[2]);
       const out = { backend: [], projcache: [], workspaces: [], global: [], spilled: [], errors: {} };
@@ -286,7 +320,7 @@ it('keeps ephemeral sessions in process memory and out of every durable dsh stor
         create: async (header, options) => { out.backend.push('create ' + header.id + (options?.inheritedEventCount ? '@' + options.inheritedEventCount : '')); return { id: header.id, native: true }; },
         open: async (id, access) => { out.backend.push('open ' + id + ' ' + access); return { id, native: true }; },
         stat: async id => { out.backend.push('stat ' + id); return undefined; },
-        list: async () => [],
+        list: async () => ({ sessions: [] }),
       };
       const original = { create: backend.create, open: backend.open, stat: backend.stat };
       const listeners = {}; const disposers = []; const injections = [];
@@ -332,7 +366,14 @@ it('keeps ephemeral sessions in process memory and out of every durable dsh stor
       const sessionController = {
         async prompt(request) { await Promise.resolve(); return attachments.saveImages(request.images); },
         async attachment(request) { return attachments.readImage(request.ref); },
+        // Native mints the fork's identity and creates it from the inclusive cut.
+        async fork(request) {
+          await Promise.resolve();
+          return backend.create(header(forkIds.shift(), { ...(forkLineage ? { parentSession: request.sessionId } : {}), isSeeded: true }), { inheritedEventCount: request.atSeq + 1 });
+        },
       };
+      const forkLineage = process.argv[4] === 'true';
+      const forkIds = [];
       const loader = { import: async name => name.endsWith('attachment-local') ? { LocalAttachmentStore } : { DeepSeekUploadIndex } };
       const services = { sessionPersistence: backend, attachments, sessionController, agents, loader };
       const projcacheTable = { put: async key => { out.projcache.push(key); } };
@@ -387,7 +428,8 @@ it('keeps ephemeral sessions in process memory and out of every durable dsh stor
       // Claudian's fork token makes exactly one fork of its parent at its checkpoint ephemeral.
       const forks = {};
       for (const [id, parent, inheritedEventCount] of JSON.parse(process.argv[3])) {
-        const handle = forks[id] = await backend.create(header(id, { parentSession: parent, isSeeded: true }), { inheritedEventCount });
+        forkIds.push(id);
+        const handle = forks[id] = await sessionController.fork({ sessionId: parent, atSeq: inheritedEventCount - 1 });
         out[id] = handle.native ? 'native' : 'memory';
       }
       // Native stores a fork's inherited seed as the start of its own log, from seq 0, then its live suffix.
@@ -441,7 +483,7 @@ it('keeps ephemeral sessions in process memory and out of every durable dsh stor
     // Two forks of `saved` at checkpoint 4 race for one token; a fork at another checkpoint never takes it.
     const withdraw = await artifacts.offerEphemeralFork('saved', 4);
     const result = JSON.parse((await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script, row.name, JSON.stringify(row.config),
-      JSON.stringify([['other-cut', 'saved', 3], ['side', 'saved', 5], ['second', 'saved', 5]])], { cwd: root })).stdout);
+      JSON.stringify([['other-cut', 'saved', 3], ['side', 'saved', 5], ['second', 'saved', 5]]), String(forkLineage)], { cwd: root })).stdout);
     await withdraw();
     expect(JSON.parse(await readFile(row.config.stateFile, 'utf8'))).toEqual({ forks: [] });
 
@@ -494,8 +536,8 @@ describe('owner lifecycle tether', () => {
     const root = await mkdtemp(join(tmpdir(), 'deepseek lifecycle '));
     const artifacts = await prepareDeepSeekLaunchArtifacts(root);
     try {
-      const patch = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
-      const lifecyclePath = patch.find((entry: { insert?: unknown }) => entry.insert).insert[0].name;
+      const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+      const lifecyclePath = patch.find((entry) => entry.insert)!.insert![0].name;
       // A stand-in Host that would otherwise run indefinitely, like dsh web.
       const child = spawn(process.execPath, ['--input-type=module', '-e', `
         import { pathToFileURL } from 'node:url';
@@ -517,4 +559,140 @@ describe('owner lifecycle tether', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+});
+
+it.each(['http', 'relay'])('runs the sessions plugin over %s, forwarding caller identity, re-reading the route, and cancelling calls', async transport => {
+  const endpoint = new LoopbackSessionToolServer();
+  const replacement = new LoopbackSessionToolServer();
+  const artifacts = await prepareDeepSeekLaunchArtifacts();
+  const calls: Array<{ name: string; args: unknown; callerNativeId: string }> = [];
+  let stopCall = (): void => {};
+  let cancelled!: () => void;
+  const aborted = new Promise<void>(resolve => { cancelled = resolve; });
+  try {
+    const next = await replacement.registerCallRoute(async request => {
+      calls.push({ name: request.name, args: request.args, callerNativeId: request.callerNativeId });
+      if ((request.args as { text?: string }).text === 'hold') {
+        const stopped = new Promise<void>(resolve => request.signal.addEventListener('abort', () => { cancelled(); resolve(); }, { once: true }));
+        stopCall();
+        await stopped;
+      }
+      return { isError: false, text: 'second route' };
+    });
+    const first = await endpoint.registerCallRoute(async request => {
+      calls.push({ name: request.name, args: request.args, callerNativeId: request.callerNativeId });
+      // Replace the launch file while this plugin is still loaded in the child.
+      await artifacts.writeSessionToolRoute(next);
+      return { isError: false, text: 'first route' };
+    });
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const row = patch.find((entry) => entry.insert)!.insert!.find((entry) => entry.config?.id === 'claudian')!.config.plugins.find((entry) => entry.id === 'claudian-sessions')!;
+    expect(row).toBeDefined();
+    await artifacts.writeSessionToolRoute(first);
+    const file = row.config.endpointFile;
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ url: first.url, routeId: first.routeId });
+    const modes = await Promise.all([stat(file), stat(new URL(row.name))]);
+    expect(process.platform === 'win32' || modes.every(mode => (mode.mode & 0o777) === 0o600)).toBe(true);
+    const relay = {
+      command: process.execPath,
+      args: ['--input-type=module', '-e', `
+        import { createInterface } from 'node:readline';
+        const abort = new AbortController();
+        process.stdin.on('end', () => abort.abort());
+        let called = false;
+        createInterface({ input: process.stdin }).on('line', async line => {
+          if (called) process.exit(2);
+          called = true;
+          const body = JSON.parse(line);
+          if (body.routeId || body.token) process.exit(3);
+          try {
+            const response = await fetch(process.env.CLAUDIAN_SESSION_TOOL_URL, {
+              method: 'POST', headers: { 'Content-Type': 'application/json', 'x-claudian-route': process.env.CLAUDIAN_SESSION_TOOL_ROUTE },
+              body: line, signal: abort.signal,
+            });
+            if (!response.ok) process.exit(4);
+            const text = await response.text();
+            if (process.stdin.readableEnded) process.exit(5);
+            process.stdout.write(text + '\\n', () => process.exit(0));
+          } catch { process.exit(abort.signal.aborted ? 0 : 6); }
+        });
+      `],
+      env: { CLAUDIAN_SESSION_TOOL_MODE: 'call' },
+    };
+    const child = promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+      if (process.env.CLAUDIAN_DEEPSEEK_SESSION_RELAY) globalThis.fetch = () => { throw new Error('WSL plugin must use its relay'); };
+      const plugin = await import(process.argv[1]);
+      const tools = [];
+      await plugin.apply({ loader: { import: async name => {
+        if (name !== '@deepseek-ai/dsh-tools') throw new Error('Unexpected native dependency');
+        return { defineTool: spec => {
+          if (!spec.output.schema || !spec.output.render) throw new Error('Missing output contract');
+          // Native annotations permit required:true or absence, never required:false.
+          for (const value of Object.values(spec.parameters)) {
+            if ('required' in value && value.required !== true) throw new Error('required must be true when present');
+          }
+          return spec;
+        } };
+      } }, tools: { register: tool => tools.push(tool) } }, JSON.parse(process.argv[2]));
+      const exec = { agent: { id: 'child-native' }, signal: new AbortController().signal };
+      const before = await tools[0].execute({}, exec);
+      const after = await tools[1].execute({ sessionId: 'target', text: 'hello' }, exec);
+      const stop = new AbortController();
+      process.stdin.once('data', () => stop.abort());
+      const pending = tools[1].execute({ text: 'hold' }, { ...exec, signal: stop.signal });
+      let aborted = false;
+      try { await pending; } catch { aborted = true; }
+      process.stdout.write(JSON.stringify({ before, after, aborted, tools: tools.map(tool => ({ name: tool.name, timeoutMs: tool.timeoutMs, parameters: tool.parameters })) }));
+    `, row.name, JSON.stringify(row.config)], { timeout: 10_000, env: { ...process.env, ...(transport === 'relay' ? { CLAUDIAN_DEEPSEEK_SESSION_RELAY: JSON.stringify(relay) } : {}) } });
+    // Stop only after the real endpoint has received the call and installed its disconnect listener.
+    stopCall = () => { child.child.stdin!.end('abort'); };
+    const { stdout } = await child;
+    const output = JSON.parse(stdout);
+    expect(output).toMatchObject({ before: { text: 'first route' }, after: { text: 'second route' }, aborted: true });
+    expect(output.tools.map((tool: { name: string; timeoutMs: number }) => tool.name)).toEqual(SESSION_TOOL_SPECS.map(spec => spec.name));
+    expect(output.tools.every((tool: { name: string; timeoutMs: number }) => tool.timeoutMs > 0 && tool.timeoutMs <= 60_000)).toBe(true);
+    // Required fields carry the native flag; optional ones omit it.
+    expect(output.tools[2].parameters.sessionId).toMatchObject({ type: 'string', required: true });
+    expect(output.tools[1].parameters.sessionId.required).not.toBe(true);
+    expect(output.tools[1].parameters.text.required).not.toBe(true);
+    await aborted;
+    expect(calls).toEqual([
+      { name: 'claudian_list_destinations', args: {}, callerNativeId: 'child-native' },
+      { name: 'claudian_send_message', args: { sessionId: 'target', text: 'hello' }, callerNativeId: 'child-native' },
+      { name: 'claudian_send_message', args: { text: 'hold' }, callerNativeId: 'child-native' },
+    ]);
+  } finally { await endpoint.close(); await replacement.close(); await artifacts.dispose(); }
+});
+
+// Windows hosts have a real C:\Temp; WindowsHostFS models it on POSIX hosts.
+it.skipIf(sep === '\\')('maps every nested launch path for Linux while retaining host files for mutations and disposal', async () => {
+  createWindowsHostFS({ fs, fsPromises });
+  await mkdir('C:\\Temp', { recursive: true });
+  const mapper = createExecutionPathMapper({ method: 'wsl', distroName: 'Ubuntu', platformOs: 'linux', platformFamily: 'unix' });
+  const artifacts = await prepareDeepSeekLaunchArtifacts('C:\\Temp', [], undefined, mapper);
+  try {
+    const patch: LaunchPatchEntry[] = JSON.parse(await readFile(artifacts.patchPath, 'utf8'));
+    const rows = patch.flatMap(row => row.insert ?? []);
+    const ephemeral = rows.find(row => row.id === 'claudian-ephemeral')!;
+    const preset = rows.find(row => row.config?.id === 'claudian')!;
+    const compatibility = preset.config.plugins.find(row => row.id === 'claudian-compatibility')!;
+    const sessions = preset.config.plugins.find(row => row.id === 'claudian-sessions')!;
+    for (const path of [rows[0].name, ephemeral.name, ...Object.values(ephemeral.config), compatibility.config.promptDirectory, compatibility.config.codeModeFile, sessions.config.endpointFile]) {
+      expect(path).toMatch(/^\/mnt\/c\/Temp\/claudian-deepseek-/);
+    }
+    for (const row of [compatibility, sessions]) expect(row.name).toMatch(/^file:\/\/\/mnt\/c\/Temp\//);
+    expect(preset.config.plugins.map(row => row.id)).toContain('tool-bash');
+    expect(preset.config.plugins.map(row => row.id)).not.toContain('tool-pwsh');
+    await artifacts.writePrompt('alpha', 'Linux prompt');
+    await artifacts.writeCodeMode(true);
+    const hostRoot = dirname(artifacts.patchPath);
+    expect(await readFile(join(hostRoot, 'code-mode'), 'utf8')).toBe('both');
+    const [prompt] = await readdir(join(hostRoot, 'prompts'));
+    expect(await readFile(join(hostRoot, 'prompts', prompt), 'utf8')).toBe('Linux prompt');
+    const withdraw = await artifacts.offerEphemeralFork('saved', 7);
+    expect(JSON.parse(await readFile(join(hostRoot, 'ephemeral-forks.json'), 'utf8')).forks).toHaveLength(1);
+    await withdraw();
+    await artifacts.dispose();
+    await expect(access(artifacts.patchPath)).rejects.toThrow();
+  } finally { await artifacts.dispose(); }
 });

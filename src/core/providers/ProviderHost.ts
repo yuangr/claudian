@@ -5,8 +5,10 @@ import type {
   ProviderExecutionLifecycleRegistry,
   ProviderExecutionTransitionScope,
 } from '../execution';
+import type { SessionToolEndpoint } from '../session-tools/SessionToolEndpoint';
 import type { ClaudianSettings } from '../types';
 import type { EnvironmentScope } from '../types/settings';
+import type { ProviderRuntimeHost } from './ProviderRuntimeHost';
 import type { ProviderCLIResolutionContext, ProviderId } from './types';
 
 /**
@@ -22,10 +24,15 @@ export interface ProviderHost {
   readonly settings: Readonly<ClaudianSettings>;
   readonly storage: ProviderHostStorage;
   readonly manifest?: { version?: string };
+  /** Absolute local directory provider processes run in; null when the host has no local directory. */
+  readonly workingDirectory: string | null;
+  /** Loopback endpoint through which shared provider processes reach main-chat session tools. */
+  readonly sessionToolEndpoint: SessionToolEndpoint;
 
   mutateSettings(
     mutation: (settings: ClaudianSettings) => void | Promise<void>,
   ): Promise<void>;
+  /** Returning false discards the draft: nothing is committed, persisted, or published. */
   mutateSettingsConditionally(
     mutation: (settings: ClaudianSettings) => boolean | Promise<boolean>,
   ): Promise<void>;
@@ -56,4 +63,7 @@ export interface ProviderHost {
   ): Promise<T>;
 
   notifyProviderChatOptionsChanged(providerId: ProviderId): void;
+
+  /** The provider-scoped view handed to that provider's runtime code. */
+  getRuntimeHost(providerId: ProviderId): ProviderRuntimeHost;
 }

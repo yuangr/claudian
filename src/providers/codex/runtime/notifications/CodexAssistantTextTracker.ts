@@ -9,17 +9,16 @@ import { asRecord, firstString } from './codexNotificationValues';
 
 /**
  * Deduplicates assistant text that arrives as deltas, completed agent messages,
- * raw response messages, and turn-level event messages.
+ * raw response messages, and legacy agent_message events.
  *
  * Completion text is compared against what already streamed for the same message,
- * the current segment (text since the last tool boundary), or the whole turn.
+ * or the current segment (text since the last tool boundary).
  */
 export class CodexAssistantTextTracker {
   #startedMessageIds = new Set<string>();
   #streamedTextByMessageId = new Map<string, string>();
   #emittedCitationIds = new Set<string>();
   #emittedCitationKeys = new Set<string>();
-  #turnText = '';
   #segmentId: string | undefined;
   #segmentText = '';
 
@@ -30,7 +29,6 @@ export class CodexAssistantTextTracker {
     this.#streamedTextByMessageId.clear();
     this.#emittedCitationIds.clear();
     this.#emittedCitationKeys.clear();
-    this.#turnText = '';
     this.endSegment();
   }
 
@@ -46,7 +44,6 @@ export class CodexAssistantTextTracker {
     if (delta) {
       this.#claimSegment(itemId);
       this.#segmentText += delta;
-      this.#turnText += delta;
     }
     this.emit({ type: 'text', content: delta });
   }
@@ -89,22 +86,12 @@ export class CodexAssistantTextTracker {
       return;
     }
 
-    this.#turnText += missingText;
     this.emit({ type: 'text', content: missingText });
   }
 
-  /** Turn-level agent message events complete the whole turn's text. */
-  completeTurnMessage(rawText: string, memoryCitation: unknown): void {
-    const text = stripCodexMemoryCitationMarkup(rawText);
-    const missingText = normalizeCompletionText(text, this.#turnText);
-    if (missingText) {
-      this.#turnText += missingText;
-      this.#segmentText += missingText;
-      if (this.#segmentId) {
-        this.#streamedTextByMessageId.set(this.#segmentId, this.#segmentText);
-      }
-      this.emit({ type: 'text', content: missingText });
-    }
+  /** Legacy agent_message events repeat one assistant message, not the whole turn. */
+  completeLegacyMessage(rawText: string, memoryCitation: unknown): void {
+    this.completeRawMessage({ text: rawText });
     this.#emitMemoryCitation(memoryCitation);
   }
 
@@ -131,7 +118,6 @@ export class CodexAssistantTextTracker {
 
     this.#claimSegment(itemId);
     this.#segmentText = text;
-    this.#turnText += missingText;
     this.emit({ type: 'text', content: missingText });
   }
 

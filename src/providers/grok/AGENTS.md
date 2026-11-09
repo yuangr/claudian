@@ -1,12 +1,13 @@
 # Grok constraints
 
-- Authentication is native: never automatically call ACP authenticate or persist xAI credentials. Preserve session identity across prompt/CLI/environment changes by reloading it after process replacement.
+- Authentication is native: never automatically call ACP authenticate or persist xAI credentials. Preserve session identity across prompt/CLI changes by reloading it after process replacement; target, distro or native session-store changes retire the resume binding while keeping a recovery-only history locator.
 - Native fork requests omit system-prompt metadata. Load the child with the complete current replacement before its first prompt; mark configuration applied only after successful load.
 - Keep Grok/xAI tools enabled except native plan entry/exit, which Claudian blocks without replacing native or user agent profiles. Preserve unknown tool data and native task names/payloads while adapting subagent presentation.
 - ACP `session/set_mode` does not change Grok permissions; only session `_meta.autoMode`/`yoloMode` do, and relaxing is sticky until process replacement. Accept-edits is answered client-side on native `default` edit prompts. Native Claude-compatible `defaultMode` settings can still loosen Ask and Accept edits.
 - Grok client-hook errors and timeouts fail open. Answer plan-hook callbacks with a native denial directly, including during cancellation; do not route them through user approval or throw on malformed callbacks.
-- Explicit selected-model order supersedes the discovered default.
 - Discover reasoning metadata through session-independent native queries or actual sessions, never a session created only for discovery. Keep stale device discovery on environment/CLI fingerprint changes while preserving native conversation identifiers.
 - Do not rewrite native config, own BYOK endpoints, or source shell startup files.
 - Grok discovers user runtime AGENTS.md natively. Claudian must not create, rewrite, suppress, or explicitly inject those files.
 - Nonstandard xAI behavior requires sanitized native protocol evidence.
+- Sessions with a session-tool port attach Claudian’s MCP route (native HTTP; WSL stdio through the Windows interop relay so default NAT works) on every `session/new` and `session/load`, including process replacement and fork-child loading. Keep route identity only in `X-Claudian-Route` on HTTP and private relay environment on stdio; Grok persists URLs. Dispose the route with its owning session.
+- Grok MCP calls combine native cancellation with the owning run’s signal, which expires at terminal settlement. Session-tool permission auto-allow belongs in the existing ACP permission handler; do not add a parallel interaction router.

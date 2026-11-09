@@ -15,7 +15,7 @@ type OpencodeMetadataServiceFactory = (
 ) => OpencodeMetadataService;
 
 const DEFAULT_METADATA_SERVICE_FACTORY: OpencodeMetadataServiceFactory =
-  plugin => new OpencodeMetadataService(plugin);
+  plugin => new OpencodeMetadataService(plugin.getRuntimeHost('opencode'), plugin.executionLifecycleRegistry);
 
 export class OpencodeCommandLoader implements ProviderCommandLoaderContract {
   constructor(
@@ -30,6 +30,13 @@ export class OpencodeCommandLoader implements ProviderCommandLoaderContract {
 
   isAvailable(settings: Record<string, unknown>): boolean {
     return getOpencodeProviderSettings(settings).enabled;
+  }
+
+  async watchCommands(context: ProviderCommandLoaderContext, onChange: () => void): Promise<void> {
+    if (!context.signal || !context.allowIsolatedMetadataCreation || !this.isAvailable(context.plugin.settings)) return;
+    const service = this.metadataService ?? this.createMetadataService(context.plugin);
+    try { await service.watchCommands(onChange, context.signal); }
+    finally { if (!this.metadataService) await service.dispose(); }
   }
 
   async loadCommands(

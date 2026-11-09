@@ -7,16 +7,18 @@ import {
   restoreDisplayOnlyCodeFences,
 } from '@/features/chat/rendering/markdown/DisplayOnlyCodeFences';
 import { escapeRawHTMLTags } from '@/features/chat/rendering/markdown/markdownHTML';
-import { MarkdownRenderScope } from '@/features/chat/rendering/markdown/MarkdownRenderScope';
 import { renderMermaidDiagrams } from '@/features/chat/rendering/markdown/MermaidRenderer';
 import { t } from '@/i18n/i18n';
 import { enhanceRenderedCodeFence } from '@/shared/components/CopyableCodeFence';
+import { MarkdownRenderScope } from '@/shared/components/MarkdownRenderScope';
 import { processFileLinks } from '@/utils/fileLink';
 import { replaceImageEmbedsWithHTML } from '@/utils/imageEmbed';
 import {
   escapeMathDelimitersForStreaming,
   normalizeLatexMathDelimiters,
 } from '@/utils/markdownMath';
+
+const RENDER_SCOPE_ATTRIBUTE = 'data-chat-markdown-scope';
 
 export interface RenderContentOptions {
   deferMath?: boolean;
@@ -53,8 +55,12 @@ export class MarkdownContentRenderer {
     this.#releaseOne(el);
     const scope = new MarkdownRenderScope();
     this.#renders.set(el, scope);
+    el.setAttribute(RENDER_SCOPE_ATTRIBUTE, '');
     scope.register(() => {
-      if (this.#renders.get(el) === scope) this.#renders.delete(el);
+      if (this.#renders.get(el) === scope) {
+        this.#renders.delete(el);
+        el.removeAttribute(RENDER_SCOPE_ATTRIBUTE);
+      }
     });
     this.component.addChild(scope);
     scope.load();
@@ -71,9 +77,12 @@ export class MarkdownContentRenderer {
       // as plain text. Trusted plugin markup (image embeds) is injected only
       // after this step, otherwise it would be escaped too.
       const safeMarkdown = escapeRawHTMLTags(renderMarkdown);
+      // Escaping HTML can expose math that was previously hidden in tag attributes or bodies.
+      const visibleMarkdown = options?.deferMath && safeMarkdown !== renderMarkdown
+        ? escapeMathDelimitersForStreaming(safeMarkdown) : safeMarkdown;
       // Plugin-rendered fences stay inert until the message is final, like Mermaid.
       const displayOnlyCodeFences = prepareDisplayOnlyCodeFences(
-        safeMarkdown,
+        visibleMarkdown,
         options?.deferDiagrams ? undefined : getPluginFenceLanguageSet(this.getPluginFenceLanguages()),
       );
       const processedMarkdown = replaceImageEmbedsWithHTML(
@@ -114,18 +123,18 @@ export class MarkdownContentRenderer {
 
   /** Releases renders at or inside `container`, or every render when omitted. */
   release(container?: HTMLElement): void {
-    for (const el of this.#renders.keys()) {
-      if (!container || container === el || container.contains(el)) {
-        this.#releaseOne(el);
-      }
+    if (!container) {
+      for (const el of this.#renders.keys()) this.#releaseOne(el);
+      return;
     }
+    const descendants = container.querySelectorAll<HTMLElement>(`[${RENDER_SCOPE_ATTRIBUTE}]`);
+    this.#releaseOne(container);
+    descendants.forEach(el => this.#releaseOne(el));
   }
 
-  /** Releases the render of an element that has left the root. */
+  /** Releases owned render targets in a subtree that has left the root. */
   releaseRemoved(el: HTMLElement): void {
-    if (this.#renders.has(el) && !this.rootEl.contains(el)) {
-      this.#releaseOne(el);
-    }
+    if (!this.rootEl.contains(el)) this.release(el);
   }
 
   dispose(): void {
@@ -137,6 +146,7 @@ export class MarkdownContentRenderer {
     const scope = this.#renders.get(el);
     if (!scope) return;
     this.#renders.delete(el);
+    el.removeAttribute(RENDER_SCOPE_ATTRIBUTE);
     this.component.removeChild(scope);
   }
 }

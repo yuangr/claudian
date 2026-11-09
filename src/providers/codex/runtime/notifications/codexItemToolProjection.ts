@@ -146,7 +146,7 @@ export function projectCommandToolResult(
 ): CodexToolResultProjection {
   const output = item.aggregatedOutput ?? '';
   return {
-    content: rawResult?.content ?? normalizeCodexToolResult(normalizeCodexToolName('command_execution'), output),
+    content: rawResult?.content ?? output,
     isError: item.exitCode !== null
       ? item.exitCode !== 0
       : rawResult?.isError ?? isCodexToolOutputError(output),

@@ -74,7 +74,12 @@ function readMoveTarget(kind: unknown): string | undefined {
 
 function renderApplyPatchDiffSections(container: HTMLElement, fileDiffs: ApplyPatchFileDiffs): void {
   for (const fileDiff of fileDiffs) {
-    const sectionEl = container.createDiv({ cls: 'claudian-tool-patch-section' });
+    const path = fileDiff.movedTo ? `${fileDiff.filePath} -> ${fileDiff.movedTo}` : fileDiff.filePath;
+    const sectionEl = container.createDiv({
+      cls: 'claudian-tool-patch-section',
+      attr: { role: 'group', 'aria-label': path },
+    });
+    sectionEl.createDiv({ cls: 'claudian-tool-line', text: path });
 
     if (fileDiff.operation === 'delete' && fileDiff.diffLines.length === 0) {
       renderEmptyResult(sectionEl, t('chat.tools.fileDeleted'));

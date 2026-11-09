@@ -1,8 +1,8 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
-import { fireEvent, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
+import { axe } from '@test/helpers/accessibility';
+import { createEvent, fireEvent, waitFor, within } from '@testing-library/dom';
 import { Notice } from 'obsidian';
 
 import type { ToolCallInfo } from '@/core/types';
@@ -11,14 +11,53 @@ import { createInteractionPromptPort } from '@/features/chat/interactions/intera
 import { SessionInteractions } from '@/features/chat/interactions/SessionInteractions';
 import { setLocale } from '@/i18n/i18n';
 import { ClaudeExecutionInteractionRouter } from '@/providers/claude/execution/ClaudeExecutionInteractionRouter';
-
-HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
-HTMLElement.prototype.removeClass = function (...classes) { this.classList.remove(...classes); };
-HTMLElement.prototype.toggleClass = function (name, force) { for (const item of Array.isArray(name) ? name : [name]) this.classList.toggle(item, force); };
-HTMLElement.prototype.scrollIntoView = function () {};
+import { CodexExecutionServerRequestRouter } from '@/providers/codex/execution/CodexExecutionServerRequestRouter';
 
 afterEach(() => { document.body.replaceChildren(); setLocale('en'); });
+
+it('makes long approval details a named keyboard-scrollable region', async () => {
+  const parent = document.body.createDiv();
+  const suppressed = parent.createDiv();
+  const prompts = new SessionInteractions({ getPromptParentEl: () => parent, getSuppressedEl: () => suppressed });
+  const pending = prompts.requestApproval('approval-id', 'Bash', {}, 'A long command description');
+  const details = within(parent).getByRole('region', { name: 'Bash approval details' });
+  details.focus();
+  expect(document.activeElement).toBe(details);
+  const parentKeyDown = vi.fn();
+  parent.addEventListener('keydown', parentKeyDown);
+  for (const key of ['ArrowDown', 'Enter']) {
+    const event = createEvent.keyDown(details, { key });
+    fireEvent(details, event);
+    expect(event.defaultPrevented).toBe(false);
+  }
+  expect(parentKeyDown).not.toHaveBeenCalled();
+  expect(await axe(parent)).toHaveNoViolations();
+  prompts.dismiss('approval-id');
+  await pending;
+});
+
+it('resumes the newest response when an older generation prompt settles last', async () => {
+  const parent = document.body.createDiv();
+  let generation = 1;
+  const resumed: number[] = [];
+  const prompts = new SessionInteractions({
+    getPromptParentEl: () => parent,
+    onBeforeShow: () => {
+      const shownGeneration = generation;
+      return () => resumed.push(shownGeneration);
+    },
+  });
+  const question = { questions: [{ id: '0', question: 'Which check?', options: [{ label: 'History' }] }] };
+  const first = prompts.askUserQuestion('first', question);
+  generation = 2;
+  const second = prompts.askUserQuestion('second', question);
+  prompts.dismiss('second');
+  await second;
+  expect(resumed).toEqual([]);
+  prompts.dismiss('first');
+  await first;
+  expect(resumed).toEqual([2]);
+});
 
 it('keeps an approval requested without a view pending until the user answers after attachment', async () => {
   let parent: HTMLElement | null = null;
@@ -40,7 +79,7 @@ it('keeps answer drafts and an in-flight submission across presentation disposal
   const prompts = new SessionInteractions({ getPromptParentEl: () => parent });
   let fail!: (error: Error) => void;
   const delivery = new Promise<void>((_resolve, reject) => { fail = reject; });
-  const answer = jest.fn().mockReturnValueOnce(delivery).mockResolvedValue(undefined);
+  const answer = vi.fn().mockReturnValueOnce(delivery).mockResolvedValue(undefined);
   let settled = false;
   const pending = prompts.askUserQuestion('question', { questions: [
     { id: 'scope', question: 'Which scope?', isOther: true, options: [{ label: 'All' }] },
@@ -76,7 +115,7 @@ it.each([false, true])('localizes explicit Claude approval choices through the r
   const prompts = new SessionInteractions({ getPromptParentEl: () => parent });
   const router = new ClaudeExecutionInteractionRouter({
     interactionPort: createInteractionPromptPort(() => prompts),
-    sessionInstanceId: 'localized', getTurnId: () => 'turn', isToolAllowed: () => true, onToolBlocked: jest.fn(),
+    sessionInstanceId: 'localized', getTurnId: () => 'turn', isToolAllowed: () => true, onToolBlocked: vi.fn(),
   });
   // Construct the adapter before selecting the locale to catch eagerly translated option arrays.
   setLocale('zh-CN');
@@ -113,8 +152,8 @@ it.each([
   const tool: ToolCallInfo = { id: 'question', name: 'AskUserQuestion', status: 'completed', questionStatus: 'pending', input: {
     replyMode: 'user-message', questions: [{ id: '0', question: 'Which check?', options: [{ label: 'History' }] }],
   } };
-  const steer = jest.fn(async (onDelivery: (accepted: boolean) => void) => { onDelivery(false); return 'accepted' as const; });
-  const submit = jest.fn();
+  const steer = vi.fn(async (onDelivery: (accepted: boolean) => void) => { onDelivery(false); return 'accepted' as const; });
+  const submit = vi.fn();
   const pending = prompts.askUserQuestion('question', tool.input, undefined, {
     onSubmit: answers => deliverAsyncQuestion(tool, answers, {
       providerId: failure === 'unsupported' ? 'claude' : 'codex', assertCurrent: () => undefined,
@@ -140,10 +179,51 @@ it('localizes uncertain answer-delivery feedback without requeueing the native r
   const tool: ToolCallInfo = { id: 'question', name: 'AskUserQuestion', status: 'completed', questionStatus: 'pending', input: {
     replyMode: 'user-message', questions: [{ id: '0', question: 'Which check?', options: [{ label: 'History' }] }],
   } };
-  const submit = jest.fn();
-  const prepare = jest.fn((_reply: { content: string }) => ({ steer: async () => 'uncertain' as const, submit }));
+  const submit = vi.fn();
+  const prepare = vi.fn((_reply: { content: string }) => ({ steer: async () => 'uncertain' as const, submit }));
   await deliverAsyncQuestion(tool, { '0': 'History' }, { providerId: 'codex', assertCurrent: () => undefined, prepare });
   expect(Notice).toHaveBeenCalledWith('无法确认回答是否送达。为避免重复发送，未将其重新加入队列。');
   expect(submit).not.toHaveBeenCalled();
   expect(prepare.mock.calls[0][0].content).toContain('History');
+});
+
+
+it.each([false, true])('honors Codex isSecret=%s during answer review and delivers the original value', async isSecret => {
+  const parent = document.body.createDiv();
+  const prompts = new SessionInteractions({ getPromptParentEl: () => parent });
+  const turn = {
+    localTurnId: 'local-turn', nativeThreadId: 'thread', nativeTurnId: 'turn',
+    toolPolicy: { kind: 'provider-default' } as const, cancellation: new AbortController(),
+  };
+  const router = new CodexExecutionServerRequestRouter('session', createInteractionPromptPort(() => prompts), () => true, () => turn);
+  const pending = router.handleServerRequest('request', 'item/tool/requestUserInput', {
+    threadId: 'thread', turnId: 'turn', itemId: 'item', questions: [{
+      id: 'token', header: 'Token', question: 'Enter API token', options: null, isOther: true, isSecret,
+    }],
+  });
+  try {
+    const region = within(parent).getByRole('region', { name: 'Question' });
+    const input = within(region).getByLabelText('Enter API token');
+    expect(input.getAttribute('type')).toBe(isSecret ? 'password' : 'text');
+    const answer = 'sample-sensitive-token-123';
+    fireEvent.input(input, { target: { value: answer } });
+    fireEvent.click(within(region).getByRole('button', { name: 'Submit' }));
+    expect(within(region).getByText('Review your answers')).toBeDefined();
+    const review = within(region).getByRole('button', { name: 'Edit answer to Enter API token' });
+    expect(review.textContent).toContain(isSecret ? '••••••••' : answer);
+    expect(region.textContent?.includes(answer)).toBe(!isSecret);
+    expect(await axe(region)).toHaveNoViolations();
+
+    // Editing the masked review preserves the underlying answer in its original input type.
+    fireEvent.click(review);
+    const restoredInput = within(region).getByLabelText('Enter API token') as HTMLInputElement;
+    expect(restoredInput.type).toBe(isSecret ? 'password' : 'text');
+    expect(restoredInput.value).toBe(answer);
+    fireEvent.click(within(region).getByRole('button', { name: 'Submit' }));
+    fireEvent.click(within(region).getByRole('button', { name: 'Submit answers' }));
+    await expect(pending).resolves.toEqual({ answers: { token: { answers: [answer] } } });
+  } finally {
+    router.abortAll('cancelled');
+    await pending;
+  }
 });

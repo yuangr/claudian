@@ -74,6 +74,25 @@
   background: transparent;
 }
 
+/* Icon tabs: each icon in its provider's logo colour, dimmed until hovered, focused or selected. */
+.claudian-settings button.claudian-settings-provider-tab--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+}
+
+.claudian-settings-provider-icon {
+  width: 16px;
+  height: 16px;
+  color: var(--claudian-provider-logo);
+  opacity: 0.55;
+}
+
+.claudian-settings button.claudian-settings-provider-tab:is(:hover, :focus-visible, .claudian-settings-provider-tab--active) .claudian-settings-provider-icon {
+  opacity: 1;
+}
+
 .claudian-settings-provider-content {
   display: none;
 }
@@ -252,4 +271,13 @@
   gap: 4px;
   margin-left: 16px;
   flex-shrink: 0;
+}
+
+/* Focus lives on the native switch input; keep the host's visible toggle ring. */
+.claudian-setting-toggle:focus-within {
+  outline: var(--toggle-s-border-width) solid var(--background-modifier-border-focus);
+}
+
+.modal .claudian-setting-toggle:focus-within {
+  outline-width: var(--toggle-border-width);
 }

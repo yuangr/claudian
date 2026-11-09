@@ -11,7 +11,7 @@ interface ACPToolStreamState {
   rawOutput?: unknown;
 }
 
-export type ACPToolRawNameProvenance = 'fallback' | 'kind' | 'mapped-kind' | 'title';
+export type ACPToolRawNameProvenance = 'fallback' | 'kind' | 'title';
 
 export interface ACPResolvedToolRawName {
   provenance: ACPToolRawNameProvenance;
@@ -23,12 +23,21 @@ export interface ACPToolStreamPresentationAdapter {
   normalizeToolInput(rawName: string | undefined, input: Record<string, unknown>, rawOutput?: unknown): Record<string, unknown>;
   /** Raw input/output let dispatcher tools present the tool they dispatch to. */
   normalizeToolName(rawName: string | undefined, rawInput?: unknown, rawOutput?: unknown): string;
-  /** Provider-specific result fields; they override the shared ACP diff field by field. */
+  /** Provider-owned result presentation, including outcomes carried in native metadata. */
+  normalizeToolResult?(
+    rawName: string | undefined,
+    content: string,
+    rawOutput: unknown,
+  ): { content: string; isError: boolean };
+  /**
+   * Provider-specific result fields; they override the shared ACP diff field by field. The tool call id
+   * correlates results with data the provider received outside the tool stream.
+   */
   normalizeToolResultDetails(
     rawName: string | undefined,
     input: Record<string, unknown>,
     rawOutput: unknown,
-    rawInput: unknown,
+    toolCallId: string,
   ): ToolResultDetails | undefined;
   /** Lossless native fields attached to the tool's start and result. */
   buildToolProviderPayload?(
@@ -114,8 +123,11 @@ export class ACPToolStreamAdapter {
       provenance: current.rawNameProvenance,
       rawName: current.rawName,
     } : undefined, update);
-    const rawInput = update.rawInput !== undefined ? update.rawInput : current?.rawInput;
-    const rawOutput = update.rawOutput !== undefined ? update.rawOutput : current?.rawOutput;
+    // ACP v1 treats null raw fields like omitted updates; an initial null remains native payload.
+    const rawInput = update.rawInput !== undefined && (update.rawInput !== null || !current)
+      ? update.rawInput : current?.rawInput;
+    const rawOutput = update.rawOutput !== undefined && (update.rawOutput !== null || !current)
+      ? update.rawOutput : current?.rawOutput;
     if (
       current && rawInput === current.rawInput && rawOutput === current.rawOutput
       && nextRawName.rawName === current.rawName
@@ -144,14 +156,16 @@ export class ACPToolStreamAdapter {
           ...this.#buildProviderPayloadFields(state),
         };
       case 'tool_result': {
+        const result = this.adapter.normalizeToolResult?.(state.rawName, chunk.content, state.rawOutput);
         const resultDetails = mergeToolResultDetails(chunk.resultDetails, this.adapter.normalizeToolResultDetails(
           state.rawName,
           state.input,
           state.rawOutput,
-          state.rawInput,
+          chunk.id,
         ));
         return {
           ...chunk,
+          ...(result ? { content: result.content, isError: chunk.isError || result.isError } : {}),
           ...(resultDetails ? { resultDetails } : {}),
           ...this.#buildProviderPayloadFields(state),
         };

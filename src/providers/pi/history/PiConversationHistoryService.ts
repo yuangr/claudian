@@ -1,30 +1,37 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 import { copyProviderHistoryState } from '@/core/providers/providerHistory';
+import { readFileRevision } from '@/utils/fileRevision';
 
 import { mergePersistedProviderState } from '../../../core/providers/providerState';
 import type {
   ProviderConversationHistoryService,
   ProviderHistoryInput,
-  ProviderHistoryPathContext,
   ProviderHistoryResult,
   ProviderHistoryState,
   ProviderHistoryUpdate,
 } from '../../../core/providers/types';
 import type { ChatMessage } from '../../../core/types';
+import { piHostPath } from '../runtime/piTargetPaths';
 import {
   addPiPreviousSession,
   buildPersistedPiState,
   clearPiResumeState,
   getPiState,
   type PiPreviousSession,
+  type PiProviderState,
 } from '../types';
+import { PiHistoryContextResolver } from './PiHistoryContextResolver';
 import {
   isPiSessionPathReference,
+  type PiHistoryPathContext,
+  resolvePiHistoryTarget,
   resolvePiSessionFileHint,
 } from './PiHistoryPathResolver';
 import {
+  followPiLeafAppends,
   type ParsedPiSessionEntries,
   parsePiSessionContent,
   parsePiSessionModel,
@@ -34,6 +41,7 @@ import {
 } from './PiHistoryStore';
 
 const PI_PROVIDER_STATE_KEYS = [
+  'bindingRetired', // Retired-binding migration.
   'treeCursor',
   'treeSelections',
   'forkSource',
@@ -46,6 +54,7 @@ const PI_PROVIDER_STATE_KEYS = [
 ] as const;
 
 export class PiConversationHistoryService implements ProviderConversationHistoryService {
+  private readonly contextResolver = new PiHistoryContextResolver();
 
   hasConversationModelRecoverySource(conversation: ProviderHistoryInput): boolean {
     const state = getPiState(conversation.providerState);
@@ -61,8 +70,9 @@ export class PiConversationHistoryService implements ProviderConversationHistory
   async recoverConversationModelSelection(
     conversation: ProviderHistoryInput,
     vaultPath: string | null,
-    pathContext?: ProviderHistoryPathContext,
+    pathContext?: PiHistoryPathContext,
   ): Promise<string | null> {
+    if (pathContext) pathContext = await this.contextResolver.resolve(vaultPath, pathContext);
     const state = getPiState(conversation.providerState);
     const isPendingFork = this.isPendingForkConversation(conversation);
     const sessionId = isPendingFork
@@ -79,7 +89,10 @@ export class PiConversationHistoryService implements ProviderConversationHistory
     try {
       const content = await readPiSessionEntries(sessionFile);
       const cursor = state.treeCursor ? resolvePiTreeCursor(content.entries, state.treeCursor) : undefined;
-      return parsePiSessionModel(content, isPendingFork ? state.forkSource!.resumeAt : cursor ? cursor.leafId : state.leafEntryId);
+      // The same leaf hydration shows: a turn leaf follows turns other Pi clients appended to it.
+      const leafEntryId = cursor ? cursor.leafId
+        : state.leafEntryId ? followPiLeafAppends(content.entries, state.leafEntryId) : state.leafEntryId;
+      return parsePiSessionModel(content, isPendingFork ? state.forkSource!.resumeAt : leafEntryId);
     } catch {
       return null;
     }
@@ -88,10 +101,13 @@ export class PiConversationHistoryService implements ProviderConversationHistory
   async hydrateConversationHistory(
     input: ProviderHistoryInput,
     vaultPath: string | null,
-    pathContext?: ProviderHistoryPathContext,
+    pathContext?: PiHistoryPathContext,
   ): Promise<ProviderHistoryUpdate> {
     const conversation = copyProviderHistoryState(input);
     const state = getPiState(conversation.providerState);
+    if (!state.sessionId && !conversation.sessionId && !state.sessionFile && !state.forkSource && !state.previousSessions?.length) return conversation;
+    if (pathContext) pathContext = await this.contextResolver.resolve(vaultPath, pathContext);
+    const executionTarget = pathContext ? resolvePiHistoryTarget(vaultPath, pathContext) : undefined;
     if (this.isPendingForkConversation(conversation)) {
       const sourceSessionFile = await this.#resolvePreviousSessionFile(
         {
@@ -108,6 +124,7 @@ export class PiConversationHistoryService implements ProviderConversationHistory
         'forkSourceSessionFile',
         state.forkSourceSessionFile,
         sourceSessionFile,
+        executionTarget,
       );
       if (conversation.messages.length > 0) {
         return conversation;
@@ -181,6 +198,7 @@ export class PiConversationHistoryService implements ProviderConversationHistory
           'sessionFile',
           item.source.sessionFile,
           sessionFile,
+          executionTarget,
         );
       }
       if (sessionFile) {
@@ -213,13 +231,19 @@ export class PiConversationHistoryService implements ProviderConversationHistory
       try {
         const cursor = source.kind === 'current' && state.treeCursor
           ? resolvePiTreeCursor(content.entries, state.treeCursor) : undefined;
+        // An explicit branch selection keeps its cursor rules; a turn leaf follows turns other Pi clients append.
+        const leafEntryId = !cursor && source.kind === 'current' && source.leafEntryId
+          ? followPiLeafAppends(content.entries, source.leafEntryId) : source.leafEntryId;
         const sourceMessages = parsePiSessionContent(content, {
-          leafEntryId: cursor ? cursor.leafId : source.leafEntryId,
+          leafEntryId: cursor ? cursor.leafId : leafEntryId,
           includeBranches: source.kind === 'current',
           requireLeafEntryId: !!source.leafEntryId || !!state.treeCursor,
           syntheticIdNamespace: source.sessionFile,
         });
         if (source.kind === 'current') readCurrent = true;
+        if (leafEntryId !== source.leafEntryId) {
+          conversation.providerState = { ...conversation.providerState, leafEntryId };
+        }
         if (cursor) {
           conversation.providerState = { ...conversation.providerState, treeCursor: cursor };
           if (cursor.leafId === null) delete conversation.providerState.leafEntryId;
@@ -247,6 +271,69 @@ export class PiConversationHistoryService implements ProviderConversationHistory
     }
 
     conversation.messages = dedupeMessages(messages);
+    return conversation;
+  }
+
+  /** Revision of the live session file; previous sessions are frozen and pending forks have none. */
+  async readNativeHistoryRevision(
+    conversation: ProviderHistoryInput,
+    vaultPath: string | null,
+    pathContext?: PiHistoryPathContext,
+  ): Promise<string | null> {
+    if (this.isPendingForkConversation(conversation)) return null;
+    const state = getPiState(conversation.providerState);
+    const sessionId = state.sessionId ?? conversation.sessionId;
+    if (!state.sessionFile && !sessionId) return null;
+    try {
+      if (pathContext) pathContext = await this.contextResolver.resolve(vaultPath, pathContext);
+      const sessionFile = resolvePiSessionFileHint(state.sessionFile, sessionId, vaultPath, pathContext);
+      return sessionFile ? await readFileRevision(sessionFile) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Retired-binding migration (#1647, added 2026-10-16; remove after 2027-01-16).
+   * Earlier versions retired live bindings on launch-only changes without marking them. The latest
+   * session is restored once when it is still this conversation's own transcript in the configured
+   * store. A pending fork retires into its source session, which predates the fork.
+   */
+  async recoverConversationSessionReference(
+    input: ProviderHistoryInput,
+    vaultPath: string | null,
+    pathContext?: PiHistoryPathContext,
+  ): Promise<ProviderHistoryUpdate | null> {
+    const conversation = copyProviderHistoryState(input);
+    const state = getPiState(conversation.providerState);
+    const latest = state.previousSessions?.at(-1);
+    if (
+      !latest || state.bindingRetired || !vaultPath || !pathContext || input.createdAt === undefined
+      || conversation.sessionId || state.sessionId || state.sessionFile || state.forkSource
+    ) {
+      return null;
+    }
+
+    pathContext = await this.contextResolver.resolve(vaultPath, pathContext);
+    const sessionFile = resolvePiSessionFileHint(latest.sessionFile, latest.sessionId, vaultPath, pathContext);
+    const sessionId = sessionFile
+      ? await readOwnPiSessionId(sessionFile, latest, vaultPath, input.createdAt, pathContext)
+      : null;
+    const nextState: PiProviderState = sessionFile && sessionId
+      ? {
+        ...state,
+        previousSessions: state.previousSessions!.slice(0, -1),
+        sessionFile,
+        sessionId,
+        ...(latest.leafEntryId ? { leafEntryId: latest.leafEntryId } : {}),
+      }
+      : { ...state, bindingRetired: true };
+    conversation.sessionId = sessionId;
+    conversation.providerState = mergePersistedProviderState(
+      conversation.providerState,
+      PI_PROVIDER_STATE_KEYS,
+      buildPersistedPiState(nextState) as Record<string, unknown> | undefined,
+    );
     return conversation;
   }
 
@@ -322,8 +409,9 @@ export class PiConversationHistoryService implements ProviderConversationHistory
     resumeAt: string,
     sourceProviderState?: Record<string, unknown>,
     vaultPath: string | null = null,
-    pathContext?: ProviderHistoryPathContext,
+    pathContext?: PiHistoryPathContext,
   ): Promise<Record<string, unknown>> {
+    if (pathContext) pathContext = await this.contextResolver.resolve(vaultPath, pathContext);
     const sourceState = getPiState(sourceProviderState);
     const candidates: PiForkSourceCandidate[] = [];
     const addCandidate = (source: PiPreviousSession, sessionFile: string | null): void => {
@@ -369,6 +457,9 @@ export class PiConversationHistoryService implements ProviderConversationHistory
       );
     }
     const dedupedCandidates = dedupeForkSources(candidates);
+    if (dedupedCandidates.length === 0 && pathContext && resolvePiHistoryTarget(vaultPath, pathContext).method === 'wsl') {
+      throw new Error('Cannot fork Pi session: the source file is unavailable in the current WSL store.');
+    }
     const matchingSource = await findForkSourceContainingCheckpoint(dedupedCandidates, resumeAt)
       ?? dedupedCandidates[0]
       ?? { sessionId: sourceSessionId };
@@ -397,11 +488,16 @@ export class PiConversationHistoryService implements ProviderConversationHistory
     field: 'forkSourceSessionFile' | 'sessionFile',
     persistedPath: string | undefined,
     resolvedPath: string | null,
+    executionTarget?: ExecutionTarget,
   ): void {
     if (!persistedPath || persistedPath === resolvedPath) {
       return;
     }
 
+    if (!resolvedPath && executionTarget?.method === 'wsl') {
+      clearPiResumeState(conversation);
+      return;
+    }
     const nextState = { ...getPiState(conversation.providerState) };
     if (resolvedPath) {
       nextState[field] = resolvedPath;
@@ -418,7 +514,7 @@ export class PiConversationHistoryService implements ProviderConversationHistory
   async #resolvePreviousSessionFile(
     source: PiPreviousSession,
     vaultPath: string | null,
-    pathContext?: ProviderHistoryPathContext,
+    pathContext?: PiHistoryPathContext,
     preferResolvedPath = false,
   ): Promise<string | null> {
     const resolved = resolvePiSessionFileHint(
@@ -433,17 +529,18 @@ export class PiConversationHistoryService implements ProviderConversationHistory
     if (
       preferResolvedPath
       && resolved
-      && await isMatchingArchivedPiSession(resolved, source, vaultPath)
+      && await isMatchingArchivedPiSession(resolved, source, vaultPath, pathContext)
     ) {
       return resolved;
     }
     if (
-      source.sessionFile
-      && await isMatchingArchivedPiSession(source.sessionFile, source, vaultPath)
+      (!pathContext || resolvePiHistoryTarget(vaultPath, pathContext).method !== 'wsl')
+      && source.sessionFile
+      && await isMatchingArchivedPiSession(source.sessionFile, source, vaultPath, pathContext)
     ) {
       return source.sessionFile;
     }
-    if (resolved && await isMatchingArchivedPiSession(resolved, source, vaultPath)) {
+    if (resolved && await isMatchingArchivedPiSession(resolved, source, vaultPath, pathContext)) {
       return resolved;
     }
     return null;
@@ -528,6 +625,7 @@ async function isMatchingArchivedPiSession(
   sessionFile: string,
   source: PiPreviousSession,
   vaultPath: string | null,
+  pathContext?: PiHistoryPathContext,
 ): Promise<boolean> {
   const header = await readPiSessionHeader(sessionFile);
   if (!header) {
@@ -551,7 +649,24 @@ async function isMatchingArchivedPiSession(
     return false;
   }
 
-  return await resolveRealPath(header.cwd) === await resolveRealPath(vaultPath);
+  const target = pathContext ? resolvePiHistoryTarget(vaultPath, pathContext) : undefined;
+  return await resolveRealPath(piHostPath(header.cwd, target)) === await resolveRealPath(vaultPath);
+}
+
+/** Retired-binding migration: the session's own id when it started no earlier than its conversation. */
+async function readOwnPiSessionId(
+  sessionFile: string,
+  source: PiPreviousSession,
+  vaultPath: string,
+  createdAt: number,
+  pathContext?: PiHistoryPathContext,
+): Promise<string | null> {
+  if (!await isMatchingArchivedPiSession(sessionFile, source, vaultPath, pathContext)) return null;
+  const header = await readPiSessionHeader(sessionFile);
+  const startedAt = typeof header?.timestamp === 'string' ? Date.parse(header.timestamp) : Number.NaN;
+  return typeof header?.id === 'string' && header.id.trim() && startedAt >= createdAt
+    ? header.id.trim()
+    : null;
 }
 
 async function resolveRealPath(value: string): Promise<string> {

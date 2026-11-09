@@ -6,7 +6,7 @@ import type { DiffLine } from '@/core/types/diff';
 import { setupCollapsible } from '@/features/chat/rendering/collapsible';
 import { renderDiffContent, renderDiffStats } from '@/features/chat/rendering/tools/DiffRenderer';
 import { fileNameOnly } from '@/features/chat/rendering/tools/toolContentPrimitives';
-import { getToolLabel } from '@/features/chat/rendering/tools/toolPresentation';
+import { getToolLabel, getToolName, getToolSummary } from '@/features/chat/rendering/tools/toolPresentation';
 import { t } from '@/i18n/i18n';
 
 export interface WriteEditState {
@@ -21,6 +21,7 @@ export interface WriteEditState {
   isExpanded: boolean;
   diffLines?: DiffLine[];
   diffDirty?: boolean;
+  refreshHeader: () => void;
 }
 
 export interface WriteEditRenderOptions {
@@ -77,7 +78,7 @@ export function createWriteEditBlock(
   options: WriteEditRenderOptions = {}
 ): WriteEditState {
   const {
-    wrapperEl, headerEl, nameEl, summaryEl, statsEl, statusEl, contentEl, baseAriaLabel,
+    wrapperEl, headerEl, nameEl, summaryEl, statsEl, statusEl, contentEl,
   } = createWriteEditElements(parentEl, toolCall);
 
   statusEl.addClass('status-running');
@@ -99,12 +100,17 @@ export function createWriteEditBlock(
     statusEl,
     toolCall,
     isExpanded: false,
+    refreshHeader: () => {
+      nameEl.setText(getToolName(state.toolCall.name, state.toolCall.input));
+      summaryEl.setText(getToolSummary(state.toolCall.name, state.toolCall.input));
+      refreshLabel();
+    },
   };
 
   // Setup collapsible behavior (handles click, keyboard, ARIA, CSS)
-  setupCollapsible(wrapperEl, headerEl, contentEl, state, {
+  const refreshLabel = setupCollapsible(wrapperEl, headerEl, contentEl, state, {
     initiallyExpanded: options.initiallyExpanded ?? false,
-    baseAriaLabel,
+    baseAriaLabel: () => getToolLabel(state.toolCall.name, state.toolCall.input),
     onToggle: expanded => { if (expanded) renderCurrentDiff(state); },
   });
 

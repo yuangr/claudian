@@ -1,19 +1,19 @@
 import { parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTargetAsync } from '@/core/process/execution-target/ExecutionTargetResolver';
 import type { ProviderModelCatalogController } from '@/core/providers/models/ProviderModelCatalog';
-import { getRuntimeEnvironmentText } from '@/core/providers/providerEnvironment';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import type { ProviderWorkspaceRegistration, ProviderWorkspaceServices } from '@/core/providers/types';
-import { getVaultPath } from '@/utils/path';
 
 import { DeepSeekCommandCatalog } from '../commands/DeepSeekCommandCatalog';
+import { decodeDeepSeekConfig } from '../config';
 import { DeepSeekSessionArchiveService } from '../history/DeepSeekSessionArchiveService';
-import { DeepSeekCLIResolver } from '../runtime/DeepSeekCLIResolver';
+import { DeepSeekCLIResolver, resolveDeepSeekWSLCLIPath } from '../runtime/DeepSeekCLIResolver';
+import { resolveDeepSeekExecutionContext } from '../runtime/DeepSeekExecutionContext';
 import { DeepSeekHost, type DeepSeekProcessFactory } from '../runtime/DeepSeekHost';
 import { DeepSeekHostProcess } from '../runtime/DeepSeekHostProcess';
 import { createDeepSeekModels } from '../runtime/DeepSeekModels';
 import { parseDeepSeekPresetPlugins } from '../runtime/DeepSeekPresetPlugins';
-import { getDeepSeekProviderSettings } from '../settings';
 import { createDeepSeekSettingsTabRenderer } from '../ui/DeepSeekSettingsTab';
 import { createDeepSeekCommandLoader } from './DeepSeekCommandLoader';
 
@@ -25,15 +25,22 @@ export interface DeepSeekWorkspaceServices extends ProviderWorkspaceServices {
 }
 
 export function createDeepSeekWorkspaceServices(host: ProviderHost, start: DeepSeekProcessFactory = (options, signal) => DeepSeekHostProcess.start(options, signal)): DeepSeekWorkspaceServices {
+  const runtimeHost = host.getRuntimeHost('deepseek');
   const cliResolver = new DeepSeekCLIResolver();
   const deepseek = new DeepSeekHost(async () => {
-    const cliPath = await host.getResolvedProviderCliPath('deepseek');
+    const current = decodeDeepSeekConfig(runtimeHost.config);
+    const cwd = host.workingDirectory ?? process.cwd();
+    const target = await resolveExecutionTargetAsync({ settings: current, hostVaultPath: cwd });
+    const cliPath = target.method === 'wsl' ? resolveDeepSeekWSLCLIPath(current) : await runtimeHost.resolveCliPath();
     if (!cliPath) throw new Error('DeepSeek Harness was not found. Install and configure dsh or DeepSeek Harness Desktop, or set its path in settings.');
-    const environment = { ...process.env, ...parseEnvironmentVariables(getRuntimeEnvironmentText(host.settings, 'deepseek')) };
-    const presetPlugins = parseDeepSeekPresetPlugins(getDeepSeekProviderSettings(host.settings).presetPlugins);
-    return { cliPath, environment, cwd: getVaultPath(host.app) ?? process.cwd(), presetPlugins };
-  }, start);
-  const modelCatalog = createDeepSeekModels(host, signal => deepseek.read(client => client.call('session/modelCatalog'), signal));
+    const environmentText = runtimeHost.environmentText;
+    const environment = Object.fromEntries(Object.entries({ ...process.env, ...parseEnvironmentVariables(environmentText) })
+      .filter((entry): entry is [string, string] => entry[1] !== undefined));
+    const execution = await resolveDeepSeekExecutionContext(target, cwd, environment, environmentText);
+    const presetPlugins = parseDeepSeekPresetPlugins(current.presetPlugins, target.platformOs === 'linux' ? 'linux' : process.platform);
+    return { cliPath, environment, cwd, presetPlugins, execution };
+  }, start, undefined, host.sessionToolEndpoint);
+  const modelCatalog = createDeepSeekModels(runtimeHost, signal => deepseek.read(client => client.call('session/modelCatalog'), signal));
   const sessionArchive = new DeepSeekSessionArchiveService(deepseek);
   // Execution leases are released before these hooks run; the Host then restarts lazily with the new settings.
   const offTransition = host.executionLifecycleRegistry.registerTransitionHook('deepseek', {

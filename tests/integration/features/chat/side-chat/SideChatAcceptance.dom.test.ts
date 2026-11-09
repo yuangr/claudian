@@ -1,7 +1,8 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
 import { createClaudianView } from '@test/helpers/features/chat/ClaudianViewHarness';
+import { createProjectsFake, projectRecord } from '@test/helpers/features/chat/ProjectsFake';
 import {
   createHarness,
   releaseSideChatHarnesses,
@@ -10,13 +11,15 @@ import {
 import { testDate } from '@test/helpers/testClock';
 import { fireEvent, screen, waitFor } from '@testing-library/dom';
 
+import { buildSystemPrompt } from '@/core/prompt/mainAgent';
+import { renderProjectMemberInstructions } from '@/core/prompt/projectPrompt';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { buildTabRuntimePorts } from '@/features/chat/tabs/runtime/TabRuntimePorts';
 
 afterEach(releaseSideChatHarnesses);
 
 it('delivers an admitted prompt to the child even when the panel collapses during preparation', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const started = harness.controller.handleCommandSubmission('Explore B', []);
   await waitFor(() => expect(harness.backend.sessions).toHaveLength(1));
 
@@ -34,8 +37,40 @@ it('delivers an admitted prompt to the child even when the panel collapses durin
   expect(screen.getByRole('button', { name: 'Side chat' })).toBeTruthy();
 });
 
+it.each([true, false])('freezes the side-chat Main Agent prompt and project text at start (live project: %s)', async live => {
+  const harness = await createHarness();
+  const record = projectRecord({ id: 'project-1', name: 'Launch', instructions: 'Ship the beta.' });
+  const projects = createProjectsFake(live ? [record] : []);
+  Object.assign(harness.plugin, {
+    projects,
+    getConversationSync: (id: string) => ({ id, providerId: 'claude', projectId: record.id }),
+  });
+  const { started } = await startSideChat(harness);
+  harness.backend.latest.establishChild('child-session');
+  harness.backend.latest.complete();
+  await started;
+
+  // Later project edits, deletion or the parent leaving never reach the started side chat.
+  projects.put({ ...record, name: 'Renamed', instructions: 'Changed.' });
+  Object.assign(harness.plugin, { getConversationSync: (id: string) => ({ id, providerId: 'claude' }) });
+  Object.assign((harness.plugin as { settings: object }).settings, { systemPrompt: 'Changed custom prompt.', userName: 'Changed user' });
+  const second = harness.controller.runtime!.submit({ content: 'Explore C' });
+  await waitFor(() => expect(harness.backend.latest.requests).toHaveLength(2));
+  harness.backend.latest.complete();
+  await second;
+
+  const expected = {
+    ...(live ? { projectId: record.id } : {}),
+    kind: 'main-agent',
+    instructions: buildSystemPrompt({
+      vaultPath: harness.plugin.providerHost.workingDirectory!, sessionInstructions: live ? renderProjectMemberInstructions(record) : undefined,
+    }),
+  };
+  expect(harness.backend.latest.requests.map(request => request.configuration.systemInstructions)).toEqual([expected, expected]);
+});
+
 it('admits only one child per main conversation while startup is pending', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const first = harness.controller.handleCommandSubmission('Explore B', []);
   const second = harness.controller.handleCommandSubmission('Explore C', []);
   await waitFor(() => expect(harness.backend.sessions).toHaveLength(1));
@@ -48,7 +83,7 @@ it('admits only one child per main conversation while startup is pending', async
 });
 
 it('keeps one composer mounted and the collapsed status bar visible for every state', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   const composerCount = () => harness.composerEl.querySelectorAll('.claudian-input-wrapper').length;
   expect(composerCount()).toBe(1);
@@ -70,7 +105,7 @@ it('keeps one composer mounted and the collapsed status bar visible for every st
 });
 
 it('surfaces a collapsed side approval without changing the composer destination', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.controller.collapse();
 
@@ -97,8 +132,8 @@ it('surfaces a collapsed side approval without changing the composer destination
   expect(harness.controller.destination).toBe('side');
 });
 
-it('disposes the child when its bound main conversation is replaced but keeps it on tab switching', async () => {
-  const harness = createHarness();
+it('keeps the child on tab switching and disposes it with the parent owner', async () => {
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.establishChild('child-session');
   harness.backend.latest.complete();
@@ -107,18 +142,17 @@ it('disposes the child when its bound main conversation is replaced but keeps it
 
   harness.controller.setTabActive(false);
   harness.controller.setTabActive(true);
-  harness.controller.handleConversationChanged('conversation-1');
-  expect(harness.controller.hasSideChat).toBe(true);
+  expect(harness.controller.runtime).not.toBeNull();
   expect(native.disposeCalls).toBe(0);
 
-  harness.controller.handleConversationChanged('conversation-2');
+  await harness.controller.dispose();
   await waitFor(() => expect(native.disposeCalls).toBe(1));
-  expect(harness.controller.hasSideChat).toBe(false);
+  expect(harness.controller.runtime).toBeNull();
   expect(screen.queryByRole('heading', { name: 'Side chat' })).toBeNull();
 });
 
 it('is safe to discard repeatedly and cannot be resurrected by late events', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   const native = harness.backend.latest;
 
@@ -128,14 +162,14 @@ it('is safe to discard repeatedly and cannot be resurrected by late events', asy
   expect(await started).toBe(true);
 
   native.emitSessionEvent({ type: 'commands_changed' });
-  expect(harness.controller.hasSideChat).toBe(false);
+  expect(harness.controller.runtime).toBeNull();
   expect(screen.queryByRole('heading', { name: 'Side chat' })).toBeNull();
 });
 
 it.each([false, true])('shows completed side work duration and the completion timestamp (compaction: %s)', async compaction => {
-  const harness = createHarness({ settings: { showMessageTimestamps: true } });
-  const elapsed = jest.spyOn(performance, 'now').mockReturnValue(1000);
-  const clock = jest.spyOn(Date, 'now').mockReturnValue(testDate().getTime());
+  const harness = await createHarness({ settings: { showMessageTimestamps: true } });
+  const elapsed = vi.spyOn(performance, 'now').mockReturnValue(1000);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(testDate().getTime());
   try {
     const { started } = await startSideChat(harness);
     harness.backend.latest.establishChild('child-session');
@@ -157,7 +191,7 @@ it.each([false, true])('shows completed side work duration and the completion ti
 
 it('refreshes side completion timestamps when the view timestamp setting changes', async () => {
   const settings = { showMessageTimestamps: false };
-  const harness = createHarness({ settings });
+  const harness = await createHarness({ settings });
   const mainRenderer = new MessageRenderer(harness.plugin, {} as never, document.createElement('div'));
   const tab = buildTabRuntimePorts(
     {} as never,
@@ -166,22 +200,22 @@ it('refreshes side completion timestamps when the view timestamp setting changes
     harness.plugin,
     () => { throw new Error('Timestamp refresh must not read the runtime'); },
   );
-  const view = createClaudianView({ tabManager: { getAllTabs: () => [tab] } });
-  const clock = jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-09-20T10:00:00Z').getTime());
+  const view = await createClaudianView({ tabManager: { getAllTabs: () => [Object.assign(harness.tab, tab)] } });
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(testDate().getTime());
   try {
     const { started } = await startSideChat(harness);
     harness.backend.latest.emitText('A side answer.');
-    const completedAt = new Date('2026-09-20T10:00:03Z');
+    const completedAt = testDate({ seconds: 3 });
     clock.mockReturnValue(completedAt.getTime());
     harness.backend.latest.complete();
     await started;
     harness.controller.collapse();
     const label = completedAt.toLocaleString(undefined, { hourCycle: 'h23' });
     expect(screen.queryByLabelText(label)).toBeNull();
-    settings.showMessageTimestamps = true;
+    harness.plugin.settings.showMessageTimestamps = true;
     view.refreshMessageTimestamps();
     expect(screen.getByLabelText(label)).toBeTruthy();
-    settings.showMessageTimestamps = false;
+    harness.plugin.settings.showMessageTimestamps = false;
     view.refreshMessageTimestamps();
     expect(screen.queryByLabelText(label)).toBeNull();
   } finally {
@@ -191,7 +225,7 @@ it('refreshes side completion timestamps when the view timestamp setting changes
 });
 
 it('keeps the side answer completed when cancellation follows native completion', async () => {
-  const harness = createHarness();
+  const harness = await createHarness();
   const { started } = await startSideChat(harness);
   harness.backend.latest.emitText('Completed answer');
   harness.backend.latest.complete();
@@ -199,4 +233,25 @@ it('keeps the side answer completed when cancellation follows native completion'
   await started;
   expect(screen.getByRole('button', { name: /Worked for/ })).toBeTruthy();
   expect(screen.queryByText('Interrupted')).toBeNull();
+});
+
+it('gives the child the parent conversation\'s session tools and releases them with the child', async () => {
+  const harness = await createHarness();
+  const port = { list: vi.fn(), send: vi.fn(), read: vi.fn() };
+  const release = vi.fn();
+  const bindSessionTools = vi.fn((_conversationId: string) => ({ port, dispose: release }));
+  Object.assign(harness.plugin, { bindSessionTools });
+  const { started } = await startSideChat(harness);
+  const native = harness.backend.latest;
+  // The side chat acts for its parent session, with the same tools main chat has.
+  expect(bindSessionTools.mock.calls).toEqual([['conversation-1']]);
+  expect(native.config.sessionTools).toBe(port);
+  native.establishChild('child-session');
+  native.complete();
+  await started;
+  expect(release).not.toHaveBeenCalled();
+
+  await harness.controller.discard();
+  expect(native.disposeCalls).toBe(1);
+  expect(release).toHaveBeenCalledTimes(1);
 });

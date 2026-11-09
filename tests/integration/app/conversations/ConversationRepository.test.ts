@@ -25,16 +25,16 @@ function fixture() {
   };
   const persistence = {
     metadataReader: {
-      revalidate: jest.fn().mockResolvedValue([]),
-      load: jest.fn().mockResolvedValue(null),
-      scan: jest.fn().mockResolvedValue({ records: [], complete: true, invalidMetadataCount: 0 }),
-      loadMetadata: jest.fn().mockResolvedValue(null),
-      scanMetadata: jest.fn().mockResolvedValue({ metadata: [], complete: true, invalidMetadataCount: 0 }),
-      listMetadata: jest.fn().mockResolvedValue([]),
+      revalidate: vi.fn().mockResolvedValue([]),
+      load: vi.fn().mockResolvedValue(null),
+      scan: vi.fn().mockResolvedValue({ records: [], complete: true, invalidMetadataCount: 0 }),
+      loadMetadata: vi.fn().mockResolvedValue(null),
+      scanMetadata: vi.fn().mockResolvedValue({ metadata: [], complete: true, invalidMetadataCount: 0 }),
+      listMetadata: vi.fn().mockResolvedValue([]),
     },
-    saveMetadata: jest.fn().mockResolvedValue(undefined),
-    deleteCurrentMetadata: jest.fn().mockResolvedValue(undefined),
-    assignMetadataToDevice: jest.fn().mockResolvedValue(undefined),
+    saveMetadata: vi.fn().mockResolvedValue(undefined),
+    deleteCurrentMetadata: vi.fn().mockResolvedValue(undefined),
+    assignMetadataToDevice: vi.fn().mockResolvedValue(undefined),
   };
   const settings = structuredClone(DEFAULT_CLAUDIAN_SETTINGS);
   const repository = new ConversationRepository({
@@ -47,6 +47,7 @@ function fixture() {
   const runtimeSettings = new RuntimeSettingsCoordinator({
     settings: new SettingsCoordinator(settings, async () => undefined),
     conversations: repository, getSettings: () => settings, canCompleteInvalidations: () => false,
+    executionLifecycle: new ProviderExecutionLifecycleRegistry(),
   });
   return { conversation, persistence, repository, runtimeSettings };
 }
@@ -54,9 +55,9 @@ function fixture() {
 test('failed pin persistence preserves committed state and allows a real retry', async () => {
   const { repository, persistence, conversation } = fixture();
   persistence.saveMetadata.mockRejectedValueOnce(new Error('disk unavailable'));
-  await expect(repository.setPinned(conversation.id, true)).rejects.toThrow('disk unavailable');
+  await expect(repository.setPlacement(conversation.id, { isPinned: true })).rejects.toThrow('disk unavailable');
   const publishedAfterFailure = repository.list()[0].isPinned;
-  await repository.setPinned(conversation.id, true);
+  await repository.setPlacement(conversation.id, { isPinned: true });
   expect({ publishedAfterFailure, writes: persistence.saveMetadata.mock.calls.length })
     .toEqual({ publishedAfterFailure: false, writes: 2 });
 });
@@ -68,7 +69,7 @@ test('two runtime owners cannot both hand off the same conversation to native ex
   let serial = 0;
   const coordinators = [0, 1].map(() => new ChatExecutionCoordinator({
     lifecycleRegistry, resolveBackend: () => backend, persistence: repository,
-    vaultWorkingDirectory: '/vault', createId: () => `audit-binding-${++serial}`,
+    workingDirectory: '/vault', createId: () => `audit-binding-${++serial}`,
     resolveMissingProviderSession: async () => 'preserved',
     interactionPort: {
       requestApproval: async () => { throw new Error('unexpected'); },
@@ -84,7 +85,7 @@ test('two runtime owners cannot both hand off the same conversation to native ex
     const runs = coordinators.map((coordinator, index) => coordinator.execute({
       submissionId: `audit-${index}`, timestamp: testDate().getTime(),
       rawDisplayText: 'run', canonicalText: 'run', images: [],
-      configuration: { systemInstructions: { kind: 'provider-default' } },
+      configuration: { systemInstructions: { kind: 'main-agent' as const, instructions: 'Main Agent prompt.' } },
       toolPolicy: { kind: 'provider-default' },
     }).then(result => { outcomes[index] = result; }, error => { outcomes[index] = error; }));
     await waitFor(() => backend.sessions.reduce((n, session) => n + session.requests.length, 0) + outcomes.filter(Boolean).length >= 2);
@@ -118,7 +119,6 @@ test('a metadata scan paused during source resolution cannot publish writes afte
     isUnloading: () => unloading, whenLayoutReady: callback => callback(),
     onConversationListChanged: () => undefined,
   });
-  loader.finishStartup(false, true);
   loader.scheduleRemainingLoad();
   await readingSource;
   unloading = true;
@@ -152,7 +152,7 @@ test('queued archive and pin decisions use the committed result of the preceding
   persistence.saveMetadata.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
   const archive = repository.setArchived(conversation.id, true);
   await waitFor(() => Boolean(finishWrite));
-  const pin = repository.setPinned(conversation.id, true);
+  const pin = repository.setPlacement(conversation.id, { isPinned: true });
   expect(conversation.isArchived).toBeUndefined();
   finishWrite();
   await Promise.all([archive, pin]);
@@ -201,7 +201,7 @@ test('historical recovery cannot overwrite a model selection whose write is pend
   let finishRecovery!: (model: string) => void;
   const recoveryResult = new Promise<string>(resolve => { finishRecovery = resolve; });
   const history = ProviderRegistry.getConversationHistoryService('claude');
-  const recoverySpy = jest.spyOn(history, 'recoverConversationModelSelection').mockReturnValue(recoveryResult);
+  const recoverySpy = vi.spyOn(history, 'recoverConversationModelSelection').mockReturnValue(recoveryResult);
   let finishWrite!: () => void;
   persistence.saveMetadata.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
   try {
@@ -261,12 +261,122 @@ test('provider invalidation fences session fields while preserving the rest of a
   expect(persistence.saveMetadata.mock.calls.at(-1)?.[0]).toMatchObject({ title: 'Renamed', sessionId: null });
 });
 
+test('provider invalidation demotes later snapshots from an execution binding that survived it', async () => {
+  const { repository, persistence, conversation } = fixture();
+  repository.registerExecutionBinding(conversation.id, 'surviving-binding', 1);
+  // An open binding belongs to a session that kept running through the transition (e.g. a preserved Codex turn).
+  await repository.persistConversations(repository.invalidateProviderSessions(['claude']));
+  const writes = persistence.saveMetadata.mock.calls.length;
+
+  await expect(repository.persistExecutionSnapshot(conversation.id, 'surviving-binding', 1, {
+    providerId: 'claude',
+    revision: 1,
+    status: 'idle',
+    providerSessionId: 'native-late',
+  })).resolves.toBe(true);
+  // The late session stays readable as history but never becomes the live binding.
+  expect(repository.getSync(conversation.id)).toMatchObject({
+    sessionId: null,
+    providerState: { previousProviderSessionIds: ['native-shared', 'native-late'] },
+  });
+  expect(persistence.saveMetadata).toHaveBeenCalledTimes(writes + 1);
+  await expect(repository.assertConversationExecutionAuthority(conversation.id, 'surviving-binding', 1))
+    .rejects.toThrow('no longer available');
+
+  // The replacement session can still bind and persist.
+  repository.registerExecutionBinding(conversation.id, 'replacement-binding', 2);
+  await expect(repository.persistExecutionSnapshot(conversation.id, 'replacement-binding', 2, {
+    providerId: 'claude',
+    revision: 1,
+    status: 'idle',
+    providerSessionId: 'native-replacement',
+  })).resolves.toBe(true);
+  expect(repository.getSync(conversation.id)?.sessionId).toBe('native-replacement');
+});
+
+test('provider invalidation keeps execution bindings the provider preserved', async () => {
+  const { repository, persistence } = fixture();
+  // OpenCode V2 keeps sessions bound to a persistent native database across runtime changes.
+  const preserved: Conversation = {
+    id: 'preserved-conversation', providerId: 'opencode', title: 'Preserved',
+    sessionId: 'ses_preserved', createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(),
+    messages: [], isPinned: false,
+    providerState: { databasePath: '/data/opencode/opencode.db', sessionId: 'ses_preserved' },
+  };
+  repository.replaceAll([preserved]);
+  repository.registerExecutionBinding(preserved.id, 'preserved-binding', 1);
+
+  expect(repository.invalidateProviderSessions(['opencode'])).toEqual([]);
+
+  await expect(repository.persistExecutionSnapshot(preserved.id, 'preserved-binding', 1, {
+    providerId: 'opencode',
+    revision: 1,
+    status: 'idle',
+    providerSessionId: 'ses_preserved',
+  })).resolves.toBe(true);
+  expect(persistence.saveMetadata).toHaveBeenCalledTimes(1);
+  await expect(repository.assertConversationExecutionAuthority(preserved.id, 'preserved-binding', 1)).resolves.toBeUndefined();
+});
+
+test('provider invalidation keeps the binding of a shared-runtime first run that has no native session yet', async () => {
+  const { repository, persistence } = fixture();
+  // OpenCode keeps shared-runtime sessions through the transition; a first V2 run has not
+  // captured its database yet, so its binding must stay live with the session.
+  const fresh: Conversation = {
+    id: 'fresh-conversation', providerId: 'opencode', title: 'Fresh',
+    sessionId: null, createdAt: testDate().getTime(), lastActivityAt: testDate().getTime(),
+    messages: [], isPinned: false,
+  };
+  repository.replaceAll([fresh]);
+  repository.registerExecutionBinding(fresh.id, 'first-run', 1);
+
+  expect(repository.invalidateProviderSessions(['opencode'])).toEqual([]);
+
+  await expect(repository.persistExecutionSnapshot(fresh.id, 'first-run', 1, {
+    providerId: 'opencode',
+    revision: 1,
+    status: 'idle',
+    providerSessionId: 'ses_first',
+    providerState: { databasePath: '/data/opencode/opencode.db', sessionId: 'ses_first' },
+  })).resolves.toBe(true);
+  expect(repository.getSync(fresh.id)?.sessionId).toBe('ses_first');
+  expect(persistence.saveMetadata).toHaveBeenCalledTimes(1);
+  await expect(repository.assertConversationExecutionAuthority(fresh.id, 'first-run', 1)).resolves.toBeUndefined();
+});
+
+test('provider invalidation demotes a snapshot that was admitted but not yet written', async () => {
+  const { repository, persistence, conversation } = fixture();
+  repository.registerExecutionBinding(conversation.id, 'surviving-binding', 1);
+  let finishWrite!: () => void;
+  persistence.saveMetadata.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
+  const rename = repository.rename(conversation.id, 'Renamed');
+  await waitFor(() => Boolean(finishWrite));
+  const lateSnapshot = repository.persistExecutionSnapshot(conversation.id, 'surviving-binding', 1, {
+    providerId: 'claude',
+    revision: 1,
+    status: 'idle',
+    providerSessionId: 'native-late',
+  });
+  const invalidation = repository.persistConversations(repository.invalidateProviderSessions(['claude']));
+  finishWrite();
+  await Promise.all([rename, invalidation]);
+
+  await expect(lateSnapshot).resolves.toBe(true);
+  const historyOnly = {
+    title: 'Renamed',
+    sessionId: null,
+    providerState: { previousProviderSessionIds: ['native-shared', 'native-late'] },
+  };
+  expect(repository.getSync(conversation.id)).toMatchObject(historyOnly);
+  expect(persistence.saveMetadata.mock.calls.at(-1)?.[0]).toMatchObject(historyOnly);
+});
+
 test('a missing-session check waits for an already-admitted binding write', async () => {
   const { repository, persistence, conversation } = fixture();
   let finishWrite!: () => void;
   persistence.saveMetadata.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
   const history = ProviderRegistry.getConversationHistoryService('claude');
-  const missingSpy = jest.spyOn(history, 'resolveMissingConversationSession').mockImplementation(async draft => ({
+  const missingSpy = vi.spyOn(history, 'resolveMissingConversationSession').mockImplementation(async draft => ({
     outcome: draft.sessionId === 'native-shared' ? 'delete' : 'preserve',
   }));
   try {
@@ -309,7 +419,7 @@ test('failed deletion restores a recovered model committed while deletion was pe
   persistence.saveMetadata.mockImplementationOnce(() => new Promise<void>(resolve => { finishWrite = resolve; }));
   persistence.deleteCurrentMetadata.mockRejectedValueOnce(new Error('deletion failed'));
   const history = ProviderRegistry.getConversationHistoryService('claude');
-  const recoverySpy = jest.spyOn(history, 'recoverConversationModelSelection').mockResolvedValue('sonnet');
+  const recoverySpy = vi.spyOn(history, 'recoverConversationModelSelection').mockResolvedValue('sonnet');
   try {
     const recovery = repository.recoverMissingSelectedModels();
     await waitFor(() => Boolean(finishWrite));
@@ -371,9 +481,9 @@ test('context controls read detached metadata without copying the transcript', a
   }];
   repository.replaceAll([conversation]);
   const settings = { ...DEFAULT_CLAUDIAN_SETTINGS, customContextLimits: { sonnet: 100_000, opus: 200_000 } };
-  const fullRead = jest.spyOn(repository, 'getSync');
-  const summaryRead = jest.spyOn(repository, 'getSummary');
-  const update = jest.fn();
+  const fullRead = vi.spyOn(repository, 'getSync');
+  const summaryRead = vi.spyOn(repository, 'getSummary');
+  const update = vi.fn();
   const tab = {
     conversationId: conversation.id, providerId: 'claude', draftModel: null,
     session: { runtime: { conversationId: conversation.id, providerId: 'claude', draftModel: null, reasoningSelections: new Map(), providerSelections: new Map() } },
@@ -392,9 +502,6 @@ test('context controls read detached metadata without copying the transcript', a
   const previous = repository.getSummary(conversation.id)!;
   expect(previous).not.toHaveProperty('messages');
   expect(previous).not.toHaveProperty('providerState');
-  expect(previous.capabilities).toMatchObject({ providerId: 'claude', supportsFork: true });
-  (previous.capabilities as { supportsFork: boolean }).supportsFork = false;
-  expect(repository.getSummary(conversation.id)?.capabilities?.supportsFork).toBe(true);
   await repository.update(conversation.id, { selectedModel: 'opus' });
   refreshTabContextUsage(tab, host);
   expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ contextWindow: 100_000, percentage: 50 }));

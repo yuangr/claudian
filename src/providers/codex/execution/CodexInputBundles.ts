@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import type { ProviderExecutionRequest } from '@/core/execution';
-import { appendSelectionContexts, appendSessionReferences } from '@/core/prompt/promptContext';
+import { appendExecutionContext } from '@/core/prompt/promptContext';
 import type { ImageAttachment } from '@/core/types';
 import type { UserInput } from '@/providers/codex/runtime/codexAppServerTypes';
 
@@ -81,14 +81,13 @@ export class CodexInputBundles {
         });
       }
 
-      const prompt = promptOverride ?? appendSelectionContexts(appendSessionReferences(
+      const prompt = promptOverride ?? appendExecutionContext(
         request.input
           .filter(block => block.type === 'text')
           .map(block => block.text)
           .join('\n\n'),
-        request.context?.sessionReferences,
-        hostPath => this.mapRequiredHostPath(hostPath),
-      ), request.context);
+        request.context,
+      );
       if (prompt) {
         input.push({ type: 'text', text: prompt, text_elements: [] });
       }
@@ -107,7 +106,13 @@ function toAttachmentFilename(
   const sourceName = attachment.name.trim();
   const base = sourceName.replace(/[^A-Za-z0-9._-]/g, '_')
     || `image-${index + 1}`;
-  if (base.includes('.')) return base;
   const subtype = attachment.mediaType.split('/')[1] ?? 'img';
-  return `${base}.${subtype === 'jpeg' ? 'jpg' : subtype}`;
+  const defaultExtension = `.${subtype === 'jpeg' ? 'jpg' : subtype}`;
+  // The native input path is temporary; leave room for its index on 255-byte filesystems.
+  if (base.length > 200) {
+    const originalExtension = path.extname(base);
+    const extension = originalExtension && originalExtension.length <= 16 ? originalExtension : defaultExtension;
+    return `${base.slice(0, 200 - extension.length)}${extension}`;
+  }
+  return base.includes('.') ? base : `${base}${defaultExtension}`;
 }

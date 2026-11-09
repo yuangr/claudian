@@ -39,9 +39,13 @@ export function patchSetMaxListenersForElectron(): void {
       return Reflect.apply(original, this, args);
     } catch (error) {
       // Only swallow the Electron cross-realm AbortSignal error.
+      // Invalid listener limits keep their native rejection instead of being
+      // misattributed to the cross-realm target.
       // Duck-type check avoids depending on Node.js internal error message text.
+      const limit = args[0];
       const eventTargets = args.slice(1);
-      if (eventTargets.length > 0 && eventTargets.every(isAbortSignalLike)) {
+      if ((limit === undefined || (typeof limit === 'number' && limit >= 0)) &&
+        eventTargets.length > 0 && eventTargets.every(isAbortSignalLike)) {
         return;
       }
       throw error;

@@ -1,8 +1,12 @@
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+// @test-ci {"inputs":["tests/helpers/providers/opencode/OpencodeNativePeer.cjs"]}
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
+import { seedFakeOpencodeSession } from '@test/helpers/providers/opencode/FakeOpencodeHistoryServer';
+import { writeOpencodeNativePeer } from '@test/helpers/providers/opencode/OpencodeNativePeer';
+
 import { ProviderWorkspaceRegistry } from '@/core/providers/ProviderWorkspaceRegistry';
 import type { Conversation } from '@/core/types';
 import { OpencodeConversationHistoryService } from '@/providers/opencode/history/OpencodeConversationHistoryService';
@@ -13,16 +17,12 @@ it.each(['standalone', 'registered before workspace initialization'])('loads V2 
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'claudian-http-history-')));
   const cliPath = path.join(root, 'opencode.cjs');
   const databasePath = path.join(root, 'data', 'opencode', 'native.db');
-  writeFileSync(cliPath, `#!/usr/bin/env node
-const http = require('node:http');
-if (process.argv.includes('--version')) { console.log('opencode v2.0.12'); return; }
-if (!process.argv.includes('serve') || process.env.OPENCODE_DB !== ${JSON.stringify(databasePath)}) process.exit(3);
-const server = http.createServer((req, res) => {
- const url = new URL(req.url, 'http://localhost');
- if (req.headers.authorization !== 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_PASSWORD).toString('base64')) { res.writeHead(403).end(); return; }
- let data, cursor = {};
- if (url.pathname === '/api/session/ses_worker/message') {
-   data = [
+  // A recorded database is opened only while it exists in a trusted data root.
+  mkdirSync(path.dirname(databasePath), { recursive: true });
+  writeFileSync(databasePath, '');
+  writeOpencodeNativePeer(cliPath, { scenario: 'history', version: '2.0.12', expectedDatabase: databasePath, pageSize: 1, forkId: 'ses_child' });
+  writeFileSync(databasePath, '{}');
+  seedFakeOpencodeSession(databasePath, 'ses_worker', { messages: [
      { id: 'msg_worker_user', type: 'user', time: { created: 3 }, text: 'Inspect notes' },
      { id: 'msg_worker', type: 'assistant', time: { created: 4 }, content: [
        { type: 'tool', id: 'call_read', name: 'read', state: { status: 'completed', input: { filePath: '/vault/notes.md' }, content: [{ type: 'text', text: 'Notes body' }] } },
@@ -33,9 +33,8 @@ const server = http.createServer((req, res) => {
        { type: 'tool', id: 'call_read_more', name: 'read', state: { status: 'completed', input: { filePath: '/vault/more.md' }, content: [{ type: 'text', text: 'More body' }] } },
        { type: 'text', text: 'Follow-up summary' },
      ] },
-   ];
- } else if (url.pathname === '/api/session/ses_background/message') {
-   data = [
+   ] });
+  seedFakeOpencodeSession(databasePath, 'ses_background', { messages: [
      { id: 'msg_background_user', type: 'user', time: { created: 4 }, text: 'Survey vault' },
      { id: 'msg_background', type: 'assistant', time: { created: 5 }, content: [{ type: 'text', text: 'Background answer' }] },
      { id: 'msg_background_user_again', type: 'user', time: { created: 8 }, text: 'Survey again' },
@@ -43,11 +42,8 @@ const server = http.createServer((req, res) => {
        { type: 'tool', id: 'call_read_b', name: 'read', state: { status: 'completed', input: { filePath: '/vault/b.md' }, content: [{ type: 'text', text: 'B body' }] } },
        { type: 'text', text: 'Second background answer' },
      ] },
-   ];
- } else if (url.pathname.endsWith('/message')) {
-   if (url.searchParams.has('cursor')) {
-     if (url.searchParams.has('order')) { res.writeHead(400).end(); return; }
-     data = [{ id: 'msg_answer', type: 'assistant', time: { created: 2 }, content: [
+   ] });
+  seedFakeOpencodeSession(databasePath, 'ses_parent', { model: { providerID: 'deepseek', id: 'chat' }, messages: [...[{ id: 'msg_user', type: 'user', time: { created: 1 }, text: 'Native question' }], ...[{ id: 'msg_answer', type: 'assistant', time: { created: 2 }, content: [
        { type: 'tool', id: 'call_worker', name: 'subagent', state: { status: 'completed', input: { description: 'Inspect notes', prompt: 'Inspect notes', agent: 'worker' },
          metadata: { sessionID: 'ses_worker' }, content: [{ type: 'text', text: '<subagent sessionID="ses_worker" state="completed">Worker summary</subagent>' }] } },
        { type: 'tool', id: 'call_background', name: 'subagent', state: { status: 'completed', input: { description: 'Survey vault', prompt: 'Survey vault', background: true },
@@ -58,22 +54,14 @@ const server = http.createServer((req, res) => {
        { type: 'tool', id: 'call_background_again', name: 'subagent', state: { status: 'completed', input: { description: 'Survey again', prompt: 'Survey again', background: true },
          content: [{ type: 'text', text: 'The subagent is working in the background (sessionID: ses_background)' }] } },
        { type: 'text', text: 'Native answer' },
-     ] }];
-   } else { data = [{ id: 'msg_user', type: 'user', time: { created: 1 }, text: 'Native question' }]; cursor.next = 'opaque-next'; }
- } else if (url.pathname.endsWith('/fork') && req.method === 'POST') data = { id: 'ses_child' };
- else data = { id: 'ses_parent', model: { providerID: 'deepseek', id: 'chat' } };
- res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data, cursor }));
-});
-server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({ url: 'http://127.0.0.1:' + server.address().port })));
-process.stdin.resume(); process.stdin.on('end', () => server.close());
-`, { mode: 0o700 });
+     ] }]] });
   const history = kind === 'standalone' ? new OpencodeConversationHistoryService() : opencodeProviderRegistration.historyService!;
-  const conversation = { id: 'local', sessionId: 'ses_parent', messages: [], providerState: { nativeVersion: 2, databasePath } } as unknown as Conversation;
-  const context = { settings: { providerConfigs: { opencode: { cliPath } } }, vaultPath: root, environment: { ...process.env, XDG_DATA_HOME: path.join(root, 'data'), OPENCODE_DB: path.join(root, 'untrusted.db') } };
-  const registry = new ProviderExecutionLifecycleRegistry();
-  const host: any = { settings: context.settings, app: { vault: { adapter: { basePath: root } } }, storage: { getAdapter: () => ({}) },
-    executionLifecycleRegistry: registry, runProviderExecutionTransition: (ids: string[], mutation: any) => registry.runTransition(ids, mutation),
-    getResolvedProviderCliPath: async () => cliPath };
+  const conversation = { id: 'local', sessionId: 'ses_parent', messages: [], providerState: { databasePath } } as unknown as Conversation;
+  const settings = { providerConfigs: { opencode: { cliPath } } };
+  const context = { config: settings.providerConfigs.opencode, environmentText: '', vaultPath: root, environment: { ...process.env, XDG_DATA_HOME: path.join(root, 'data'), OPENCODE_DB: path.join(root, 'untrusted.db') } };
+  const { host } = await createProviderHostFixture({ settings, overrides: {
+    getResolvedProviderCliPath: async () => cliPath,
+  } });
   ProviderWorkspaceRegistry.register('opencode', opencodeProviderRegistration.workspace!);
   const historyContext = { ...context, ensureWorkspace: () => ProviderWorkspaceRegistry.ensureInitialized(host, 'opencode', 'history') };
   try {
@@ -99,6 +87,6 @@ process.stdin.resume(); process.stdin.on('end', () => server.close());
       toolCalls: [{ id: 'call_read_b', result: 'B body' }],
     });
     await expect(history.buildForkProviderState('ses_parent', '', conversation.providerState, root, historyContext))
-      .resolves.toMatchObject({ sessionId: 'ses_child', databasePath, nativeVersion: 2 });
+      .resolves.toMatchObject({ sessionId: 'ses_child', databasePath });
   } finally { await ProviderWorkspaceRegistry.disposeInitialized(); ProviderWorkspaceRegistry.clear(); rmSync(root, { recursive: true, force: true }); }
 }, 15000);

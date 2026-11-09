@@ -7,6 +7,8 @@ import {
 } from '@/core/bootstrap/storagePaths';
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 
+import { SessionStorage } from './SessionStorage';
+
 /** Finish assignment/deletion recovery and return obsolete inputs for deferred cleanup. Safe to retry. */
 export async function migrateSessionSidecars(adapter: VaultFileAdapter): Promise<string[]> {
   const files = await adapter.listFilesRecursive(SESSIONS_PATH);
@@ -39,6 +41,8 @@ export async function migrateSessionSidecars(adapter: VaultFileAdapter): Promise
     const target = `${targetFolder}/${id}.meta.json`;
     if (await adapter.exists(source)) {
       if (await adapter.exists(target)) {
+        const assigned = await new SessionStorage(adapter, assignment.deviceKey).load(id);
+        if (assigned?.source !== 'device') continue;
         await adapter.delete(source);
       } else {
         await adapter.ensureFolder(targetFolder);

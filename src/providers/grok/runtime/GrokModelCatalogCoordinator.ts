@@ -1,24 +1,25 @@
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
+import { resolveExecutionTarget } from '@/core/process/execution-target/ExecutionTargetResolver';
+
+import type { ProviderRuntimeHost } from '../../../core/providers/ProviderRuntimeHost';
 import type {
   ProviderModelCatalogRefreshResult,
   ProviderTransitionOwnerContext,
 } from '../../../core/providers/types';
-import { computeGrokEnvironmentHash } from '../env/GrokSettingsReconciler';
+import {
+  decodeGrokConfig,
+  type GrokCatalogSnapshot,
+  updateCurrentGrokCatalogConfig,
+} from '../config';
 import {
   type GrokDiscoveredModel,
   mergeGrokDiscoveredModels,
   normalizeGrokDiscoveredModels,
 } from '../models';
-import {
-  getCurrentGrokCatalog,
-  getGrokProviderSettings,
-  type GrokCatalogSnapshot,
-  updateCurrentGrokCatalog,
-} from '../settings';
 import type {
   GrokModelCatalogDiscoveryResult,
   GrokModelDiscoveryServiceLike,
 } from './GrokModelDiscoveryService';
+import { computeGrokRuntimeInputHash } from './GrokRuntimeEnvironment';
 
 export interface GrokCatalogResult {
   catalog: GrokCatalogSnapshot | null;
@@ -53,16 +54,16 @@ export class GrokModelCatalogCoordinator {
   private readonly transitionWaiters = new Set<() => void>();
 
   constructor(
-    private readonly plugin: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly service: GrokModelDiscoveryServiceLike,
   ) {}
 
   getCachedCatalog(): GrokCatalogSnapshot | null {
-    return getCurrentGrokCatalog(this.plugin.settings);
+    return decodeGrokConfig(this.host.config, this.host.selection).currentCatalog;
   }
 
   refresh(context?: ProviderTransitionOwnerContext, signal?: AbortSignal): Promise<GrokCatalogResult> {
-    if (this.disposed || signal?.aborted || !getGrokProviderSettings(this.plugin.settings).enabled) {
+    if (this.disposed || signal?.aborted || !decodeGrokConfig(this.host.config, this.host.selection).enabled) {
       return Promise.resolve(this.#skippedResult());
     }
     return this.runMetadataOperation(
@@ -169,7 +170,7 @@ export class GrokModelCatalogCoordinator {
       this.pendingLiveRevisions.delete(revision);
     }
     if (persisted.changed) {
-      this.plugin.notifyProviderChatOptionsChanged('grok');
+      this.host.notifyChatOptionsChanged();
     }
     return persisted;
   }
@@ -303,7 +304,7 @@ export class GrokModelCatalogCoordinator {
         return this.#skippedResult();
       }
       if (persisted.changed) {
-        this.plugin.notifyProviderChatOptionsChanged('grok');
+        this.host.notifyChatOptionsChanged();
       }
       return {
         catalog: this.getCachedCatalog(),
@@ -386,23 +387,25 @@ export class GrokModelCatalogCoordinator {
     expectedGeneration?: number,
   ): Promise<{ changed: boolean; persistedSettingsChanged: boolean }> {
     let result = { changed: false, persistedSettingsChanged: false };
-    await this.plugin.mutateSettingsConditionally((settings) => {
+    await this.host.updateConfig((config, selection) => {
+      const settings = decodeGrokConfig(config, selection);
       if (
         this.disposed
         || (
           expectedGeneration !== undefined
           && !this.#isCurrentRefresh(expectedGeneration)
         )
-        || computeGrokEnvironmentHash(settings) !== expectedContextKey
+        // Settings transactions are serialized, so the committed environment is the draft's.
+        || computeGrokRuntimeInputHash(settings, this.host.environmentText, resolveExecutionTarget({ settings, hostVaultPath: this.host.workingDirectory })) !== expectedContextKey
       ) {
         return false;
       }
-      const current = getCurrentGrokCatalog(settings);
+      const current = settings.currentCatalog;
       const snapshot = buildSnapshot(current);
       const changed = !sameCatalogContent(current, snapshot);
       const persistedSettingsChanged = !sameValue(current, snapshot);
       if (persistedSettingsChanged) {
-        updateCurrentGrokCatalog(settings, snapshot);
+        updateCurrentGrokCatalogConfig(config, selection, snapshot);
       }
       result = { changed, persistedSettingsChanged };
       return persistedSettingsChanged;
@@ -411,7 +414,11 @@ export class GrokModelCatalogCoordinator {
   }
 
   #getContextKey(): string {
-    return computeGrokEnvironmentHash(this.plugin.settings);
+    const settings = decodeGrokConfig(this.host.config, this.host.selection);
+    return computeGrokRuntimeInputHash(
+      settings, this.host.environmentText,
+      resolveExecutionTarget({ settings, hostVaultPath: this.host.workingDirectory }),
+    );
   }
 
   #isCurrentRefresh(generation: number): boolean {

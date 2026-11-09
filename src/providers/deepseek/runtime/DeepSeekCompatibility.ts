@@ -1,28 +1,40 @@
 /**
  * Static native plugins, bundled as text and written beside the launch patch. They import only Node
- * built-ins. Prompts never appear in code: each preset reads its own prompt file at every assembly, and chat agents
+ * built-ins. Prompts never appear in code: each native session reads its own prompt file once per turn, and chat agents
  * read the code-mode file at creation and at each turn start.
  */
 export const DEEPSEEK_COMPATIBILITY_SOURCE = String.raw`
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export const name = 'claudian-compatibility';
-export const inject = ['systemPrompt', 'tools'];
+export const inject = ['systemPrompt', 'tools', 'sessionProjections', 'agents', 'loader'];
 
 export function apply(ctx, config) {
-  if (typeof config?.promptFile !== 'string' || !config.promptFile) {
-    throw new TypeError('Claudian compatibility requires a prompt file.');
+  if (typeof config?.promptDirectory !== 'string' || !config.promptDirectory) {
+    throw new TypeError('Claudian compatibility requires a prompt directory.');
   }
-  const allowed = ['read', 'read_image', 'glob', 'grep'];
-  if (config.allow !== undefined && (!Array.isArray(config.allow)
-    || config.allow.some(value => !allowed.includes(value))
-    || (config.allow.length !== 0 && (config.allow.length !== 4 || new Set(config.allow).size !== 4)))) {
-    throw new TypeError('Claudian auxiliary policy must be passive or read-only.');
-  }
-  if (config.codeModeFile !== undefined && (typeof config.codeModeFile !== 'string' || !config.codeModeFile || config.allow !== undefined)) {
-    throw new TypeError('Claudian code mode requires a chat preset and a mode file.');
-  }
-  const prompt = () => readFileSync(config.promptFile, 'utf8');
+  // Claudian writes one prompt per claimed native session. A session without its own (a subagent) runs on its parent's,
+  // and every session keeps the prompt its current turn started with.
+  const own = id => {
+    try { return readFileSync(join(config.promptDirectory, createHash('sha256').update(id).digest('hex') + '.txt'), 'utf8'); }
+    catch { return undefined; }
+  };
+  const turnPrompts = new Map();
+  const prompt = context => {
+    const session = context?.agent?.session;
+    if (!session) return '';
+    // dsh 0.2.2 deprecates the generic projection read in favour of the owning Agent service.
+    const turn = (typeof ctx.agents.turnBoundaryOf === 'function' ? ctx.agents.turnBoundaryOf(session)
+      : ctx.sessionProjections.stateOf(session, 'turnBoundary'))?.lastTurn;
+    const current = turnPrompts.get(session.id);
+    if (current && turn !== undefined && current.turn === turn) return current.text;
+    const parent = session.header?.parentSession;
+    const text = own(session.id) ?? (parent === undefined ? undefined : turnPrompts.get(parent)?.text) ?? '';
+    turnPrompts.set(session.id, { turn, text });
+    return text;
+  };
   for (const [name, order, text] of [
     ['deployment:persona-prefix', 'DEPLOYMENT_PERSONA_PREFIX', prompt],
     ['deployment:persona-suffix', 'DEPLOYMENT_PERSONA_SUFFIX', ''],
@@ -36,27 +48,142 @@ export function apply(ctx, config) {
       interpolate: false, complete: false,
     }), 'claudian.compatibility.section()');
   }
+  // Cordis accepts only a disposer or nothing as the resolved result.
+  return Promise.all([config.listAgents === true && mountListAgents(ctx), presentTools(ctx, config)]).then(() => undefined);
+}
+
+// dsh 0.2.2 registers list_agents with the subagent control plugin; 0.2.1 ships it as a separate entry.
+async function mountListAgents(ctx) {
+  const listAgents = await ctx.loader.import('@deepseek-ai/dsh-tool-subagent-control/list-agents').catch(error => {
+    if (error?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') return undefined;
+    throw error;
+  });
+  if (listAgents) ctx.plugin(listAgents);
+}
+
+// Each agent reaches tools directly ('native') or only through run_code programs ('both'). dsh 0.2.1 declares that with
+// tools.presentAs(); 0.2.2 mounts the matching executor plugin in the agent's scope. Auxiliary agents stay direct with
+// their fixed allow list; chat agents follow Claudian's live code-mode preference, read only between turns.
+async function presentTools(ctx, config) {
+  let executors;
+  if (typeof ctx.tools.presentAs !== 'function') {
+    const [native, ptc] = await Promise.all(['native', 'ptc'].map(name => ctx.loader.import('@deepseek-ai/dsh-tool-executor-' + name)));
+    executors = { native, both: ptc };
+  }
+  const declared = new WeakMap();
+  const present = (agent, mode) => {
+    const current = declared.get(agent);
+    if (current?.mode === mode) return;
+    current?.dispose();
+    declared.set(agent, { mode, dispose: executors ? agent.ctx.plugin(executors[mode]).dispose : agent.ctx.tools.presentAs(mode) });
+  };
   if (config.allow !== undefined) {
     ctx.on('agent/created', ({ agent }) => {
-      agent.ctx.tools.presentAs('native');
+      present(agent, 'native');
       agent.ctx.tools.restrict({ allow: config.allow });
     });
+    return;
   }
-  if (config.codeModeFile !== undefined) {
-    // Chat presentation follows Claudian's live code-mode preference, read only between turns.
-    const declared = new WeakMap();
-    const present = agent => {
-      let mode = 'native';
-      try { if (readFileSync(config.codeModeFile, 'utf8') === 'both') mode = 'both'; } catch {}
-      const current = declared.get(agent);
-      if (current?.mode === mode) return;
-      current?.dispose();
-      declared.set(agent, { mode, dispose: agent.ctx.tools.presentAs(mode) });
-    };
-    ctx.on('agent/created', ({ agent }) => present(agent));
-    ctx.on('agent/status', ({ agent, status }) => { if (status === 'running') present(agent); });
+  const preference = () => {
+    try { return readFileSync(config.codeModeFile, 'utf8') === 'both' ? 'both' : 'native'; } catch { return 'native'; }
+  };
+  ctx.on('agent/created', ({ agent }) => present(agent, preference()));
+  ctx.on('agent/status', ({ agent, status }) => { if (status === 'running') present(agent, preference()); });
+}
+`;
+
+/** Registers only Claudian's session tools; the Host owns routing and the execution session owns policy/lifetime. */
+export const DEEPSEEK_SESSIONS_SOURCE = String.raw`
+import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+
+export const name = 'claudian-sessions';
+export const inject = ['tools', 'loader'];
+
+export async function apply(ctx, config) {
+  if (typeof config?.endpointFile !== 'string' || !Array.isArray(config.tools)) {
+    throw new TypeError('Claudian sessions requires an endpoint file and tool specs.');
+  }
+  const { defineTool } = await ctx.loader.import('@deepseek-ai/dsh-tools');
+  for (const spec of config.tools) {
+    ctx.tools.register(defineTool({
+      name: spec.name,
+      description: spec.description,
+      parameters: Object.fromEntries(Object.entries(spec.inputSchema.properties).map(([key, value]) =>
+        [key, { ...value, ...(spec.inputSchema.required?.includes(key) ? { required: true } : {}) }])),
+      // Mailbox admission answers immediately; there is no wait for the recipient's turn.
+      timeoutMs: 60_000,
+      output: {
+        schema: { type: 'object', additionalProperties: false, properties: {
+          text: { type: 'string', required: true }, isError: { type: 'boolean', required: true },
+        } },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute(args, exec) {
+        exec.signal.throwIfAborted();
+        const callerNativeId = exec.agent?.id;
+        if (typeof callerNativeId !== 'string' || !callerNativeId) throw new Error('Unbound Claudian session tool caller.');
+        // Read on every call: an endpoint replacement never restarts the shared native Host.
+        const route = JSON.parse(await readFile(config.endpointFile, 'utf8'));
+        if (typeof route.url !== 'string' || typeof route.routeId !== 'string') throw new Error('Claudian session tools are unavailable.');
+        const body = { tool: spec.name, args, callerNativeId };
+        let result;
+        if (process.env.CLAUDIAN_DEEPSEEK_SESSION_RELAY) {
+          const descriptor = JSON.parse(process.env.CLAUDIAN_DEEPSEEK_SESSION_RELAY);
+          // The endpoint file remains authoritative, including after an atomic route replacement.
+          result = await callRelay({ ...descriptor, env: { ...descriptor.env,
+            CLAUDIAN_SESSION_TOOL_URL: route.url, CLAUDIAN_SESSION_TOOL_ROUTE: route.routeId,
+          } }, body, exec.signal);
+        } else {
+          const response = await fetch(route.url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', [config.routeHeader]: route.routeId },
+            body: JSON.stringify(body), signal: exec.signal,
+          });
+          if (!response.ok) throw new Error('Claudian session tool endpoint returned HTTP ' + response.status);
+          result = await response.json();
+        }
+        if (typeof result?.text !== 'string' || typeof result?.isError !== 'boolean') throw new Error('Invalid Claudian session tool result.');
+        if (result.isError) throw new Error(result.text);
+        return result;
+      },
+    }));
   }
 }
+
+function callRelay(descriptor, body, signal) {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const child = spawn(descriptor.command, descriptor.args, {
+      env: { ...process.env, ...descriptor.env }, stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let settled = false;
+    let output = '';
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      // EOF cancels the relay's pending HTTP call. Keep stdin open until response, abort or exit.
+      child.stdin.end();
+      if (error) reject(error); else resolve(result);
+    };
+    const abort = () => finish(new Error('Claudian session tool cancelled.'));
+    child.on('error', () => finish(new Error('Could not start the WSL session tool relay. Check Windows PowerShell interop.')));
+    child.stdin.on('error', () => finish(new Error('WSL session tool relay input closed.')));
+    child.on('close', () => finish(new Error('WSL session tool relay exited without a response.')));
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      output += chunk;
+      const newline = output.indexOf('\n');
+      if (newline < 0) return;
+      try { finish(undefined, JSON.parse(output.slice(0, newline))); }
+      catch { finish(new Error('Invalid WSL session tool relay response.')); }
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    else child.stdin.write(JSON.stringify(body) + '\n');
+  });
+}
+
 `;
 
 /**
@@ -145,7 +272,7 @@ export function apply(ctx, config) {
   if (!['stateFile', 'readyFile', 'spillRoot', 'attachmentRoot'].every(key => typeof config?.[key] === 'string' && config[key])) {
     throw new TypeError('Claudian ephemeral sessions require state, readiness, spill and attachment paths.');
   }
-  const ready = { persistence: false, projectionGuard: false, workspaceGuard: false, spillGuard: false, attachmentGuard: false };
+  const ready = { persistence: false, forkGuard: false, projectionGuard: false, workspaceGuard: false, spillGuard: false, attachmentGuard: false };
   const report = () => {
     const temporary = config.readyFile + '.tmp';
     writeFileSync(temporary, JSON.stringify(ready), { mode: 0o600 });
@@ -168,9 +295,13 @@ export function apply(ctx, config) {
     claimed.add(offer.token);
     return true;
   };
-  const isEphemeral = (header, inheritedEventCount) => header.id.startsWith(PREFIX)
-    || (header.parentSession !== undefined && (memory.has(header.parentSession)
-      || (header.origin === undefined && claimFork(header.parentSession, inheritedEventCount))));
+  // dsh 0.2.1 names a fork's source in its header; 0.2.2 omits it for ordinary forks, so session/fork scopes its source.
+  const forking = new AsyncLocalStorage();
+  const isEphemeral = (header, inheritedEventCount) => {
+    if (header.id.startsWith(PREFIX)) return true;
+    const parent = header.parentSession ?? forking.getStore();
+    return parent !== undefined && (memory.has(parent) || (header.origin === undefined && claimFork(parent, inheritedEventCount)));
+  };
 
   const backend = ctx.get('sessionPersistence');
   const original = { create: backend.create, open: backend.open, stat: backend.stat };
@@ -265,6 +396,13 @@ export function apply(ctx, config) {
       }, guardCtx, 'claudian.ephemeral.uploads-' + key);
     }
     ready.attachmentGuard = true;
+    report();
+  });
+  ctx.inject(['sessionController'], guardCtx => {
+    wrap(guardCtx.sessionController, 'fork', fork => function (request, ...args) {
+      return forking.run(request.sessionId, () => fork.call(this, request, ...args));
+    }, guardCtx, 'claudian.ephemeral.fork');
+    ready.forkGuard = true;
     report();
   });
   // The projection cache keeps one never-pruned record per session, titled with its first user message.

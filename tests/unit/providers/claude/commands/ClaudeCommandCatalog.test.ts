@@ -3,46 +3,6 @@ import { ClaudeCommandCatalog } from '@/providers/claude/commands/ClaudeCommandC
 
 describe('ClaudeCommandCatalog', () => {
   describe('listDropdownEntries', () => {
-    it('returns SDK runtime commands as ProviderCommandEntry', async () => {
-      const catalog = new ClaudeCommandCatalog();
-
-      const sdkCommands: SlashCommand[] = [
-        { id: 'sdk:commit', name: 'commit', description: 'Create git commit', content: '', source: 'sdk' },
-        { id: 'sdk:review', name: 'review', description: 'Review code', content: '', source: 'sdk' },
-      ];
-      catalog.setCommandSnapshot(sdkCommands);
-
-      const entries = await catalog.listDropdownEntries({ includeBuiltIns: false });
-
-      expect(entries).toHaveLength(2);
-
-      const commitEntry = entries.find(e => e.name === 'commit');
-      expect(commitEntry).toBeDefined();
-      expect(commitEntry!.providerId).toBe('claude');
-      expect(commitEntry!.scope).toBe('runtime');
-      expect(commitEntry!.source).toBe('sdk');
-      expect(commitEntry!.isEditable).toBe(false);
-      expect(commitEntry!.isDeletable).toBe(false);
-      expect(commitEntry!.displayPrefix).toBe('/');
-      expect(commitEntry!.insertPrefix).toBe('/');
-    });
-
-    it('scopes Claude Code built-in commands apart from runtime-defined ones', async () => {
-      const catalog = new ClaudeCommandCatalog();
-      catalog.setCommandSnapshot([
-        { id: 'sdk:compact', name: 'compact', content: '', source: 'builtin' },
-        { id: 'sdk:review', name: 'review', content: '', source: 'sdk' },
-      ]);
-
-      const entries = await catalog.listDropdownEntries({ includeBuiltIns: false });
-
-      expect(entries.map(({ name, scope, source, isEditable, isDeletable }) => ({ name, scope, source, isEditable, isDeletable })))
-        .toEqual([
-          { name: 'compact', scope: 'builtin', source: 'builtin', isEditable: false, isDeletable: false },
-          { name: 'review', scope: 'runtime', source: 'sdk', isEditable: false, isDeletable: false },
-        ]);
-    });
-
     it('returns empty when no runtime commands and no probe', async () => {
       const catalog = new ClaudeCommandCatalog();
 
@@ -51,28 +11,35 @@ describe('ClaudeCommandCatalog', () => {
       expect(entries).toHaveLength(0);
     });
 
-    it('filters out built-in hidden SDK commands', async () => {
+    it('hides Claude Code built-ins except /goal and custom rows their names shadow, keeping skills and custom commands', async () => {
       const catalog = new ClaudeCommandCatalog();
 
-      catalog.setCommandSnapshot([
-        { id: 'sdk:commit', name: 'commit', description: 'Commit', content: '', source: 'sdk' },
-        { id: 'sdk:init', name: 'init', description: 'Init', content: '', source: 'sdk' },
-        { id: 'sdk:debug', name: 'debug', description: 'Debug', content: '', source: 'sdk' },
-        { id: 'sdk:cost', name: 'cost', description: 'Cost', content: '', source: 'sdk' },
-        { id: 'sdk:review', name: 'review', description: 'Review', content: '', source: 'sdk' },
-      ]);
+      const entries = await catalog.listDropdownEntries({ includeBuiltIns: false, commandSnapshot: [
+        { id: 'sdk:commit', name: 'commit', description: 'Commit', content: '', source: 'sdk', kind: 'skill' },
+        { id: 'sdk:agents', name: 'agents', description: 'Agents', content: '', source: 'builtin' },
+        { id: 'sdk:review', name: 'review', description: 'Review', content: '', source: 'builtin' },
+        { id: 'sdk:init', name: 'init', description: 'My init', content: '', source: 'sdk' },
+        { id: 'sdk:simplify', name: 'simplify', description: 'Shadowed', content: '', source: 'sdk' },
+        { id: 'sdk:simplify', name: 'Simplify', description: 'Native', content: '', source: 'builtin' },
+        { id: 'sdk:goal', name: 'goal', description: 'Set a goal', content: '', source: 'builtin' },
+      ] });
 
-      const entries = await catalog.listDropdownEntries({ includeBuiltIns: false });
-
-      const names = entries.map(e => e.name);
-      expect(names).toEqual(['commit', 'review']);
-      expect(names).not.toContain('init');
-      expect(names).not.toContain('debug');
-      expect(names).not.toContain('cost');
+      expect(entries.map(e => e.name)).toEqual(['commit', 'init', 'goal']);
     });
 
-    it('probes SDK on cold start when cache is empty', async () => {
-      const probe = jest.fn().mockResolvedValue([
+    it('keeps every row of a snapshot without built-in provenance', async () => {
+      const catalog = new ClaudeCommandCatalog();
+
+      const entries = await catalog.listDropdownEntries({ includeBuiltIns: false, commandSnapshot: [
+        { id: 'sdk:cost', name: 'cost', description: 'Cost', content: '', source: 'sdk' },
+        { id: 'sdk:init', name: 'init', description: 'Init', content: '', source: 'sdk' },
+      ] });
+
+      expect(entries.map(e => e.name)).toEqual(['cost', 'init']);
+    });
+
+    it('probes SDK when the request carries no snapshot', async () => {
+      const probe = vi.fn().mockResolvedValue([
         { id: 'sdk:commit', name: 'commit', description: 'Create git commit', content: '', source: 'sdk' },
       ]);
       const catalog = new ClaudeCommandCatalog(probe);
@@ -86,7 +53,7 @@ describe('ClaudeCommandCatalog', () => {
     });
 
     it('reports a failed probe and probes again on the next request', async () => {
-      const probe = jest.fn()
+      const probe = vi.fn()
         .mockRejectedValueOnce(new Error('Claude CLI exited'))
         .mockResolvedValueOnce([
           { id: 'sdk:user-skill', name: 'user-skill', description: 'User skill', content: '', source: 'sdk' },
@@ -103,39 +70,19 @@ describe('ClaudeCommandCatalog', () => {
       ]);
     });
 
-    it('does not probe when runtime commands are cached', async () => {
-      const probe = jest.fn().mockResolvedValue([]);
+    it('does not probe when the request carries a live session snapshot', async () => {
+      const probe = vi.fn().mockResolvedValue([]);
       const catalog = new ClaudeCommandCatalog(probe);
 
-      catalog.setCommandSnapshot([
+      await catalog.listDropdownEntries({ includeBuiltIns: false, commandSnapshot: [
         { id: 'sdk:commit', name: 'commit', description: 'Commit', content: '', source: 'sdk' },
-      ]);
-
-      await catalog.listDropdownEntries({ includeBuiltIns: false });
+      ] });
 
       expect(probe).not.toHaveBeenCalled();
     });
 
-    it('probes independently when cached runtime fallback is disabled', async () => {
-      const probe = jest.fn().mockResolvedValue([
-        { id: 'sdk:cold', name: 'cold', description: 'Cold tab command', content: '', source: 'sdk' },
-      ]);
-      const catalog = new ClaudeCommandCatalog(probe);
-      catalog.setCommandSnapshot([
-        { id: 'sdk:active', name: 'active', description: 'Active tab command', content: '', source: 'sdk' },
-      ]);
-
-      const entries = await catalog.listDropdownEntries({
-        includeBuiltIns: false,
-        allowCachedCommandSnapshot: false,
-      });
-
-      expect(probe).toHaveBeenCalledTimes(1);
-      expect(entries.map(entry => entry.name)).toEqual(['cold']);
-    });
-
     it('deduplicates concurrent probe calls', async () => {
-      const probe = jest.fn().mockResolvedValue([
+      const probe = vi.fn().mockResolvedValue([
         { id: 'sdk:commit', name: 'commit', description: 'Commit', content: '', source: 'sdk' },
       ]);
       const catalog = new ClaudeCommandCatalog(probe);
@@ -153,7 +100,7 @@ describe('ClaudeCommandCatalog', () => {
     it('aborts and awaits an owned probe while fencing its old-environment result', async () => {
       let releaseOldProbe!: (commands: SlashCommand[]) => void;
       let oldProbeSignal: AbortSignal | undefined;
-      const probe = jest.fn()
+      const probe = vi.fn()
         .mockImplementationOnce((signal?: AbortSignal) => {
           oldProbeSignal = signal;
           return new Promise<SlashCommand[]>((resolve) => {
@@ -198,7 +145,7 @@ describe('ClaudeCommandCatalog', () => {
     });
 
     it('clears cached probed commands when the provider environment changes', async () => {
-      const probe = jest.fn()
+      const probe = vi.fn()
         .mockResolvedValueOnce([
           { id: 'sdk:old', name: 'old', description: 'Old', content: '', source: 'sdk' },
         ])
@@ -223,25 +170,6 @@ describe('ClaudeCommandCatalog', () => {
       expect(probe).toHaveBeenCalledTimes(2);
     });
 
-    it('clears a live command snapshot when the provider environment changes', async () => {
-      const probe = jest.fn().mockResolvedValue([
-        { id: 'sdk:fresh', name: 'fresh', description: 'Fresh', content: '', source: 'sdk' },
-      ]);
-      const catalog = new ClaudeCommandCatalog(probe);
-      catalog.setCommandSnapshot([
-        { id: 'sdk:old', name: 'old', description: 'Old', content: '', source: 'sdk' },
-      ]);
-
-      await catalog.quiesceForEnvironmentChange();
-
-      await expect(
-        catalog.listDropdownEntries({ includeBuiltIns: false }),
-      ).resolves.toEqual([
-        expect.objectContaining({ name: 'fresh' }),
-      ]);
-      expect(probe).toHaveBeenCalledTimes(1);
-    });
-
     it('cancels a request-scoped probe and starts fresh work on retry', async () => {
       let resolveFirst!: (commands: SlashCommand[]) => void;
       const firstProbe = new Promise<SlashCommand[]>((resolve) => {
@@ -254,7 +182,7 @@ describe('ClaudeCommandCatalog', () => {
         content: '',
         source: 'sdk',
       }];
-      const probe = jest.fn()
+      const probe = vi.fn()
         .mockReturnValueOnce(firstProbe)
         .mockResolvedValueOnce(freshCommands);
       const catalog = new ClaudeCommandCatalog(probe);
@@ -281,45 +209,6 @@ describe('ClaudeCommandCatalog', () => {
       expect(probe.mock.calls[0][0]).toMatchObject({ aborted: true });
       expect(probe.mock.calls[1][0]).not.toBe(secondController.signal);
       expect(probe.mock.calls[1][0]).toMatchObject({ aborted: false });
-    });
-
-    it('does not overwrite runtime commands with stale probe results', async () => {
-
-      let resolveProbe: (v: SlashCommand[]) => void;
-      const probe = jest.fn().mockReturnValue(new Promise<SlashCommand[]>((r) => { resolveProbe = r; }));
-      const catalog = new ClaudeCommandCatalog(probe);
-
-      // Start probe (it will hang)
-      const entriesPromise = catalog.listDropdownEntries({ includeBuiltIns: false });
-
-      // Runtime provides fresh data while probe is in-flight
-      catalog.setCommandSnapshot([
-        { id: 'sdk:review', name: 'review', description: 'Review', content: '', source: 'sdk' },
-      ]);
-
-      // Probe returns stale data
-      resolveProbe!([
-        { id: 'sdk:commit', name: 'commit', description: 'Commit', content: '', source: 'sdk' },
-      ]);
-
-      const entries = await entriesPromise;
-
-      // Runtime data wins — probe result is discarded
-      expect(entries).toHaveLength(1);
-      expect(entries[0].name).toBe('review');
-    });
-  });
-
-  describe('getDropdownConfig', () => {
-    it('returns Claude-specific config', () => {
-      const catalog = new ClaudeCommandCatalog();
-
-      const config = catalog.getDropdownConfig();
-
-      expect(config.triggerChars).toEqual(['/']);
-      expect(config.builtInPrefix).toBe('/');
-      expect(config.skillPrefix).toBe('/');
-      expect(config.commandPrefix).toBe('/');
     });
   });
 });

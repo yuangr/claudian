@@ -22,12 +22,21 @@ export function extractToolResultContent(
 }
 
 /**
- * Drops base64 payloads from image blocks. Tool results only display them as text, and the
+ * Drops base64 payloads from Anthropic and MCP image blocks. Tool results only display them as text, and the
  * native transcript keeps the bytes. Works as a JSON.stringify replacer or a JSON.parse reviver.
  */
 export function omitToolResultImageData(_key: string, value: unknown): unknown {
-  if (!isBase64ImageBlock(value)) return value;
-  return { ...value, source: { ...value.source, data: '' } };
+  if (isBase64ImageBlock(value)) {
+    return { ...value, source: { ...value.source, data: '' } };
+  }
+  if (value && typeof value === 'object') {
+    const block = value as Record<string, unknown>;
+    if (block.type === 'image' && typeof block.data === 'string' && block.data
+      && typeof block.mimeType === 'string' && block.mimeType.startsWith('image/')) {
+      return { ...block, data: '' };
+    }
+  }
+  return value;
 }
 
 function isTextBlock(block: unknown): block is { type: 'text'; text: string } {

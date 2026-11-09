@@ -1,6 +1,6 @@
 import { ProviderTransitionFence } from '../metadata/ProviderTransitionFence';
-import type { ProviderHost } from '../ProviderHost';
-import type { ProviderId, ProviderModelCatalogRefreshResult } from '../types';
+import type { ProviderRuntimeHost, ProviderSelectionInputs } from '../ProviderRuntimeHost';
+import type { ProviderModelCatalogRefreshResult } from '../types';
 
 export interface ProviderCatalogModel {
   id: string;
@@ -28,7 +28,8 @@ export interface ProviderModelCatalogSnapshot extends ProviderModelSelection {
 
 export type ProviderModelSelectionChange =
   | { type: 'set'; modelId: string; selected: boolean }
-  | { type: 'move'; modelId: string; target: string | -1 | 1 }
+  | { type: 'move'; modelId: string; target: string; placement: 'before' | 'after' }
+  | { type: 'move'; modelId: string; target: -1 | 1 }
   | { type: 'clear' };
 
 export interface ProviderModelCatalog {
@@ -41,17 +42,50 @@ export interface ProviderModelCatalog {
   dispose(): Promise<void>;
 }
 
+export interface ProviderModelCatalogState extends ProviderModelSelection {
+  enabled: boolean;
+}
+
+export interface ProviderModelCatalogPatch {
+  visibleModels?: string[];
+  modelAliases?: Record<string, string>;
+}
+
+/** Where a provider keeps its selected models and aliases; persistence stays provider-owned. */
+export interface ProviderModelCatalogStore {
+  read(): ProviderModelCatalogState;
+  /** Persists the patch computed from the current state in one transaction. */
+  write(change: (current: ProviderModelCatalogState) => ProviderModelCatalogPatch): Promise<void>;
+  notifyChatOptionsChanged(): void;
+}
+
 export interface ProviderModelCatalogOptions {
-  providerId: ProviderId;
   providerName: string;
-  host: Pick<ProviderHost, 'mutateSettings' | 'notifyProviderChatOptionsChanged'>;
-  read(settings?: Readonly<Record<string, unknown>>): ProviderModelSelection & { enabled: boolean };
+  store: ProviderModelCatalogStore;
   discover(signal: AbortSignal): Promise<ProviderModelCatalogRefreshResult>;
-  update(settings: Record<string, unknown>, patch: {
-    visibleModels?: string[];
-    modelAliases?: Record<string, string>;
-  }): void;
   afterSelect?(addedIds: string[]): Promise<void>;
+  /** A successful discovery has updated the provider-owned model projection. */
+  observeChanges?(observer: () => void): () => void;
+}
+
+/** A catalog store over the provider's own configuration, decoded and updated by its configuration module. */
+export function createConfigCatalogStore(
+  host: Pick<ProviderRuntimeHost, 'config' | 'selection' | 'updateConfig' | 'notifyChatOptionsChanged'>,
+  codec: {
+    read(config: Readonly<Record<string, unknown>>, selection: ProviderSelectionInputs): ProviderModelCatalogState;
+    update(config: Record<string, unknown>, selection: ProviderSelectionInputs, patch: ProviderModelCatalogPatch): void;
+  },
+): ProviderModelCatalogStore {
+  return {
+    read: () => codec.read(host.config, host.selection),
+    async write(change) {
+      await host.updateConfig((config, selection) => {
+        codec.update(config, selection, change(codec.read(config, selection)));
+        return true;
+      });
+    },
+    notifyChatOptionsChanged: () => host.notifyChatOptionsChanged(),
+  };
 }
 
 export function normalizeSelectedModelIds(ids: readonly string[]): string[] {
@@ -59,12 +93,16 @@ export function normalizeSelectedModelIds(ids: readonly string[]): string[] {
 }
 
 /** Common settings policy. Providers retain discovery, native metadata and persistence authority. */
+/** Discovery progress; only a failure carries its message. */
+type DiscoveryState =
+  | { readonly status: 'idle' | 'loading' | 'ready' }
+  | { readonly status: 'failed'; readonly error: string };
+
 export class ProviderModelCatalogController implements ProviderModelCatalog {
   private readonly transitionFence = new ProviderTransitionFence();
   private attempted = false;
   private stale = false;
-  private status: ProviderModelCatalogSnapshot['status'] = 'idle';
-  private error: string | undefined;
+  private discovery: DiscoveryState = { status: 'idle' };
   private controller: AbortController | null = null;
   private flight: Promise<ProviderModelCatalogRefreshResult> | null = null;
   private readonly pending = new Set<Promise<ProviderModelCatalogRefreshResult>>();
@@ -72,10 +110,18 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
   private generation = 0;
   private disposed = false;
 
-  constructor(private readonly options: ProviderModelCatalogOptions) {}
+  private readonly unsubscribeChanges: (() => void) | undefined;
+
+  constructor(private readonly options: ProviderModelCatalogOptions) {
+    this.unsubscribeChanges = options.observeChanges?.(() => {
+      // An older background read must not finish an in-flight explicit refresh.
+      if (this.discovery.status === 'loading') this.publish();
+      else this.publishReady();
+    });
+  }
 
   getSnapshot(): ProviderModelCatalogSnapshot {
-    const state = this.options.read();
+    const state = this.options.store.read();
     const selectedIds = normalizeSelectedModelIds(state.selectedIds);
     const models = [...state.models];
     const known = new Map(models.map(model => [model.id, model]));
@@ -94,8 +140,8 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
       models,
       selectedIds,
       stale: this.stale,
-      status: this.status,
-      error: this.error,
+      status: this.discovery.status,
+      error: this.discovery.status === 'failed' ? this.discovery.error : undefined,
       discoveredCount: state.models.length,
       defaultModelId: selectedIds.find(id => known.has(id) && known.get(id)?.isAvailable !== false) ?? null,
     };
@@ -105,7 +151,7 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
     if (this.transitionFence.isUnavailable()) {
       return this.transitionFence.waitUntilAvailable().then(available => available ? this.refresh(options) : { changed: false });
     }
-    if (this.disposed || !this.options.read().enabled) {
+    if (this.disposed || !this.options.store.read().enabled) {
       return Promise.resolve({ changed: false });
     }
     if (this.flight) return this.flight;
@@ -114,8 +160,7 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
     const controller = new AbortController();
     const generation = ++this.generation;
     this.controller = controller;
-    this.status = 'loading';
-    this.error = undefined;
+    this.discovery = { status: 'loading' };
     const flight = this.discover(controller, generation).finally(() => {
       this.pending.delete(flight);
       if (this.flight === flight) {
@@ -134,16 +179,14 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
       const result = await this.options.discover(controller.signal);
       if (controller.signal.aborted || this.disposed || generation !== this.generation) return { changed: false };
       if (result.diagnostics) throw new Error(result.diagnostics);
-      this.stale = false;
-      this.status = 'ready';
-      this.publish();
+      this.publishReady();
       return result;
     } catch (error) {
       if (controller.signal.aborted || this.disposed || generation !== this.generation) return { changed: false };
-      this.status = 'failed';
-      this.error = error instanceof Error ? error.message : 'Model discovery failed.';
+      const message = error instanceof Error ? error.message : 'Model discovery failed.';
+      this.discovery = { error: message, status: 'failed' };
       this.publish();
-      return { changed: false, diagnostics: this.error };
+      return { changed: false, diagnostics: message };
     }
   }
 
@@ -164,15 +207,14 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
     this.controller = null;
     this.flight = null;
     this.stale = true;
-    this.status = 'idle';
-    this.error = undefined;
+    this.discovery = { status: 'idle' };
     this.publish();
   }
 
   async changeSelection(change: ProviderModelSelectionChange): Promise<void> {
     let addedIds: string[] = [];
-    await this.options.host.mutateSettings(settings => {
-      const previousIds = normalizeSelectedModelIds(this.options.read(settings).selectedIds);
+    await this.options.store.write(current => {
+      const previousIds = normalizeSelectedModelIds(current.selectedIds);
       let selectedIds = [...previousIds];
       switch (change.type) {
         case 'clear':
@@ -187,32 +229,40 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
         }
         case 'move': {
           const index = selectedIds.indexOf(change.modelId);
-          const target = typeof change.target === 'string'
-            ? selectedIds.indexOf(change.target)
-            : index + change.target;
-          if (index >= 0 && target >= 0 && target < selectedIds.length) {
+          if (index < 0) break;
+          if (typeof change.target === 'string') {
+            if (change.target === change.modelId || !selectedIds.includes(change.target)) break;
             selectedIds.splice(index, 1);
-            selectedIds.splice(target, 0, change.modelId);
+            const target = selectedIds.indexOf(change.target);
+            selectedIds.splice(change.placement === 'after' ? target + 1 : target, 0, change.modelId);
+          } else {
+            const target = index + change.target;
+            if (target >= 0 && target < selectedIds.length) {
+              selectedIds.splice(index, 1);
+              selectedIds.splice(target, 0, change.modelId);
+            }
           }
           break;
         }
       }
       addedIds = selectedIds.filter(id => !previousIds.includes(id));
-      this.options.update(settings, { visibleModels: selectedIds });
+      return { visibleModels: selectedIds };
     });
     await this.options.afterSelect?.(addedIds);
-    this.options.host.notifyProviderChatOptionsChanged(this.options.providerId);
+    this.options.store.notifyChatOptionsChanged();
     this.publish();
   }
 
   async setAlias(modelId: string, alias: string): Promise<void> {
-    await this.options.host.mutateSettings(settings => {
-      const aliases = { ...this.options.read(settings).aliases };
-      if (alias.trim()) aliases[modelId] = alias.trim();
+    await this.options.store.write(current => {
+      const aliases = { ...current.aliases };
+      if (alias.trim()) {
+        Object.defineProperty(aliases, modelId, { value: alias.trim(), enumerable: true, configurable: true, writable: true });
+      }
       else delete aliases[modelId];
-      this.options.update(settings, { modelAliases: aliases });
+      return { modelAliases: aliases };
     });
-    this.options.host.notifyProviderChatOptionsChanged(this.options.providerId);
+    this.options.store.notifyChatOptionsChanged();
     this.publish();
   }
 
@@ -220,6 +270,12 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
     if (this.disposed) return () => {};
     this.observers.add(observer);
     return () => { this.observers.delete(observer); };
+  }
+
+  private publishReady(): void {
+    this.stale = false;
+    this.discovery = { status: 'ready' };
+    this.publish();
   }
 
   private publish(): void {
@@ -231,6 +287,7 @@ export class ProviderModelCatalogController implements ProviderModelCatalog {
     this.disposed = true;
     this.transitionFence.dispose();
     this.observers.clear();
+    this.unsubscribeChanges?.();
     this.generation += 1;
     this.controller?.abort();
     await this.quiesce();

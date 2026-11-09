@@ -4,7 +4,6 @@ import type {
   ProviderCommandListContext,
 } from '../../../core/providers/commands/ProviderCommandCatalog';
 import type { ProviderCommandEntry } from '../../../core/providers/commands/ProviderCommandEntry';
-import type { SlashCommand } from '../../../core/types';
 import type { SkillMetadata } from '../runtime/codexAppServerTypes';
 import {
   type CodexSkillListProvider,
@@ -13,21 +12,6 @@ import {
 } from '../skills/CodexSkillListingService';
 
 const CODEX_SKILL_ID_PREFIX = 'codex-skill-';
-
-const CODEX_COMPACT_COMMAND: ProviderCommandEntry = {
-  id: 'codex-builtin-compact',
-  providerId: 'codex',
-  kind: 'command',
-  name: 'compact',
-  description: 'Compact conversation history',
-  content: '',
-  scope: 'system',
-  source: 'builtin',
-  isEditable: false,
-  isDeletable: false,
-  displayPrefix: '/',
-  insertPrefix: '/',
-};
 
 function buildSkillId(skill: Pick<SkillMetadata, 'path' | 'scope'>): string {
   const encodedPath = encodeURIComponent(skill.path);
@@ -54,18 +38,13 @@ function listedSkillToProviderEntry(skill: SkillMetadata): ProviderCommandEntry 
 export class CodexCommandCatalog implements ProviderCommandCatalog {
   constructor(private listProvider: CodexSkillListProvider) {}
 
-  setCommandSnapshot(_commands: SlashCommand[]): void {
-    // Codex dropdown entries come from app-server metadata; runtime commands are ignored.
-  }
-
   async listDropdownEntries(context: ProviderCommandListContext): Promise<ProviderCommandEntry[]> {
     const skills = (await this.listProvider.listSkills(
       context.signal ? { signal: context.signal } : undefined,
     ))
       .filter(skill => skill.enabled)
       .sort(compareCodexSkillPriority);
-    const entries = skills.map(listedSkillToProviderEntry);
-    return context.includeBuiltIns ? [CODEX_COMPACT_COMMAND, ...entries] : entries;
+    return skills.map(listedSkillToProviderEntry);
   }
 
   getDropdownConfig(): ProviderCommandDropdownConfig {

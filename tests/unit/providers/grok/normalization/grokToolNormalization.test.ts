@@ -6,6 +6,19 @@ import {
 } from '@/providers/grok/normalization/grokToolNormalization';
 
 describe('grokToolNormalization', () => {
+  it.each(['claudian_list_destinations', 'claudian_send_message'])('normalizes session tool %s in live and replay shapes', name => {
+    const key = `claudian_sessions__${name}`;
+    const rawInput = { tool_name: key, tool_input: { text: 'hello' } };
+    for (const title of ['use_tool', key]) {
+      expect(normalizeGrokToolCall({ title, rawInput })).toMatchObject({
+        name, input: { text: 'hello' }, rawName: title, rawInput,
+      });
+    }
+    expect(normalizeGrokToolName('other', undefined, { type: 'MCP', server_name: 'claudian_sessions', tool_name: name })).toBe(name);
+    expect(normalizeGrokToolName('use_tool', { tool_name: `other__${name}` })).toBe(`mcp__other__${name}`);
+    expect(normalizeGrokToolName('use_tool', { tool_name: 'claudian_sessions__unknown' })).toBe('mcp__claudian_sessions__unknown');
+  });
+
   it('keeps unknown tool results printable when they contain a circular record', () => {
     const output: Record<string, unknown> = {};
     output.self = output;
@@ -35,6 +48,16 @@ describe('grokToolNormalization', () => {
     ['enter_plan_mode', 'EnterPlanMode'],
     ['exit_plan_mode', 'ExitPlanMode'],
   ])('maps %s to the approved renderer %s', (rawName, expected) => {
+    expect(normalizeGrokToolName(rawName)).toBe(expected);
+  });
+
+  it.each([
+    ['constructor', 'constructor'],
+    ['__proto__', '__proto__'],
+    ['toString', 'toString'],
+    [' Constructor ', 'Constructor'],
+  ])('keeps unknown tool name %j as its trimmed literal string %j', (rawName, expected) => {
+    expect(typeof normalizeGrokToolName(rawName)).toBe('string');
     expect(normalizeGrokToolName(rawName)).toBe(expected);
   });
 
@@ -123,6 +146,15 @@ describe('grokToolNormalization', () => {
     })).toEqual({ provenance: 'title', rawName: 'run_terminal_command' });
     expect(resolveGrokRawToolName(undefined, { kind: 'read', title: 'read_file' }))
       .toEqual({ provenance: 'title', rawName: 'read_file' });
+    // Only registered alias titles canonicalize; prototype-key titles keep their spelling and case.
+    expect(resolveGrokRawToolName(undefined, { title: 'Constructor' }))
+      .toEqual({ provenance: 'title', rawName: 'Constructor' });
+    expect(resolveGrokRawToolName(undefined, { title: 'constructor' }))
+      .toEqual({ provenance: 'title', rawName: 'constructor' });
+    expect(resolveGrokRawToolName(undefined, { title: '__proto__' }))
+      .toEqual({ provenance: 'title', rawName: '__proto__' });
+    expect(resolveGrokRawToolName(undefined, { title: 'toString' }))
+      .toEqual({ provenance: 'title', rawName: 'toString' });
   });
 
   it.each([
@@ -191,5 +223,53 @@ describe('grokToolNormalization', () => {
     )?.resolvedAnswers).toEqual({
       'How should we continue?': jsonAnswer,
     });
+  });
+
+  it('keeps own text and id __proto__ aliases for free-form answers', () => {
+    const textAliased = normalizeGrokToolResultDetails(
+      'ask_user_question',
+      {
+        questions: [{
+          id: 'color',
+          multiSelect: false,
+          options: [{ description: '', label: 'Blue' }],
+          question: '__proto__',
+        }],
+      },
+      { UserAnswered: { message: 'Blue' }, type: 'UserAnswered' },
+    );
+    expect(Object.hasOwn(textAliased!.resolvedAnswers!, '__proto__')).toBe(true);
+    expect(JSON.stringify(textAliased!.resolvedAnswers)).toBe('{"__proto__":"Blue","color":"Blue"}');
+
+    const idAliased = normalizeGrokToolResultDetails(
+      'ask_user_question',
+      {
+        questions: [{
+          id: '__proto__',
+          multiSelect: false,
+          options: [{ description: '', label: 'Blue' }],
+          question: 'Color?',
+        }],
+      },
+      { UserAnswered: { message: 'Blue' }, type: 'UserAnswered' },
+    );
+    expect(Object.hasOwn(idAliased!.resolvedAnswers!, '__proto__')).toBe(true);
+    expect(JSON.stringify(idAliased!.resolvedAnswers)).toBe('{"Color?":"Blue","__proto__":"Blue"}');
+  });
+
+  it('takes the literal message when a parsed unrelated-key payload meets a prototype-named id', () => {
+    const details = normalizeGrokToolResultDetails(
+      'ask_user_question',
+      {
+        questions: [{
+          id: 'toString',
+          multiSelect: false,
+          options: [{ description: '', label: 'Blue' }],
+          question: 'Color?',
+        }],
+      },
+      { UserAnswered: { message: '{"other":"keep this as the answer"}' }, type: 'UserAnswered' },
+    );
+    expect(JSON.stringify(details!.resolvedAnswers)).toBe('{"Color?":"{\\"other\\":\\"keep this as the answer\\"}","toString":"{\\"other\\":\\"keep this as the answer\\"}"}');
   });
 });

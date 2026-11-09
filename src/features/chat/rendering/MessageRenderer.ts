@@ -1,6 +1,7 @@
-import type { Component } from 'obsidian';
+import { type Component, Notice } from 'obsidian';
 
-import { extractUserDisplayContent } from '@/core/prompt/promptContext';
+import { getUserDisplayText } from '@/core/prompt/promptContext';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderCapabilities, type ProviderSubagentLifecycleAdapter } from '@/core/providers/types';
 import type { ChatMessage, ImageAttachment, SubagentInfo, ToolCallInfo } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
@@ -9,7 +10,16 @@ import { MarkdownContentRenderer, type RenderContentOptions } from '@/features/c
 import { type MessageActionCallbacks, MessageActions } from '@/features/chat/rendering/MessageActions';
 import { getResponseSegments } from '@/features/chat/rendering/NotificationBoundaries';
 import { ResponseFinalizer } from '@/features/chat/rendering/ResponseFinalizer';
-import { createResponseTextBlock } from '@/features/chat/rendering/ResponseLayout';
+import {
+  appendInterruptLabel,
+  createResponseTextBlock,
+  isConsumedInterruptMarker,
+  isFoldedByLaterInterrupt,
+  isInterruptedResponse,
+  isInterruptMarker,
+  markResponseElement,
+} from '@/features/chat/rendering/ResponseLayout';
+import { createSessionLink, registerSessionLinkHandler } from '@/features/chat/rendering/sessionLinks';
 import { renderStoredThinkingBlock } from '@/features/chat/rendering/ThinkingBlockRenderer';
 import { updateToolCallResult } from '@/features/chat/rendering/tools/ToolCallRenderer';
 import { isSilentWriteStdinTool, renderToolCard } from '@/features/chat/rendering/tools/toolCardDispatch';
@@ -18,6 +28,8 @@ import { resolveStoredTaskSubagent } from '@/features/chat/subagents/storedTaskS
 import { resolveSubagentAdapter } from '@/features/chat/subagents/subagentAdapterResolution';
 import { renderSubagentHistory } from '@/features/chat/subagents/SubagentHistoryRenderer';
 import { renderStoredAsyncSubagent, renderStoredSubagent } from '@/features/chat/subagents/SubagentRenderer';
+import { cancelScheduledAnimationFrame, scheduleAnimationFrame, type ScheduledAnimationFrame } from '@/features/chat/utils/animationFrame';
+import { type ConversationDirectoryEntry, formatConversationDirectoryTitle, getRenderedConversationDirectory } from '@/features/chat/utils/conversationDirectoryTitle';
 import { t } from '@/i18n/i18n';
 import { ImagePreviewModal } from '@/shared/modals/ImagePreviewModal';
 import { registerFileLinkHandler } from '@/utils/fileLink';
@@ -39,6 +51,34 @@ interface MessageLiveScope {
   open: boolean;
 }
 
+/** Messages a transcript renders at once, counted back from its end; earlier ones render on request. */
+const RENDER_WINDOW = 40;
+
+/** Where the reader is: the first message showing at the top, and its offset from the viewport top. */
+export interface ReadingAnchor {
+  readonly messageId: string;
+  readonly offset: number;
+}
+
+/** Messages before `start` are not rendered yet; `messages` is the transcript the window was cut from. */
+interface EarlierMessages {
+  readonly messages: ChatMessage[];
+  readonly live?: LiveTranscriptOptions;
+  readonly control: HTMLElement;
+  start: number;
+}
+
+/**
+ * The window's first message at or before `index`: a prompt, so every response it renders is
+ * whole. A bare interrupt marker belongs to the response before it and never starts a window.
+ */
+function findWindowStart(messages: ChatMessage[], index: number): number {
+  for (let i = index; i > 0; i--) {
+    if (messages[i].role === 'user' && !isInterruptMarker(messages[i])) return i;
+  }
+  return 0;
+}
+
 /**
  * Renders a tab's transcript: live and replayed messages, assistant content
  * blocks and stored tool/subagent cards. Markdown scopes, message actions and
@@ -52,12 +92,16 @@ export class MessageRenderer {
   private readonly getCapabilities: () => ProviderCapabilities;
   private readonly messageEls = new Map<string, HTMLElement>();
   private removeFileLinkHandler: () => void;
+  private removeSessionLinkHandler: () => void;
+  readonly #openConversation: ((conversationId: string) => Promise<void>) | undefined;
   private readonly imagePreviewModal = new ImagePreviewModal();
   private readonly contentRemovalObserver?: MutationObserver;
   #pendingLayoutScroll: ResizeObserver | null = null;
+  #pendingTailScroll: { frame?: ScheduledAnimationFrame; scrollTop: number } | null = null;
   readonly #markdown: MarkdownContentRenderer;
   readonly #actions: MessageActions;
   readonly #finalizer: ResponseFinalizer;
+  #earlier: EarlierMessages | null = null;
 
   updateQuestionTool(tool: ToolCallInfo): void {
     for (const element of this.messagesEl.querySelectorAll<HTMLElement>('[data-tool-id]')) {
@@ -75,8 +119,11 @@ export class MessageRenderer {
     forkCallback?: MessageActionCallbacks['fork'],
     getCapabilities?: () => ProviderCapabilities,
     branchActions?: MessageActionCallbacks['branches'],
+    /** Opens a session from a transcript link; omitted where the presentation cannot navigate. */
+    openConversation?: (conversationId: string) => Promise<void>,
   ) {
     this.app = plugin.app;
+    this.#openConversation = openConversation;
     this.plugin = plugin;
     this.messagesEl = messagesEl;
     this.getCapabilities = getCapabilities ?? (() => ({
@@ -98,7 +145,7 @@ export class MessageRenderer {
       rewind: rewindCallback,
       fork: forkCallback,
       branches: branchActions,
-    });
+    }, () => this.#earlier !== null);
     this.#finalizer = new ResponseFinalizer(
       id => this.findMessageEl(id),
       (el, markdown) => this.renderContent(el, markdown),
@@ -106,6 +153,11 @@ export class MessageRenderer {
 
     // Register delegated click handler for file links
     this.removeFileLinkHandler = registerFileLinkHandler(this.app, this.messagesEl);
+    // Live tool cards render into the same container, so one delegated handler covers both paths.
+    this.removeSessionLinkHandler = registerSessionLinkHandler(this.messagesEl, id => { void this.#openSession(id); }, id => {
+      const summary = this.plugin.getConversationSummary(id);
+      return summary ? { title: summary.title || undefined, providerId: summary.providerId } : null;
+    });
 
     // Controllers also clear message DOM directly. Inspect only removed subtrees,
     // rather than scanning every retained message on each streaming mutation.
@@ -118,14 +170,15 @@ export class MessageRenderer {
             this.messageEls.delete(id);
             this.#actions.forget(id);
           }
-          this.#markdown.releaseRemoved(el);
         };
         for (const record of records) {
           for (const node of record.removedNodes) {
             if (node.nodeType !== 1) continue;
             const el = node as HTMLElement;
+            if (this.messagesEl.contains(el)) continue;
             releaseRemoved(el);
-            el.querySelectorAll<HTMLElement>('*').forEach(releaseRemoved);
+            el.querySelectorAll<HTMLElement>('[data-message-id]').forEach(releaseRemoved);
+            this.#markdown.releaseRemoved(el);
           }
         }
       });
@@ -135,14 +188,37 @@ export class MessageRenderer {
 
   dispose(): void {
     if (this.#markdown.isDisposed) return;
+    this.#cancelTailScroll();
     this.contentRemovalObserver?.disconnect();
     this.#cancelLayoutScroll();
     this.#markdown.dispose();
     this.imagePreviewModal.close();
     this.removeFileLinkHandler();
     this.removeFileLinkHandler = () => {};
+    this.removeSessionLinkHandler();
+    this.removeSessionLinkHandler = () => {};
     this.#actions.clear();
     this.messageEls.clear();
+    this.#earlier = null;
+  }
+
+  /** Session links may outlive their session; a missing one is reported rather than opened. */
+  async #openSession(conversationId: string): Promise<void> {
+    try {
+      const open = this.#openConversation;
+      if (!open) {
+        new Notice(t('chat.sessionTools.openUnavailable'));
+        return;
+      }
+      await this.plugin.ensureConversationMetadataLoaded([conversationId]);
+      if (!this.plugin.getConversationSummary(conversationId)) {
+        new Notice(t('chat.sessionTools.sessionMissing'));
+        return;
+      }
+      await open(conversationId);
+    } catch (error) {
+      new Notice(t('chat.sessionTools.openFailed', { message: error instanceof Error ? error.message : String(error) }));
+    }
   }
 
   #resolveSubagentAdapter(toolName?: string) {
@@ -165,7 +241,7 @@ export class MessageRenderer {
     if (msg.role === 'user' && msg.displayContent === '' && !msg.images?.length) {
       return this.messagesEl;
     }
-    this.#actions.retireFullSessionForks();
+    if (afterMessageId !== undefined) this.#revealThrough(afterMessageId);
     const previous = this.messagesEl.lastChild;
     let element: HTMLElement;
     if (msg.role === 'user') {
@@ -192,6 +268,7 @@ export class MessageRenderer {
   }
 
   removeMessage(messageId: string): void {
+    this.#forgetEarlier(messageId);
     this.messagesEl.querySelector(`[data-user-message-id="${messageId}"]`)?.remove();
     const msgEl = this.findMessageEl(messageId);
     if (!msgEl) {
@@ -205,7 +282,8 @@ export class MessageRenderer {
   }
 
   /**
-   * Renders all messages for conversation load/switch.
+   * Renders a transcript for conversation load/switch: its latest messages, below a control
+   * that renders earlier ones on request.
    * @param messages Array of messages to render
    * @param getGreeting Function to get greeting text
    * @returns The newly created welcome element
@@ -219,29 +297,140 @@ export class MessageRenderer {
     this.messagesEl.empty();
     this.#actions.clear();
     this.messageEls.clear();
+    this.#earlier = null;
 
     // Recreate welcome element after clearing
     const newWelcomeEl = createWelcomeElement(this.messagesEl, getGreeting());
-    const openIds = live ? new Set(messages.filter(message => live.isResponseOpen(message.id))
-      .flatMap(message => getResponseSegments(message, messages).map(segment => segment.id))) : undefined;
-
-    for (let i = 0; i < messages.length; i++) {
-      this.renderStoredMessage(messages[i], messages, i, live && { options: live, open: openIds?.has(messages[i].id) === true });
+    const start = findWindowStart(messages, messages.length - RENDER_WINDOW);
+    if (start > 0) {
+      // A copy, so later appends cannot shift the window; `removeMessage` keeps it in sync.
+      this.#earlier = { messages: messages.slice(), live, control: this.#createEarlierControl(), start };
     }
+    this.#renderRange(messages, start, messages.length, live);
 
     this.#scrollToBottomOnceLaidOut();
     return newWelcomeEl;
+  }
+
+  /** Renders the window's earlier messages above it, the next block or all, keeping the reading position. */
+  revealEarlierMessages(all = false): void {
+    const earlier = this.#earlier;
+    if (earlier) this.#revealFrom(all ? 0 : findWindowStart(earlier.messages, earlier.start - RENDER_WINDOW));
+  }
+
+  /** Lists the transcript's prompts without materializing the earlier message bodies. */
+  getDirectoryEntries(): ConversationDirectoryEntry[] {
+    const entries: ConversationDirectoryEntry[] = [];
+    const earlier = this.#earlier;
+    if (earlier) {
+      for (let index = 0; index < earlier.start; index += 1) {
+        const message = earlier.messages[index];
+        if (message.role !== 'user' || message.isRebuiltContext || isInterruptMarker(message)) continue;
+        const title = formatConversationDirectoryTitle(getUserDisplayText(message));
+        if (title) entries.push({ title, reveal: () => {
+          this.#revealThrough(message.id);
+          return this.findMessageEl(message.id);
+        } });
+      }
+    }
+    return entries.concat(getRenderedConversationDirectory(this.messagesEl));
+  }
+
+  #revealFrom(start: number): void {
+    const earlier = this.#earlier;
+    if (!earlier || start >= earlier.start || this.#markdown.isDisposed) return;
+    const { messages, live, control } = earlier;
+    const end = earlier.start;
+    const firstPromptId = this.messagesEl.querySelector<HTMLElement>('[data-role="user"]')?.dataset.messageId;
+    const fromBottom = this.messagesEl.scrollHeight - this.messagesEl.scrollTop;
+    const last = this.messagesEl.lastChild;
+    this.#renderRange(messages, start, end, live);
+    const added: ChildNode[] = [];
+    for (let node = last ? last.nextSibling : null; node; node = node.nextSibling) added.push(node);
+    control.after(...added);
+    earlier.start = start;
+    if (start === 0) {
+      this.#earlier = null;
+      // Keep keyboard focus in the transcript when its focused control goes away.
+      if (control.contains(control.ownerDocument.activeElement)) {
+        if (!this.messagesEl.hasAttribute('tabindex')) this.messagesEl.tabIndex = -1;
+        this.messagesEl.focus({ preventScroll: true });
+      }
+      control.remove();
+    }
+    // Only the transcript's first prompt lacks branch controls; the old and new first prompts change role.
+    const newFirstPromptId = this.messagesEl.querySelector<HTMLElement>('[data-role="user"]')?.dataset.messageId;
+    this.#actions.refreshBranchButtons(messages.filter(message => message.id === firstPromptId || message.id === newFirstPromptId));
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight - fromBottom;
+  }
+
+  /** The reading position by message, which survives rerendering and messages added below it. */
+  captureReadingAnchor(): ReadingAnchor | null {
+    if (this.messagesEl.clientHeight === 0) return null;
+    const top = this.messagesEl.getBoundingClientRect().top;
+    for (const child of Array.from(this.messagesEl.children) as HTMLElement[]) {
+      const messageId = child.dataset.messageId;
+      if (!messageId) continue;
+      const rect = child.getBoundingClientRect();
+      if (rect.bottom > top) return { messageId, offset: rect.top - top };
+    }
+    return null;
+  }
+
+  /** Renders the window down to the anchor's message if needed, then shows it where the reader left it. */
+  restoreReadingAnchor(anchor: ReadingAnchor): void {
+    if (this.messagesEl.clientHeight === 0) return;
+    this.#revealThrough(anchor.messageId);
+    const el = this.findMessageEl(anchor.messageId);
+    if (!el) return;
+    const offset = el.getBoundingClientRect().top - this.messagesEl.getBoundingClientRect().top;
+    this.messagesEl.scrollTop += offset - anchor.offset;
+  }
+
+  /** A removed message must not come back when its earlier block is revealed. */
+  #forgetEarlier(messageId: string): void {
+    const earlier = this.#earlier;
+    const index = earlier?.messages.findIndex(message => message.id === messageId) ?? -1;
+    if (!earlier || index < 0) return;
+    earlier.messages.splice(index, 1);
+    if (index < earlier.start) earlier.start--;
+  }
+
+  /** Renders the window down to an unrendered earlier message, e.g. before inserting beside it. */
+  #revealThrough(messageId: string): void {
+    const earlier = this.#earlier;
+    const index = earlier?.messages.findIndex(message => message.id === messageId) ?? -1;
+    if (earlier && index >= 0) this.#revealFrom(findWindowStart(earlier.messages, index));
+  }
+
+  #createEarlierControl(): HTMLElement {
+    const control = this.messagesEl.createDiv({ cls: 'claudian-earlier-messages' });
+    const button = control.createEl('button', {
+      cls: 'claudian-earlier-messages-btn', text: t('chat.showEarlierMessages'), attr: { type: 'button' },
+    });
+    button.addEventListener('click', () => this.revealEarlierMessages());
+    return control;
+  }
+
+  #renderRange(messages: ChatMessage[], start: number, end: number, live?: LiveTranscriptOptions): void {
+    const openIds = live ? new Set(messages.filter(message => live.isResponseOpen(message.id))
+      .flatMap(message => getResponseSegments(message, messages).map(segment => segment.id))) : undefined;
+    for (let i = start; i < end; i++) {
+      this.renderStoredMessage(messages[i], messages, i, live && { options: live, open: openIds?.has(messages[i].id) === true });
+    }
   }
 
   renderStoredMessage(msg: ChatMessage, allMessages?: ChatMessage[], index?: number, scope?: MessageLiveScope): void {
     const open = !!scope && (scope.options.isResponseOpen(msg.id)
       || (msg.isAutomaticResponse === true && msg.completedAt === undefined && !this.#hasVisibleContent(msg)));
     const live = scope && { options: scope.options, open: scope.open || open };
-    // Bare interrupt marker: user-role interrupts (Claude bracket markers) always render
-    // as a standalone indicator. Assistant-role interrupts (Codex partial responses)
-    // only use the bare marker when there's no content to preserve.
-    if (msg.isInterrupt && (msg.role === 'user' || !this.#hasVisibleContent(msg))) {
-      this.#renderInterruptMessage();
+    // Bare interrupt marker: user-role interrupts (Claude bracket markers) and
+    // assistant-role interrupts without content (Codex aborted turns). The
+    // interrupted response it ends already shows it inside its disclosure.
+    if (isInterruptMarker(msg)) {
+      const previous = allMessages?.[(index ?? 0) - 1];
+      if (!previous || !isConsumedInterruptMarker(msg, allMessages ?? [], index)
+        || !this.messageEls.get(previous.id)?.isConnected) this.#renderInterruptMessage();
       return;
     }
 
@@ -255,7 +444,9 @@ export class MessageRenderer {
       this.#renderUserMessage(msg, { live: false, allMessages, index });
       return;
     }
-    if (msg.role === 'assistant' && !this.#hasVisibleContent(msg) && !open) {
+    const interrupted = isInterruptedResponse(msg, allMessages ?? [msg], index);
+    // An interrupted reply whose output is all hidden still ends its turn's fold.
+    if (msg.role === 'assistant' && !this.#hasVisibleContent(msg) && !open && !interrupted) {
       // A pre-output notification can leave an empty first segment that still
       // anchors its continuation's work disclosure when the transcript rerenders.
       const anchorsContinuation = allMessages?.some(message => message !== msg
@@ -271,16 +462,17 @@ export class MessageRenderer {
         const info = msg.toolCalls?.find(tool => tool.id === id)?.subagent;
         if (info) renderSubagentHistory(card, info, allMessages ?? [msg]);
       }
-      if (msg.isInterrupt) {
+      if (msg.isInterrupt || interrupted) {
         this.appendInterruptIndicator(contentEl);
       }
     }
 
     this.#actions.appendTimestamp(msgEl, msg.completedAt);
     const next = index === undefined ? undefined : allMessages?.[index + 1];
-    if (msg.role === 'assistant' && !open && (msg.durationSeconds !== undefined || next?.role !== 'assistant'
-      || msg.contentBlocks?.some(block => block.type === 'task_notification'))) {
-      this.finalizeResponse(msg, allMessages ?? [msg], !next?.isInterrupt, index);
+    if (msg.role === 'assistant' && !open && !isFoldedByLaterInterrupt(msg, allMessages ?? [msg], index)
+      && (msg.durationSeconds !== undefined || next?.role !== 'assistant'
+      || interrupted || msg.contentBlocks?.some(block => block.type === 'task_notification'))) {
+      this.finalizeResponse(msg, allMessages ?? [msg], true, index);
     }
   }
 
@@ -292,7 +484,7 @@ export class MessageRenderer {
     msg: ChatMessage,
     context: { live: true } | { live: false; allMessages?: ChatMessage[]; index?: number },
   ): HTMLElement | null {
-    const text = msg.displayContent ?? extractUserDisplayContent(msg.content) ?? msg.content;
+    const text = getUserDisplayText(msg);
     if (msg.images && msg.images.length > 0) {
       const imagesEl = this.#renderMessageImages(msg.images);
       imagesEl.dataset.userMessageId = msg.id;
@@ -301,6 +493,13 @@ export class MessageRenderer {
     if (!text && !this.#actions.branchesEnabled) return null;
 
     const { msgEl, contentEl } = this.#createMessageEl(msg);
+    if (msg.sessionMessage) {
+      const { from, sessionId } = msg.sessionMessage;
+      // Only the session name is the link; the label stays plain text beside it.
+      const senderEl = contentEl.createDiv({ cls: 'claudian-session-message-sender' });
+      senderEl.createSpan({ text: t('chat.sessionMessage.fromLabel') });
+      createSessionLink(senderEl, { sessionId, text: from });
+    }
     if (text) void this.renderContent(createResponseTextBlock(contentEl), text);
     this.#actions.decorateUserMessage(msgEl, msg, text, context.live ? undefined : context);
     return msgEl;
@@ -324,9 +523,9 @@ export class MessageRenderer {
     const msgEl = this.findMessageEl(msg.id);
     const contentEl = msgEl?.querySelector<HTMLElement>('.claudian-message-content');
     if (!msgEl || !contentEl) return;
-    const copyText = this.#finalizer.finalize(msgEl, contentEl, msg, messages, collapse, index);
-    if (copyText === null) return;
-    this.#actions.decorateResponse(msgEl, contentEl, msg, messages, copyText);
+    const finalized = this.#finalizer.finalize(msgEl, contentEl, msg, messages, collapse, index);
+    if (finalized === null) return;
+    this.#actions.decorateResponse(msgEl, contentEl, msg, finalized.answer);
   }
 
   #hasVisibleContent(msg: ChatMessage): boolean {
@@ -356,13 +555,7 @@ export class MessageRenderer {
   }
 
   appendInterruptIndicator(contentEl: HTMLElement): void {
-    const textEl = createResponseTextBlock(contentEl);
-    textEl.createSpan({ cls: 'claudian-interrupted', text: t('chat.zen.interrupted') });
-    textEl.appendText(' ');
-    textEl.createSpan({
-      cls: 'claudian-interrupted-hint',
-      text: t('chat.interruptedHint'),
-    });
+    appendInterruptLabel(markResponseElement(contentEl.createDiv({ cls: 'claudian-text-block' }), 'interrupt'));
   }
 
   renderTaskNotification(contentEl: HTMLElement, content: string): void {
@@ -389,7 +582,7 @@ export class MessageRenderer {
             continue;
           }
           const textEl = createResponseTextBlock(contentEl);
-          void this.renderContent(textEl, block.content);
+          void this.renderContent(textEl, ProviderRegistry.prepareAssistantMarkdown(this.getCapabilities().providerId, block.content));
           this.addTextCopyButton(textEl, block.content);
         } else if (block.type === 'citations') {
           renderCitationGroup(contentEl, block.citations);
@@ -430,7 +623,7 @@ export class MessageRenderer {
       // Fallback for old conversations without contentBlocks
       if (msg.content.trim() && !live?.options.isResponseOpen(msg.id)) {
         const textEl = createResponseTextBlock(contentEl);
-        void this.renderContent(textEl, msg.content);
+        void this.renderContent(textEl, ProviderRegistry.prepareAssistantMarkdown(this.getCapabilities().providerId, msg.content));
         this.addTextCopyButton(textEl, msg.content);
       }
       if (msg.toolCalls) {
@@ -581,7 +774,7 @@ export class MessageRenderer {
 
       imageWrapper.addEventListener('click', () => {
         if (this.#markdown.isDisposed) return;
-        this.imagePreviewModal.open(this.messagesEl.ownerDocument ?? window.document, image);
+        this.imagePreviewModal.open(this.messagesEl.ownerDocument ?? window.document, image, this.app.keymap);
       });
     }
     return imagesEl;
@@ -633,7 +826,14 @@ export class MessageRenderer {
 
   /** Scrolls messages container to bottom. */
   scrollToBottom(): void {
+    this.#cancelTailScroll();
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  #cancelTailScroll(): void {
+    const pending = this.#pendingTailScroll;
+    this.#pendingTailScroll = null;
+    if (pending?.frame) cancelScheduledAnimationFrame(pending.frame);
   }
 
   /** A transcript rendered into a hidden presentation ignores scroll writes until it gets a box. */
@@ -659,12 +859,20 @@ export class MessageRenderer {
 
   /** Scrolls to bottom if already near bottom (within threshold). */
   scrollToBottomIfNeeded(threshold = 100): void {
+    this.#cancelTailScroll();
+    if (this.#markdown.isDisposed) return;
     const { scrollTop, scrollHeight, clientHeight } = this.messagesEl;
     const isNearBottom = scrollHeight - scrollTop - clientHeight < threshold;
     if (isNearBottom) {
-      window.requestAnimationFrame(() => {
-        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-      });
+      const pending = { scrollTop } as { frame?: ScheduledAnimationFrame; scrollTop: number };
+      this.#pendingTailScroll = pending;
+      pending.frame = scheduleAnimationFrame(() => {
+        if (this.#pendingTailScroll !== pending) return;
+        this.#pendingTailScroll = null;
+        if (this.messagesEl.scrollTop === pending.scrollTop) {
+          this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+        }
+      }, this.messagesEl.ownerDocument.defaultView);
     }
   }
 }

@@ -1,4 +1,7 @@
+import { globalAgent } from 'node:http';
+
 import { NativePeer } from '@test/helpers/deepseek/NativePeer';
+import { nativeRequest } from '@test/helpers/deepseek/NativeRequest';
 
 let peer: NativePeer;
 
@@ -7,7 +10,7 @@ beforeEach(async () => {
   peer.onCall = method => method === 'session/list' ? { items: [] } : `${method} answered`;
   await peer.open();
 });
-afterEach(async () => { jest.useRealTimers(); await peer.close(); });
+afterEach(async () => { vi.useRealTimers(); await peer.close(); });
 
 it('runs one fork at a time and lets only an ephemeral fork hold a token, withdrawn even when native refuses', async () => {
   let releaseFirst!: () => void;
@@ -15,7 +18,7 @@ it('runs one fork at a time and lets only an ephemeral fork hold a token, withdr
   peer.onCall = async (method, args) => {
     if (method === 'session/list') return { items: [] };
     if (method !== 'session/fork') return `${method} answered`;
-    if (args.request.sessionId === 'refused') throw Object.assign(new Error('fork refused'), { code: 'session/fork-unavailable' });
+    if (nativeRequest(args).sessionId === 'refused') throw Object.assign(new Error('fork refused'), { code: 'session/fork-unavailable' });
     if (peer.calls.filter(call => call.method === 'session/fork').length === 1) await held;
     return { sessionId: `fork-${peer.calls.filter(call => call.method === 'session/fork').length}` };
   };
@@ -59,7 +62,7 @@ it('keeps an ephemeral fork token until native work ends: no client deadline, an
   peer.onCall = async (method, args) => {
     if (method === 'session/list') return { items: [] };
     if (method !== 'session/fork') return `${method} answered`;
-    if (args.request.atSeq === 1) { await slow; return { sessionId: 'slow-fork' }; }
+    if (nativeRequest(args).atSeq === 1) { await slow; return { sessionId: 'slow-fork' }; }
     // A failure native did not classify: the fork may still complete inside the process.
     throw new Error('connection reset');
   };
@@ -67,22 +70,19 @@ it('keeps an ephemeral fork token until native work ends: no client deadline, an
   try {
     const lease = await deepseek.attach();
     // Only the client deadline is virtual; the fixture server answers on immediates.
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    vi.useFakeTimers({ toNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
     const forking = lease.fork({ sessionId: 'saved', atSeq: 1 }, true);
     forking.catch(() => undefined);
-    for (let turns = 0; !peer.calls.some(call => call.method === 'session/fork'); turns++) {
-      if (turns > 10_000) throw new Error('Fork never reached native.');
-      await flush();
-    }
+    await peer.waitForCall('session/fork');
     // Native forks have no cancellation; a client deadline would withdraw the token while native still forks.
-    jest.advanceTimersByTime(120_000);
+    vi.advanceTimersByTime(120_000);
     await flush();
     expect(lifecycle.ephemeralForks[0].forksAtWithdraw).toBeUndefined();
     finish();
     expect(await forking).toBe('slow-fork');
-    jest.useRealTimers();
+    vi.useRealTimers();
 
-    const lost = jest.fn();
+    const lost = vi.fn();
     lease.onLost(lost);
     await expect(lease.fork({ sessionId: 'saved', atSeq: 2 }, true)).rejects.toThrow('connection reset');
     // The token stays published until the process that might still claim it is gone.
@@ -97,7 +97,7 @@ it.each([false, true])('retires the process after an unclassified failure of any
   peer.onCall = async (method, args) => {
     if (method === 'session/list') return { items: [] };
     if (method !== 'session/fork') return `${method} answered`;
-    if (args.request.atSeq === 9) throw Object.assign(new Error('native refused'), { code: 'session/fork-unavailable' });
+    if (nativeRequest(args).atSeq === 9) throw Object.assign(new Error('native refused'), { code: 'session/fork-unavailable' });
     throw new Error('connection reset');
   };
   const { deepseek, lifecycle } = peer.host();
@@ -106,7 +106,7 @@ it.each([false, true])('retires the process after an unclassified failure of any
     // A native refusal proves no fork exists and keeps the process.
     await expect(lease.fork({ sessionId: 'saved', atSeq: 9 }, ephemeralFork)).rejects.toThrow('native refused');
     expect(lifecycle.disposed).toBe(0);
-    const lost = jest.fn();
+    const lost = vi.fn();
     lease.onLost(lost);
     await expect(lease.fork({ sessionId: 'saved', atSeq: 2 }, ephemeralFork)).rejects.toThrow('connection reset');
     expect(lifecycle.disposed).toBe(1);
@@ -127,22 +127,19 @@ it.each([true, false])('retires the process when a native fork never settles ins
   const { deepseek, lifecycle } = peer.host({ ephemeralReady: ready });
   try {
     const lease = await deepseek.attach();
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    vi.useFakeTimers({ toNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
     // Without the plugin the unfinished fork could still persist an orphan after Claudian reported it failed.
     const hung = lease.fork({ sessionId: 'saved', atSeq: 1 }, ready);
     const queued = lease.fork({ sessionId: 'saved', atSeq: 1 }, false);
-    const settled = jest.fn();
+    const settled = vi.fn();
     hung.then(settled, settled); queued.then(settled, settled);
-    for (let turns = 0; !peer.calls.some(call => call.method === 'session/fork'); turns++) {
-      if (turns > 10_000) throw new Error('Fork never reached native.');
-      await flush();
-    }
+    await peer.waitForCall('session/fork');
     // Native forks may legitimately wait on MCP discovery; minutes pass before the Host gives up.
-    jest.advanceTimersByTime(4 * 60_000);
+    vi.advanceTimersByTime(4 * 60_000);
     await flush();
     expect(settled).not.toHaveBeenCalled();
-    jest.advanceTimersByTime(60_000);
-    jest.useRealTimers();
+    vi.advanceTimersByTime(60_000);
+    vi.useRealTimers();
     await expect(hung).rejects.toThrow(/did not finish/);
     await expect(queued).rejects.toThrow();
     expect(lifecycle.disposed).toBe(1);
@@ -157,7 +154,7 @@ it('retires the process when a refused fork\'s token cannot be withdrawn, but ke
   peer.onCall = async (method, args) => {
     if (method === 'session/list') return { items: [] };
     if (method !== 'session/fork') return `${method} answered`;
-    if (args.request.atSeq === 9) throw Object.assign(new Error('native refused'), { code: 'session/fork-unavailable' });
+    if (nativeRequest(args).atSeq === 9) throw Object.assign(new Error('native refused'), { code: 'session/fork-unavailable' });
     return { sessionId: 'side' };
   };
   const { deepseek, lifecycle } = peer.host({ failWithdrawals: true });
@@ -232,7 +229,7 @@ it('shares one startup between attachments and reads, then stops only after the 
   let release!: () => void;
   const startup = new Promise<void>(resolve => { release = resolve; });
   // Idle timers are virtual so no wall-clock delay can stand in for the lease holding the process.
-  jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+  vi.useFakeTimers({ toNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
   const { deepseek, lifecycle } = peer.host({ idleMs: 30, beforeStart: () => startup });
   try {
     const attaching = deepseek.attach();
@@ -242,15 +239,15 @@ it('shares one startup between attachments and reads, then stops only after the 
     expect(await reading).toBe('session/modelCatalog answered');
     expect(lifecycle.starts).toBe(1);
     // The read has left; only the held lease keeps the process past many idle periods.
-    jest.advanceTimersByTime(300);
+    vi.advanceTimersByTime(300);
     await flush();
     expect(lifecycle.disposed).toBe(0);
     lease.release();
-    jest.advanceTimersByTime(29);
+    vi.advanceTimersByTime(29);
     await flush();
     expect(lifecycle.disposed).toBe(0);
-    jest.advanceTimersByTime(1);
-    jest.useRealTimers();
+    vi.advanceTimersByTime(1);
+    vi.useRealTimers();
     await until(() => lifecycle.disposed === 1);
     expect(await deepseek.read(reader => reader.call('session/projections', { request: { sessionId: 'saved' } }))).toBe('session/projections answered');
     expect(lifecycle.starts).toBe(2);
@@ -285,7 +282,7 @@ it('notifies attachments when the process exits and starts a replacement only af
   const { deepseek, lifecycle } = peer.host({ onDispose: () => teardown });
   try {
     const lease = await deepseek.attach();
-    const lost = jest.fn();
+    const lost = vi.fn();
     lease.onLost(lost);
     lifecycle.exit();
     expect(lost).toHaveBeenCalledWith('process-exited', expect.any(Error));
@@ -313,17 +310,100 @@ it('never hands out a lease on a process that exited while startup was finishing
   } finally { await deepseek.dispose(); }
 });
 
-it('fails attached sessions recoverably and replaces the process when reconnection cannot list sessions', async () => {
+it('keeps one live mux while reconnecting the live process through a roster failure and a socket that drops again', async () => {
   const { deepseek, lifecycle } = peer.host();
   try {
     const lease = await deepseek.attach();
-    const lost = new Promise<[string, Error]>(resolve => lease.onLost((loss, error) => resolve([loss, error])));
-    peer.onCall = method => method === 'session/list' ? Promise.reject(new Error('roster unavailable')) : `${method} answered`;
-    for (const stream of peer.streams.values()) stream.socket.terminate();
-    const [loss, error] = await lost;
+    const losses: string[] = [];
+    lease.onLost(loss => losses.push(loss));
+    const lists = (): number => peer.calls.filter(call => call.method === 'session/list').length;
+    const before = lists();
+    const sockets = openSockets();
+    let drops = 0;
+    lease.client.onDisconnect(() => { drops++; });
+    peer.onCall = async method => {
+      if (method !== 'session/list') return `${method} answered`;
+      if (lists() === before + 1) throw new Error('roster unavailable');
+      if (lists() === before + 2) {
+        // Native's heartbeat terminates a stalled client again after the reconnected socket subscribed to its streams.
+        dropHost();
+        await until(() => drops === 2);
+      }
+      return { items: [] };
+    };
+    dropHost();
+    await until(() => lists() === before + 3);
+    await until(() => [...peer.streams.values()].some(stream => stream.endpoint === 'session/control' && stream.socket.readyState === stream.socket.OPEN));
+    await until(() => openSockets() === sockets);
+    expect(losses).toEqual([]);
+    expect(lifecycle.disposed).toBe(0);
+    lease.release();
+  } finally { await deepseek.dispose(); }
+});
+
+it('retries a failed reconnection of the live process, failing attached sessions and replacing it only when the budget ends', async () => {
+  const { deepseek, lifecycle } = peer.host();
+  try {
+    const lease = await deepseek.attach();
+    const losses: Array<[string, Error]> = [];
+    lease.onLost((loss, error) => losses.push([loss, error]));
+    const lists = (): number => peer.calls.filter(call => call.method === 'session/list').length;
+    let hang = false;
+    let hung = 0;
+    // Late in the budget native stops answering the roster; its request must not outlive the budget.
+    peer.onCall = method => method !== 'session/list' ? `${method} answered`
+      : hang ? (hung++, new Promise<never>(() => {})) : Promise.reject(new Error('roster unavailable'));
+    // The fixture server answers on immediates; reconnection waits and client deadlines run on the fake clock.
+    vi.useFakeTimers({ toNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    // The budget starts when the client observes the close, which is real I/O. The Host subscribed at boot, before this
+    // listener, so once it runs the budget timer exists on the fake clock; advancing earlier would spend budget time.
+    let observed = false;
+    lease.client.onDisconnect(() => { observed = true; });
+    let attempts = 0;
+    lease.roster.onReset(() => { attempts++; });
+    const listed = lists();
+    dropHost();
+    for (const deadline = realNow() + 2_000; !observed && realNow() < deadline;) await flush();
+    expect(observed).toBe(true);
+    // The budget timer was armed at this virtual instant.
+    const budgetEnds = Date.now() + 60_000;
+    /** Fires the Host's pending backoff, which starts its next attempt. */
+    const startNextAttempt = async (): Promise<void> => {
+      for (const started = attempts; attempts === started;) {
+        expect(Date.now()).toBeLessThan(budgetEnds);
+        vi.advanceTimersToNextTimer();
+        await flush();
+      }
+    };
+    for (let attempt = 1; ; attempt++) {
+      // Each attempt connects and asks native's roster over real I/O. Once its roster request has reached native and the
+      // client's HTTP exchange has ended, the failure was consumed in that turn and the Host is waiting on its backoff.
+      await settle(() => lists() === listed + attempt && !httpInFlight());
+      if (Date.now() >= budgetEnds - 10_000) break;
+      await startNextAttempt();
+    }
+    expect(lists()).toBeGreaterThan(5);
+    // Late in the budget native stops answering; the next attempt's roster request reaches it and stays outstanding.
+    hang = true;
+    await startNextAttempt();
+    await settle(() => hung === 1);
+    // Its own 30-second deadline cannot elapse before the budget ends, so this request is outstanding at expiry.
+    vi.advanceTimersByTime(budgetEnds - Date.now() - 1);
+    await flush();
+    expect(hung).toBe(1);
+    expect(losses).toEqual([]);
+    expect(lifecycle.disposed).toBe(0);
+    vi.advanceTimersByTime(1);
+    // Socket teardown is real I/O: bound the wait by real time, not by a count of flushes a loaded runner can exhaust.
+    for (const deadline = realNow() + 2_000; !losses.length && realNow() < deadline;) await flush();
+    vi.useRealTimers();
+    expect(losses).toHaveLength(1);
+    const [[loss, error]] = losses;
     expect(loss).toBe('transport');
     expect(error.message).toMatch(/roster unavailable/);
     await until(() => lifecycle.disposed === 1);
+    // Only the fixture's own client remains: no attempt's socket outlives the process.
+    await until(() => openSockets() === 1);
     lease.release();
     peer.onCall = method => method === 'session/list' ? { items: [] } : `${method} answered`;
     const replacement = await deepseek.attach();
@@ -332,6 +412,30 @@ it('fails attached sessions recoverably and replaces the process when reconnecti
     replacement.release();
   } finally { await deepseek.dispose(); }
 });
+
+/** Native's heartbeat terminating the Host's mux; the fixture's own client keeps its socket. */
+function dropHost(): void {
+  for (const stream of peer.streams.values()) if (stream.endpoint === 'session/control') stream.socket.terminate();
+}
+
+/** Distinct open mux sockets at the native peer, including the fixture's own client. */
+function openSockets(): number {
+  return new Set([...peer.streams.values()].filter(stream => stream.socket.readyState === stream.socket.OPEN).map(stream => stream.socket)).size;
+}
+
+// Captured before any test fakes timers, so waits on real I/O stay bounded by real time.
+const realNow = performance.now.bind(performance);
+
+/** Waits on real I/O for a lifecycle point; the real-time bound only reports a missing signal. */
+async function settle(predicate: () => boolean): Promise<void> {
+  for (const deadline = realNow() + 2_000; !predicate() && realNow() < deadline;) await flush();
+  expect(predicate()).toBe(true);
+}
+
+/** Whether a client HTTP exchange is still open: the agent releases its socket once the response has ended. */
+function httpInFlight(): boolean {
+  return Object.values(globalAgent.sockets).some(sockets => sockets?.length);
+}
 
 /** Settles every pending microtask continuation. */
 function flush(): Promise<void> {

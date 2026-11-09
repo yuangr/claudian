@@ -7,6 +7,7 @@ import type { ProviderCommandKind } from '@/core/providers/commands/ProviderComm
 import { type ComposerSessionMention, findComposerSessionMentions } from '@/features/chat/composer/composerSessionMentions';
 import { findComposerWikilinks } from '@/features/chat/composer/composerWikilinks';
 import { t } from '@/i18n/i18n';
+import { MarkdownRenderScope } from '@/shared/components/MarkdownRenderScope';
 import type { ComposerCommandResolver, ComposerInputElement } from '@/shared/composer-dropdown/types';
 import { registerFileLinkHandler } from '@/utils/fileLink';
 import { filterMarkdownTextTokens } from '@/utils/markdownTextTokens';
@@ -16,6 +17,9 @@ const programmatic = Annotation.define<boolean>();
 const INPUT_RELATIONSHIP_ATTRIBUTES = ['aria-autocomplete', 'aria-activedescendant', 'aria-controls', 'aria-haspopup'];
 
 class WikilinkWidget extends WidgetType {
+  // CodeMirror can keep a DOM node while replacing its equivalent WidgetType.
+  private static readonly renders = new WeakMap<HTMLElement, MarkdownRenderScope>();
+
   constructor(
     private readonly markdown: string,
     private readonly app: App,
@@ -34,10 +38,21 @@ class WikilinkWidget extends WidgetType {
     const el = ownerWindow.createSpan();
     el.className = 'claudian-composer-wikilink markdown-rendered';
     el.contentEditable = 'false';
-    void MarkdownRenderer.render(this.app, this.markdown, el, '', this.component).then(() => {
+    const scope = this.component.addChild(new MarkdownRenderScope());
+    scope.load();
+    WikilinkWidget.renders.set(el, scope);
+    void MarkdownRenderer.render(this.app, this.markdown, el, '', scope).then(() => {
       if (el.isConnected) view.requestMeasure();
     }).catch(() => { el.textContent = this.markdown; });
     return el;
+  }
+
+  override destroy(dom: HTMLElement): void {
+    const scope = WikilinkWidget.renders.get(dom);
+    if (!scope) return;
+    WikilinkWidget.renders.delete(dom);
+    this.component.removeChild(scope);
+    scope.unload();
   }
 }
 
@@ -130,6 +145,7 @@ export class ComposerEditor {
   private linkRevision = 0;
   private commandResolver: ComposerCommandResolver | null = null;
   private readonly removeFileLinkHandler: () => void;
+  private readonly removeWindowMigrationHandler: () => void;
 
   constructor(parent: HTMLElement, private readonly app: App, private readonly component: Component) {
     const host = parent.createDiv({
@@ -235,8 +251,20 @@ export class ComposerEditor {
     };
     this.element.isChipRange = (from, to) => isChipRange(this.state.field(decorations), from, to);
     this.element.getAccessibleTextbox = () => this.textbox;
+    this.element.isCaretOnEdgeRow = direction => {
+      const view = this.view;
+      if (!view) return null;
+      const caret = view.state.selection.main;
+      const caretRect = view.coordsAtPos(caret.head, caret.assoc < 0 ? -1 : 1);
+      const edgeRect = direction === 'up' ? view.coordsAtPos(0, 1) : view.coordsAtPos(view.state.doc.length, -1);
+      if (!caretRect || !edgeRect || caretRect.bottom <= caretRect.top || edgeRect.bottom <= edgeRect.top) return null;
+      return direction === 'up' ? caretRect.top < edgeRect.bottom : caretRect.bottom > edgeRect.top;
+    };
     host.setAttribute('data-placeholder', this.placeholderText);
     host.addEventListener('focusin', this.onFocusIn);
+    // CodeMirror resolves its root document once; a tab moved to a pop-out keeps the old one, so focus and
+    // selection writes would target the wrong window.
+    this.removeWindowMigrationHandler = host.onWindowMigrated(win => this.view?.setRoot(win.document));
   }
 
   refreshLinks(): void {
@@ -276,6 +304,7 @@ export class ComposerEditor {
   destroy(): void {
     this.destroyed = true;
     this.element.removeEventListener('focusin', this.onFocusIn);
+    this.removeWindowMigrationHandler();
     this.removeFileLinkHandler();
     this.view?.destroy();
     this.view = null;

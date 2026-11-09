@@ -1,6 +1,7 @@
 import {
   extractResolvedAnswers,
   extractResolvedAnswersFromResultText,
+  normalizeResolvedAnswers,
 } from '@/core/tools/toolInput';
 
 describe('extractResolvedAnswers', () => {
@@ -29,6 +30,12 @@ describe('extractResolvedAnswers', () => {
       ok: 'true',
       choices: ['A', 'B'],
     });
+  });
+
+  it('keeps a multi-answer array under a __proto__ key as an own entry', () => {
+    const normalized = normalizeResolvedAnswers(JSON.parse('{"__proto__":["Blue","Red"]}'))!;
+    expect(JSON.stringify(normalized)).toBe('{"__proto__":["Blue","Red"]}');
+    expect(Object.getOwnPropertyDescriptor(normalized, '__proto__')).toMatchObject({ value: ['Blue', 'Red'], enumerable: true });
   });
 
   it('excludes empty-string answers', () => {
@@ -60,6 +67,18 @@ describe('extractResolvedAnswersFromResultText', () => {
       'Color?': 'Blue',
       'Fast?': 'true',
     });
+  });
+
+  it('keeps a literal JSON __proto__ answer as an own key', () => {
+    const parsed = extractResolvedAnswersFromResultText('{"__proto__":"Blue"}')!;
+    expect(JSON.stringify(parsed)).toBe('{"__proto__":"Blue"}');
+    expect(Object.getOwnPropertyDescriptor(parsed, '__proto__')).toMatchObject({ value: 'Blue', enumerable: true });
+  });
+
+  it('keeps a quoted-pair __proto__ answer as an own key', () => {
+    const parsed = extractResolvedAnswersFromResultText('"__proto__"="Blue"')!;
+    expect(JSON.stringify(parsed)).toBe('{"__proto__":"Blue"}');
+    expect(Object.getOwnPropertyDescriptor(parsed, '__proto__')).toMatchObject({ value: 'Blue', enumerable: true });
   });
 
   it('extracts nested Codex answer objects from JSON result text', () => {

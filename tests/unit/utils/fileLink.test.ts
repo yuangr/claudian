@@ -37,10 +37,19 @@ describe('parseWikilinks', () => {
       expect(matches[0].fullMatch).toBe('[[note.md|My Note]]');
     });
 
-    it('extracts display text correctly', () => {
-      const fullMatch = '[[note.md|My Display Text]]';
-      const displayText = parseWikilinks(fullMatch)[0].displayText;
-      expect(displayText).toBe('My Display Text');
+    it.each([
+      ['[[note.md|My Display Text]]', 'note.md', 'My Display Text'],
+      ['[[note.md|Left | Right]]', 'note.md', 'Left | Right'],
+      ['[[note.md#section|Left | Right]]', 'note.md#section', 'Left | Right'],
+      ['[[note.md|Trailing |]]', 'note.md', 'Trailing |'],
+    ])('extracts complete display text from %s', (fullMatch, linkTarget, displayText) => {
+      expect(parseWikilinks(`See ${fullMatch} here`)).toEqual([{
+        index: 4,
+        fullMatch,
+        linkPath: 'note.md',
+        linkTarget,
+        displayText,
+      }]);
     });
   });
 

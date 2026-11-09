@@ -6,6 +6,7 @@ import type {
   ProviderWorkspaceServices,
 } from '../../../core/providers/types';
 import { OpencodeCommandCatalog } from '../commands/OpencodeCommandCatalog';
+import { preservesOpencodeConversationSession } from '../env/OpencodeSettingsReconciler';
 import { OpencodeExecutionSession } from '../execution/OpencodeExecutionSession';
 import { OpencodeServerService } from '../http/OpencodeServerService';
 import { OpencodeMetadataService } from '../metadata/OpencodeMetadataService';
@@ -25,18 +26,28 @@ export interface OpencodeWorkspaceServices extends ProviderWorkspaceServices {
 export async function createOpencodeWorkspaceServices(
   plugin: ProviderHost,
 ): Promise<OpencodeWorkspaceServices> {
+  const runtimeHost = plugin.getRuntimeHost('opencode');
   const commandCatalog = new OpencodeCommandCatalog();
-  const serverService = new OpencodeServerService();
-  const runtime = new OpencodeSharedRuntime(plugin, serverService, version => commandCatalog.setNativeVersion(version));
+  const serverService = new OpencodeServerService(plugin.sessionToolEndpoint);
+  const runtime = new OpencodeSharedRuntime(runtimeHost, serverService);
   const unregister = plugin.executionLifecycleRegistry.registerTransitionHook('opencode', {
-    preserveSessions: session => getOpencodeProviderSettings(plugin.settings).enabled
-      && session instanceof OpencodeExecutionSession && session.usesSharedRuntime,
+    preserveSessions: (session, { sessionsInvalidated }) => {
+      if (!getOpencodeProviderSettings(plugin.settings).enabled) return false;
+      if (!(session instanceof OpencodeExecutionSession)) return false;
+      if (!sessionsInvalidated) return true;
+      // Invalidation retires bindings the provider does not preserve; their sessions end with them.
+      const snapshot = session.getSnapshot();
+      return preservesOpencodeConversationSession({
+        sessionId: snapshot.providerSessionId ?? null,
+        providerState: snapshot.providerState,
+      });
+    },
     beforeTransition: () => runtime.beginTransition(),
     afterTransition: () => runtime.endTransition(),
   });
-  const metadataService = new OpencodeMetadataService(plugin, { commandCatalog, serverService });
+  const metadataService = new OpencodeMetadataService(runtimeHost, plugin.executionLifecycleRegistry, { serverService });
 
-  const modelCatalog = createOpencodeModels(plugin, metadataService);
+  const modelCatalog = createOpencodeModels(runtimeHost, metadataService);
   const unregisterModels = plugin.executionLifecycleRegistry.registerTransitionHook('opencode', { beforeTransition: () => modelCatalog.beginTransition(), afterTransition: () => modelCatalog.endTransition() });
   const cliResolver = new OpencodeCLIResolver();
   return {

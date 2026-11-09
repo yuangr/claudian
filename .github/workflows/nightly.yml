@@ -13,6 +13,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # PR and push CI runs native WSL suites only for WSL-related changes; the full reusable CI here
+  # runs every WSL suite weekly so a WSL regression outside that selection surfaces within a week.
+  full-ci:
+    uses: ./.github/workflows/ci.yml
+
   full-platform:
     name: Full suite (${{ matrix.os }}, ${{ matrix.shard }})
     strategy:
@@ -23,7 +28,6 @@ jobs:
             shard: 1/1
           - os: macos-latest
             shard: 1/1
-          # Keep native filesystem suites serial, with parallelism across runners.
           - os: windows-latest
             shard: 1/3
           - os: windows-latest
@@ -52,21 +56,29 @@ jobs:
           SCRIPT_SELECTION: ${{ startsWith(matrix.shard, '1/') && 'null' || '[]' }}
         run: |
           worker_args=()
-          if [[ "$RUNNER_OS" == "Windows" ]]; then worker_args=(--maxWorkers=1); fi
-          npm run test -- --script-selection "$SCRIPT_SELECTION" "${worker_args[@]}" --shard="$TEST_SHARD" --json --outputFile=test-results/jest.json
+          if [[ "$RUNNER_OS" == "Windows" ]]; then worker_args=(--maxWorkers=4); fi
+          npm run test -- --script-selection "$SCRIPT_SELECTION" "${worker_args[@]}" --shard="$TEST_SHARD" --reporter=default --reporter=json --outputFile=test-results/vitest.json
 
       - name: Summarize test timings
         if: always() && steps.tests.outcome != 'skipped'
-        run: node scripts/summarize-jest-results.mjs test-results/jest.json test-results/timings
+        run: node scripts/summarize-vitest-results.mjs test-results/vitest.json test-results/timings
 
       - name: Upload test timings
         if: always() && steps.tests.outcome != 'skipped'
         uses: actions/upload-artifact@v7
         with:
-          name: jest-full-timings-${{ runner.os }}-${{ strategy.job-index }}
+          name: vitest-full-timings-${{ runner.os }}-${{ strategy.job-index }}
           path: test-results/timings/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Check shared state with shuffled files and tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          SHUFFLE_SEED: ${{ github.run_id }}
+        run: |
+          echo "Vitest shuffle seed: $SHUFFLE_SEED"
+          npm run test:unit -- --sequence.shuffle --sequence.seed="$SHUFFLE_SEED"
 
       - name: Build production plugin
         if: startsWith(matrix.shard, '1/')
@@ -87,7 +99,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Detect Jest lifecycle leaks
+      - name: Detect Vitest lifecycle leaks
         run: npm run check:open-handles
 
   production-audit:

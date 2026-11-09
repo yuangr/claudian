@@ -3,6 +3,7 @@ import {
   parseImageDataUri,
 } from '@/core/execution/imageAttachment';
 import { extractUserDisplayContent } from '@/core/prompt/promptContext';
+import { decodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import { resolveToolDiffData } from '@/core/tools/toolDiff';
 import { isCompactionCanceledStderr, isInterruptSignalText } from '@/providers/claude/history/interrupt';
 
@@ -15,6 +16,7 @@ import type {
   ImageAttachment,
   ToolCallInfo,
 } from '../../../core/types';
+import { normalizeClaudeSessionToolName } from '../normalization/claudeSessionToolNames';
 import { extractXMLTag, parseClaudeTaskNotification } from '../normalization/claudeTaskNotification';
 import { extractClaudeTextContent, isClaudeNoContentPlaceholder } from '../normalization/claudeTextContent';
 import { normalizeClaudeToolResultDetails } from '../normalization/claudeToolResultDetails';
@@ -100,7 +102,9 @@ function extractToolCalls(
     const result = results.get(block.id);
     return {
       id: block.id,
-      name: block.name,
+      name: normalizeClaudeSessionToolName(block.name),
+      ...(normalizeClaudeSessionToolName(block.name) !== block.name
+        ? { providerPayload: { rawName: block.name } } : {}),
       input: block.input ?? {},
       status: result ? (result.isError ? 'error' : 'completed') : 'running',
       result: result?.content,
@@ -208,6 +212,7 @@ export function parseSDKMessageToChat(
       : extractUserDisplayContent(textContent);
   }
 
+  const sessionMessage = sdkMsg.type === 'user' ? decodeSessionMessage(textContent) : null;
   const isInterrupt = sdkMsg.type === 'user' && isInterruptSignalText(textContent);
   const isRebuiltContext = sdkMsg.type === 'user' && isRebuiltContextContent(textContent);
 
@@ -216,6 +221,7 @@ export function parseSDKMessageToChat(
     role: sdkMsg.type,
     content: textContent,
     displayContent,
+    ...(sessionMessage ? { sessionMessage: { from: sessionMessage.from, sessionId: sessionMessage.sessionId } } : {}),
     timestamp,
     toolCalls: sdkMsg.type === 'assistant' ? extractToolCalls(content, toolResults) : undefined,
     contentBlocks: sdkMsg.type === 'assistant' ? mapContentBlocks(content) : undefined,
@@ -292,20 +298,49 @@ export function collectAsyncSubagentResults(
       continue;
     }
 
-    results.set(notification.taskId, { result: notification.content, status });
+    results.set(notification.taskId, {
+      result: notification.content,
+      status,
+      summaryOnly: !notification.hasResult,
+    });
   }
 
   return results;
 }
 
+export function isQueuedPromptAttachment(record: SDKNativeMessage): boolean {
+  return record.type === 'attachment' && record.attachment?.type === 'queued_command'
+    && record.attachment.commandMode === 'prompt';
+}
+
+/**
+ * A queued prompt Claude folds into a running turn keeps its enqueue timestamp,
+ * while the record it follows marks consumption, where the live transcript shows it.
+ * `followedAt` is that record's own effective timestamp, so consecutive folds stay ordered.
+ */
+export function getSDKUserMessageTimestamp(
+  record: SDKNativeMessage,
+  followedAt: string | undefined,
+): string | undefined {
+  if (!isQueuedPromptAttachment(record)) return record.timestamp;
+  const enqueuedAt = Date.parse(record.timestamp ?? '');
+  const consumedAt = Date.parse(followedAt ?? '');
+  return Number.isFinite(consumedAt) && !(enqueuedAt >= consumedAt) ? followedAt : record.timestamp;
+}
+
 export function isCanonicalSDKUserMessage(record: SDKNativeMessage): boolean {
-  const queuedPrompt = record.type === 'attachment'
-    && record.attachment?.type === 'queued_command' && record.attachment.commandMode === 'prompt';
+  const queuedPrompt = isQueuedPromptAttachment(record);
   if ((!queuedPrompt && record.type !== 'user') || isSystemInjectedMessage(record)) return false;
   const content = queuedPrompt ? record.attachment?.prompt : record.message?.content;
   const text = extractClaudeTextContent(content);
   if (!text && (!content || typeof content === 'string')) return false;
   return !isInterruptSignalText(text) && !isRebuiltContextContent(text);
+}
+
+/** A blocking Stop hook's feedback, after which the same native turn continues. */
+export function isStopHookFeedback(sdkMsg: SDKNativeMessage): boolean {
+  return sdkMsg.type === 'user' && sdkMsg.isMeta === true
+    && extractClaudeTextContent(sdkMsg.message?.content)?.startsWith('Stop hook feedback:') === true;
 }
 
 export function isSystemInjectedMessage(sdkMsg: SDKNativeMessage): boolean {
@@ -385,19 +420,22 @@ export function hydrateStructuredToolResults(messages: ChatMessage[], toolUseRes
     }
 
     for (const toolCall of msg.toolCalls) {
-      const toolUseResult = toolUseResults.get(toolCall.id);
-      const details = normalizeClaudeToolResultDetails(toolUseResult);
-      if (toolUseResult && !toolCall.diffData) {
-        toolCall.diffData = resolveToolDiffData(details?.diff, toolCall);
-      }
+      hydrateStructuredToolResult(toolCall, toolUseResults.get(toolCall.id));
+    }
+  }
+}
 
-      if (toolCall.name === TOOL_ASK_USER_QUESTION && !toolCall.resolvedAnswers) {
-        const answers = details?.resolvedAnswers
-          ?? extractResolvedAnswersFromResultText(toolCall.result);
-        if (answers) {
-          toolCall.resolvedAnswers = answers;
-        }
-      }
+export function hydrateStructuredToolResult(toolCall: ToolCallInfo, toolUseResult: unknown): void {
+  const details = normalizeClaudeToolResultDetails(toolUseResult);
+  if (toolUseResult && !toolCall.diffData) {
+    toolCall.diffData = resolveToolDiffData(details?.diff, toolCall);
+  }
+
+  if (toolCall.name === TOOL_ASK_USER_QUESTION && !toolCall.resolvedAnswers) {
+    const answers = details?.resolvedAnswers
+      ?? extractResolvedAnswersFromResultText(toolCall.result);
+    if (answers) {
+      toolCall.resolvedAnswers = answers;
     }
   }
 }

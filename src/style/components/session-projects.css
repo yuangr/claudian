@@ -1,0 +1,58 @@
+/*
+ * The projects section above the sessions in the session sidebar. Like the pinned
+ * section it takes only the height it needs, up to a cap, and scrolls its own rows,
+ * so the session list below always keeps room.
+ */
+.claudian-session-sidebar .claudian-history-section--projects {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  max-height: 40%;
+  min-height: 0;
+}
+
+.claudian-session-sidebar .claudian-session-project-items {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: none;
+}
+
+:is(.claudian-session-sidebar, .claudian-history-menu) .claudian-session-project-empty {
+  /* The label lines up with project and session titles: inset, icon, gap. */
+  padding: 4px var(--claudian-session-inline-inset) 6px
+    calc(var(--claudian-session-inline-inset) + var(--claudian-session-icon-size) + var(--claudian-session-icon-gap));
+  color: var(--text-faint);
+  font-size: calc(12 * var(--claudian-font-px));
+}
+
+/*
+ * A project row's header holds native buttons (toggle, actions, New session), so the
+ * header itself is not interactive; the toggle fills it and owns focus, while the row
+ * owns hover like a session row. The toggle's padding is taken out of the row's inline
+ * start so its icon still sits at the sidebar inset.
+ */
+:is(.claudian-session-sidebar, .claudian-history-menu) .claudian-session-group-header--project {
+  padding: 2px var(--claudian-session-inline-inset) 2px calc(var(--claudian-session-inline-inset) - 8px);
+  cursor: default;
+}
+
+/* The native button reset is shared with the other session-manager buttons in history.css. */
+:is(.claudian-session-sidebar, .claudian-history-menu) .claudian-session-group-toggle {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--claudian-session-icon-gap);
+  min-width: 0;
+  height: auto;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+}
+
+/* An inset ring, so the scrolling projects list cannot clip it. */
+:is(.claudian-session-sidebar, .claudian-history-menu) .claudian-session-group-header .claudian-session-group-toggle:focus-visible {
+  outline-offset: -2px;
+}

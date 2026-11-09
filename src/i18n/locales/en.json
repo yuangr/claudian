@@ -14,8 +14,17 @@
     "none": "None"
   },
   "chat": {
+    "queue": {
+      "queued": "Queued",
+      "steering": "Steering",
+      "steerNow": "Steer Now",
+      "edit": "Edit queued message",
+      "discard": "Discard queued message",
+      "images": "[images]"
+    },
     "promptSuggestionHint": "Tab to accept",
     "selectAvailableModel": "Select an available model before sending.",
+    "reloadingHistory": "This chat changed outside Claudian and is reloading. Send again when it finishes.",
     "selectAvailableTitleModel": "Select an available title model in Claudian settings.",
     "rewind": {
       "confirmMessage": "Rewind to this point? File changes after this message may be overwritten or removed. This cannot be undone.",
@@ -104,9 +113,57 @@
       "showLess": "Show less",
       "moreItems": "+{count} more"
     },
+    "welcome": {
+      "sunday": "Happy Sunday",
+      "sundayNamed": "Happy Sunday, {name}",
+      "monday": "Happy Monday",
+      "mondayNamed": "Happy Monday, {name}",
+      "tuesday": "Happy Tuesday",
+      "tuesdayNamed": "Happy Tuesday, {name}",
+      "wednesday": "Happy Wednesday",
+      "wednesdayNamed": "Happy Wednesday, {name}",
+      "thursday": "Happy Thursday",
+      "thursdayNamed": "Happy Thursday, {name}",
+      "friday": "Happy Friday",
+      "fridayNamed": "Happy Friday, {name}",
+      "saturday": "Happy Saturday!",
+      "saturdayNamed": "Happy Saturday, {name}",
+      "backAtIt": "Back at it!",
+      "backAtItNamed": "Back at it, {name}",
+      "fridayFeeling": "That Friday feeling",
+      "fridayFeelingNamed": "That Friday feeling, {name}",
+      "weekend": "Welcome to the weekend",
+      "weekendNamed": "Welcome to the weekend, {name}",
+      "sundaySession": "Sunday session?",
+      "morning": "Good morning",
+      "morningNamed": "Good morning, {name}",
+      "coffee": "Coffee and {brand} time?",
+      "afternoon": "Good afternoon",
+      "afternoonNamed": "Good afternoon, {name}",
+      "hey": "Hey there",
+      "heyNamed": "Hey there, {name}",
+      "howGoing": "How's it going?",
+      "howGoingNamed": "How's it going, {name}?",
+      "evening": "Good evening",
+      "eveningNamed": "Good evening, {name}",
+      "eveningShort": "Evening",
+      "eveningShortNamed": "Evening, {name}",
+      "howDay": "How was your day?",
+      "howDayNamed": "How was your day, {name}?",
+      "nightOwl": "Hello, night owl",
+      "hiHow": "Hi, how are you?",
+      "hiHowNamed": "Hi {name}, how are you?",
+      "welcomeBack": "Welcome back!",
+      "welcomeBackNamed": "Welcome back, {name}!",
+      "whatsNew": "What's new?",
+      "whatsNewNamed": "What's new, {name}?",
+      "returnsNamed": "{name} returns!",
+      "right": "You are absolutely right!"
+    },
     "worked": "Worked",
     "taskNotification": "Task notification",
     "copyMessage": "Copy message",
+    "showEarlierMessages": "Show earlier messages",
     "renderFailed": "Failed to render message content.",
     "interruptedHint": "· What should Claudian do instead?",
     "sessions": {
@@ -184,6 +241,10 @@
       "enteringPlan": "Entering plan mode",
       "planComplete": "Plan complete",
       "messageAgent": "Message agent",
+      "listDestinations": "List destinations",
+      "messageSession": "Message session",
+      "stopSession": "Stop session",
+      "readSession": "Read session",
       "continueAgent": "Continue agent",
       "listAgents": "List agents",
       "interruptAgent": "Interrupt agent",
@@ -194,6 +255,27 @@
       "toolsPlaceholder": "tools",
       "agentCount": "{count} agent",
       "agentCountPlural": "{count} agents"
+    },
+    "subagentUI": {
+      "prompt": "Prompt",
+      "result": "Result",
+      "taskLabel": "Subagent task: {description} - {status}",
+      "backgroundTaskLabel": "Background task: {description} - {status}",
+      "statusLabel": "Status: {status}",
+      "initializing": "Initializing",
+      "error": "Error",
+      "orphaned": "Orphaned",
+      "completed": "Completed",
+      "runningInBackground": "Running in background",
+      "running": "Running",
+      "orphanedResult": "Conversation ended before task completed",
+      "lastTool": "Last tool: {name}",
+      "toolUse": "{count} tool use",
+      "toolUses": "{count} tool uses",
+      "tokens": "{value} tokens",
+      "compactTokens": "{value}k tokens",
+      "previousRuns": "Previous runs ({count})",
+      "runLabel": "Run {number} · {status}"
     },
     "citations": {
       "memoryUsed": "Memory used",
@@ -245,6 +327,11 @@
       "active": "Thinking {seconds}s...",
       "completed": "Thought for {seconds}s",
       "label": "Thought"
+    },
+    "contextUsage": {
+      "label": "Context usage",
+      "details": "Context usage: {details}",
+      "nearLimit": " (Approaching limit, run {command} to continue)"
     },
     "suggestions": {
       "loading": "Loading…",
@@ -314,6 +401,169 @@
     "pi": {
       "extension": "Pi extension",
       "notification": "Pi extension notification."
+    },
+    "sessionMessage": {
+      "undelivered": "Messages from {senders} could not be delivered.",
+      "fromLabel": "From session:"
+    },
+    "sessionTools": {
+      "noSessions": "No sessions",
+      "thisSession": "This session",
+      "truncated": "More sessions not shown",
+      "recipient": "Recipient",
+      "model": "Model",
+      "reasoning": "Reasoning",
+      "message": "Message",
+      "openSession": "Open session {sessionId}",
+      "openProviderSession": "Open {provider} session {sessionId}",
+      "sessionMissing": "That session no longer exists.",
+      "openFailed": "Failed to open session: {message}",
+      "openUnavailable": "Sessions cannot be opened from here.",
+      "providersIncluded": "Included available providers and models",
+      "newSession": "New session",
+      "session": "Session",
+      "turns": "Turns",
+      "turnRange": "{from}–{to} of {total}",
+      "noTurns": "None yet",
+      "mode": "Delivery",
+      "modeSteer": "Steer into running turn",
+      "modeInterrupt": "Interrupt current work"
+    },
+    "modelPicker": {
+      "options": "Model options",
+      "provider": "Provider",
+      "modelLabel": "Model: {label}",
+      "unavailable": "Model unavailable",
+      "setup": "Set up models",
+      "guidance": "Choose an enabled model in provider settings. If discovery failed, refresh the model list.",
+      "model": "Model",
+      "empty": "No models available. Check provider settings and refresh the model list if discovery failed.",
+      "changeModelFailed": "Failed to change model",
+      "defaultEffort": "Default",
+      "effortLabel": "effort {label}",
+      "thinking": "Thinking",
+      "changeEffortFailed": "Failed to change effort level",
+      "fastActive": "fast mode on",
+      "fast": "Fast",
+      "fastLabel": "Fast mode: {label}",
+      "changeTierFailed": "Failed to change service tier"
+    },
+    "navigation": {
+      "scrollToTop": "Scroll to top",
+      "previousMessage": "Previous message",
+      "directory": "Conversation directory",
+      "nextMessage": "Next message",
+      "scrollToBottom": "Scroll to bottom",
+      "emptyDirectory": "No user prompts in this conversation"
+    },
+    "tabNavigation": {
+      "tabName": "Tab name",
+      "renameTab": "Rename tab…",
+      "resetName": "Reset tab name",
+      "showNumber": "Show number",
+      "showName": "Show name",
+      "showTitle": "Show title",
+      "closeTab": "Close tab",
+      "active": "active",
+      "needsInput": "needs your input",
+      "working": "working",
+      "errorReview": "stopped with an error, ready to review",
+      "finishedReview": "finished, ready to review",
+      "idle": "idle",
+      "badge": "{title}, {status}",
+      "namedBadge": "{label} ({title}), {status}",
+      "newTab": "New tab",
+      "newConversation": "New conversation",
+      "showWideFailed": "Failed to show the session in the wide layout",
+      "createTabFailed": "Failed to create tab",
+      "createConversationFailed": "Failed to create conversation",
+      "startConversationFailed": "Failed to start a new conversation",
+      "switchFailed": "Failed to switch tab",
+      "closeFailed": "Failed to close tab",
+      "resize": "Resize conversation sessions",
+      "previewCloseFailed": "Failed to close the provisional session preview",
+      "commandNew": "New",
+      "commandReplace": "Replace current conversation",
+      "commandClose": "Close current tab",
+      "commandRename": "Rename current tab"
+    },
+    "projects": {
+      "header": "Projects",
+      "noSessions": "No sessions",
+      "newSessionIn": "New session in {name}",
+      "actionsFor": "Actions for {name}",
+      "newProjectAction": "New project",
+      "chipLabel": "Project: {name}",
+      "noProject": "No project",
+      "menu": {
+        "edit": "Edit project",
+        "openMemory": "Open project memory",
+        "archive": "Archive project",
+        "restore": "Restore project",
+        "pin": "Pin project",
+        "unpin": "Unpin project",
+        "delete": "Delete project",
+        "moveTo": "Move to project…",
+        "moveSelectionTo": "Move {count} sessions to project…",
+        "removeFrom": "Remove from project",
+        "removeSelectionFrom": "Remove {count} session from project",
+        "removeSelectionFromPlural": "Remove {count} sessions from project",
+        "newProject": "New project…"
+      },
+      "deleteConfirm": "Delete project “{name}” and move its memory file to the trash? Its sessions stay, outside any project.",
+      "errors": {
+        "create": "Failed to create project",
+        "update": "Failed to update project",
+        "delete": "Failed to delete project",
+        "archive": "Failed to archive project",
+        "restore": "Failed to restore project",
+        "pin": "Failed to update project pin",
+        "reorder": "Failed to reorder projects",
+        "move": "Failed to move sessions to project",
+        "remove": "Failed to remove sessions from project",
+        "start": "Failed to start a session in this project"
+      },
+      "editor": {
+        "titleNew": "New project",
+        "titleEdit": "Edit project",
+        "name": "Name",
+        "nameDesc": "Shown in the session manager and in member sessions.",
+        "namePlaceholder": "Project name",
+        "iconButton": "Project icon: {icon}",
+        "iconDefault": "Default folder",
+        "iconPicker": "Choose project icon",
+        "iconSearch": "Search icons",
+        "iconNoMatches": "No icons match.",
+        "instructions": "Instructions",
+        "instructionsDesc": "Added to the system prompt of every member session from its next turn.",
+        "memoryPath": "Memory file",
+        "memoryPathDesc": "Vault path of the project memory file. A missing .md extension is added. Changing it moves the file.",
+        "memoryPathPlaceholder": "Folder/MEMORY.md",
+        "memoryPathInvalid": "Enter a file path inside the vault, such as Projects/MEMORY.md.",
+        "memoryPathTaken": "{path} is already used by a file or another project.",
+        "openMemory": "Open",
+        "nameRequired": "Enter a project name."
+      },
+      "memory": {
+        "title": "Project memory: {name}",
+        "reload": "Reload",
+        "overwrite": "Overwrite",
+        "recreate": "Recreate from template",
+        "edit": "Edit",
+        "preview": "Preview",
+        "missing": "The project memory file is missing.",
+        "conflict": "The memory file changed since it was loaded. Reload to discard your edits, or overwrite to keep them.",
+        "loadFailed": "Failed to load the project memory",
+        "saveFailed": "Failed to save the project memory",
+        "saved": "Project memory saved",
+        "loading": "Loading…",
+        "updated": "Updated {time}",
+        "changedOutside": "The memory file was updated outside this window, probably by an agent.",
+        "keepMine": "Keep my edits",
+        "discardConfirm": "Discard your unsaved changes to the project memory?",
+        "discard": "Discard",
+        "emptyHint": "Agents fill this in as the project progresses."
+      }
     }
   },
   "settings": {
@@ -558,21 +808,8 @@
       }
     },
     "codex": {
-      "installationMethod": {
-        "name": "Installation method",
-        "desc": "How Claudian should launch Codex on Windows. Native Windows uses a Windows executable path. WSL launches the Linux CLI inside a selected distro.",
-        "nativeWindows": "Native Windows",
-        "wsl": "WSL"
-      },
       "cliPath": {
-        "name": "Codex CLI path",
-        "validation": {
-          "wslWindowsPath": "WSL mode expects a Linux command or Linux absolute path, not a Windows executable path."
-        }
-      },
-      "wslDistroOverride": {
-        "name": "WSL distro override",
-        "desc": "Optional advanced override. Leave empty to infer the distro from a WSL workspace path when possible, otherwise use the default WSL distro."
+        "name": "Codex CLI path"
       },
       "safeMode": {
         "workspaceWrite": "Workspace write",
@@ -648,12 +885,13 @@
       }
     },
     "opencode": {
+      "emptyModels": "OpenCode server returned no enabled models for this vault. Check the vault's .opencode/opencode.json and OpenCode logs (run opencode debug paths to locate them). For OpenCode v2, configured V1 plugins may be incompatible. Compare opencode models --standalone in the vault, then click Discover.",
       "environment": {
         "name": "OpenCode environment variables",
         "desc": "Extra environment variables passed to OpenCode."
       },
       "migrationNotice": {
-        "text": "Claudian now supports OpenCode v2. OpenCode v1 support ends on October 30, 2026.",
+        "text": "OpenCode v1 is no longer supported. Update to OpenCode v2 to use it in Claudian.",
         "link": "Migrate to OpenCode v2"
       }
     },
@@ -661,6 +899,9 @@
       "environment": {
         "name": "Pi environment variables",
         "desc": "Environment variables passed only to Pi."
+      },
+      "models": {
+        "desc": "Claudian keeps its own model list, separate from Pi's enabledModels. Discover lists every model Pi can authenticate in its current environment, grouped by the provider route Pi will call. The route determines credentials and billing."
       }
     },
     "grok": {
@@ -669,16 +910,21 @@
         "desc": "Environment variables passed only to Grok Build. Custom-model secrets stay in this provider scope and are referenced from native config by env_key."
       }
     },
+    "antigravity": {
+      "environment": {
+        "name": "Antigravity environment variables",
+        "desc": "Environment variables passed only to Antigravity (agy), such as GEMINI_API_KEY."
+      }
+    },
     "deepseek": {
       "installation": {
         "desc": "Auto prefers dsh, then discovers Desktop on macOS or Windows. To use Desktop when both are installed, enter its .app path or Windows install folder. Open Desktop once to complete setup.",
-        "desktop": "Using your native Desktop profile.",
-        "web": "Using your native Web profile."
+        "wslDesc": "WSL requires Linux Node.js and npm dsh inside the selected distro, with its native Web profile configured. DeepSeek Harness Desktop cannot supply a WSL installation. Install @deepseek-ai/dsh in the distro or select Native Windows to use Desktop."
       },
       "preset": "Preset",
       "codeMode": {
         "name": "Enable code mode",
-        "desc": "Applies from each conversation's next turn, including existing conversations. Adds native run_code alongside direct tools."
+        "desc": "Applies from each conversation's next turn, including existing conversations. The model calls tools from native run_code programs instead of directly."
       },
       "presetPlugins": {
         "name": "Additional preset plugins",
@@ -772,6 +1018,19 @@
         "failed": "Sync failed: {message}",
         "summary": "Moved {moved}, converted {converted}, trashed {trashed}, removed {unlinked} link(s)."
       }
+    },
+    "executionTarget": {
+      "installationMethod": {
+        "name": "Installation method",
+        "desc": "How Claudian should launch {provider} on Windows. Native Windows uses a Windows executable path. WSL launches the Linux CLI inside a selected distro.",
+        "nativeWindows": "Native Windows",
+        "wsl": "WSL"
+      },
+      "wslDistroOverride": {
+        "name": "WSL distro override",
+        "desc": "Optional advanced override. Leave empty to infer the distro from a WSL workspace path when possible, otherwise use the default WSL distro."
+      },
+      "wslWindowsPath": "WSL mode expects a Linux command or Linux absolute path, not a Windows executable path."
     }
   }
 }

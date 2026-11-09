@@ -51,16 +51,16 @@ describe('transformSDKMessage', () => {
     });
 
     it('emits an authoritative blocked tool result for permission denials', () => {
-      const message = {
+      const message = msg({
         type: 'system',
         subtype: 'permission_denied',
         tool_name: 'Bash',
         tool_use_id: 'tool-123',
         decision_reason: 'Denied by policy',
         message: 'The tool was not run.',
-        uuid: 'message-123',
+        uuid: '00000000-0000-4000-8000-000000000123',
         session_id: 'test-session',
-      } as any;
+      });
 
       const results = transform(message);
 
@@ -73,18 +73,6 @@ describe('transformSDKMessage', () => {
       }]);
     });
 
-    it('yields context_compacted event for compact_boundary subtype', () => {
-      const message = msg({
-        type: 'system',
-        subtype: 'compact_boundary',
-      });
-
-      const results = transform(message);
-
-      expect(results).toEqual([
-        { type: 'context_compacted' },
-      ]);
-    });
 
     it('captures permissionMode from init message', () => {
       const message = msg({
@@ -113,7 +101,7 @@ describe('transformSDKMessage', () => {
         status: 'completed',
         output_file: '/tmp/agent-123.output',
         summary: 'Agent completed successfully.',
-      } as any);
+      });
 
       const results = transform(message);
 
@@ -137,7 +125,7 @@ describe('transformSDKMessage', () => {
         status: 'failed',
         output_file: '/tmp/agent-failed.output',
         summary: 'Agent failed.',
-      } as any);
+      });
 
       const results = transform(message);
 
@@ -176,29 +164,6 @@ describe('transformSDKMessage', () => {
       ]);
     });
 
-    it('yields subagent_tool_use for assistant tool_use in subagent context', () => {
-      const message = msg({
-        type: 'assistant',
-        parent_tool_use_id: 'parent-tool-abc',
-        message: {
-          content: [
-            { type: 'tool_use', id: 'child-tool-1', name: 'Read', input: { file_path: 'subagent.md' } },
-          ],
-        },
-      });
-
-      const results = transform(message);
-
-      expect(results).toEqual([
-        {
-          type: 'subagent_tool_use',
-          subagentId: 'parent-tool-abc',
-          id: 'child-tool-1',
-          name: 'Read',
-          input: { file_path: 'subagent.md' },
-        },
-      ]);
-    });
 
     it('handles empty content array', () => {
       const message = msg({
@@ -329,7 +294,7 @@ describe('transformSDKMessage', () => {
 
       expect(results.length).toBe(1);
       expect(results[0].type).toBe('subagent_tool_result');
-      expect((results[0] as any).content).toContain('"status": "success"');
+      expect(results[0]).toMatchObject({ content: expect.stringContaining('"status": "success"') });
     });
 
     it('extracts text from array-based tool_use_result content', () => {
@@ -384,8 +349,11 @@ describe('transformSDKMessage', () => {
       ]);
     });
 
-    it('omits base64 image payloads from tool_result content', () => {
+    it.each(['anthropic', 'mcp'])('omits %s image payloads from tool_result content', format => {
       const data = 'a'.repeat(4096);
+      const image = (data: string) => format === 'mcp'
+        ? { type: 'image', mimeType: 'image/png', data }
+        : { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
       const message = msg({
         type: 'user',
         message: {
@@ -393,7 +361,7 @@ describe('transformSDKMessage', () => {
             {
               type: 'tool_result',
               tool_use_id: 'tool-image',
-              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }],
+              content: [image(data)],
               is_error: false,
             },
           ],
@@ -407,7 +375,7 @@ describe('transformSDKMessage', () => {
       const content = 'content' in result ? result.content : undefined;
       expect(content).not.toContain(data);
       expect(JSON.parse(content as string)).toEqual([
-        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: '' } },
+        image(''),
       ]);
     });
 
@@ -484,7 +452,7 @@ describe('transformSDKMessage', () => {
       const results = transform(message);
 
       expect(results.length).toBe(1);
-      expect((results[0] as any).content).toContain('"key": "value"');
+      expect(results[0]).toMatchObject({ content: expect.stringContaining('"key": "value"') });
     });
 
     it('preserves tool_reference array content in tool_result blocks', () => {
@@ -508,7 +476,7 @@ describe('transformSDKMessage', () => {
       const results = transform(message);
 
       expect(results.length).toBe(1);
-      expect((results[0] as any).content).toBe(JSON.stringify(toolRefs, null, 2));
+      expect(results[0]).toMatchObject({ content: JSON.stringify(toolRefs, null, 2) });
     });
 
     it('emits one result for a subagent frame carrying both structured output and its tool_result block', () => {
@@ -639,6 +607,42 @@ describe('transformSDKMessage', () => {
       ]);
     });
 
+    it.each([
+      { number: '1e3', expected: 1000 },
+      { number: '1e-3', expected: 0.001 },
+      { number: '-2.5E+2', expected: -250 },
+    ])('preserves JSON exponent numbers $number in streamed tool inputs', ({ number, expected }) => {
+      const streamState = createTransformStreamState();
+      const event = (value: Record<string, unknown>) => msg({ type: 'stream_event', event: { index: 0, ...value } });
+      transform(event({ type: 'content_block_start', content_block: {
+        type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: {},
+      } }), { streamState });
+      const results = transform(event({ type: 'content_block_delta', delta: {
+        type: 'input_json_delta', partial_json: `{"scale":${number},"label":`,
+      } }), { streamState });
+      expect(results).toEqual([{ type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: { scale: expected } }]);
+      expect(transform(event({ type: 'content_block_delta', delta: {
+        type: 'input_json_delta', partial_json: '"value"}',
+      } }), { streamState })).toEqual([{ type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: { scale: expected, label: 'value' } }]);
+    });
+
+    it('waits for an incomplete exponent before publishing that number', () => {
+      const streamState = createTransformStreamState();
+      const event = (value: Record<string, unknown>) => msg({ type: 'stream_event', event: { index: 0, ...value } });
+      transform(event({ type: 'content_block_start', content_block: {
+        type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: {},
+      } }), { streamState });
+      const delta = (partial_json: string) => transform(event({ type: 'content_block_delta', delta: {
+        type: 'input_json_delta', partial_json,
+      } }), { streamState });
+      expect(delta('{"label":"value","scale":1e-')).toEqual([{
+        type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: { label: 'value' },
+      }]);
+      expect(delta('3}')).toEqual([{
+        type: 'tool_use', id: 'numeric-tool', name: 'mcp__calculator__scale', input: { label: 'value', scale: 0.001 },
+      }]);
+    });
+
     it('reparses streamed tool input only when a delta can change the parsed snapshot', () => {
       const streamState = createTransformStreamState();
       const usageState = createTransformUsageState();
@@ -657,7 +661,7 @@ describe('transformSDKMessage', () => {
         content_block: { type: 'tool_use', id: 'stream-tool-1', name: 'Write', input: {} },
       }), { streamState, usageState });
 
-      const parseSpy = jest.spyOn(JSON, 'parse');
+      const parseSpy = vi.spyOn(JSON, 'parse');
       const emitted: unknown[] = [];
       try {
         for (const partialJson of deltas) {
@@ -1517,7 +1521,7 @@ describe('transformSDKMessage', () => {
       const usageResults = results.filter(r => r.type === 'usage');
       expect(usageResults).toHaveLength(1);
 
-      const usage = (usageResults[0] as any).usage;
+      const usage = usageResults[0].usage;
       expect(usage.inputTokens).toBe(1000);
       expect(usage.cacheCreationInputTokens).toBe(300);
       expect(usage.cacheReadInputTokens).toBe(200);
@@ -1549,7 +1553,7 @@ describe('transformSDKMessage', () => {
 
       const usageResults = results.filter(r => r.type === 'usage');
       expect(usageResults).toHaveLength(1);
-      expect((usageResults[0] as any).usage).toEqual({
+      expect(usageResults[0].usage).toEqual({
         model: 'sonnet',
         inputTokens: 1000,
         cacheCreationInputTokens: 300,
@@ -1596,7 +1600,7 @@ describe('transformSDKMessage', () => {
       const usageResults = results.filter(r => r.type === 'usage');
       expect(usageResults).toHaveLength(1);
 
-      const usage = (usageResults[0] as any).usage;
+      const usage = usageResults[0].usage;
       expect(usage.inputTokens).toBe(0);
       expect(usage.cacheCreationInputTokens).toBe(0);
       expect(usage.cacheReadInputTokens).toBe(0);

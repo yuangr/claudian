@@ -1,52 +1,43 @@
-import { getInstallationKey } from '@/core/device/InstallationKey';
-import { parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTarget } from '@/core/process/execution-target/ExecutionTargetResolver';
 
-import { createCLIPathFingerprintInputs } from '../../../core/providers/cli/CLIPathFingerprintInputs';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
-import { createRuntimeInputFingerprint } from '../../../core/providers/settings/RuntimeInputFingerprint';
 import type { ProviderSettingsReconciler } from '../../../core/providers/types';
 import {
   decodeGrokModelId,
   encodeGrokModelId,
 } from '../models';
+import { computeGrokRuntimeInputHash, computeGrokSessionEnvironmentHash } from '../runtime/GrokRuntimeEnvironment';
 import {
   getGrokProviderSettings,
   updateGrokProviderSettings
 } from '../settings';
-
-export function computeGrokEnvironmentHash(settings: Record<string, unknown>): string {
-  const providerSettings = getGrokProviderSettings(settings);
-  const cliPathInputs = createCLIPathFingerprintInputs(
-    providerSettings.cliPathsByHost[getInstallationKey()],
-    providerSettings.cliPath,
-  );
-  const environment = Object.entries(parseEnvironmentVariables(
-    getRuntimeEnvironmentText(settings, 'grok'),
-  )).sort(([left], [right]) => left.localeCompare(right));
-  return createRuntimeInputFingerprint({
-    additionalInputs: cliPathInputs,
-    environmentKeys: environment.map(([key]) => key),
-    environmentText: getRuntimeEnvironmentText(settings, 'grok'),
-  });
-}
+import { clearGrokResumeState } from '../types';
 
 export const grokSettingsReconciler: ProviderSettingsReconciler = {
-  environmentSessionPolicy: 'reload',
+  invalidateConversationSessions: conversations => conversations.filter(conversation => (
+    conversation.providerId === 'grok' && clearGrokResumeState(conversation)
+  )),
 
-  invalidateConversationSessions: () => [],
-
-  reconcileModelWithEnvironment(settings) {
+  reconcileModelWithEnvironment(settings, context) {
     if (!getGrokProviderSettings(settings).enabled) {
-      return { changed: false, invalidatedConversations: [] };
+      return { changed: false };
     }
 
-    const environmentHash = computeGrokEnvironmentHash(settings);
-    if (getGrokProviderSettings(settings).environmentHash === environmentHash) {
-      return { changed: false, invalidatedConversations: [] };
+    const current = getGrokProviderSettings(settings);
+    const target = resolveExecutionTarget({ settings: current, hostVaultPath: context?.vaultPath });
+    const environmentText = getRuntimeEnvironmentText(settings, 'grok');
+    const environmentHash = computeGrokRuntimeInputHash(current, environmentText, target);
+    const sessionEnvironmentHash = computeGrokSessionEnvironmentHash(environmentText, target);
+    if (current.environmentHash === environmentHash && current.sessionEnvironmentHash === sessionEnvironmentHash) {
+      return { changed: false };
     }
-
-    updateGrokProviderSettings(settings, { environmentHash });
-    return { changed: true, invalidatedConversations: [] };
+    // Existing native installations predate the scoped store fingerprint. Backfill
+    // without discarding their sessions. WSL is new and cannot resume that store.
+    const invalidate = current.sessionEnvironmentHash
+      ? current.sessionEnvironmentHash !== sessionEnvironmentHash
+      : target.method === 'wsl';
+    updateGrokProviderSettings(settings, { environmentHash, sessionEnvironmentHash });
+    return { changed: true, sessionPolicy: invalidate ? 'invalidate' : 'reload' };
   },
 
   normalizeModelVariantSettings(settings): boolean {

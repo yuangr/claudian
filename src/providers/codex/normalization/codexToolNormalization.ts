@@ -1,3 +1,6 @@
+import { isSessionTool } from '@/core/tools/toolNames';
+import { extractToolResultContent } from '@/core/tools/toolResultContent';
+import type { ToolProviderPayload } from '@/core/types';
 import { stringifyUnknown } from '@/utils/stringify';
 
 import { isCodexEncryptedMessage } from './codexSubagentNormalization';
@@ -51,11 +54,19 @@ export function isCodexInternalToolCall(rawName: string | undefined, namespace?:
 
 export function normalizeCodexToolName(rawName: string | undefined): string {
   if (!rawName) return 'tool';
+  const sessionName = rawName.startsWith('claudian_sessions__') ? rawName.slice('claudian_sessions__'.length) : rawName;
+  if (isSessionTool(sessionName)) return sessionName;
   if (NATIVE_TOOLS.has(rawName)) return rawName;
-  return TOOL_NAME_MAP[rawName] ?? rawName;
+  // Own entries only: prototype keys (e.g. constructor) stay unknown names verbatim.
+  return Object.hasOwn(TOOL_NAME_MAP, rawName) ? TOOL_NAME_MAP[rawName] : rawName;
+}
+
+function sessionToolPayload(rawName: string | undefined): Pick<NormalizedCodexToolCall, 'providerPayload'> {
+  return isSessionTool(normalizeCodexToolName(rawName)) ? { providerPayload: { rawName } } : {};
 }
 
 export interface NormalizedCodexToolCall {
+  providerPayload?: ToolProviderPayload;
   name: string;
   input: Record<string, unknown>;
 }
@@ -77,15 +88,17 @@ export function normalizeCodexToolCall(
   return {
     name: normalizeCodexToolName(rawName),
     input: normalizeCodexToolInput(rawName, rawInput),
+    ...sessionToolPayload(rawName),
   };
 }
 
 export function decodeCodexExecEnvelope(
   input: Record<string, unknown>,
 ): NormalizedCodexToolCall[] | null {
-  return decodeCodexExecEnvelopeCalls(input)?.map(({ name, input: normalizedInput }) => ({
+  return decodeCodexExecEnvelopeCalls(input)?.map(({ name, input: normalizedInput, providerPayload }) => ({
     name,
     input: normalizedInput,
+    ...(providerPayload ? { providerPayload } : {}),
   })) ?? null;
 }
 
@@ -110,6 +123,7 @@ export function decodeCodexExecEnvelopeCalls(
       rawInput,
       name: normalizeCodexToolName(call.name),
       input: normalizeCodexToolInput(call.name, rawInput),
+      ...sessionToolPayload(call.name),
     });
   }
 
@@ -576,6 +590,7 @@ function normalizeQuestions(input: Record<string, unknown>): Array<Record<string
         : `Q${index + 1}`,
       options,
       multiSelect: Boolean(item.multiSelect ?? item.multi_select),
+      ...(item.isSecret === true ? { isSecret: true } : {}),
     };
   });
 }
@@ -744,6 +759,7 @@ interface CodexMCPResultPart {
 
 interface CodexMCPResultPayload {
   content?: CodexMCPResultPart[] | null;
+  structuredContent?: unknown;
 }
 
 export interface NormalizedCodexMCPToolState {
@@ -778,7 +794,11 @@ export function normalizeCodexMCPToolState(
   rawError?: unknown,
 ): NormalizedCodexMCPToolState {
   const status = typeof rawStatus === 'string' ? rawStatus : '';
-  const error = typeof rawError === 'string' ? rawError : '';
+  const error = typeof rawError === 'string' ? rawError
+    : rawError !== null && typeof rawError === 'object' && !Array.isArray(rawError)
+      && typeof (rawError as Record<string, unknown>).message === 'string'
+      ? (rawError as { message: string }).message
+      : '';
   const resultText = extractCodexMCPResultText(resultPayload);
   const isTerminalStatus = status === 'completed' || isCodexFailedToolStatus(status);
   const isTerminal = isTerminalStatus || Boolean(error) || Boolean(resultText);
@@ -800,13 +820,12 @@ export function normalizeCodexMCPToolState(
 function extractCodexMCPResultText(resultPayload?: unknown): string {
   if (!resultPayload || typeof resultPayload !== 'object') return '';
 
-  const content = (resultPayload as CodexMCPResultPayload).content;
-  if (!Array.isArray(content)) return '';
-
-  return content
+  const { content, structuredContent } = resultPayload as CodexMCPResultPayload;
+  const text = Array.isArray(content) ? content
     .map(item => (typeof item?.text === 'string' ? item.text : ''))
     .filter(Boolean)
-    .join('\n');
+    .join('\n') : '';
+  return text || extractToolResultContent(structuredContent, { fallbackIndent: 2 });
 }
 
 // ---------------------------------------------------------------------------

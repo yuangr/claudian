@@ -18,7 +18,7 @@
   box-shadow: none;
   color: var(--text-normal);
   font-family: inherit;
-  font-size: 14px;
+  font-size: calc(14 * var(--claudian-font-px));
 
   /* One source for the pre-mount placeholder and the mounted editor, so first focus does not shift layout. */
   line-height: 1.4;
@@ -36,6 +36,13 @@
   padding: var(--claudian-composer-padding-top) var(--claudian-composer-padding-inline) var(--claudian-composer-padding-bottom);
   content: attr(data-placeholder);
   color: var(--text-muted);
+}
+
+/* Restored drafts are plain text until first focus mounts CodeMirror. */
+.claudian-composer-editor[role="textbox"]:not(:empty) {
+  padding: var(--claudian-composer-padding-top) var(--claudian-composer-padding-inline) var(--claudian-composer-padding-bottom);
+  max-height: var(--claudian-textarea-max-height, none);
+  overflow: auto;
 }
 
 .claudian-composer-editor .cm-editor {

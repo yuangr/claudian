@@ -1,15 +1,14 @@
 import { getEnhancedPath, parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTargetAsync } from '@/core/process/execution-target/ExecutionTargetResolver';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
+import type { TargetLaunchSpec } from '@/core/process/execution-target/types';
+import { createExecutionPathMapper } from '@/core/process/execution-target/WSLPathMapper';
 
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
-import type {
-  ProviderId,
-  ProviderTransitionOwnerContext,
-} from '../../../core/providers/types';
-import { getVaultPath } from '../../../utils/path';
+import type { ProviderRuntimeHost } from '../../../core/providers/ProviderRuntimeHost';
+import type { ProviderTransitionOwnerContext } from '../../../core/providers/types';
+import { decodeCodexConfig } from '../config';
 import type { InitializeResult } from './codexAppServerTypes';
-import { resolveCodexExecutionTargetAsync } from './CodexExecutionTargetResolver';
 import { buildCodexLaunchSpec } from './CodexLaunchSpecBuilder';
-import type { CodexLaunchSpec } from './codexLaunchTypes';
 import type { CodexRPCTransport } from './CodexRPCTransport';
 
 const CODEX_APP_SERVER_CLIENT_INFO = Object.freeze({
@@ -17,19 +16,19 @@ const CODEX_APP_SERVER_CLIENT_INFO = Object.freeze({
   version: '1.0.0',
 });
 
-export function getCodexAppServerWorkingDirectory(plugin: ProviderHost): string {
-  return getVaultPath(plugin.app) ?? process.cwd();
+export function getCodexAppServerWorkingDirectory(host: Pick<ProviderRuntimeHost, 'workingDirectory'>): string {
+  return host.workingDirectory ?? process.cwd();
 }
 
 export function buildCodexAppServerEnvironment(
-  plugin: ProviderHost,
-  providerId: ProviderId = 'codex',
+  host: Pick<ProviderRuntimeHost, 'environmentText'>,
+  target?: ExecutionTarget,
 ): Record<string, string> {
-  const customEnv = parseEnvironmentVariables(plugin.getActiveEnvironmentVariables(providerId));
+  const customEnv = parseEnvironmentVariables(host.environmentText);
   const baseEnv = Object.fromEntries(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
-  const enhancedPath = getEnhancedPath(customEnv.PATH);
+  const enhancedPath = target?.method === 'wsl' ? customEnv.PATH ?? baseEnv.PATH : getEnhancedPath(customEnv.PATH);
 
   return {
     ...baseEnv,
@@ -38,25 +37,34 @@ export function buildCodexAppServerEnvironment(
   };
 }
 
+function resolveCodexExecutionTarget(host: ProviderRuntimeHost, hostVaultPath: string): Promise<ExecutionTarget> {
+  return resolveExecutionTargetAsync({ settings: decodeCodexConfig(host.config), hostVaultPath });
+}
+
+export async function resolveCodexExecutionWorkingDirectory(host: ProviderRuntimeHost, hostWorkingDirectory: string): Promise<string> {
+  const target = await resolveCodexExecutionTarget(host, hostWorkingDirectory);
+  if (target.method !== 'wsl') return hostWorkingDirectory;
+  const targetPath = createExecutionPathMapper(target).toTargetPath(hostWorkingDirectory);
+  if (!targetPath) throw new Error('The Vault path cannot be represented in the selected WSL distro.');
+  return targetPath;
+}
+
 export async function resolveCodexAppServerLaunchSpec(
-  plugin: ProviderHost,
-  providerId: ProviderId = 'codex',
+  host: ProviderRuntimeHost,
   context?: ProviderTransitionOwnerContext,
-): Promise<CodexLaunchSpec> {
-  const hostVaultPath = getCodexAppServerWorkingDirectory(plugin);
-  const executionTarget = await resolveCodexExecutionTargetAsync({
-    settings: plugin.settings,
-    hostVaultPath,
-  });
+): Promise<TargetLaunchSpec> {
+  const hostVaultPath = getCodexAppServerWorkingDirectory(host);
+  const executionTarget = await resolveCodexExecutionTarget(host, hostVaultPath);
 
   return buildCodexLaunchSpec({
-    settings: plugin.settings,
-    resolvedCliCommand: await plugin.getResolvedProviderCliPath(providerId, {
+    codexSettings: decodeCodexConfig(host.config),
+    resolvedCliCommand: await host.resolveCliPath({
       ...context,
       executionTarget,
     }),
     hostVaultPath,
-    env: buildCodexAppServerEnvironment(plugin, providerId),
+    env: buildCodexAppServerEnvironment(host, executionTarget),
+    environmentText: host.environmentText,
     executionTarget,
   });
 }

@@ -14,8 +14,17 @@
     "none": "無"
   },
   "chat": {
+    "queue": {
+      "queued": "排隊中",
+      "steering": "引導中",
+      "steerNow": "立即引導",
+      "edit": "編輯排隊訊息",
+      "discard": "捨棄排隊訊息",
+      "images": "[圖片]"
+    },
     "promptSuggestionHint": "按 Tab 接受",
     "selectAvailableModel": "請先選擇可用的模型再傳送。",
+    "reloadingHistory": "此對話在 Claudian 之外有所變更，正在重新載入。載入完成後請重新傳送。",
     "selectAvailableTitleModel": "請在 Claudian 設定中選擇可用的標題產生模型。",
     "rewind": {
       "confirmMessage": "回退到此處？此訊息之後的檔案變更可能被覆寫或刪除。此操作無法復原。",
@@ -104,9 +113,57 @@
       "showLess": "收合",
       "moreItems": "+{count} 項"
     },
+    "welcome": {
+      "sunday": "週日快樂",
+      "sundayNamed": "週日快樂，{name}",
+      "monday": "週一快樂",
+      "mondayNamed": "週一快樂，{name}",
+      "tuesday": "週二快樂",
+      "tuesdayNamed": "週二快樂，{name}",
+      "wednesday": "週三快樂",
+      "wednesdayNamed": "週三快樂，{name}",
+      "thursday": "週四快樂",
+      "thursdayNamed": "週四快樂，{name}",
+      "friday": "週五快樂",
+      "fridayNamed": "週五快樂，{name}",
+      "saturday": "週六快樂！",
+      "saturdayNamed": "週六快樂，{name}",
+      "backAtIt": "繼續加油！",
+      "backAtItNamed": "{name}，繼續加油！",
+      "fridayFeeling": "週五的感覺真好",
+      "fridayFeelingNamed": "週五的感覺真好，{name}",
+      "weekend": "週末到了",
+      "weekendNamed": "{name}，週末到了",
+      "sundaySession": "週日來一場？",
+      "morning": "早安",
+      "morningNamed": "早安，{name}",
+      "coffee": "喝杯咖啡，開始用 {brand}？",
+      "afternoon": "午安",
+      "afternoonNamed": "午安，{name}",
+      "hey": "嗨，你好",
+      "heyNamed": "嗨，{name}",
+      "howGoing": "最近怎麼樣？",
+      "howGoingNamed": "{name}，最近怎麼樣？",
+      "evening": "晚上好",
+      "eveningNamed": "晚上好，{name}",
+      "eveningShort": "晚安呀",
+      "eveningShortNamed": "晚安呀，{name}",
+      "howDay": "今天過得怎麼樣？",
+      "howDayNamed": "{name}，今天過得怎麼樣？",
+      "nightOwl": "你好，夜貓子",
+      "hiHow": "嗨，你好嗎？",
+      "hiHowNamed": "{name}，你好嗎？",
+      "welcomeBack": "歡迎回來！",
+      "welcomeBackNamed": "歡迎回來，{name}！",
+      "whatsNew": "有什麼新鮮事？",
+      "whatsNewNamed": "{name}，有什麼新鮮事？",
+      "returnsNamed": "{name} 回來了！",
+      "right": "你說得完全正確！"
+    },
     "worked": "已完成工作",
     "taskNotification": "任務通知",
     "copyMessage": "複製訊息",
+    "showEarlierMessages": "顯示較早的訊息",
     "renderFailed": "訊息內容呈現失敗。",
     "interruptedHint": "· 你希望 Claudian 改做什麼？",
     "sessions": {
@@ -184,6 +241,10 @@
       "enteringPlan": "正在進入規劃模式",
       "planComplete": "規劃完成",
       "messageAgent": "向代理傳送訊息",
+      "listDestinations": "列出目標",
+      "messageSession": "向工作階段傳送訊息",
+      "stopSession": "停止工作階段",
+      "readSession": "讀取工作階段",
       "continueAgent": "繼續代理任務",
       "listAgents": "列出代理",
       "interruptAgent": "中斷代理",
@@ -194,6 +255,27 @@
       "toolsPlaceholder": "工具",
       "agentCount": "{count} 個代理",
       "agentCountPlural": "{count} 個代理"
+    },
+    "subagentUI": {
+      "prompt": "提示詞",
+      "result": "結果",
+      "taskLabel": "子代理任務：{description} - {status}",
+      "backgroundTaskLabel": "背景任務：{description} - {status}",
+      "statusLabel": "狀態：{status}",
+      "initializing": "初始化中",
+      "error": "錯誤",
+      "orphaned": "未完成",
+      "completed": "已完成",
+      "runningInBackground": "背景執行中",
+      "running": "執行中",
+      "orphanedResult": "對話在任務完成前已結束",
+      "lastTool": "最近工具：{name}",
+      "toolUse": "{count} 次工具呼叫",
+      "toolUses": "{count} 次工具呼叫",
+      "tokens": "{value} 個 token",
+      "compactTokens": "{value}k 個 token",
+      "previousRuns": "先前的執行（{count}）",
+      "runLabel": "第 {number} 次執行 · {status}"
     },
     "citations": {
       "memoryUsed": "引用的記憶",
@@ -245,6 +327,11 @@
       "active": "思考中，已用時 {seconds} 秒…",
       "completed": "思考了 {seconds} 秒",
       "label": "思考過程"
+    },
+    "contextUsage": {
+      "label": "上下文用量",
+      "details": "上下文用量：{details}",
+      "nearLimit": "（接近上限，執行 {command} 以繼續）"
     },
     "suggestions": {
       "loading": "正在載入…",
@@ -314,6 +401,169 @@
     "pi": {
       "extension": "Pi 擴充功能",
       "notification": "Pi 擴充功能通知。"
+    },
+    "sessionMessage": {
+      "undelivered": "無法傳遞來自 {senders} 的訊息。",
+      "fromLabel": "來自工作階段："
+    },
+    "sessionTools": {
+      "noSessions": "沒有工作階段",
+      "thisSession": "此工作階段",
+      "truncated": "還有更多工作階段未顯示",
+      "recipient": "接收者",
+      "model": "模型",
+      "reasoning": "推理",
+      "message": "訊息",
+      "openSession": "開啟工作階段 {sessionId}",
+      "openProviderSession": "開啟 {provider} 工作階段 {sessionId}",
+      "sessionMissing": "該工作階段已不存在。",
+      "openFailed": "無法開啟工作階段：{message}",
+      "openUnavailable": "無法從這裡開啟工作階段。",
+      "providersIncluded": "已包含可用的提供者和模型",
+      "newSession": "新工作階段",
+      "session": "工作階段",
+      "turns": "輪次",
+      "turnRange": "{from}–{to}，共 {total}",
+      "noTurns": "尚無",
+      "mode": "傳遞方式",
+      "modeSteer": "插入進行中的輪次",
+      "modeInterrupt": "中斷目前工作"
+    },
+    "modelPicker": {
+      "options": "模型選項",
+      "provider": "提供商",
+      "modelLabel": "模型：{label}",
+      "unavailable": "模型無法使用",
+      "setup": "設定模型",
+      "guidance": "請在提供商設定中選擇已啟用的模型。如果探索失敗，請重新整理模型清單。",
+      "model": "模型",
+      "empty": "沒有可用模型。請檢查提供商設定；如果探索失敗，請重新整理模型清單。",
+      "changeModelFailed": "無法切換模型",
+      "defaultEffort": "預設",
+      "effortLabel": "思考強度 {label}",
+      "thinking": "思考",
+      "changeEffortFailed": "無法變更思考強度",
+      "fastActive": "快速模式已開啟",
+      "fast": "快速",
+      "fastLabel": "快速模式：{label}",
+      "changeTierFailed": "無法變更服務層級"
+    },
+    "navigation": {
+      "scrollToTop": "捲動至頂端",
+      "previousMessage": "上一則訊息",
+      "directory": "對話目錄",
+      "nextMessage": "下一則訊息",
+      "scrollToBottom": "捲動至底端",
+      "emptyDirectory": "此對話中尚無使用者提示詞"
+    },
+    "tabNavigation": {
+      "tabName": "分頁名稱",
+      "renameTab": "重新命名分頁…",
+      "resetName": "重設分頁名稱",
+      "showNumber": "顯示編號",
+      "showName": "顯示名稱",
+      "showTitle": "顯示標題",
+      "closeTab": "關閉分頁",
+      "active": "目前",
+      "needsInput": "需要您輸入",
+      "working": "工作中",
+      "errorReview": "因錯誤而停止，可供檢閱",
+      "finishedReview": "已完成，可供檢閱",
+      "idle": "閒置",
+      "badge": "{title}，{status}",
+      "namedBadge": "{label}（{title}），{status}",
+      "newTab": "新增分頁",
+      "newConversation": "新增對話",
+      "showWideFailed": "無法在雙欄配置中顯示工作階段",
+      "createTabFailed": "無法建立分頁",
+      "createConversationFailed": "無法建立對話",
+      "startConversationFailed": "無法開始新對話",
+      "switchFailed": "無法切換分頁",
+      "closeFailed": "無法關閉分頁",
+      "resize": "調整對話區域大小",
+      "previewCloseFailed": "無法關閉暫時的工作階段預覽",
+      "commandNew": "新增",
+      "commandReplace": "取代目前的對話",
+      "commandClose": "關閉目前的分頁",
+      "commandRename": "重新命名目前的分頁"
+    },
+    "projects": {
+      "header": "專案",
+      "noSessions": "沒有工作階段",
+      "newSessionIn": "在 {name} 中新增工作階段",
+      "actionsFor": "{name} 的操作",
+      "newProjectAction": "新增專案",
+      "chipLabel": "專案：{name}",
+      "noProject": "無專案",
+      "menu": {
+        "edit": "編輯專案",
+        "openMemory": "開啟專案記憶",
+        "archive": "封存專案",
+        "restore": "還原專案",
+        "pin": "釘選專案",
+        "unpin": "取消釘選專案",
+        "delete": "刪除專案",
+        "moveTo": "移動到專案…",
+        "moveSelectionTo": "將 {count} 個工作階段移動到專案…",
+        "removeFrom": "從專案中移除",
+        "removeSelectionFrom": "從專案中移除 {count} 個工作階段",
+        "removeSelectionFromPlural": "從專案中移除 {count} 個工作階段",
+        "newProject": "新增專案…"
+      },
+      "deleteConfirm": "刪除專案「{name}」並將其記憶檔案移到垃圾桶？工作階段會保留，但不再屬於任何專案。",
+      "errors": {
+        "create": "建立專案失敗",
+        "update": "更新專案失敗",
+        "delete": "刪除專案失敗",
+        "archive": "無法封存專案",
+        "restore": "無法還原專案",
+        "pin": "更新專案釘選狀態失敗",
+        "reorder": "重新排序專案失敗",
+        "move": "將工作階段移動到專案失敗",
+        "remove": "從專案中移除工作階段失敗",
+        "start": "在此專案中新增工作階段失敗"
+      },
+      "editor": {
+        "titleNew": "新增專案",
+        "titleEdit": "編輯專案",
+        "name": "名稱",
+        "nameDesc": "顯示在工作階段管理器和成員工作階段中。",
+        "namePlaceholder": "專案名稱",
+        "iconButton": "專案圖示：{icon}",
+        "iconDefault": "預設資料夾",
+        "iconPicker": "選擇專案圖示",
+        "iconSearch": "搜尋圖示",
+        "iconNoMatches": "沒有相符的圖示。",
+        "instructions": "指示",
+        "instructionsDesc": "從下一輪起加入每個成員工作階段的系統提示詞。",
+        "memoryPath": "記憶檔案",
+        "memoryPathDesc": "專案記憶檔案在儲存庫中的路徑。缺少 .md 副檔名時會自動加上。變更後會移動該檔案。",
+        "memoryPathPlaceholder": "資料夾/MEMORY.md",
+        "memoryPathInvalid": "請輸入儲存庫內的檔案路徑，例如 Projects/MEMORY.md。",
+        "memoryPathTaken": "{path} 已被某個檔案或其他專案使用。",
+        "openMemory": "開啟",
+        "nameRequired": "請輸入專案名稱。"
+      },
+      "memory": {
+        "title": "專案記憶：{name}",
+        "reload": "重新載入",
+        "overwrite": "覆寫",
+        "recreate": "從範本重新建立",
+        "edit": "編輯",
+        "preview": "預覽",
+        "missing": "專案記憶檔案不存在。",
+        "conflict": "記憶檔案在載入後已被修改。重新載入會捨棄你的編輯，覆寫則保留你的編輯。",
+        "loadFailed": "載入專案記憶失敗",
+        "saveFailed": "儲存專案記憶失敗",
+        "saved": "專案記憶已儲存",
+        "loading": "載入中…",
+        "updated": "{time}更新",
+        "changedOutside": "記憶檔案已在此視窗之外被更新，可能是代理所為。",
+        "keepMine": "保留我的編輯",
+        "discardConfirm": "放棄對專案記憶的未儲存變更？",
+        "discard": "放棄",
+        "emptyHint": "代理會隨著專案推進填寫這裡。"
+      }
     }
   },
   "settings": {
@@ -558,21 +808,8 @@
       }
     },
     "codex": {
-      "installationMethod": {
-        "name": "安裝方式",
-        "desc": "Claudian 在 Windows 上啟動 Codex 的方式。原生 Windows 使用 Windows 可執行檔路徑；WSL 會在所選發行版內啟動 Linux CLI。",
-        "nativeWindows": "原生 Windows",
-        "wsl": "WSL"
-      },
       "cliPath": {
-        "name": "Codex CLI 路徑",
-        "validation": {
-          "wslWindowsPath": "WSL 模式需要 Linux 命令或 Linux 絕對路徑，而不是 Windows 可執行檔路徑。"
-        }
-      },
-      "wslDistroOverride": {
-        "name": "WSL 發行版覆寫",
-        "desc": "可選進階覆寫。留空時會盡可能從 WSL 工作區路徑推斷發行版，否則使用預設 WSL 發行版。"
+        "name": "Codex CLI 路徑"
       },
       "safeMode": {
         "workspaceWrite": "工作區可寫",
@@ -648,12 +885,13 @@
       }
     },
     "opencode": {
+      "emptyModels": "OpenCode 伺服器未為此儲存庫傳回已啟用的模型。請檢查儲存庫的 .opencode/opencode.json 與 OpenCode 日誌（執行 opencode debug paths 查看位置）。使用 OpenCode v2 時，設定的 V1 外掛可能不相容。請在儲存庫中執行 opencode models --standalone 比較，然後按「探索」。",
       "environment": {
         "name": "OpenCode 環境變數",
         "desc": "傳遞給 OpenCode 的額外環境變數。"
       },
       "migrationNotice": {
-        "text": "Claudian 現已支援 OpenCode v2。OpenCode v1 的支援將於 2026 年 10 月 30 日結束。",
+        "text": "OpenCode v1 已不再受支援。請更新至 OpenCode v2 以在 Claudian 中使用。",
         "link": "遷移至 OpenCode v2"
       }
     },
@@ -661,6 +899,9 @@
       "environment": {
         "name": "Pi 環境變數",
         "desc": "僅傳遞給 Pi 的環境變數。"
+      },
+      "models": {
+        "desc": "Claudian 維護獨立於 Pi enabledModels 的模型清單。Discover 會列出 Pi 在目前環境中可驗證的所有模型，並依 Pi 實際呼叫的供應商路由分組。路由決定憑證與計費。"
       }
     },
     "grok": {
@@ -669,16 +910,21 @@
         "desc": "僅傳遞給 Grok Build 的環境變數。自訂模型的密鑰保留在此提供者範圍內，並在原生設定中透過 env_key 參照。"
       }
     },
+    "antigravity": {
+      "environment": {
+        "name": "Antigravity 環境變數",
+        "desc": "僅傳遞給 Antigravity（agy）的環境變數，例如 GEMINI_API_KEY。"
+      }
+    },
     "deepseek": {
       "installation": {
         "desc": "自動模式優先使用 dsh，其次偵測 macOS 或 Windows 上的 Desktop。兩者都已安裝時，輸入 Desktop 的 .app 路徑或 Windows 安裝資料夾即可選擇它。請先開啟 Desktop 完成初始設定。",
-        "desktop": "使用你的原生 Desktop 設定檔。",
-        "web": "使用你的原生 Web 設定檔。"
+        "wslDesc": "WSL 需要在所選發行版中安裝 Linux Node.js 和 npm dsh，並設定其原生 Web 設定檔。DeepSeek Harness Desktop 無法作為 WSL 安裝使用。請在該發行版中安裝 @deepseek-ai/dsh，或選擇「原生 Windows」以使用 Desktop。"
       },
       "preset": "預設集",
       "codeMode": {
         "name": "啟用程式碼模式",
-        "desc": "從每個對話的下一輪開始生效，包括既有對話。在直接工具之外加入原生 run_code。"
+        "desc": "從每個對話的下一輪開始生效，包括既有對話。模型透過原生 run_code 程式呼叫工具，而非直接呼叫。"
       },
       "presetPlugins": {
         "name": "附加預設外掛",
@@ -772,6 +1018,19 @@
         "failed": "同步失敗:{message}",
         "summary": "已移動 {moved},已轉換 {converted},已移至垃圾桶 {trashed},已移除 {unlinked} 個連結。"
       }
+    },
+    "executionTarget": {
+      "installationMethod": {
+        "name": "安裝方式",
+        "desc": "Claudian 在 Windows 上啟動 {provider} 的方式。原生 Windows 使用 Windows 可執行檔路徑；WSL 會在所選發行版內啟動 Linux CLI。",
+        "nativeWindows": "原生 Windows",
+        "wsl": "WSL"
+      },
+      "wslDistroOverride": {
+        "name": "WSL 發行版覆寫",
+        "desc": "可選進階覆寫。留空時會盡可能從 WSL 工作區路徑推斷發行版，否則使用預設 WSL 發行版。"
+      },
+      "wslWindowsPath": "WSL 模式需要 Linux 命令或 Linux 絕對路徑，而不是 Windows 可執行檔路徑。"
     }
   }
 }

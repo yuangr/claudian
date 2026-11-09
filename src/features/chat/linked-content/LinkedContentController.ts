@@ -42,11 +42,6 @@ export type LinkedContentPathEvent =
     readonly includeDescendants: boolean;
   };
 
-export interface LinkedContentSubmissionSettlement {
-  readonly linkedContentPath?: string;
-  readonly queuedEvents: readonly LinkedContentPathEvent[];
-}
-
 export interface LinkedContentControllerOptions {
   readonly app: App;
   readonly getExcludedTags: () => readonly string[];
@@ -64,6 +59,11 @@ interface ActiveSubmission {
   readonly checkpoint: DraftCheckpoint;
   readonly queuedEvents: LinkedContentPathEvent[];
 }
+
+/** Only a submission in flight holds a checkpoint and queues path events until it settles. */
+type LinkedContentState =
+  | { readonly mode: Exclude<LinkedContentMode, 'submitting'> }
+  | { readonly mode: 'submitting'; readonly submission: ActiveSubmission };
 
 function isSameOrDescendant(path: string, parentPath: string, includeDescendants: boolean): boolean {
   return path === parentPath
@@ -87,9 +87,8 @@ export class LinkedContentController {
   private readonly app: App;
   private readonly options: LinkedContentControllerOptions;
   private readonly pickerSource: LinkedContentPickerSource;
-  private mode: LinkedContentMode = 'auto-draft';
+  private state: LinkedContentState = { mode: 'auto-draft' };
   private path: string | null = null;
-  private activeSubmission: ActiveSubmission | null = null;
   private selector: LinkedContentSelector | null = null;
   private chip: LinkedContentChip | null = null;
   private destroyed = false;
@@ -103,6 +102,10 @@ export class LinkedContentController {
     });
   }
 
+  private get mode(): LinkedContentMode {
+    return this.state.mode;
+  }
+
   getSnapshot(): LinkedContentSnapshot {
     return {
       mode: this.mode,
@@ -112,10 +115,15 @@ export class LinkedContentController {
 
   resetAutoDraft(): void {
     this.#assertLive();
-    this.activeSubmission = null;
-    this.mode = 'auto-draft';
+    this.state = { mode: 'auto-draft' };
     this.path = this.#eligibleActiveFilePath(this.app.workspace.getActiveFile());
     this.publish();
+  }
+
+  /** New returning to a draft drops any explicit choice and links the active Note again. */
+  reopenAutoDraft(): void {
+    if (this.destroyed || (this.mode !== 'auto-draft' && this.mode !== 'explicit-draft')) return;
+    this.resetAutoDraft();
   }
 
   selectExplicit(path: string | null): void {
@@ -126,7 +134,7 @@ export class LinkedContentController {
     if (this.mode === 'locked') {
       throw new Error('Linked content is locked for this Conversation');
     }
-    this.mode = 'explicit-draft';
+    this.state = { mode: 'explicit-draft' };
     this.path = path === null ? null : assertLinkedContentPath(path);
     this.publish();
   }
@@ -145,8 +153,7 @@ export class LinkedContentController {
 
   lock(path: string | undefined): void {
     this.#assertLive();
-    this.activeSubmission = null;
-    this.mode = 'locked';
+    this.state = { mode: 'locked' };
     this.path = path === undefined ? null : assertLinkedContentPath(path);
     this.publish();
   }
@@ -160,33 +167,26 @@ export class LinkedContentController {
     const token = Object.freeze(
       this.path === null ? {} : { path: this.path },
     ) as LinkedContentSubmissionToken;
-    this.activeSubmission = { token, checkpoint, queuedEvents: [] };
-    this.mode = 'submitting';
+    this.state = { mode: 'submitting', submission: { token, checkpoint, queuedEvents: [] } };
     this.publish();
     return token;
   }
 
-  commitSubmission(token: LinkedContentSubmissionToken): LinkedContentSubmissionSettlement {
+  commitSubmission(token: LinkedContentSubmissionToken): void {
     this.#assertLive();
     const submission = this.#requireSubmission(token);
-    this.mode = 'locked';
+    this.state = { mode: 'locked' };
     this.path = token.path ?? null;
     for (const event of submission.queuedEvents) this.#applyPathEvent(event);
-    this.activeSubmission = null;
     this.publish();
-    return {
-      ...(this.path === null ? {} : { linkedContentPath: this.path }),
-      queuedEvents: [...submission.queuedEvents],
-    };
   }
 
   rollbackSubmission(token: LinkedContentSubmissionToken): void {
     this.#assertLive();
     const submission = this.#requireSubmission(token);
-    this.mode = submission.checkpoint.mode;
+    this.state = { mode: submission.checkpoint.mode };
     this.path = submission.checkpoint.path;
     for (const event of submission.queuedEvents) this.#applyPathEvent(event);
-    this.activeSubmission = null;
     this.publish();
   }
 
@@ -202,8 +202,8 @@ export class LinkedContentController {
       newPath: assertLinkedContentPath(newPath),
       includeDescendants,
     };
-    if (this.activeSubmission) {
-      this.activeSubmission.queuedEvents.push(event);
+    if (this.state.mode === 'submitting') {
+      this.state.submission.queuedEvents.push(event);
       return;
     }
     if (this.#applyPathEvent(event)) this.publish();
@@ -216,8 +216,8 @@ export class LinkedContentController {
       path: assertLinkedContentPath(path),
       includeDescendants,
     };
-    if (this.activeSubmission) {
-      this.activeSubmission.queuedEvents.push(event);
+    if (this.state.mode === 'submitting') {
+      this.state.submission.queuedEvents.push(event);
       return;
     }
     if (this.#applyPathEvent(event)) this.publish();
@@ -271,32 +271,34 @@ export class LinkedContentController {
       new Notice(t('chat.linkedContent.missingNotice', { path: this.path }));
       return;
     }
-    if (content.target instanceof TFile) {
+    if (content.target instanceof TFile || content.target instanceof TFolder) {
       try {
-        await this.#revealFile(content.target);
+        if (content.target instanceof TFile) {
+          await this.#revealFile(content.target);
+        } else {
+          await this.#revealFolder(content.target);
+        }
       } catch (error) {
         new Notice(
           t('chat.linkedContent.openFailed', { error: error instanceof Error ? error.message : String(error) }),
         );
       }
-      return;
     }
-    if (content.target instanceof TFolder) await this.#revealFolder(content.target);
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.activeSubmission = null;
     this.unmountWelcome();
     this.unmountInfoRow();
   }
 
   #requireSubmission(token: LinkedContentSubmissionToken): ActiveSubmission {
-    if (!this.activeSubmission || this.activeSubmission.token !== token) {
+    const { state } = this;
+    if (state.mode !== 'submitting' || state.submission.token !== token) {
       throw new Error('Stale Linked content submission');
     }
-    return this.activeSubmission;
+    return state.submission;
   }
 
   #applyPathEvent(event: LinkedContentPathEvent): boolean {
@@ -314,7 +316,7 @@ export class LinkedContentController {
     }
     if (!isSameOrDescendant(this.path, event.path, event.includeDescendants)) return false;
     if (this.mode === 'locked') return true;
-    this.mode = 'explicit-draft';
+    this.state = { mode: 'explicit-draft' };
     this.path = null;
     return true;
   }
@@ -352,8 +354,9 @@ export class LinkedContentController {
       fileTags.push(frontmatterTags);
     }
     if (cache.tags) fileTags.push(...cache.tags.map(tag => tag.tag));
-    const normalizedExcluded = new Set(excludedTags.map(tag => tag.replace(/^#/, '')));
-    return fileTags.some(tag => normalizedExcluded.has(tag.replace(/^#/, '')))
+    const normalizeTag = (tag: string): string => tag.replace(/^#/, '').toLowerCase();
+    const normalizedExcluded = new Set(excludedTags.map(normalizeTag));
+    return fileTags.some(tag => normalizedExcluded.has(normalizeTag(tag)))
       ? 'excluded'
       : 'not-excluded';
   }

@@ -1,3 +1,5 @@
+import { SerialQueue } from '@/utils/SerialQueue';
+
 export type SettingsMutation<T extends object> = (
   settings: T,
 ) => void | Promise<void>;
@@ -32,7 +34,7 @@ function publishSettings<T extends object>(settings: T, snapshot: T): void {
 }
 
 export class SettingsCoordinator<T extends object> {
-  private tail: Promise<void> = Promise.resolve();
+  private readonly queue = new SerialQueue();
 
   constructor(
     private readonly settings: T,
@@ -52,6 +54,7 @@ export class SettingsCoordinator<T extends object> {
     return this.#enqueueTransactional(async (draft) => {
       await mutation(draft);
       await this.persist(draft);
+      return true;
     }, onCommitted);
   }
 
@@ -60,9 +63,9 @@ export class SettingsCoordinator<T extends object> {
     onCommitted?: SettingsCommit<T>,
   ): Promise<void> {
     return this.#enqueueTransactional(async (draft) => {
-      if (await mutation(draft)) {
-        await this.persist(draft);
-      }
+      if (!await mutation(draft)) return false;
+      await this.persist(draft);
+      return true;
     }, onCommitted);
   }
 
@@ -71,19 +74,18 @@ export class SettingsCoordinator<T extends object> {
   }
 
   private enqueue(operation: () => Promise<void>): Promise<void> {
-    const result = this.tail.then(operation);
-    this.tail = result.catch(() => undefined);
-    return result;
+    return this.queue.run(operation);
   }
 
   #enqueueTransactional(
-    operation: (draft: T) => Promise<void>,
+    /** Resolves false to discard the draft without committing or publishing it. */
+    operation: (draft: T) => Promise<boolean>,
     onCommitted?: SettingsCommit<T>,
   ): Promise<void> {
     return this.enqueue(async () => {
       const snapshot = structuredClone(this.settings);
       const draft = structuredClone(this.settings);
-      await operation(draft);
+      if (!await operation(draft)) return;
       publishSettings(this.settings, draft);
       const errors: unknown[] = [];
       try { await onCommitted?.(this.settings); } catch (error) { errors.push(error); }

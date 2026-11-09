@@ -5,13 +5,14 @@ import type { ConversationController } from '@/features/chat/conversation/Conver
 import { ConversationTitleGeneration } from '@/features/chat/conversation/ConversationTitleGeneration';
 import type { LinkedContentController, LinkedContentSubmissionToken } from '@/features/chat/linked-content';
 import type { ChatState } from '@/features/chat/state/ChatState';
-import { cloneChatTurnRequest } from '@/features/chat/state/chatTurnRequest';
 import type { ChatTurnRequest } from '@/features/chat/state/types';
 
 export interface FirstTurnAdmissionDeps {
   host: ChatFeatureHost;
   state: ChatState;
-  conversationController: Pick<ConversationController, 'createConversation'>;
+  conversationController: Pick<
+    ConversationController, 'createConversation' | 'freezeDraftProject' | 'releaseDraftProject'
+  >;
   getLinkedContentController: () => LinkedContentController;
   getTitleGenerationService: () => TitleGenerationService | null;
 }
@@ -19,13 +20,13 @@ export interface FirstTurnAdmissionDeps {
 /** One main turn's admission into its Conversation, from creation through Linked content binding. */
 export interface TurnAdmission {
   /**
-   * Creates the Conversation this turn starts, freezing the Linked content captured at begin.
+   * Creates the Conversation this turn starts, freezing the Linked content and project seed captured at begin.
    * The target is resolved only when a Conversation must be created.
    */
   ensureConversation(resolveTarget: () => { providerId: ProviderId; model: string | undefined }): Promise<void>;
   /** Titles a Conversation after its first user message is admitted. */
   titleFirstTurn(): Promise<void>;
-  /** Returns the captured Linked content draft when this turn never created its Conversation. */
+  /** Returns the captured Linked content draft and project seed when this turn never created its Conversation. */
   rollbackIfUncreated(): void;
   /** Binds the Linked content this turn carries to the provider. */
   bind(request: ChatTurnRequest): ChatTurnRequest;
@@ -49,6 +50,8 @@ export class FirstTurnAdmission {
     const { state } = this.deps;
     const linkedContent = this.deps.getLinkedContentController();
     const creation = state.currentConversationId ? null : linkedContent.beginSubmission();
+    // The project seed freezes with the Linked content at first input.
+    const projectId = creation ? this.deps.conversationController.freezeDraftProject() : null;
 
     return {
       ensureConversation: async resolveTarget => {
@@ -60,6 +63,7 @@ export class FirstTurnAdmission {
         await this.deps.conversationController.createConversation(creation, {
           providerId,
           selectedModel: model,
+          ...(projectId ? { projectId } : {}),
         });
       },
       titleFirstTurn: async () => {
@@ -71,6 +75,7 @@ export class FirstTurnAdmission {
       rollbackIfUncreated: () => {
         if (creation && !state.currentConversationId) {
           linkedContent.rollbackSubmission(creation);
+          this.deps.conversationController.releaseDraftProject();
         }
       },
       bind: request => this.#bindLinkedContent(request, { isCompact, creation, transcriptBeforeTurn }),
@@ -97,7 +102,7 @@ export class FirstTurnAdmission {
     const linkedContentPath = isFirstTurn ? frozenPath ?? undefined : undefined;
     if (request.linkedContentPath === linkedContentPath) return request;
 
-    const admittedRequest = cloneChatTurnRequest(request);
+    const admittedRequest = { ...request };
     if (linkedContentPath) {
       admittedRequest.linkedContentPath = linkedContentPath;
     } else {

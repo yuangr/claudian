@@ -1,5 +1,6 @@
 import { Notice, type Plugin } from 'obsidian';
 
+import type { ProviderExecutionLifecycleRegistry } from '@/core/execution/ProviderExecutionLifecycleRegistry';
 import { StartupProfiler } from '@/core/performance/StartupProfiler';
 import type { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
@@ -13,6 +14,7 @@ import { ConversationRepository } from '../conversations/ConversationRepository'
 import { ConversationService } from '../conversations/ConversationService';
 import { NativeSessionArchiveSync } from '../conversations/NativeSessionArchiveSync';
 import { SessionMetadataLoader } from '../conversations/SessionMetadataLoader';
+import { ProjectService } from '../projects/ProjectService';
 import { ChatModelSelectionCoordinator } from '../settings/ChatModelSelectionCoordinator';
 import { PinnedLinkedContentPathCoordinator } from '../settings/PinnedLinkedContentPathCoordinator';
 import { RuntimeSettingsCoordinator } from '../settings/RuntimeSettingsCoordinator';
@@ -21,7 +23,6 @@ import { SharedStorageService } from '../storage/SharedStorageService';
 
 export type StartupProviderCatalog = Pick<
   typeof ProviderRegistry,
-  | 'getCapabilities'
   | 'getConversationHistoryService'
   | 'getProviderDisplayName'
   | 'getRegisteredProviderIds'
@@ -32,6 +33,7 @@ export type StartupProviderSettings = Pick<
   typeof ProviderSettingsCoordinator,
   | 'getProviderSettingsSnapshot'
   | 'invalidateConversationSessions'
+  | 'preservesConversationSession'
   | 'normalizeAllModelVariants'
   | 'normalizeProviderSelection'
   | 'persistProjectedProviderState'
@@ -44,8 +46,7 @@ export interface ApplicationStartupOptions {
   readonly defaultSettings: Readonly<ClaudianSettings>;
   readonly providers: StartupProviderCatalog;
   readonly providerSettings: StartupProviderSettings;
-  /** Defers sessions not selected for restoration to the background metadata scan. */
-  readonly deferNonRestoredSessionMetadata: boolean;
+  readonly executionLifecycle: Pick<ProviderExecutionLifecycleRegistry, 'markSessionsInvalidated'>;
   isUnloading(): boolean;
   publishCommittedSettings(
     settings: Readonly<ClaudianSettings>,
@@ -70,6 +71,7 @@ export interface ApplicationDomains {
   readonly nativeSessionArchives: NativeSessionArchiveSync;
   readonly runtimeSettings: RuntimeSettingsCoordinator;
   readonly sessionMetadata: SessionMetadataLoader;
+  readonly projects: ProjectService;
 }
 
 /**
@@ -81,7 +83,13 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
   const { plugin, providers, providerSettings } = options;
   const workspace = plugin.app.workspace;
   const storage = new SharedStorageService(plugin, options.defaultSettings);
-  const { claudian } = await storage.initialize();
+  // Projects load before any chat turn can resolve a member's project.
+  const [{ claudian }, loadedProjects] = await Promise.all([
+    storage.initialize(),
+    storage.projects.load(),
+  ]);
+  StartupProfiler.recordCount('project-count', loadedProjects.records.length);
+  StartupProfiler.recordCount('invalid-project-count', loadedProjects.invalidCount);
   const settings: ClaudianSettings = {
     ...structuredClone(options.defaultSettings),
     ...claudian,
@@ -97,6 +105,10 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
   );
   const chatModelSelection = new ChatModelSelectionCoordinator(settingsCoordinator);
   const pinnedLinkedContentPaths = new PinnedLinkedContentPathCoordinator(settingsCoordinator);
+  const projects = new ProjectService(loadedProjects.records, {
+    store: storage.projects,
+    memory: storage.getAdapter(),
+  });
   const conversationRepository = new ConversationRepository({
     providers,
     providerSettings,
@@ -105,11 +117,14 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
     getVaultPath: () => getVaultPath(plugin.app),
     persistence: storage.conversationPersistence,
     onConversationDeleted: conversationId => options.onConversationDeleted(conversationId),
+    projects,
   });
   const runtimeSettings: RuntimeSettingsCoordinator = new RuntimeSettingsCoordinator({
     settings: settingsCoordinator,
     conversations: conversationRepository,
+    executionLifecycle: options.executionLifecycle,
     getSettings: () => settings,
+    getVaultPath: () => getVaultPath(plugin.app),
     // Consulted only by post-startup commits, after the loader below exists.
     canCompleteInvalidations: (): boolean => sessionMetadata.hasLoadedAll && !options.isUnloading(),
   });
@@ -139,6 +154,7 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
   });
   const conversations = new ConversationService({
     repository: conversationRepository,
+    projects,
     sessionMetadata,
     pinnedLinkedContentPaths,
     nativeSessionArchives,
@@ -147,57 +163,17 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
 
   const didNormalizePendingSessionInvalidations = runtimeSettings.syncPendingSessionInvalidations();
   const didNormalizeProviderSelection = providerSettings.normalizeProviderSelection(settings);
-  const didNormalizeModelVariants = providerSettings.normalizeAllModelVariants(settings);
+  const didNormalizeModelVariants = providerSettings.normalizeAllModelVariants(settings, { vaultPath: getVaultPath(plugin.app) });
 
-  const deferRemainingMetadata = options.deferNonRestoredSessionMetadata;
-  const initialMetadataScan = deferRemainingMetadata
-    ? {
-        records: [],
-        complete: false,
-        invalidMetadataCount: 0,
-      }
-    : await StartupProfiler.runAsync(
-        'session-metadata-load',
-        () => sessionMetadata.readInitialMetadata(),
-      );
-  const initialModelRecoverySources = initialMetadataScan.records.map(({ metadata }) => (
-    sessionMetadata.createShell(metadata)
-  ));
-  const initialEntries = initialMetadataScan.records.map(({ metadata, needsMigration, source }) => ({
-    conversation: sessionMetadata.createShell(metadata),
-    needsMigration,
-    source,
-  }));
-  StartupProfiler.recordCount('initial-session-metadata-count', initialEntries.length);
-  StartupProfiler.recordCount('session-metadata-count', initialEntries.length);
-  StartupProfiler.recordCount(
-    'invalid-session-metadata-count',
-    initialMetadataScan.invalidMetadataCount,
-  );
-  await conversationRepository.adoptMetadataConversations(initialEntries);
-  conversationRepository.registerHistoricalModelRecoverySources(
-    initialModelRecoverySources,
-  );
-  if (initialMetadataScan.complete) {
-    const recoveredModels = await conversationRepository.recoverMissingSelectedModels();
-    StartupProfiler.recordCount(
-      'recovered-session-model-count',
-      recoveredModels.length,
-    );
-  }
   setLocale(settings.locale as Locale);
 
+  // No conversation is loaded yet: restored and remaining sessions apply pending
+  // invalidations as the metadata loader adopts them.
   const reconciliation = runtimeSettings.reconcile();
   runtimeSettings.markPendingSessionInvalidations(
     settings,
     reconciliation.sessionInvalidationProviderIds,
   );
-  const pendingInvalidatedConversations = conversationRepository.invalidateProviderSessions(
-    runtimeSettings.getPendingProviderIds(),
-  );
-  const completedInvalidationGenerations = initialMetadataScan.complete
-    ? new Map(runtimeSettings.getPendingGenerations())
-    : new Map<ProviderId, number>();
 
   providerSettings.projectActiveProviderState(settings);
 
@@ -210,14 +186,6 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
     await settingsCoordinator.persistCurrent();
   }
 
-  const conversationsToSave = new Set([
-    ...reconciliation.invalidatedConversations,
-    ...pendingInvalidatedConversations,
-  ]);
-  await conversationRepository.persistConversations(Array.from(conversationsToSave));
-  await runtimeSettings.completePendingSessionInvalidations(completedInvalidationGenerations);
-  sessionMetadata.finishStartup(initialMetadataScan.complete, deferRemainingMetadata);
-
   return {
     storage,
     settings: settingsCoordinator,
@@ -227,5 +195,6 @@ export async function startApplication(options: ApplicationStartupOptions): Prom
     nativeSessionArchives,
     runtimeSettings,
     sessionMetadata,
+    projects,
   };
 }

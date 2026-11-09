@@ -429,6 +429,7 @@ export class InlineAskUserQuestion {
   }
 
   #getAnswerText(idx: number): string {
+    if (this.questions[idx].isSecret && this.#isQuestionAnswered(idx)) return '••••••••';
     const selected = this.#getSelectedLabels(idx);
     const custom = this.state.customInputs.get(idx)!;
     const parts: string[] = [];
@@ -461,7 +462,7 @@ export class InlineAskUserQuestion {
     if (this.config.immediateSelect) {
       const key = q.id ?? q.question;
       const result: Record<string, string> = {};
-      result[key] = optionValue;
+      Object.defineProperty(result, key, { value: optionValue, enumerable: true, writable: true, configurable: true });
       this.#handleResolve(result);
       return;
     }
@@ -700,11 +701,11 @@ export class InlineAskUserQuestion {
         if (customInput) {
           answers.push(customInput);
         }
-        result[key] = answers;
+        Object.defineProperty(result, key, { value: answers, enumerable: true, writable: true, configurable: true });
         continue;
       }
 
-      result[key] = customInput || selectedValues[0] || '';
+      Object.defineProperty(result, key, { value: customInput || selectedValues[0] || '', enumerable: true, writable: true, configurable: true });
     }
     if (this.config.onSubmit) {
       void this.#submitAsync(result);

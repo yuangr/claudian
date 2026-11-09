@@ -2,13 +2,16 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 
-jest.mock('cross-spawn', () => jest.fn());
+vi.mock('cross-spawn', () => ({ default: vi.fn() }));
 
 import spawn from 'cross-spawn';
+import type { MockedFunction } from 'vitest';
 
 import { ManagedStdioProcess } from '@/core/process/ManagedStdioProcess';
 
-const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
+
+
+const mockSpawn = spawn as MockedFunction<typeof spawn>;
 
 function createMockProcess(): ChildProcessWithoutNullStreams {
   const proc = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
@@ -21,7 +24,7 @@ function createMockProcess(): ChildProcessWithoutNullStreams {
     stdin: new Writable({ write: (_chunk, _encoding, callback) => callback() }),
     stdout: new Readable({ read() {} }),
   });
-  proc.kill = jest.fn().mockReturnValue(true);
+  proc.kill = vi.fn().mockReturnValue(true);
   return proc;
 }
 
@@ -42,14 +45,14 @@ describe('ManagedStdioProcess', () => {
   let proc: ChildProcessWithoutNullStreams;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     proc = createMockProcess();
     mockSpawn.mockReturnValue(proc);
   });
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', { value: originalPlatform });
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   it('starts once and exposes the owned stdio streams and liveness state', () => {
@@ -93,7 +96,7 @@ describe('ManagedStdioProcess', () => {
       throw error;
     });
     const managed = createManagedProcess();
-    const onError = jest.fn();
+    const onError = vi.fn();
     managed.onError(onError);
 
     expect(() => managed.start()).toThrow(error);
@@ -113,9 +116,9 @@ describe('ManagedStdioProcess', () => {
 
   it('observes operational errors without treating them as process exit', () => {
     const managed = createManagedProcess();
-    const onError = jest.fn();
-    const onExit = jest.fn();
-    const onClose = jest.fn();
+    const onError = vi.fn();
+    const onExit = vi.fn();
+    const onClose = vi.fn();
     managed.onError(onError);
     managed.onExit(onExit);
     managed.onClose(onClose);
@@ -179,6 +182,90 @@ describe('ManagedStdioProcess', () => {
     expect(proc.stderr.listenerCount('data')).toBe(0);
   });
 
+  it.each([
+    { text: '\u4e2d', split: 1 },
+    { text: '\u4e2d', split: 2 },
+    { text: '\ud83d\ude80', split: 1 },
+    { text: '\ud83d\ude80', split: 2 },
+    { text: '\ud83d\ude80', split: 3 },
+  ])('decodes $text split after byte $split without exposing incomplete bytes', ({ text, split }) => {
+    const managed = createManagedProcess();
+    managed.start();
+    const bytes = Buffer.from(text, 'utf8');
+
+    proc.stderr.emit('data', Buffer.from('prefix:'));
+    proc.stderr.emit('data', bytes.subarray(0, split));
+    expect(managed.getStderrSnapshot()).toBe('prefix:');
+    proc.stderr.emit('data', bytes.subarray(split));
+    expect(managed.getStderrSnapshot()).toBe(`prefix:${text}`);
+    expect(managed.stderr).toBe(proc.stderr);
+    proc.emit('close', 0, null);
+    expect(managed.getStderrSnapshot()).toBe(`prefix:${text}`);
+  });
+
+  it.each([
+    {
+      name: 'complete buffers and strings',
+      chunks: [Buffer.from('\u4e2d'), 'literal', Buffer.from('\ud83d\ude80')],
+      expected: '\u4e2dliteral\ud83d\ude80',
+    },
+    {
+      name: 'nonempty string flushes the pending prefix',
+      chunks: [Buffer.from([0xe4]), 'literal', Buffer.from([0xb8, 0xad])],
+      expected: '\ufffdliteral\ufffd\ufffd',
+    },
+    {
+      name: 'empty string leaves the pending prefix intact',
+      chunks: [Buffer.from([0xe4]), '', Buffer.from([0xb8, 0xad])],
+      expected: '\u4e2d',
+    },
+  ])('preserves mixed stderr ordering: $name', ({ chunks, expected }) => {
+    const managed = createManagedProcess();
+    managed.start();
+
+    for (const chunk of chunks) proc.stderr.emit('data', chunk);
+
+    expect(managed.getStderrSnapshot()).toBe(expected);
+    proc.emit('close', 0, null);
+    expect(managed.getStderrSnapshot()).toBe(expected);
+  });
+
+  it('finalizes pending bytes before close observers and only once', () => {
+    const managed = createManagedProcess();
+    const snapshotAtClose = vi.fn(() => managed.getStderrSnapshot());
+    managed.onClose(snapshotAtClose);
+    managed.start();
+    proc.stderr.emit('data', Buffer.from([0xe4, 0xb8]));
+    expect(managed.getStderrSnapshot()).toBe('');
+
+    proc.emit('close', 1, null);
+
+    expect(snapshotAtClose).toHaveReturnedWith('\ufffd');
+    expect(proc.stderr.listenerCount('data')).toBe(0);
+    proc.emit('close', 1, null);
+    proc.stderr.emit('data', Buffer.from('late'));
+    expect(snapshotAtClose).toHaveBeenCalledTimes(1);
+    expect(managed.getStderrSnapshot()).toBe('\ufffd');
+  });
+
+  it('keeps pending decoder bytes isolated between managed instances', () => {
+    const otherProc = createMockProcess();
+    mockSpawn.mockReturnValueOnce(proc).mockReturnValueOnce(otherProc);
+    const first = createManagedProcess();
+    const second = createManagedProcess();
+    first.start();
+    second.start();
+
+    proc.stderr.emit('data', Buffer.from([0xe4]));
+    otherProc.stderr.emit('data', Buffer.from([0xb8, 0xad]));
+    proc.stderr.emit('data', Buffer.from([0xb8, 0xad]));
+
+    expect(first.getStderrSnapshot()).toBe('\u4e2d');
+    expect(second.getStderrSnapshot()).toBe('\ufffd\ufffd');
+    proc.emit('close', 0, null);
+    otherProc.emit('close', 0, null);
+  });
+
   it('wraps Windows command shims and terminates their process tree', async () => {
     Object.defineProperty(process, 'platform', { value: 'win32' });
     const managed = createManagedProcess({
@@ -223,7 +310,7 @@ describe('ManagedStdioProcess', () => {
   });
 
   it('continues SIGKILL escalation when signal delivery emits an error', async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     const managed = createManagedProcess();
     managed.start();
 
@@ -231,7 +318,7 @@ describe('ManagedStdioProcess', () => {
     proc.emit('error', new Error('kill EPERM'));
 
     expect(managed.isAlive()).toBe(true);
-    jest.advanceTimersByTime(3_000);
+    vi.advanceTimersByTime(3_000);
     expect(proc.kill).toHaveBeenNthCalledWith(1, 'SIGTERM');
     expect(proc.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
 
@@ -240,17 +327,24 @@ describe('ManagedStdioProcess', () => {
   });
 
   it('escalates to SIGKILL and settles at the final shutdown deadline', async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     const managed = createManagedProcess();
     managed.start();
+    proc.stderr.emit('data', Buffer.from([0xe4, 0xb8]));
+    expect(managed.getStderrSnapshot()).toBe('');
 
     const shutdown = managed.shutdown();
-    jest.advanceTimersByTime(3_000);
+    vi.advanceTimersByTime(3_000);
     expect(proc.kill).toHaveBeenNthCalledWith(1, 'SIGTERM');
     expect(proc.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
 
-    jest.advanceTimersByTime(3_000);
+    vi.advanceTimersByTime(3_000);
     await expect(shutdown).resolves.toBeUndefined();
+    expect(managed.getStderrSnapshot()).toBe('\ufffd');
+    expect(proc.stderr.listenerCount('data')).toBe(0);
+    await managed.shutdown();
+    proc.stderr.emit('data', Buffer.from('late'));
+    expect(managed.getStderrSnapshot()).toBe('\ufffd');
     expect(proc.listenerCount('error')).toBe(0);
     expect(proc.listenerCount('exit')).toBe(0);
     expect(proc.listenerCount('close')).toBe(0);

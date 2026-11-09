@@ -123,7 +123,7 @@ function normalizeCodexAgentStatus(
     const normalized = value.trim().toLowerCase();
     if (!normalized) return null;
     if (normalized === 'shutdown') return { status: 'error', result: 'Agent shut down', unavailable: true };
-    if (normalized === 'notfound') return { status: 'error', result: 'Agent not found', unavailable: true };
+    if (normalized === 'notfound' || normalized === 'not_found') return { status: 'error', result: 'Agent not found', unavailable: true };
     if (/interrupt|cancel|error|fail|kill/.test(normalized)) {
       return { result: value.trim(), status: 'error' };
     }
@@ -138,8 +138,11 @@ function normalizeCodexAgentStatus(
 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const status = value as Record<string, unknown>;
-  if (typeof status.completed === 'string') {
+  if (typeof status.completed === 'string' || status.completed === null) {
     return { result: status.completed || 'DONE', status: 'completed' };
+  }
+  if (typeof status.errored === 'string') {
+    return { result: status.errored || 'Agent stopped', status: 'error' };
   }
   const failure = firstString(status, ['error', 'failed', 'interrupted']);
   if (failure) return { result: failure, status: 'error' };
@@ -294,10 +297,6 @@ export function buildCodexSubagentInfo(
     toolCalls: [],
     ...(spawnResult.agentId ? { agentId: spawnResult.agentId } : {}),
   };
-}
-
-export function isCodexSubagentSpawnToolCall(toolCall: ToolCallInfo): boolean {
-  return toolCall.name === TOOL_SPAWN_AGENT;
 }
 
 function getCodexLifecycleTargetIds(toolCall: ToolCallInfo): string[] {

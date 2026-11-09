@@ -27,10 +27,59 @@ function source(
 }
 
 describe('MentionSource', () => {
+  it('ranks a large matching vault with bounded comparison work', () => {
+    const count = 4096;
+    const files = Array.from({ length: count }, (_, index) =>
+      file(`Note ${String((index * 2053) % count).padStart(4, '0')}.md`));
+    const { source: value } = source({
+      getCachedVaultFiles: () => files,
+      getCachedVaultFolders: () => [],
+    });
+    const compare = vi.spyOn(String.prototype, 'localeCompare');
+    let items;
+    let comparisons;
+    try {
+      items = value.load(value.match('@Note', 5)!, new AbortController().signal);
+      comparisons = compare.mock.calls.length;
+    } finally {
+      compare.mockRestore();
+    }
+    expect(items.map(item => item.id)).toEqual(Array.from({ length: 100 }, (_, index) =>
+      `vault-file:Note ${String(index).padStart(4, '0')}.md`));
+    // Ranking the retained 100 suggestions should not sort all 4096 matches.
+    expect(comparisons).toBeLessThan(count * 3);
+  });
+
+  it('ranks ancestor folders by their newest descendant and reflects timestamp changes', () => {
+    const files = [file('Projects/old/a.md', 5), file('Projects/new/deep/b.md', 10), file('Projects/new/c.md', 2)];
+    const { source: value } = source({
+      getCachedVaultFiles: () => files,
+      getCachedVaultFolders: () => [
+        { name: 'Projects', path: 'Projects/' },
+        { name: 'new', path: 'Projects\\new/' },
+        { name: 'old', path: 'Projects/old' },
+        { name: 'empty', path: 'Projects/empty' },
+      ],
+    });
+    const lookup = () => value.load(value.match('@new', 4)!, new AbortController().signal);
+    expect(lookup().map(item => item.id)).toEqual([
+      'vault-folder:Projects/new', 'vault-file:Projects/new/deep/b.md', 'vault-file:Projects/new/c.md',
+    ]);
+    const folders = value.load(value.match('@Projects', 9)!, new AbortController().signal)
+      .filter(item => item.id.startsWith('vault-folder:'));
+    expect(folders.map(item => item.id)).toEqual([
+      'vault-folder:Projects', 'vault-folder:Projects/new', 'vault-folder:Projects/old', 'vault-folder:Projects/empty',
+    ]);
+    files[1].stat.mtime = 1;
+    expect(lookup().map(item => item.id)).toEqual([
+      'vault-folder:Projects/new', 'vault-file:Projects/new/c.md', 'vault-file:Projects/new/deep/b.md',
+    ]);
+  });
+
   it('formats only retained suggestions while preserving file and folder ranking', async () => {
     const now = testDate().getTime();
     const files = Array.from({ length: 250 }, (_, index) => file(`folder${index % 60}/Note ${index}.md`, now + index + 1));
-    const formatVaultFileMention = jest.fn((path: string) => `@${path} `);
+    const formatVaultFileMention = vi.fn((path: string) => `@${path} `);
     const { source: value } = source({
       getCachedVaultFiles: () => files,
       getCachedVaultFolders: () => Array.from({ length: 60 }, (_, index) => ({ name: `folder${index}`, path: `folder${index}` })),
@@ -47,16 +96,53 @@ describe('MentionSource', () => {
     expect(updated.slice(0, 2).map(item => item.id)).toEqual(['vault-file:folder0/Note 0.md', 'vault-folder:folder0']);
   });
 
-  it('matches @ at a token boundary and preserves file names containing spaces', () => {
-    const { source: value } = source();
-    expect(value.match('Ask @Al', 7)).toEqual(expect.objectContaining({ query: 'Al' }));
-    expect(value.match('mail@example', 12)).toBeNull();
-    expect(value.match('@Alpha note', 11)).toEqual(expect.objectContaining({
-      query: 'Alpha note',
-    }));
+  it('matches @ at a token boundary and keeps spaces only while a name still matches', () => {
+    const { source: value } = source({
+      getCachedVaultFiles: () => [file('notes/Alpha note.md', 5)],
+      getCachedVaultFolders: () => [{ name: 'My Projects', path: 'My Projects' }],
+    }, {
+      getSessionItems: () => [
+        { id: 'session:1', kind: 'value', label: 'Weekly review', replacement: 'token ', mtime: 1 },
+      ],
+    });
+    const queryAt = (input: string) => value.match(input, input.length)?.query ?? null;
+    expect(queryAt('Ask @Al')).toBe('Al');
+    expect(queryAt('mail@example')).toBeNull();
+    // Each kind of name keeps a spaced query open, by name or by path.
+    expect(queryAt('@Alpha note')).toBe('Alpha note');
+    expect(queryAt('@notes/alpha N')).toBe('notes/alpha N');
+    expect(queryAt('@my proj')).toBe('my proj');
+    expect(queryAt('@Weekly rev')).toBe('Weekly rev');
+    // An unmatched word stays open until a space, then closes for the rest of the line.
+    expect(queryAt('meet @3pm')).toBe('3pm');
+    expect(queryAt('meet @3pm ')).toBeNull();
+    expect(queryAt('meet @3pm tomorrow')).toBeNull();
     const completed = '@[A \\] B](claudian-session:conv-1-a) summarize this';
     expect(value.match(completed, completed.length)).toBeNull();
     expect(value.match(`${completed} @Al`, completed.length + 4)).toEqual(expect.objectContaining({ query: 'Al' }));
+    value.destroy();
+  });
+
+  it('does not rescan the vault while an unmatched spaced query is extended', () => {
+    const files = [file('notes/Alpha note.md', 5)];
+    const getCachedVaultFiles = vi.fn(() => files);
+    const { source: value } = source({ getCachedVaultFiles });
+    const queryAt = (input: string) => value.match(input, input.length)?.query ?? null;
+    expect(queryAt('meet @3pm t')).toBeNull();
+    const scans = getCachedVaultFiles.mock.calls.length;
+    expect(queryAt('meet @3pm to')).toBeNull();
+    expect(queryAt('meet @3pm tomorrow')).toBeNull();
+    expect(getCachedVaultFiles.mock.calls.length).toBe(scans);
+
+    // Any other query forgets the rejection, so names added since then are found.
+    expect(queryAt('meet ')).toBeNull();
+    files.push(file('3pm tomorrow.md', 6));
+    expect(queryAt('meet @3pm tomorrow')).toBe('3pm tomorrow');
+    // Vault invalidation also forgets it.
+    expect(queryAt('@new n')).toBeNull();
+    files.push(file('New note.md', 7));
+    value.invalidate();
+    expect(queryAt('@new no')).toBe('new no');
     value.destroy();
   });
 
@@ -72,35 +158,6 @@ describe('MentionSource', () => {
     const rootItems = await value.load(value.match('@notes', 6)!, new AbortController().signal);
     expect(rootItems).toEqual(expect.arrayContaining([
       expect.objectContaining({ label: '@notes/' }),
-    ]));
-    value.destroy();
-  });
-
-  it('loads async extension folders without owning their feature semantics', async () => {
-    const { source: value } = source();
-    value.setExtensionFoldersLoader(async () => [{
-      id: 'extension',
-      kind: 'folder',
-      label: "Member's Changes",
-      load: () => [],
-    }]);
-    const items = await value.load(value.match('@member', 7)!, new AbortController().signal);
-    expect(items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'extension', label: "Member's Changes" }),
-    ]));
-    value.destroy();
-  });
-
-  it('keeps base mentions available when an optional extension fails', async () => {
-    const { source: value } = source();
-    value.setExtensionFoldersLoader(async () => {
-      throw new Error('Reference source unavailable');
-    });
-
-    const items = await value.load(value.match('@alp', 4)!, new AbortController().signal);
-
-    expect(items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ label: 'notes/Alpha.md' }),
     ]));
     value.destroy();
   });

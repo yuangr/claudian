@@ -222,7 +222,9 @@ export function getPiToolName(value: Record<string, unknown>): string {
 }
 
 export function normalizePiToolName(name: string): string {
-  return PI_BUILT_IN_TOOL_NAMES[name.trim().toLowerCase()] ?? name;
+  const lookup = name.trim().toLowerCase();
+  // Own entries only: prototype keys (e.g. constructor) stay unknown names verbatim.
+  return Object.hasOwn(PI_BUILT_IN_TOOL_NAMES, lookup) ? PI_BUILT_IN_TOOL_NAMES[lookup] : name;
 }
 
 function parseJSONObject(text: string | undefined): Record<string, unknown> | undefined {

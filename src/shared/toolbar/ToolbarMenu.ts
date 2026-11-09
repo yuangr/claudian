@@ -1,0 +1,375 @@
+import { Notice, setIcon } from 'obsidian';
+
+export function runToolbarAction(action: () => Promise<void>, failureMessage: string): void {
+  void action().catch(() => {
+    new Notice(failureMessage);
+  });
+}
+
+const MENU_ITEM_SELECTOR = [
+  '[role="menuitemradio"]',
+  '[role="menuitemcheckbox"]',
+  '[role="option"]',
+  '[role="tab"]',
+  '[role="switch"]',
+].join(', ');
+/** Lists that keep Home and End to themselves. */
+const LIST_SELECTOR = '[role="listbox"], [role="tablist"]';
+
+let toolbarElementSequence = 0;
+
+export function nextToolbarId(prefix: string): string {
+  return `claudian-toolbar-${prefix}-${++toolbarElementSequence}`;
+}
+
+type MenuFocusTarget = 'checked' | 'first' | 'last';
+
+/** The toolbar's menus as one unit: at most one is open, and teardown closes it. */
+export interface ToolbarMenus {
+  /** Closes the open menu and returns focus to its button; false when none was open. */
+  closeOpenMenu(): boolean;
+  destroy(): void;
+}
+
+/** Keeps at most one toolbar menu open. */
+export class ToolbarMenuGroup implements ToolbarMenus {
+  #openMenu: ToolbarMenu | null = null;
+
+  activate(menu: ToolbarMenu): void {
+    if (this.#openMenu && this.#openMenu !== menu) this.#openMenu.close(false);
+    this.#openMenu = menu;
+  }
+
+  release(menu: ToolbarMenu): void {
+    if (this.#openMenu === menu) this.#openMenu = null;
+  }
+
+  closeOpenMenu(): boolean {
+    const menu = this.#openMenu;
+    if (!menu) return false;
+    menu.close(true);
+    return true;
+  }
+
+  destroy(): void {
+    this.#openMenu?.close(false);
+    this.#openMenu = null;
+  }
+}
+
+interface ToolbarMenuOptions {
+  anchorCls: string;
+  /** A menu holds only menu items; a dialog also holds other controls, such as lists and switches. */
+  popupRole?: 'menu' | 'dialog';
+  buttonCls?: string;
+  menuLabel: string;
+  closeOnSelect: boolean;
+  group?: ToolbarMenuGroup;
+  /**
+   * For hosts that clip their content, such as CodeMirror widgets: while open, the menu moves into this
+   * layer, fixed beside its button's end edge, and returns to its button when it closes.
+   */
+  floatingLayer?: HTMLElement;
+  /** Rereads settings into the button and menu before the menu shows. */
+  onOpen: () => void;
+}
+
+/** Gap between a floating menu and its button, matching the anchored menu's. */
+const FLOATING_MENU_GAP = 8;
+const FLOATING_MENU_VIEWPORT_MARGIN = 8;
+/** A floating menu keeps the anchored model menu's minimum width. */
+const FLOATING_MENU_MIN_WIDTH = 160;
+
+interface ToolbarMenuItemOptions {
+  role: 'menuitemradio' | 'menuitemcheckbox' | 'option' | 'tab' | 'switch';
+  /** Options and tabs report aria-selected; the other roles report aria-checked. */
+  checked: boolean;
+  /** Dialog controls take one tab stop each; menu items are reached with arrow keys only. */
+  tabbable?: boolean;
+  label: string;
+  /** Identifies the item across rebuilds when its label is not unique, such as a model value. */
+  key?: string;
+  cls?: string;
+  detail?: string;
+  title?: string;
+  leadingIcon?: string;
+  showCheck?: boolean;
+  onSelect: () => void;
+}
+
+/** A native chip button whose menu opens on click or from the keyboard. */
+export class ToolbarMenu {
+  readonly anchorEl: HTMLElement;
+  readonly buttonEl: HTMLButtonElement;
+  readonly menuEl: HTMLElement;
+  readonly #chevronEl: HTMLElement;
+  readonly #options: ToolbarMenuOptions;
+  readonly #popupRole: 'menu' | 'dialog';
+  #lastFocusedKey: string | null = null;
+  #keyTarget: Window | null = null;
+  #floatingWindow: Window | null = null;
+
+  constructor(parentEl: HTMLElement, options: ToolbarMenuOptions) {
+    this.#options = options;
+    this.#popupRole = options.popupRole ?? 'menu';
+    const menuId = nextToolbarId('menu');
+    this.anchorEl = parentEl.createDiv({ cls: `claudian-toolbar-chip-anchor ${options.anchorCls}` });
+    this.buttonEl = this.anchorEl.createEl('button', {
+      cls: `claudian-toolbar-chip${options.buttonCls ? ` ${options.buttonCls}` : ''}`,
+      attr: {
+        type: 'button',
+        'aria-haspopup': this.#popupRole,
+        'aria-expanded': 'false',
+        'aria-controls': menuId,
+      },
+    });
+    this.#chevronEl = this.buttonEl.createSpan({ cls: 'claudian-toolbar-chip-chevron' });
+    setIcon(this.#chevronEl, 'chevron-down');
+    this.menuEl = this.anchorEl.createDiv({
+      cls: 'claudian-toolbar-popover',
+      attr: { id: menuId, role: this.#popupRole, 'aria-label': options.menuLabel, tabindex: '-1' },
+    });
+    this.menuEl.hidden = true;
+
+    this.buttonEl.addEventListener('click', this.#onButtonClick);
+    this.buttonEl.addEventListener('keydown', this.#onButtonKeydown);
+    this.menuEl.addEventListener('keydown', this.#onMenuKeydown);
+    this.menuEl.addEventListener('focusin', this.#onMenuFocusIn);
+    this.anchorEl.addEventListener('focusout', this.#onFocusOut);
+    // A floating menu lives outside the anchor while open.
+    if (options.floatingLayer) this.menuEl.addEventListener('focusout', this.#onFocusOut);
+  }
+
+  get isOpen(): boolean {
+    return !this.menuEl.hidden;
+  }
+
+  /** Adds button content ahead of the chevron. */
+  createChipPart(cls: string): HTMLElement {
+    const partEl = this.buttonEl.createSpan({ cls });
+    this.buttonEl.appendChild(this.#chevronEl);
+    return partEl;
+  }
+
+  createItem(parentEl: HTMLElement, options: ToolbarMenuItemOptions): HTMLButtonElement {
+    const itemEl = parentEl.createEl('button', {
+      cls: `claudian-toolbar-popover-option${options.cls ? ` ${options.cls}` : ''}`,
+      attr: {
+        type: 'button',
+        role: options.role,
+        [options.role === 'option' || options.role === 'tab' ? 'aria-selected' : 'aria-checked']: String(options.checked),
+        tabindex: options.tabbable ? '0' : '-1',
+        'data-menu-key': `${options.role}:${options.key ?? options.label}`,
+      },
+    });
+    if (options.leadingIcon) {
+      setIcon(itemEl.createSpan({ cls: 'claudian-toolbar-popover-option-icon' }), options.leadingIcon);
+    }
+    // Labels stay direct children of the item unless a detail line needs a stacked copy block.
+    const copyEl = options.detail
+      ? itemEl.createSpan({ cls: 'claudian-toolbar-popover-option-copy' })
+      : itemEl;
+    copyEl.createSpan({ cls: 'claudian-toolbar-popover-option-label', text: options.label });
+    if (options.detail) {
+      copyEl.createSpan({ cls: 'claudian-toolbar-popover-option-detail', text: options.detail });
+    }
+    if (options.title) itemEl.setAttribute('title', options.title);
+    if (options.showCheck && options.checked) {
+      setIcon(itemEl.createSpan({ cls: 'claudian-toolbar-popover-option-check' }), 'check');
+    }
+    itemEl.addEventListener('click', () => {
+      if (this.#options.closeOnSelect) this.close(true);
+      options.onSelect();
+    });
+    return itemEl;
+  }
+
+  open(focus: MenuFocusTarget = 'checked'): void {
+    if (!this.isOpen) {
+      this.#options.group?.activate(this);
+      this.#options.onOpen();
+      if (this.anchorEl.classList.contains('claudian-hidden')) {
+        this.#options.group?.release(this);
+        return;
+      }
+      this.menuEl.hidden = false;
+      this.#float();
+      this.buttonEl.setAttribute('aria-expanded', 'true');
+      this.anchorEl.ownerDocument.addEventListener('pointerdown', this.#onDocumentPointerDown, true);
+      // Window capture runs ahead of Obsidian's keymap, whose view scope cancels a running turn on Escape.
+      this.#keyTarget = this.anchorEl.ownerDocument.defaultView;
+      this.#keyTarget?.addEventListener('keydown', this.#onWindowKeydown, true);
+    }
+    this.#focusItem(focus);
+  }
+
+  close(restoreFocus: boolean): void {
+    if (!this.isOpen) return;
+    this.menuEl.hidden = true;
+    this.buttonEl.setAttribute('aria-expanded', 'false');
+    this.#land();
+    this.anchorEl.ownerDocument.removeEventListener('pointerdown', this.#onDocumentPointerDown, true);
+    this.#keyTarget?.removeEventListener('keydown', this.#onWindowKeydown, true);
+    this.#keyTarget = null;
+    this.#options.group?.release(this);
+    this.#lastFocusedKey = null;
+    if (restoreFocus) this.buttonEl.focus();
+  }
+
+  /** Returns keyboard focus to the same choice after the open menu's items are rebuilt. */
+  restoreFocus(): void {
+    if (!this.isOpen) return;
+    const ownerDocument = this.anchorEl.ownerDocument;
+    const activeEl = ownerDocument.activeElement;
+    if (activeEl && activeEl !== ownerDocument.body && activeEl.isConnected) return;
+    const sameItem = this.#items().find(item => item.dataset.menuKey === this.#lastFocusedKey);
+    if (sameItem) {
+      sameItem.focus();
+      return;
+    }
+    this.#focusItem('checked');
+  }
+
+  /** Moves a floating menu into its layer and keeps it over the button while the page scrolls. */
+  #float(): void {
+    const layer = this.#options.floatingLayer;
+    if (!layer) return;
+    layer.appendChild(this.menuEl);
+    this.menuEl.addClass('claudian-toolbar-popover--floating');
+    this.#floatingWindow = this.anchorEl.ownerDocument.defaultView;
+    this.#floatingWindow?.addEventListener('scroll', this.#placeFloating, true);
+    this.#floatingWindow?.addEventListener('resize', this.#placeFloating);
+    this.#placeFloating();
+  }
+
+  #land(): void {
+    if (!this.#options.floatingLayer) return;
+    this.#floatingWindow?.removeEventListener('scroll', this.#placeFloating, true);
+    this.#floatingWindow?.removeEventListener('resize', this.#placeFloating);
+    this.#floatingWindow = null;
+    this.menuEl.removeClass('claudian-toolbar-popover--floating');
+    this.buttonEl.removeAttribute('data-menu-placement');
+    this.anchorEl.appendChild(this.menuEl);
+  }
+
+  readonly #placeFloating = (event?: Event): void => {
+    // Scrolling a menu column does not move its anchor or change available space.
+    if (event?.type === 'scroll' && event.target && 'nodeType' in event.target
+      && this.menuEl.contains(event.target as Node)) return;
+    const view = this.#floatingWindow;
+    if (!view) return;
+    const button = this.buttonEl.getBoundingClientRect();
+    // Measure its preferred CSS height again after a previously constrained placement.
+    this.menuEl.style.removeProperty('--claudian-toolbar-popover-max-height');
+    const height = this.menuEl.getBoundingClientRect().height;
+    const margin = FLOATING_MENU_VIEWPORT_MARGIN;
+    const aboveEdge = Math.max(margin, Math.min(view.innerHeight - margin, button.top - FLOATING_MENU_GAP));
+    const belowEdge = Math.max(margin, Math.min(view.innerHeight - margin, button.bottom + FLOATING_MENU_GAP));
+    const above = aboveEdge - margin;
+    const below = view.innerHeight - margin - belowEdge;
+    const opensBelow = height > above && below > above;
+    // The chip's chevron points toward the open menu.
+    if (opensBelow) this.buttonEl.setAttribute('data-menu-placement', 'below');
+    else this.buttonEl.removeAttribute('data-menu-placement');
+    this.menuEl.setCssProps({
+      '--claudian-toolbar-popover-top': opensBelow ? `${belowEdge}px` : 'auto',
+      '--claudian-toolbar-popover-max-height': `${Math.max(0, opensBelow ? below : above)}px`,
+      '--claudian-toolbar-popover-right': `${view.innerWidth - button.right}px`,
+      '--claudian-toolbar-popover-bottom': opensBelow ? 'auto' : `${view.innerHeight - aboveEdge}px`,
+      '--claudian-toolbar-popover-min-width': `${Math.max(button.width, FLOATING_MENU_MIN_WIDTH)}px`,
+    });
+  };
+
+  #contains(node: Node | null): boolean {
+    return node !== null && (this.anchorEl.contains(node) || this.menuEl.contains(node));
+  }
+
+  #items(scopeEl: Element = this.menuEl): HTMLElement[] {
+    return Array.from(scopeEl.querySelectorAll<HTMLElement>(MENU_ITEM_SELECTOR))
+      .filter(item => !(item as HTMLButtonElement).disabled && !item.closest('.claudian-hidden, [inert]'));
+  }
+
+  #focusItem(target: MenuFocusTarget): void {
+    const items = this.#items();
+    // The current choice: a selected option, or a checked menu item. A switch is a setting and a tab
+    // only browses, so neither is a choice.
+    const checked = target === 'checked'
+      ? items.find(item => (item.getAttribute('role') === 'option' && item.getAttribute('aria-selected') === 'true')
+        || (item.getAttribute('role')?.startsWith('menuitem') && item.getAttribute('aria-checked') === 'true'))
+      : undefined;
+    const item = target === 'last' ? items[items.length - 1] : checked ?? items[0];
+    (item ?? this.menuEl).focus();
+  }
+
+  /** Up and Down step through every control. */
+  #moveFocus(event: KeyboardEvent): boolean {
+    const target = event.target as HTMLElement;
+    const items = this.#items();
+    const current = items.indexOf(target);
+    if (current < 0) return false;
+
+    switch (event.key) {
+      case 'ArrowDown':
+        items[(current + 1) % items.length].focus();
+        return true;
+      case 'ArrowUp':
+        items[(current - 1 + items.length) % items.length].focus();
+        return true;
+      case 'Home':
+      case 'End': {
+        // In a list these jump within that list, not to the popover's other controls.
+        const scoped = this.#items(target.closest(LIST_SELECTOR) ?? this.menuEl);
+        scoped[event.key === 'Home' ? 0 : scoped.length - 1].focus();
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  readonly #onButtonClick = (): void => {
+    if (this.isOpen) {
+      this.close(true);
+      return;
+    }
+    this.open('checked');
+  };
+
+  readonly #onButtonKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    this.open(event.key === 'ArrowUp' ? 'last' : 'checked');
+  };
+
+  readonly #onMenuKeydown = (event: KeyboardEvent): void => {
+    // A dialog's controls are separate tab stops, so Tab only closes a menu.
+    if (event.key === 'Tab' && this.#popupRole === 'menu') {
+      // Tab continues from the button, so focus moves on to the neighbouring control.
+      this.buttonEl.focus();
+      this.close(false);
+      return;
+    }
+    if (this.#moveFocus(event)) event.preventDefault();
+  };
+
+  readonly #onMenuFocusIn = (event: FocusEvent): void => {
+    const key = (event.target as HTMLElement | null)?.dataset?.menuKey;
+    if (key) this.#lastFocusedKey = key;
+  };
+
+  readonly #onWindowKeydown = (event: KeyboardEvent): void => {
+    if (event.key !== 'Escape' || !this.isOpen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.close(true);
+  };
+
+  readonly #onFocusOut = (event: FocusEvent): void => {
+    const next = event.relatedTarget as Node | null;
+    if (next && !this.#contains(next)) this.close(false);
+  };
+
+  readonly #onDocumentPointerDown = (event: Event): void => {
+    if (!this.#contains(event.target as Node | null)) this.close(false);
+  };
+}

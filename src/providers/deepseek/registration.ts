@@ -5,12 +5,14 @@ import type { ProviderModule } from '@/core/providers/types';
 
 import { deepseekWorkspaceRegistration, getDeepSeekWorkspaceServices } from './app/DeepSeekWorkspaceServices';
 import { DEEPSEEK_PROVIDER_CAPABILITIES } from './capabilities';
+import { findDeepSeekModel } from './config';
 import { deepseekModelPolicy } from './DeepSeekModelPolicy';
 import { deepseekSettingsReconciler } from './env/DeepSeekSettingsReconciler';
 import { DeepSeekExecutionBackend } from './execution/DeepSeekExecutionBackend';
 import { DeepSeekConversationHistoryService } from './history/DeepSeekConversationHistoryService';
 import { deepseekSubagentAdapter } from './normalization/DeepSeekSubagents';
-import { findDeepSeekModel, getDeepSeekProviderSettings, projectDeepSeekModelSettings, updateDeepSeekProviderSettings } from './settings';
+import { resolveDeepSeekExecutionWorkingDirectory } from './runtime/DeepSeekExecutionContext';
+import { getDeepSeekProviderSettings, projectDeepSeekModelSettings, updateDeepSeekProviderSettings } from './settings';
 import { deepseekChatUIConfig } from './ui/DeepSeekChatUIConfig';
 
 export const deepseekProviderRegistration: ProviderModule = {
@@ -20,8 +22,9 @@ export const deepseekProviderRegistration: ProviderModule = {
   modelPolicy: deepseekModelPolicy,
   chatUIConfig: deepseekChatUIConfig,
   capabilities: DEEPSEEK_PROVIDER_CAPABILITIES,
+  resolveExecutionWorkingDirectory: (host, cwd) => resolveDeepSeekExecutionWorkingDirectory(host.getRuntimeHost('deepseek'), cwd),
   environmentKeyPatterns: [/^DSH_/i, /^DEEPSEEK_/i],
-  createExecutionBackend: host => new DeepSeekExecutionBackend(host, () => getDeepSeekWorkspaceServices().deepseek),
+  createExecutionBackend: host => new DeepSeekExecutionBackend(host.getRuntimeHost('deepseek'), () => getDeepSeekWorkspaceServices().deepseek),
   historyService: new DeepSeekConversationHistoryService(async context => {
     await context?.ensureWorkspace?.();
     return getDeepSeekWorkspaceServices().deepseek;
@@ -30,7 +33,7 @@ export const deepseekProviderRegistration: ProviderModule = {
   taskResultInterpreter: NOOP_TASK_RESULT_INTERPRETER,
   workspace: deepseekWorkspaceRegistration,
   settingsStorage: {
-    hostScopedFields: ['cliPathsByHost'], projectPersistedConfig: projectDeepSeekModelSettings,
+    hostScopedFields: ['cliPathsByHost', 'installationMethodsByHost', 'wslDistroOverridesByHost'], projectPersistedConfig: projectDeepSeekModelSettings,
     needsReasoningMetadata: settings => {
       const current = getDeepSeekProviderSettings(settings);
       return current.visibleModels.some(id => !Array.isArray(findDeepSeekModel(current, id)?.reasoning));

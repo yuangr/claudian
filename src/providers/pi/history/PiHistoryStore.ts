@@ -6,22 +6,26 @@ import * as path from 'node:path';
 
 import { buildImageAttachmentFromBase64 } from '@/core/execution/imageAttachment';
 import { extractUserQuery } from '@/core/prompt/promptContext';
+import { decodeRecoveryPrompt, unwrapRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
+import { decodeSessionMessage } from '@/core/session-tools/sessionMessageEnvelope';
 import { resolveToolDiffData } from '@/core/tools/toolDiff';
+import { isSessionTool } from '@/core/tools/toolNames';
 import { forEachJSONLLine } from '@/utils/jsonlFile';
 
 import { isWriteEditTool } from '../../../core/tools/toolNames';
 import type { ChatMessage, ContentBlock, ImageAttachment, ToolCallInfo, TurnStats } from '../../../core/types';
-import { createTurnStats, isTokenCount } from '../../../core/types';
+import { createTurnStats, isTokenCount, settleInterruptedTurn } from '../../../core/types';
 import { encodePiModelId } from '../models';
 import { getPiCustomMessageDisplayText } from '../normalization/piCustomMessageNormalization';
+import { PI_PEEPS_RUN_ENTRY_TYPE, PiPeepsSubagents } from '../normalization/PiPeepsSubagents';
 import {
   extractPiToolResultText,
+  extractPiToolTextContent,
   normalizePiToolInput,
   normalizePiToolName,
   normalizePiToolResultDetails,
 } from '../normalization/piToolNormalization';
 import type { PiTreeCursor } from '../types';
-import { decodePiRecoveryPrompt } from './PiRecoveryPromptCodec';
 
 export interface PiSessionEntry {
   id?: string;
@@ -44,6 +48,8 @@ export interface ParsePiSessionContentOptions {
 }
 
 export interface CreatePiForkSessionFileOptions {
+  /** Native parent path for the written header; returned locators stay host-side. */
+  parentSession?: string;
   now?: Date;
   sessionDir?: string;
   sessionId?: string;
@@ -56,17 +62,6 @@ export interface CreatedPiForkSessionFile {
   sessionFile: string;
   sessionId: string;
 }
-
-interface PiForkRollbackOwnership {
-  flight: Promise<void> | null;
-  readonly parentSession: string;
-  readonly sessionFile: string;
-}
-
-const rollbackEligibleForkTargets = new WeakMap<
-  CreatedPiForkSessionFile,
-  PiForkRollbackOwnership
->();
 
 export function parsePiSessionContent(
   content: string | ParsedPiSessionEntries,
@@ -171,9 +166,21 @@ export function resolvePiTreeCursor(entries: PiSessionEntry[], cursor: PiTreeCur
   const latest = entries.at(-1)?.id;
   if (!cursor.appendId || !latest || latest === cursor.appendId) return cursor;
   if (!entries.some(entry => entry.id === cursor.appendId)) throw new Error('Pi branch history changed since navigation.');
-  const path = resolvePiActivePath(entries, latest);
-  if (cursor.leafId !== null && !path.some(entry => entry.id === cursor.leafId)) return cursor;
+  if (cursor.leafId !== null && !descendsFrom(entries, latest, cursor.leafId)) return cursor;
   return { targetId: latest, leafId: latest, appendId: latest };
+}
+
+/**
+ * The leaf a saved turn leaf has moved to: the latest entry when it continues that leaf, as a turn appended
+ * by another Pi client does; otherwise the saved leaf, whose branch the latest entry left.
+ */
+export function followPiLeafAppends(entries: PiSessionEntry[], leafId: string): string {
+  const latest = entries.at(-1)?.id;
+  return latest && latest !== leafId && descendsFrom(entries, latest, leafId) ? latest : leafId;
+}
+
+function descendsFrom(entries: PiSessionEntry[], descendantId: string, ancestorId: string): boolean {
+  return resolvePiActivePath(entries, descendantId).some(entry => entry.id === ancestorId);
 }
 
 export function parsePiSessionModel(
@@ -432,7 +439,7 @@ export async function createPiForkSessionFile(
     id: sessionId,
     timestamp: timestampText,
     cwd: options.targetCwd ?? sourceCwd,
-    parentSession: sourceSessionFile,
+    parentSession: options.parentSession ?? sourceSessionFile,
   };
 
   await fsp.mkdir(sessionDir, { recursive: true });
@@ -446,37 +453,18 @@ export async function createPiForkSessionFile(
     await handle.close();
   }
 
-  const created = {
+  return {
     leafEntryId: resumeAt,
     parentSession: sourceSessionFile,
     sessionFile,
     sessionId,
   };
-  rollbackEligibleForkTargets.set(created, {
-    flight: null,
-    parentSession: sourceSessionFile,
-    sessionFile,
-  });
-  return created;
 }
 
 export async function rollbackCreatedPiForkSessionFile(
   created: CreatedPiForkSessionFile,
 ): Promise<void> {
-  const ownership = rollbackEligibleForkTargets.get(created);
-  if (!ownership) {
-    throw new Error('Pi fork rollback target is not owned by this process.');
-  }
-  if (!ownership.flight) {
-    ownership.flight = (async () => {
-      if (path.resolve(ownership.sessionFile) === path.resolve(ownership.parentSession)) {
-        throw new Error('Pi fork rollback cannot remove the source session.');
-      }
-      await fsp.unlink(ownership.sessionFile);
-      rollbackEligibleForkTargets.delete(created);
-    })();
-  }
-  return ownership.flight;
+  await fsp.unlink(created.sessionFile);
 }
 
 export function findPiSessionFile(
@@ -539,19 +527,36 @@ function mapPiSessionEntries(
   let turnStartedAt: number | undefined;
   // An extension message outside a prompted turn starts an automatic response.
   let promptedTurnOpen = false;
+  // Pi records no turn ID: a prompt, or a notice while no turn runs, starts the next turn,
+  // which a tool call keeps running. `turnStart` is its first message.
+  let turnStart = 0;
+  let turnRunning = false;
   const stats = new PiTurnStats();
 
   for (const entry of entries) {
+    // Native triggers start turns even when their notification is hidden.
+    if (entry.type === 'custom_message' && !turnRunning) {
+      turnStart = messages.length;
+      turnRunning = true;
+    }
     const mapped = mapPiSessionEntry(entry, messages, syntheticIdNamespace);
     if (mapped) {
-      if (entry.type === 'custom_message' && !promptedTurnOpen) mapped.isAutomaticResponse = true;
+      if (!promptedTurnOpen && (entry.type === 'custom_message'
+        || (isAssistantMessageEntry(entry) && turnRunning && messages.length === turnStart))) {
+        mapped.isAutomaticResponse = true;
+      }
       const previous = messages[messages.length - 1];
       // Results steered into a prompted turn stay in its response, as live output renders them.
       const continuesResponse = isAssistantMessageEntry(entry)
         || (entry.type === 'custom_message' && promptedTurnOpen);
-      if (continuesResponse && canMergeAssistantContinuation(previous, mapped)) {
+      if (continuesResponse && messages.length > turnStart && canMergeAssistantContinuation(previous, mapped)) {
         mergeAssistantContinuation(previous, mapped);
       } else {
+        if (mapped.role === 'user' || (mapped.isAutomaticResponse && !turnRunning)) {
+          turnStart = messages.length + (mapped.role === 'user' ? 1 : 0);
+          turnRunning = true;
+        }
+        if (mapped.role === 'assistant') mapped.turnId = `pi-turn-${turnStart}`;
         messages.push(mapped);
       }
 
@@ -573,15 +578,58 @@ function mapPiSessionEntries(
           messages[messages.length - 1].completedAt = completedAt;
           messages[messages.length - 1].durationSeconds = Math.floor((completedAt - turnStartedAt) / 1_000);
         }
+        // A user Stop ends the turn as `aborted`; its `errorMessage` is not a failure to show.
+        if (stopReason === 'aborted') settleAbortedTurn(messages.slice(turnStart));
         if (stopReason && stopReason !== 'toolUse') {
           promptedTurnOpen = false;
           turnStartedAt = undefined;
+          turnRunning = false;
         }
       }
     }
   }
 
+  applyPiPeepsSubagents(entries, messages);
   return messages;
+}
+
+/** The messages a stopped turn displayed as settle as one interrupted response. */
+function settleAbortedTurn(turn: ChatMessage[]): void {
+  const segments = turn.filter(message => message.role === 'assistant');
+  settleInterruptedTurn(segments);
+  const last = segments.at(-1);
+  if (last) last.isInterrupt = true;
+}
+
+/** Peeps answers arrive after the turn that started the work; attach them to its tool call. */
+function applyPiPeepsSubagents(entries: PiSessionEntry[], messages: ChatMessage[]): void {
+  const peeps = new PiPeepsSubagents();
+  for (const entry of entries) {
+    const message = entry.message ?? entry.raw;
+    const timestamp = parseTimestamp(entry.raw.timestamp);
+    if (entry.type === 'custom_message') {
+      peeps.customMessage(entry.raw, timestamp);
+    } else if (entry.type === 'custom' && entry.raw.customType === PI_PEEPS_RUN_ENTRY_TYPE) {
+      peeps.runEntry(entry.raw.data);
+    } else if (isToolResultEntry(entry)) {
+      const toolCallId = getToolResultCallId(entry);
+      if (toolCallId) {
+        peeps.toolEnded(toolCallId, {
+          details: message.details,
+          isError: message.isError === true,
+          text: extractPiToolTextContent(message.content),
+        });
+      }
+    } else if (isAssistantMessageEntry(entry)) {
+      for (const toolCall of extractAssistantToolCalls(message.content ?? message.parts ?? message.blocks)) {
+        peeps.toolStarted(toolCall.id, toolCall.name, toolCall.input, timestamp);
+      }
+    }
+  }
+  for (const toolCall of messages.flatMap(message => message.toolCalls ?? [])) {
+    const subagent = peeps.get(toolCall.id);
+    if (subagent) toolCall.subagent = subagent;
+  }
 }
 
 /** Account on the resolved native branch; tool results never contribute usage. */
@@ -676,9 +724,9 @@ function mapPiSessionEntry(
 
   if (role === 'user') {
     const rawContent = extractTextContent(message.content ?? message.text ?? message.message);
-    const recoveryPrompt = decodePiRecoveryPrompt(rawContent);
-    const content = recoveryPrompt?.currentInput ?? (recoveryPrompt ? '' : rawContent);
-    const displayContent = extractPiSkillDisplayContent(content);
+    const content = unwrapRecoveryPrompt(rawContent);
+    const sessionMessage = decodeSessionMessage(content);
+    const displayContent = sessionMessage?.text ?? extractPiSkillDisplayContent(content);
     const messageId = entry.id ?? createSyntheticPiMessageId(
       'user',
       messages.length,
@@ -693,6 +741,7 @@ function mapPiSessionEntry(
     }
     return {
       content,
+      ...(sessionMessage ? { sessionMessage: { from: sessionMessage.from, sessionId: sessionMessage.sessionId } } : {}),
       ...(displayContent ? { displayContent } : {}),
       id: messageId,
       ...(images.length > 0 ? { images } : {}),
@@ -787,7 +836,7 @@ function mapPiSessionEntry(
 
 function isHiddenPiRecoveryInput(message: Record<string, unknown>, hasImages?: boolean): boolean {
   const content = extractTextContent(message.content ?? message.text ?? message.message);
-  if (decodePiRecoveryPrompt(content)?.currentInput !== null) return false;
+  if (decodeRecoveryPrompt(content)?.currentInput !== null) return false;
   return !(hasImages ?? (extractUserImages(message.content ?? message.parts ?? message.blocks, 'recovery').length > 0));
 }
 
@@ -903,6 +952,7 @@ function extractAssistantToolCalls(value: unknown): ToolCallInfo[] {
       input: normalizePiToolInput(part.input ?? part.arguments ?? part.args, name),
       name,
       status: 'running',
+      ...(isSessionTool(name) ? { providerPayload: { rawName } } : {}),
     }];
   });
 }

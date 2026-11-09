@@ -1,11 +1,14 @@
 import '@/providers';
 
+import { runInNewContext } from 'vm';
+
 import {
   classifyEnvironmentVariablesByOwnership,
   getEnvironmentReviewKeysForScope,
   getEnvironmentScopeUpdates,
   getProviderEnvironmentVariables,
   getRuntimeEnvironmentText,
+  getRuntimeEnvironmentVariables,
   getSharedEnvironmentVariables,
   inferEnvironmentSnippetScope,
   resolveEnvironmentSnippetScope,
@@ -35,19 +38,49 @@ describe('providerEnvironment', () => {
 
     it('keeps comments attached to the next owned variable when migrating', () => {
       const result = classifyEnvironmentVariablesByOwnership([
+        '# first Claude comment',
+        'ANTHROPIC_MODEL=first',
         '# shared comment',
         'PATH=/usr/local/bin',
         '',
         '# claude comment',
-        'ANTHROPIC_MODEL=claude-custom',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-custom',
+        '# trailing Claude comment',
+        '',
       ].join('\n'));
 
       expect(result.shared).toBe(['# shared comment', 'PATH=/usr/local/bin'].join('\n'));
-      expect(result.providers.claude).toBe(['', '# claude comment', 'ANTHROPIC_MODEL=claude-custom'].join('\n'));
+      expect(result.providers.claude).toBe([
+        '# first Claude comment', 'ANTHROPIC_MODEL=first', '', '# claude comment',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL=claude-custom', '# trailing Claude comment', '',
+      ].join('\n'));
     });
   });
 
   describe('runtime env accessors', () => {
+    it.each([
+      ['ANTHROPIC_MODEL=custom-model', 'shared'],
+      ['__proto__=provider', 'provider'],
+      ['__proto__=', ''],
+    ])('preserves explicit shared/provider keys with %s', (providerText, expectedValue) => {
+      const settings = {
+        sharedEnvironmentVariables: '__proto__=shared\nPATH=/usr/local/bin',
+        providerConfigs: {
+          claude: { environmentVariables: providerText },
+        },
+      };
+
+      const result = getRuntimeEnvironmentVariables(settings, 'claude');
+
+      expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).toBe(true);
+      expect(result['__proto__']).toBe(expectedValue);
+      // Keep native spread semantics for the prototype-sensitive assertion.
+      expect(runInNewContext('({ ...environment })', { environment: result })['__proto__'])
+        .toBe(expectedValue);
+      expect(result.PATH).toBe('/usr/local/bin');
+    });
+
     it('reads split shared/provider env from settings', () => {
       const settings: Record<string, unknown> = {
         sharedEnvironmentVariables: 'PATH=/usr/local/bin',
@@ -146,10 +179,14 @@ describe('providerEnvironment', () => {
       ]);
     });
 
-    it('uses the fallback scope only when there is no inferable content', () => {
-      expect(getEnvironmentScopeUpdates('', 'provider:claude')).toEqual([
-        { scope: 'provider:claude', envText: '' },
+    it.each(['', ' \n# Claude only\n\n'])('preserves exact fallback text when there is no inferable content (%o)', envText => {
+      expect(getEnvironmentScopeUpdates(envText, 'provider:claude')).toEqual([
+        { scope: 'provider:claude', envText },
       ]);
+    });
+
+    it('does not invent shared updates for comments without a fallback', () => {
+      expect(getEnvironmentScopeUpdates(' \n# Unscoped comment\n\n')).toEqual([]);
     });
   });
 });

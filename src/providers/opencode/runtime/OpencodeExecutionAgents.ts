@@ -1,8 +1,3 @@
-import { getInlineEditSystemPrompt } from '@/core/prompt/inlineEdit';
-import { buildSystemPrompt, type SystemPromptSettings } from '@/core/prompt/mainAgent';
-import { buildTitleGenerationSystemPrompt } from '@/core/prompt/titleGeneration';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
-
 import type { OpencodeExecutionProfile } from '../execution/OpencodeSessionContract';
 import type { OpencodeManagedAgentConfig } from './OpencodeLaunchArtifacts';
 
@@ -54,29 +49,4 @@ export function buildAgentConfig(
       },
       id: AUX_AGENT_IDS.passive,
     };
-}
-
-export interface OpencodeSystemPromptParams {
-  settings?: SystemPromptSettings;
-  titleLocale?: string;
-  workspaceRoot: string;
-}
-
-/** Claudian's default instructions for each native execution profile. */
-export function buildOpencodeSystemPrompt(profile: OpencodeExecutionProfile, params: OpencodeSystemPromptParams): string {
-  if (profile === 'readonly') return getInlineEditSystemPrompt(params.workspaceRoot);
-  if (profile === 'passive') return buildTitleGenerationSystemPrompt(params.titleLocale);
-  return buildSystemPrompt(params.settings ?? {});
-}
-
-export function getSystemPromptSettings(
-  plugin: Pick<ProviderHost, 'settings'>,
-  vaultPath: string,
-): SystemPromptSettings {
-  return {
-    customPrompt: plugin.settings.systemPrompt,
-    mediaFolder: plugin.settings.mediaFolder,
-    userName: plugin.settings.userName,
-    vaultPath,
-  };
 }

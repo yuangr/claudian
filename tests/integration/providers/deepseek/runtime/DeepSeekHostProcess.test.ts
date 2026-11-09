@@ -1,19 +1,29 @@
+// @test-ci {"native":true,"inputs":["tests/fixtures/providers/deepseek/runtime/**","tests/helpers/deepseek/NativePluginHost.mjs"]}
+import * as childProcess from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
+import type { LaunchPatchEntry } from '@test/helpers/deepseek/LaunchPatch';
 import { NativePeer } from '@test/helpers/deepseek/NativePeer';
+import { testDate } from '@test/helpers/testClock';
 
+import { LoopbackSessionToolServer } from '@/core/session-tools/LoopbackSessionToolServer';
 import { DeepSeekHostProcess } from '@/providers/deepseek/runtime/DeepSeekHostProcess';
+
+// Forward the native namespace so the spawn observer still starts real processes.
+vi.mock('node:child_process', async importOriginal => ({ ...await importOriginal<typeof childProcess>() }));
 
 const FAKE_DSH = resolve(__dirname, '../../../../fixtures/providers/deepseek/runtime/FakeDeepSeekCLI.mjs');
 
 interface Invocation { pid: number; cwd: string; args: string[] }
 
 const WINDOWS = process.platform === 'win32';
+
+// Launch, transport setup and process cleanup are real; their speed is not the assertion.
+vi.setConfig({ testTimeout: 45_000 });
 
 describe('native Host process', () => {
   let root: string;
@@ -33,9 +43,10 @@ describe('native Host process', () => {
   });
 
   afterEach(async () => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
     await peer.close();
-    await rm(root, { recursive: true, force: true });
+    // Windows can hold an exited process's executable briefly after exit.
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   const start = (mode: string, extra: NodeJS.ProcessEnv = {}, signal = new AbortController().signal): Promise<DeepSeekHostProcess> => DeepSeekHostProcess.start({
@@ -49,7 +60,7 @@ describe('native Host process', () => {
   };
 
   const launched = async (): Promise<Invocation> => {
-    for (const deadline = Date.now() + 5000; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 10))) {
+    for (const deadline = Date.now() + 30_000; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 10))) {
       const [host] = await invocations();
       if (host) return host;
     }
@@ -140,11 +151,12 @@ describe('native Host process', () => {
   });
 
   it.each([
-    ['after the origin', (url: string) => new URL(url).origin.length],
-    ['inside the login token', (url: string) => url.length - 3],
-  ])('connects to the launch URL split %s and removes the process and its launch files on dispose', async (_split, offset) => {
-    const hostProcess = await start('serve', { FAKE_DSH_SPLIT: String(offset(peer.url)) });
-    const exited = jest.fn();
+    ['after the origin', (url: string) => new URL(url).origin.length, {}],
+    ['inside the login token', (url: string) => url.length - 3, {}],
+    ['inside the login token while stderr logs', (url: string) => url.length - 3, { FAKE_DSH_GAP_LOG: 'loading MCP servers' }],
+  ])('connects to the launch URL split %s and removes the process and its launch files on dispose', async (_split, offset, extra) => {
+    const hostProcess = await start('serve', { FAKE_DSH_SPLIT: String(offset(peer.url)), ...extra });
+    const exited = vi.fn();
     hostProcess.onExit(exited);
     const invocation = await launched();
     try {
@@ -152,12 +164,16 @@ describe('native Host process', () => {
       expect(realpathSync.native(invocation.cwd)).toBe(realpathSync.native(root));
       expect(invocation.args).toEqual(['--profile', 'web', '--patch', expect.any(String), '--no-open', '--port', '0']);
       expect(await hostProcess.client.call('session/modelCatalog')).toBe('session/modelCatalog answered');
-      await hostProcess.writePrompt('claudian', 'Live prompt');
-      expect(await readFile(join(artifactRoot(invocation), 'prompts', 'claudian.txt'), 'utf8')).toBe('Live prompt');
+      await hostProcess.writePrompt('native-session', 'Live prompt');
+      const prompts = join(artifactRoot(invocation), 'prompts');
+      const [promptFile] = await readdir(prompts);
+      expect(await readFile(join(prompts, promptFile), 'utf8')).toBe('Live prompt');
+      await hostProcess.removePrompt('native-session');
+      expect(await readdir(prompts)).toEqual([]);
       await hostProcess.writeCodeMode(true);
       expect(await readFile(join(artifactRoot(invocation), 'code-mode'), 'utf8')).toBe('both');
-      const patch = JSON.parse(await readFile(invocation.args[invocation.args.indexOf('--patch') + 1], 'utf8'));
-      const chat = patch.find((entry: { insert?: unknown }) => entry.insert).insert.find((entry: any) => entry.config?.id === 'claudian');
+      const patch: LaunchPatchEntry[] = JSON.parse(await readFile(invocation.args[invocation.args.indexOf('--patch') + 1], 'utf8'));
+      const chat = patch.find((entry) => entry.insert)!.insert!.find((entry) => entry.config?.id === 'claudian')!;
       expect(chat.config.plugins.at(-1)).toEqual({ id: 'tool-todo', name: '@deepseek-ai/dsh-tool-todo' });
     } finally { await hostProcess.dispose(); }
     await expectGone(invocation);
@@ -165,19 +181,22 @@ describe('native Host process', () => {
   });
 
   it('reports an exit once its owner\'s end of stdin closes, and stays silent for exits caused by disposal', async () => {
+    const spawned = vi.spyOn(childProcess, 'spawn');
     const hostProcess = await start('serve');
     const invocation = await launched();
     try {
       const exited = new Promise<void>(resolve => hostProcess.onExit(resolve));
       // Claudian's end of the pipe closing is what the bundled lifecycle plugin tethers the native Host to.
-      (hostProcess as unknown as { process: { stdin: Writable } }).process.stdin.end();
+      const native = spawned.mock.results.find(result => result.type === 'return' && result.value.pid === invocation.pid)?.value;
+      expect(native?.stdin).toBeDefined();
+      native!.stdin!.end();
       await exited;
       expect(() => process.kill(invocation.pid, 0)).toThrow();
     } finally { await hostProcess.dispose(); }
     await expectGone(invocation);
 
     const disposed = await start('serve');
-    const late = jest.fn();
+    const late = vi.fn();
     const disposal = disposed.dispose();
     disposed.onExit(late);
     await disposal;
@@ -233,15 +252,17 @@ describe('native Host process', () => {
 
   it('stops a Host that never becomes ready when startup is cancelled or times out', async () => {
     const cancel = new AbortController();
-    const cancelled = start('hang', {}, cancel.signal);
+    const cancelled = start('hang', { FAKE_DSH_INTERRUPTS: join(root, 'interrupts.log') }, cancel.signal);
     const first = await launched();
     cancel.abort();
     await expect(cancelled).rejects.toThrow('DeepSeek startup cancelled.');
+    // An abandoned startup still releases native's locks through its own interrupt rather than a kill.
+    expect(await readFile(join(root, 'interrupts.log'), 'utf8')).toBe(`${JSON.stringify({ pid: first.pid, by: 'owner' })}\n`);
     await expectGone(first);
 
     await rm(log);
     const deadline = new AbortController();
-    jest.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal);
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal);
     const timing = start('hang');
     const second = await launched();
     deadline.abort();
@@ -260,12 +281,52 @@ describe('native Host process', () => {
       await expectGone(invocation);
     });
 
-    // Waits out the real grace period, then the forced stop.
+    // Advance only the idle grace deadline; the child and its forced termination stay real.
     it('still stops a Host that outlives its owner\'s end of stdin', async () => {
       const hostProcess = await start('untethered');
       const invocation = await launched();
-      await expect(hostProcess.dispose()).resolves.toBeUndefined();
-      await expectGone(invocation);
+      vi.useFakeTimers({ now: testDate(), toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const disposal = hostProcess.dispose();
+      let settled = false;
+      void disposal.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        expect(window.setTimeout).toBe(setTimeout);
+        for (let elapsed = 0; !settled && elapsed < 6_000; elapsed += 50) await vi.advanceTimersByTimeAsync(50);
+        vi.useRealTimers();
+        await vi.waitFor(() => expect(settled).toBe(true), { timeout: 3_000 });
+        await expect(disposal).resolves.toBeUndefined();
+        await expectGone(invocation);
+      } finally {
+        vi.useRealTimers();
+        // Also clean up a surviving real child when the deadline/escalation regression fails.
+        try { process.kill(invocation.pid, 'SIGKILL'); } catch { /* Already exited. */ }
+        await hostProcess.dispose();
+      }
     }, 20_000);
   });
+});
+
+it('runs the WSL CI fixture locally through real authenticated HTTP/WebSocket and the generated plugins', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'deepseek WSL fixture '));
+  const home = join(root, 'home');
+  const server = new LoopbackSessionToolServer();
+  let child: DeepSeekHostProcess | undefined;
+  try {
+    await mkdir(join(home, 'profiles/web'), { recursive: true });
+    await writeFile(join(home, 'profiles/web/package.json'), '{}');
+    const route = await server.registerCallRoute(async call => ({ isError: false, text: call.callerNativeId }));
+    child = await DeepSeekHostProcess.start({
+      cliPath: resolve(__dirname, '../../../../fixtures/providers/deepseek/runtime/FakeDeepSeekWSLHost.mjs'), cwd: root,
+      sessionToolRoute: route,
+      environment: { ...process.env, DSH_HOME: home, DSH_FIXTURE_PACKAGE: resolve('package.json'), DSH_FIXTURE_EXIT: join(root, 'exit.log') },
+    }, new AbortController().signal);
+    await child.writePrompt('root', 'fixture prompt'); await child.writeCodeMode(true);
+    const withdraw = await child.offerEphemeralFork('root', 7);
+    expect(await child.client.call('fixture/inspect')).toMatchObject({ prompt: 'fixture prompt', presentation: ['root present both'],
+      forks: [{ parent: 'root', atSeq: 7 }], spill: 'Linux artifact', attachment: 'Linux artifact' });
+    expect(await child.client.call('fixture/tool', { id: 'one', caller: 'root', tool: 'claudian_list_destinations', input: {} }))
+      .toEqual({ isError: false, text: 'root' });
+    await withdraw(); await child.dispose();
+    expect(await readFile(join(root, 'exit.log'), 'utf8')).toBe('owner\n');
+  } finally { await child?.dispose(); await server.close(); await rm(root, { recursive: true, force: true }); }
 });

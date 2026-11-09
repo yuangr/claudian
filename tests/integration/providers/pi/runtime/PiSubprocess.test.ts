@@ -1,0 +1,577 @@
+import { spawn as nativeSpawn } from 'node:child_process';
+import { ChildProcess } from 'node:child_process';
+import * as syncFS from 'node:fs';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { Readable, Writable } from 'node:stream';
+
+// WindowsHostFS serves the Windows temporary directory on POSIX hosts through these forwarding namespaces.
+vi.mock('node:fs', async () => ({ ...(await vi.importActual<typeof import('node:fs')>('node:fs')) }));
+vi.mock('node:fs/promises', async () => ({ ...(await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')) }));
+vi.mock('cross-spawn', () => ({ default: vi.fn() }));
+vi.mock('node:child_process', async () => ({
+  ...(await vi.importActual<typeof import('node:child_process')>('node:child_process')),
+  spawn: vi.fn(),
+}));
+
+import { createWindowsHostFS } from '@test/helpers/WindowsHostFS';
+import { readWSLExec } from '@test/helpers/WSLLaunch';
+import spawn from 'cross-spawn';
+import type { MockedFunction } from 'vitest';
+
+import * as env from '@/core/process/env';
+import { PiSubprocess } from '@/providers/pi/runtime/PiSubprocess';
+
+
+
+const mockSpawn = spawn as MockedFunction<typeof spawn>;
+const mockNativeSpawn = vi.mocked(nativeSpawn);
+
+function createMockProcess() {
+  const proc = Object.assign(new ChildProcess(), {
+    stdin: new Writable({ write: (_chunk, _encoding, callback) => callback() }),
+    stdout: new Readable({ read() {} }),
+    stderr: new Readable({ read() {} }),
+    exitCode: null as number | null,
+    killed: false,
+    pid: 12345 as number | undefined,
+  });
+  proc.kill = vi.fn((signal?: NodeJS.Signals | number) => {
+    proc.killed = signal === 'SIGKILL';
+    return true;
+  });
+  return proc;
+}
+
+describe('PiSubprocess', () => {
+  const originalPlatform = process.platform;
+  let proc: ReturnType<typeof createMockProcess>;
+  let windowsNpmPrefix: string;
+  let windowsAbsolutePiCommand: string;
+  let windowsMalformedCommands: string[];
+  let windowsManagedBin: string;
+  let windowsManagedCommands: Record<'cmd' | 'ps1', string>;
+  let windowsPackageRoot: string;
+  let windowsPiBin: string;
+  let windowsPiCommand: string;
+  let windowsPnpmBin: string;
+  let windowsPnpmCommand: string;
+  let windowsUnownedCommand: string;
+  let windowsUnknownCommand: string;
+  let windowsYarnBin: string;
+  let windowsYarnCommand: string;
+
+  // Windows hosts have a real Windows temporary directory, so the modeled one only runs elsewhere.
+  it.skipIf(process.platform === 'win32')('delivers a literal >32K WSL system prompt through a mapped file and cleans it on exit', async () => {
+    const files = createWindowsHostFS({ fs: syncFS, fsPromises: fs });
+    await fs.mkdir(String.raw`C:\Temp`, { recursive: true });
+    // POSIX os.tmpdir() follows TMPDIR, so the prompt directory lands on the modeled Windows drive.
+    vi.stubEnv('TMPDIR', String.raw`C:\Temp`);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    const prompt = '  literal $HOME `command` "quotes"\n' + 'x'.repeat(40_000) + '\n  ';
+    const child = createMockProcess();
+    mockNativeSpawn.mockReturnValue(child);
+    mockSpawn.mockReturnValue(child);
+    const subprocess = new PiSubprocess({
+      command: 'pi', cwd: 'C:\\Vault', env: {}, args: ['--mode', 'rpc', '--system-prompt', prompt],
+      executionTarget: { method: 'wsl', platformFamily: 'unix', platformOs: 'linux', distroName: 'Ubuntu' },
+    });
+    subprocess.start();
+    const [directory] = syncFS.readdirSync(String.raw`C:\Temp`);
+    expect(directory).toMatch(/^claudian-pi-prompt-/u);
+    expect(await files.read(`C:\\Temp\\${directory}\\system-prompt.txt`)).toBe(prompt);
+    const call = mockNativeSpawn.mock.calls.at(-1)!;
+    expect(call[0]).toMatch(/wsl\.exe$/i);
+    const args = call[1] as string[];
+    expect(args.join(' ').length).toBeLessThan(32_767);
+    const native = readWSLExec({ args }).args;
+    expect(native.at(-1)).toBe(`/mnt/c/Temp/${directory}/system-prompt.txt`);
+    expect(call[2]).toMatchObject({ windowsVerbatimArguments: true });
+    child.emit('exit', 0, null);
+    expect(syncFS.readdirSync(String.raw`C:\Temp`)).toEqual([]);
+  });
+
+  beforeAll(async () => {
+    windowsNpmPrefix = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-windows-launch-'));
+    windowsPackageRoot = path.join(
+      windowsNpmPrefix,
+      'node_modules',
+      '@earendil-works',
+      'pi-coding-agent',
+    );
+    windowsPiBin = path.join(windowsPackageRoot, 'dist', 'bundle', 'cli.js');
+    windowsPiCommand = path.join(windowsNpmPrefix, 'pi.cmd');
+    await fs.mkdir(path.dirname(windowsPiBin), { recursive: true });
+    await fs.writeFile(windowsPiBin, '#!/usr/bin/env node\n');
+    await fs.writeFile(path.join(windowsPackageRoot, 'package.json'), JSON.stringify({
+      bin: { pi: 'dist/bundle/cli.js' },
+      name: '@earendil-works/pi-coding-agent',
+    }));
+    await fs.writeFile(windowsPiCommand, createWindowsCommandShim(
+      windowsPiCommand,
+      windowsPiBin,
+    ));
+    windowsAbsolutePiCommand = path.join(windowsNpmPrefix, 'absolute-bin', 'pi.cmd');
+    await fs.mkdir(path.dirname(windowsAbsolutePiCommand), { recursive: true });
+    await fs.writeFile(
+      windowsAbsolutePiCommand,
+      `@ECHO off\r\nnode "${windowsPiBin}" %*\r\n`,
+    );
+
+    const pnpmPackageRoot = path.join(
+      windowsNpmPrefix,
+      'global',
+      '5',
+      '.pnpm',
+      '@earendil-works+pi-coding-agent@0.84.3',
+      'node_modules',
+      '@earendil-works',
+      'pi-coding-agent',
+    );
+    windowsPnpmBin = path.join(pnpmPackageRoot, 'dist', 'bundle', 'cli.js');
+    windowsPnpmCommand = path.join(windowsNpmPrefix, 'pnpm-bin', 'pi.cmd');
+    await writePiPackage(pnpmPackageRoot, windowsPnpmBin);
+    await fs.mkdir(path.dirname(windowsPnpmCommand), { recursive: true });
+    await fs.writeFile(windowsPnpmCommand, createWindowsCommandShim(
+      windowsPnpmCommand,
+      windowsPnpmBin,
+    ));
+
+    const yarnPackageRoot = path.join(
+      windowsNpmPrefix,
+      'Yarn',
+      'Data',
+      'global',
+      'node_modules',
+      '@earendil-works',
+      'pi-coding-agent',
+    );
+    windowsYarnBin = path.join(yarnPackageRoot, 'dist', 'bundle', 'cli.js');
+    windowsYarnCommand = path.join(windowsNpmPrefix, 'Yarn', 'bin', 'pi.cmd');
+    await writePiPackage(yarnPackageRoot, windowsYarnBin);
+    await fs.mkdir(path.dirname(windowsYarnCommand), { recursive: true });
+    await fs.writeFile(windowsYarnCommand, createWindowsCommandShim(
+      windowsYarnCommand,
+      windowsYarnBin,
+    ));
+
+    const unownedBin = path.join(windowsNpmPrefix, 'unowned', 'cli.js');
+    windowsUnownedCommand = path.join(windowsNpmPrefix, 'unowned-bin', 'pi.cmd');
+    await fs.mkdir(path.dirname(unownedBin), { recursive: true });
+    await fs.mkdir(path.dirname(windowsUnownedCommand), { recursive: true });
+    await fs.writeFile(unownedBin, '#!/usr/bin/env node\n');
+    await fs.writeFile(windowsUnownedCommand, createWindowsCommandShim(
+      windowsUnownedCommand,
+      unownedBin,
+    ));
+
+    windowsUnknownCommand = path.join(windowsNpmPrefix, 'unknown-bin', 'pi.cmd');
+    await fs.mkdir(path.dirname(windowsUnknownCommand), { recursive: true });
+    await fs.writeFile(windowsUnknownCommand, '@ECHO off\r\nunknown-wrapper %*\r\n');
+
+    const windowsManagedRoot = path.join(windowsNpmPrefix, '.pi', 'agent');
+    windowsManagedBin = await writeManagedPiInstall(windowsManagedRoot, '1.1.0');
+    windowsManagedCommands = {
+      cmd: path.join(windowsManagedRoot, 'bin', 'pi.cmd'),
+      ps1: path.join(windowsManagedRoot, 'bin', 'pi.ps1'),
+    };
+
+    const malformedDir = path.join(windowsNpmPrefix, 'malformed-bin');
+    await fs.mkdir(malformedDir, { recursive: true });
+    windowsMalformedCommands = await Promise.all([
+      (target: string) => `REM ${target}`,
+      (target: string) => `unknown-wrapper & node ${target}`,
+      (target: string) => `call ${target}`,
+    ].map(async (buildContents, index) => {
+      const command = path.join(malformedDir, String(index), 'pi.cmd');
+      await fs.mkdir(path.dirname(command), { recursive: true });
+      await fs.writeFile(
+        command,
+        `${buildContents(createWindowsCommandTarget(command, windowsPiBin))}\r\n`,
+      );
+      return command;
+    }));
+  });
+
+  afterAll(async () => {
+    await fs.rm(windowsNpmPrefix, { force: true, recursive: true });
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    mockNativeSpawn.mockReturnValue(proc);
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('spawns Pi RPC with the launch spec args, cwd, stdio, and enhanced PATH', () => {
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: '/opt/pi/bin/pi',
+      cwd: '/vault',
+      env: { PATH: '/usr/bin' },
+    });
+
+    subprocess.start();
+
+    expect(mockSpawn).toHaveBeenCalledWith('/opt/pi/bin/pi', ['--mode', 'rpc'], expect.objectContaining({
+      cwd: '/vault',
+      stdio: 'pipe',
+      windowsHide: true,
+      env: expect.objectContaining({
+        PATH: expect.stringContaining('/usr/bin'),
+      }),
+    }));
+  });
+
+  it('launches the Pi package entry directly for Windows npm shims', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const subprocess = new PiSubprocess({
+      args: [
+        '--mode',
+        'rpc',
+        '--system-prompt',
+        'First line\nUse R&D policy',
+        '--session',
+        'D:\\文档\\Pi Sessions\\session.jsonl',
+      ],
+      command: windowsPiCommand,
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    });
+
+    subprocess.start();
+
+    expect(mockNativeSpawn).toHaveBeenCalledWith(
+      expect.stringMatching(/node(?:\.exe)?$/i),
+      [
+        windowsPiBin,
+        '--mode',
+        'rpc',
+        '--system-prompt',
+        'First line\nUse R&D policy',
+        '--session',
+        'D:\\文档\\Pi Sessions\\session.jsonl',
+      ],
+      expect.objectContaining({
+        cwd: 'C:\\Vault',
+        windowsHide: true,
+      }),
+    );
+    expect(mockSpawn).not.toHaveBeenCalledWith(
+      process.env.ComSpec || process.env.comspec || 'cmd.exe',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('attempts node when discovery misses it and reports the process error', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    vi.spyOn(env, 'findNodeExecutable').mockReturnValue(null);
+    proc.pid = undefined;
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: windowsPiBin,
+      cwd: 'C:\\Vault',
+      env: { PATH: '' },
+    });
+    const onClose = vi.fn();
+    subprocess.onClose(onClose);
+    subprocess.start();
+
+    expect(mockNativeSpawn).toHaveBeenCalledWith(
+      'node', [windowsPiBin, '--mode', 'rpc'], expect.any(Object),
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+    const error = Object.assign(new Error('spawn node ENOENT'), { code: 'ENOENT' });
+    proc.emit('error', error);
+    expect(onClose).toHaveBeenCalledWith(error);
+    expect(subprocess.isAlive()).toBe(false);
+  });
+
+  it('fails closed when a Windows Pi shim targets an unowned script', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    expect(() => new PiSubprocess({
+      args: ['--mode', 'rpc', '--system-prompt', 'First line\nSecond line'],
+      command: windowsUnownedCommand,
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    })).toThrow('could not be resolved to its Node.js entry point');
+  });
+
+  it('does not replace an unknown Windows shim with PI_PACKAGE_DIR', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    expect(() => new PiSubprocess({
+      args: ['--mode', 'rpc', '--system-prompt', 'First line\nSecond line'],
+      command: windowsUnknownCommand,
+      cwd: 'C:\\Vault',
+      env: {
+        PATH: process.env.PATH,
+        PI_PACKAGE_DIR: windowsPackageRoot,
+      },
+    })).toThrow('could not be resolved to its Node.js entry point');
+  });
+
+  it.each([
+    ['commented', 0],
+    ['prefixed', 1],
+    ['malformed', 2],
+  ])('rejects a %s owned-bin reference in an unsupported shim layout', (
+    _layout,
+    commandIndex,
+  ) => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    expect(() => new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: windowsMalformedCommands[commandIndex],
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    })).toThrow('could not be resolved to its Node.js entry point');
+  });
+
+  it.each([
+    ['pnpm', () => windowsPnpmCommand, () => windowsPnpmBin],
+    ['Yarn', () => windowsYarnCommand, () => windowsYarnBin],
+    ['cross-volume', () => windowsAbsolutePiCommand, () => windowsPiBin],
+  ])('resolves the package entry referenced by a %s Windows shim', (
+    _packageManager,
+    getCommand,
+    getBin,
+  ) => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc', '--system-prompt', 'First line\nSecond line'],
+      command: getCommand(),
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    });
+
+    subprocess.start();
+
+    expect(mockNativeSpawn).toHaveBeenCalledWith(
+      expect.stringMatching(/node(?:\.exe)?$/i),
+      [getBin(), '--mode', 'rpc', '--system-prompt', 'First line\nSecond line'],
+      expect.objectContaining({ windowsHide: true }),
+    );
+  });
+
+  it.each(['cmd', 'ps1'] as const)(
+    'launches the active release entry for a pi.dev managed %s launcher',
+    (launcher) => {
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      const args = [
+        '--mode',
+        'rpc',
+        '--system-prompt',
+        'First line\nSecond line',
+        '--session',
+        'C:\\Users\\pi\\.pi\\agent\\sessions\\--C--Vault--\\session.jsonl',
+      ];
+      const subprocess = new PiSubprocess({
+        args,
+        command: windowsManagedCommands[launcher],
+        cwd: 'C:\\Vault',
+        env: { PATH: process.env.PATH },
+      });
+
+      subprocess.start();
+
+      expect(mockNativeSpawn).toHaveBeenCalledWith(
+        expect.stringMatching(/node(?:\.exe)?$/i),
+        [windowsManagedBin, ...args],
+        expect.objectContaining({ windowsHide: true }),
+      );
+      expect(mockSpawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['an invalid install marker', async (root: string) => {
+      await fs.writeFile(path.join(root, 'install', 'managed-install.json'), '{}');
+    }],
+    ['an unsafe active version', async (root: string) => {
+      await fs.writeFile(path.join(root, 'install', 'current-version'), '../1.1.0\n');
+    }],
+    ['a missing active release', async (root: string) => {
+      await fs.writeFile(path.join(root, 'install', 'current-version'), '9.9.9\n');
+    }],
+  ])('fails closed for a managed launcher with %s', async (_fault, corrupt) => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const root = await fs.mkdtemp(path.join(windowsNpmPrefix, 'managed-fault-'));
+    await writeManagedPiInstall(root, '1.1.0');
+    await corrupt(root);
+
+    for (const launcher of ['pi.cmd', 'pi.ps1']) {
+      expect(() => new PiSubprocess({
+        args: ['--mode', 'rpc'],
+        command: path.join(root, 'bin', launcher),
+        cwd: 'C:\\Vault',
+        env: { PATH: process.env.PATH },
+      })).toThrow('could not be resolved to its Node.js entry point');
+    }
+  });
+
+  it('fails closed instead of shell-launching an unknown PowerShell launcher', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const command = path.join(windowsNpmPrefix, 'ps1-bin', 'pi.ps1');
+    await fs.mkdir(path.dirname(command), { recursive: true });
+    await fs.writeFile(command, '& unknown-wrapper $args\r\n');
+
+    expect(() => new PiSubprocess({
+      args: ['--mode', 'rpc', '--system-prompt', 'First line\nSecond line'],
+      command,
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    })).toThrow('could not be resolved to its Node.js entry point');
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('kills the process tree when shutting down a direct Windows Pi launch', async () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: windowsPiCommand,
+      cwd: 'C:\\Vault',
+      env: { PATH: process.env.PATH },
+    });
+    subprocess.start();
+
+    const shutdown = subprocess.shutdown();
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      'taskkill.exe',
+      ['/pid', '12345', '/t', '/f'],
+      expect.objectContaining({
+        stdio: 'ignore',
+        windowsHide: true,
+      }),
+    );
+    expect(proc.kill).not.toHaveBeenCalled();
+
+    proc.exitCode = 0;
+    proc.emit('exit', 0, null);
+    await shutdown;
+  });
+
+  it('keeps a bounded stderr snapshot for runtime errors', () => {
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: 'pi',
+      cwd: '/vault',
+      env: {},
+    });
+    subprocess.start();
+
+    proc.stderr.emit('data', 'a'.repeat(9_000));
+
+    expect(subprocess.getStderrSnapshot()).toHaveLength(8_000);
+  });
+
+  it('notifies close listeners and escalates shutdown after timeout', async () => {
+    vi.useFakeTimers();
+    const subprocess = new PiSubprocess({
+      args: ['--mode', 'rpc'],
+      command: 'pi',
+      cwd: '/vault',
+      env: {},
+    });
+    const onClose = vi.fn();
+    subprocess.onClose(onClose);
+    subprocess.start();
+
+    const shutdown = subprocess.shutdown();
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+
+    vi.advanceTimersByTime(3_000);
+    expect(proc.kill).toHaveBeenCalledWith('SIGKILL');
+
+    proc.exitCode = 1;
+    proc.emit('exit', 1, 'SIGKILL');
+    await shutdown;
+
+    expect(onClose).toHaveBeenCalledWith(expect.any(Error));
+  });
+});
+
+function createWindowsCommandShim(commandPath: string, targetPath: string): string {
+  return [
+    '@ECHO off',
+    'GOTO start',
+    ':find_dp0',
+    'SET dp0=%~dp0',
+    'EXIT /b',
+    ':start',
+    'SETLOCAL',
+    'CALL :find_dp0',
+    'IF EXIST "%dp0%\\node.exe" (',
+    '  SET "_prog=%dp0%\\node.exe"',
+    ') ELSE (',
+    '  SET "_prog=node"',
+    ')',
+    `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  ${createWindowsCommandTarget(commandPath, targetPath)}`,
+    '',
+  ].join('\r\n');
+}
+
+function createWindowsCommandTarget(commandPath: string, targetPath: string): string {
+  const relativeTarget = path.relative(path.dirname(commandPath), targetPath)
+    .split(path.sep)
+    .join('\\');
+  return `"%~dp0\\${relativeTarget}" %*`;
+}
+
+async function writePiPackage(packageRoot: string, binPath: string): Promise<void> {
+  await fs.mkdir(path.dirname(binPath), { recursive: true });
+  await fs.writeFile(binPath, '#!/usr/bin/env node\n');
+  await fs.writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+    bin: { pi: path.relative(packageRoot, binPath) },
+    name: '@earendil-works/pi-coding-agent',
+  }));
+}
+
+async function writeManagedPiInstall(root: string, version: string): Promise<string> {
+  const binDir = path.join(root, 'bin');
+  const installRoot = path.join(root, 'install');
+  const packageRoot = path.join(
+    installRoot,
+    'releases',
+    version,
+    'node_modules',
+    '@earendil-works',
+    'pi-coding-agent',
+  );
+  const releaseBin = path.join(packageRoot, 'dist', 'bundle', 'cli.js');
+  await writePiPackage(packageRoot, releaseBin);
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(installRoot, 'managed-install.json'), JSON.stringify({
+    kind: 'pi-managed-install',
+    layout: 'releases-v1',
+    schemaVersion: 1,
+  }));
+  await fs.writeFile(path.join(installRoot, 'current-version'), `${version}\n`);
+  await fs.writeFile(path.join(binDir, 'pi-launcher.js'), '#!/usr/bin/env node\n');
+  await fs.writeFile(
+    path.join(binDir, 'pi.cmd'),
+    '@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n',
+  );
+  await fs.writeFile(path.join(binDir, 'pi.ps1'), [
+    '#!/usr/bin/env pwsh',
+    '$basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent',
+    '$launcher = Join-Path $basedir "pi-launcher.js"',
+    'if ($MyInvocation.ExpectingInput) { $input | & node $launcher $args }',
+    'else { & node $launcher $args }',
+    'exit $LASTEXITCODE',
+    '',
+  ].join('\r\n'));
+  return releaseBin;
+}

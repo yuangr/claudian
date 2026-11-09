@@ -1,10 +1,12 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 import '@/providers';
 
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { parseCodexSessionContent } from '@test/helpers/providers/codex/parseCodexSessionContent';
 import { testDate, testTime } from '@test/helpers/testClock';
 import { fireEvent, screen, within } from '@testing-library/dom';
 import fs from 'fs';
-import { axe } from 'jest-axe';
 import { Component } from 'obsidian';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -19,28 +21,34 @@ import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { createAsyncSubagentBlock, createSubagentBlock, updateAsyncSubagentBlock, updateSubagentBlock } from '@/features/chat/subagents/SubagentRenderer';
 import { StreamController } from '@/features/chat/turns/StreamController';
+import { setLocale } from '@/i18n/i18n';
 import { ClaudeTaskResultInterpreter } from '@/providers/claude/runtime/ClaudeTaskResultInterpreter';
 import { CodexSubagentTracker } from '@/providers/codex/execution/CodexSubagentTracker';
-import { parseCodexSessionContent } from '@/providers/codex/history/CodexHistoryStore';
 import { codexSubagentLifecycleAdapter } from '@/providers/codex/normalization/codexSubagentNormalization';
 import type { Thread } from '@/providers/codex/runtime/codexAppServerTypes';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
 
-HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
-HTMLElement.prototype.removeClass = function (...classes) { this.classList.remove(...classes); };
+
+
+
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
   cleanups.splice(0).forEach(cleanup => cleanup());
+  setLocale('en');
   document.body.replaceChildren();
 });
 
-function createCodexLifecycleView() {
+function expandButton(parent: HTMLElement, name: RegExp): void {
+  const button = within(parent).getByRole('button', { name });
+  if (button.getAttribute('aria-expanded') !== 'true') fireEvent.click(button);
+}
+
+async function createCodexLifecycleView() {
   const parent = document.body.createDiv();
   const manager = new SubagentManager(() => {}, NOOP_TASK_RESULT_INTERPRETER);
   const tools: ToolCallInfo[] = [];
-  const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
   const renderer = new MessageRenderer(plugin,
     new Component(), parent,
     undefined, undefined, () => ProviderRegistry.getCapabilities('codex'));
@@ -61,7 +69,7 @@ function createCodexLifecycleView() {
 }
 
 it.each(['native', 'raw-first', 'canonical-first'])('renders %s Codex identity, progress, and final output without losing the answer on close', async source => {
-  const { parent, tools, router, flush } = createCodexLifecycleView();
+  const { parent, tools, router, flush } = await createCodexLifecycleView();
   const notify = (id: string, tool: string, status: string, message: string | null) => {
     router.handleNotification('item/completed', {
       threadId: 'main', turnId: 'turn', item: {
@@ -128,7 +136,7 @@ it.each(['native', 'raw-first', 'canonical-first'])('renders %s Codex identity, 
 });
 
 it.each(['native', 'raw'])('matches %s lifecycle updates to an agent with a task name and thread ID', async source => {
-  const { parent, tools, router, renderer, message, flush } = createCodexLifecycleView();
+  const { parent, tools, router, renderer, message, flush } = await createCodexLifecycleView();
   for (const item of [
     { type: 'function_call', call_id: 'spawn', name: 'spawn_agent', arguments: '{"task_name":"reviewer","message":"Review"}' },
     { type: 'function_call_output', call_id: 'spawn', output: '{"task_name":"reviewer"}' },
@@ -166,7 +174,7 @@ it.each(['native', 'raw'])('matches %s lifecycle updates to an agent with a task
 });
 
 it.each(['live', 'history'] as const)('keeps raw Codex identity and completion details in %s cards', async mode => {
-  const { parent, manager, tools, router, flush } = createCodexLifecycleView();
+  const { parent, manager, tools, router, flush } = await createCodexLifecycleView();
   const calls = [
     { id: 'spawn', name: 'spawn_agent', input: { message: 'Review storage.', model: 'test-model-with-a-long-name', reasoning_effort: 'high', agent_type: 'explorer' },
       output: { agent_id: 'child', nickname: 'Ada' } },
@@ -211,9 +219,50 @@ it.each(['live', 'history'] as const)('keeps raw Codex identity and completion d
   expect(within(parent).getByText('Storage is correct.')).toBeDefined();
 });
 
+it.each((['live', 'history'] as const).flatMap(mode => [
+  { mode, label: 'native error', native: { errored: 'Native agent failed.' }, status: 'error', result: 'Native agent failed.' },
+  { mode, label: 'empty native error', native: { errored: '' }, status: 'error', result: 'Agent stopped' },
+  { mode, label: 'completion without text', native: { completed: null }, status: 'completed', result: 'DONE' },
+  { mode, label: 'missing agent', native: 'not_found', status: 'error', result: 'Agent not found' },
+]))('settles $label in $mode Codex cards using raw native statuses', async ({ mode, native, status, result }) => {
+  const { parent, manager, tools, router, flush } = await createCodexLifecycleView();
+  const payloads = [
+    { type: 'function_call', call_id: 'spawn-native', name: 'spawn_agent', arguments: '{"message":"Review.","agent_type":"explorer"}' },
+    { type: 'function_call_output', call_id: 'spawn-native', output: '{"agent_id":"child"}' },
+    { type: 'function_call', call_id: 'wait-native', name: 'wait', arguments: '{"ids":["child"]}' },
+    { type: 'function_call_output', call_id: 'wait-native', output: JSON.stringify({ status: { child: native }, timed_out: false }) },
+  ];
+  if (mode === 'live') {
+    for (const item of payloads) {
+      router.handleNotification('rawResponseItem/completed', { threadId: 'main', turnId: 'turn', item });
+      if (item.type === 'function_call_output') {
+        router.handleNotification('item/completed', { threadId: 'main', turnId: 'turn', item: {
+          type: 'collabAgentToolCall', id: item.call_id, tool: item.call_id === 'spawn-native' ? 'spawnAgent' : 'wait',
+          status: 'completed', receiverThreadIds: ['child'],
+          agentsStates: { child: { status: item.call_id === 'spawn-native' ? 'running' : status === 'completed' ? 'completed' : 'errored', message: null } },
+        } });
+      }
+    }
+    await flush();
+  } else {
+    const messages = parseCodexSessionContent(payloads.map((payload, index) => JSON.stringify({
+      type: 'response_item', timestamp: testTime({ seconds: index }), payload,
+    })).join('\n'));
+    tools.push(...messages.flatMap(message => message.toolCalls ?? []));
+    manager.updateLifecycleSpawn(tools[0], tools, codexSubagentLifecycleAdapter, parent);
+  }
+  expect(tools[0].subagent).toMatchObject({ status, result });
+  const header = within(parent).getByRole('button', { name: new RegExp(`Subagent task:.*Status: ${status}`) });
+  fireEvent.click(header);
+  fireEvent.click(within(parent).getByRole('button', { name: /^Result/ }));
+  expect(within(parent).getByText(result)).toBeDefined();
+  expect(within(parent).queryByRole('button', { name: /^wait - click to expand$/i, hidden: true })).toBeNull();
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
 it.each(['raw-output', 'item-result', 'text-output'])(
   'combines %s acknowledgements with native follow-up state', async source => {
-    const { parent, tools, router, flush } = createCodexLifecycleView();
+    const { parent, tools, router, flush } = await createCodexLifecycleView();
     const complete = (id: string, tool: string, status: string, message: string | null, result?: unknown) => {
       router.handleNotification('item/completed', {
         threadId: 'main', turnId: 'turn', item: {
@@ -292,6 +341,7 @@ it('normalizes a completed synchronous answer containing not-ready prose', () =>
   expect(manager.getSyncSubagent('sync')?.toolCalls).toEqual([
     expect.objectContaining({ input: { file_path: 'note.md', limit: 10 }, status: 'completed', result: 'The note.' }),
   ]);
+  expandButton(parent, /Subagent task: Deployment check/);
   expect(parent.querySelectorAll('.claudian-subagent-tool-item')).toHaveLength(1);
   const answer = 'Deployment is not ready.';
   const metadata = 'agentId: agent-sync\n<usage>total_tokens: 500</usage>';
@@ -309,7 +359,7 @@ it.each(['unrelated', 'running'] as const)('defers output-file recovery for %s r
   const directory = fs.mkdtempSync(join(tmpdir(), 'claudian-managed-output-'));
   const outputPath = join(directory, 'task.output');
   fs.writeFileSync(outputPath, JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'Recovered task answer' }] } }));
-  const read = jest.spyOn(fs, 'readFileSync');
+  const read = vi.spyOn(fs, 'readFileSync');
   const manager = new SubagentManager(() => {}, new ClaudeTaskResultInterpreter());
   const parent = document.createElement('div');
   document.body.append(parent);
@@ -373,8 +423,23 @@ it.each(['sync', 'async'] as const)('renders %s snapshots without changing their
   Object.freeze(initial);
   const parent = document.body.createDiv();
   const view = mode === 'sync' ? createSubagentBlock(parent, initial) : createAsyncSubagentBlock(parent, initial);
+  expect(view.toolsContainerEl.childElementCount).toBe(0);
+  const updated = Object.freeze({ ...initial, toolCalls: [Object.freeze({ ...initial.toolCalls[0], status: 'completed' as const, result: 'First child result' })] });
+  if ('statusTextEl' in view) updateAsyncSubagentBlock(view as ReturnType<typeof createAsyncSubagentBlock>, updated);
+  else updateSubagentBlock(view, updated);
+  expect(view.toolsContainerEl.childElementCount).toBe(0);
   fireEvent.click(within(parent).getByRole('button', { name: /Snapshot task/ }));
-  fireEvent.click(within(parent).getByRole('button', { name: /^Read/ }));
+  expect(within(parent).queryByText('First child result')).toBeNull();
+  const childHeader = within(parent).getByRole('button', { name: /^Read/ });
+  fireEvent.click(childHeader);
+  expect(within(parent).getByText('First child result')).toBeDefined();
+  fireEvent.click(childHeader);
+  const latest = Object.freeze({ ...updated, toolCalls: [Object.freeze({ ...updated.toolCalls[0], result: 'Latest child result' })] });
+  if ('statusTextEl' in view) updateAsyncSubagentBlock(view as ReturnType<typeof createAsyncSubagentBlock>, latest);
+  else updateSubagentBlock(view, latest);
+  expect(within(parent).queryByText('Latest child result')).toBeNull();
+  fireEvent.click(childHeader);
+  expect(within(parent).getByText('Latest child result')).toBeDefined();
   const completed = Object.freeze({ ...initial, status: 'completed' as const, asyncStatus: 'completed' as const, result: 'Snapshot result' });
   if ('statusTextEl' in view) updateAsyncSubagentBlock(view as ReturnType<typeof createAsyncSubagentBlock>, completed);
   else updateSubagentBlock(view, completed);
@@ -384,6 +449,25 @@ it.each(['sync', 'async'] as const)('renders %s snapshots without changing their
   expect(initial.toolCalls[0].isExpanded).toBe(false);
   expect(completed.isExpanded).toBe(false);
   expect(await axe(parent)).toHaveNoViolations();
+});
+
+it('reconciles a large expanded child list with linear identity lookups and removes retired tools', () => {
+  let identityReads = 0;
+  const tools: ToolCallInfo[] = Array.from({ length: 100 }, (_, index) => ({
+    get id() { identityReads += 1; return `child-${index}`; },
+    name: 'Read', input: { file_path: `note-${index}.md` }, status: 'completed', result: 'contents',
+  }));
+  const info: SubagentInfo = { id: 'many-tools', description: 'Many tools', status: 'running', isExpanded: false, toolCalls: tools };
+  const parent = document.body.createDiv();
+  const view = createSubagentBlock(parent, info);
+  fireEvent.click(within(parent).getByRole('button', { name: /Subagent task: Many tools/ }));
+  expect(parent.querySelectorAll('.claudian-subagent-tool-item')).toHaveLength(100);
+  identityReads = 0;
+  updateSubagentBlock(view, { ...info, toolCalls: tools.slice(1) });
+  expect(parent.querySelectorAll('.claudian-subagent-tool-item')).toHaveLength(99);
+  expect(parent.querySelector('[data-tool-id="child-0"]')).toBeNull();
+  expect(parent.querySelector('[data-tool-id="child-99"]')).not.toBeNull();
+  expect(identityReads).toBeLessThanOrEqual(400);
 });
 
 it('preserves focus in a completed child result when a sibling tool updates', () => {
@@ -422,7 +506,7 @@ it('preserves async prompt expansion and focus on repeated tool snapshots', () =
 
 
 it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex card updated with session events %s, parent settlement, and a follow-up', async timing => {
-  const view = createCodexLifecycleView();
+  const view = await createCodexLifecycleView();
   let tracker = new CodexSubagentTracker(info => view.stream.subagents.handleSubagentUpdate(info), async () => {
     throw new Error('Child read unavailable');
   });
@@ -454,6 +538,8 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
   ] });
   expect(view.tools[0].subagent).toMatchObject({ status: 'completed', result: 'Ready.' });
   expect(view.parent.textContent).toContain('Ready.');
+  expandButton(view.parent, /^Subagent task:/);
+  expandButton(view.parent, /^clock__curr_time/);
   expect(view.parent.querySelectorAll('.claudian-subagent-tool-item')).toHaveLength(1);
   expect(view.parent.textContent).toContain('clock__curr_time');
   expect(view.parent.textContent).toContain('Clock result');
@@ -500,6 +586,7 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
   await followupWork;
   await view.stream.handleStreamChunk({ type: 'done' }, laterMessage);
   expect(view.state.currentContentEl!.querySelector('[data-tool-id="native-wait"]')).toBeNull();
+  expandButton(view.state.currentContentEl!, /^Subagent task:/);
   const liveHistory = within(view.state.currentContentEl!).getByRole('button', { name: 'Previous runs (1)' });
   liveHistory.focus();
   const dateItems = timing === 'native only' ? [
@@ -513,6 +600,8 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
   for (const item of dateItems) tracker.handleNotification('child', 'child-turn-2',
     item.type === 'commandExecution' ? 'item/completed' : 'rawResponseItem/completed',
     { threadId: 'child', turnId: 'child-turn-2', item });
+  expandButton(view.state.currentContentEl!, /^Bash/);
+  liveHistory.focus();
   expect(view.state.currentContentEl!.textContent).toContain('Date result');
   tracker.turnCompleted('child', { id: 'child-turn-2', status: 'completed', error: null, items: [
     { type: 'agentMessage', id: 'answer-2', text: 'Two.', phase: 'final_answer', memoryCitation: null },
@@ -535,6 +624,10 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
     if (reload) view.renderer.renderMessages(view.state.messages, () => 'Hello');
     const original = view.parent.querySelector('[data-message-id="response"]')! as HTMLElement;
     const later = view.parent.querySelector('[data-message-id="later"]')! as HTMLElement;
+    expandButton(original, /^Subagent task:/);
+    expandButton(original, /^clock__curr_time/);
+    expandButton(later, /^Subagent task:/);
+    expandButton(later, /^Bash/);
     expect(original.querySelectorAll('.claudian-subagent-list')).toHaveLength(1);
     expect(original.textContent).toContain('Ready.');
     expect(original.textContent).toContain('Clock result');
@@ -552,6 +645,7 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
     expect(run.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(run);
     const runBody = document.getElementById(run.getAttribute('aria-controls')!)!;
+    expandButton(runBody, /^clock__curr_time/);
     expect(within(runBody).getByRole('button', { name: /^Result/ }).getAttribute('aria-expanded')).toBe('true');
     expect(later.textContent).toContain('Clock result');
     expect(later.textContent).toContain('Ready.');
@@ -559,10 +653,13 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
     expect(later.querySelectorAll('[data-subagent-id="spawn"]')).toHaveLength(0);
     expect(within(later).queryByRole('button', { name: 'Go to original turn' })).toBeNull();
     const final = view.parent.querySelector('[data-message-id="final-run"]')! as HTMLElement;
+    expandButton(final, /^Subagent task:/);
     fireEvent.click(within(final).getByRole('button', { name: 'Previous runs (2)' }));
     expect(within(final).getAllByRole('button', { name: /^Run \d/ }).map(button => button.textContent))
       .toEqual(['Run 1 · Completed', 'Run 2 · Completed']);
-    fireEvent.click(within(final).getByRole('button', { name: 'Run 2 · Completed' }));
+    const secondRun = within(final).getByRole('button', { name: 'Run 2 · Completed' });
+    fireEvent.click(secondRun);
+    expandButton(document.getElementById(secondRun.getAttribute('aria-controls')!)!, /^Bash/);
     expect(final.textContent!.includes('Run bash date')).toBe(timing !== 'native only');
     expect(final.textContent).toContain('Date result');
     expect(final.textContent).toContain('Two.');
@@ -574,7 +671,7 @@ it.each(['before spawn', 'after spawn', 'native only'])('keeps the native Codex 
 
 
 it('shows previous runs after completed-turn regrouping without navigation or other agents', async () => {
-  const view = createCodexLifecycleView();
+  const view = await createCodexLifecycleView();
   const tool = (id: string, agentId: string): ToolCallInfo => ({
     id, name: 'spawn_agent', input: {}, status: 'completed',
     subagent: { id, agentId, lifecycleSource: 'session', description: 'Helper', status: 'completed',
@@ -618,10 +715,10 @@ it.each([undefined, '', '   '])('hides an unavailable prompt (%s) and reveals a 
   expect(within(parent).queryByRole('button', { name: /^Prompt/ })).toBeNull();
 });
 
-function createOpencodeView() {
+async function createOpencodeView() {
   const parent = document.body.createDiv();
   const manager = new SubagentManager(() => {}, ProviderRegistry.getTaskResultInterpreter('opencode'));
-  const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
   const renderer = new MessageRenderer(plugin,
     new Component(), parent,
     undefined, undefined, () => ProviderRegistry.getCapabilities('opencode'));
@@ -639,7 +736,7 @@ function createOpencodeView() {
 }
 
 it('shows previous runs of reused OpenCode subagents live and after reload', async () => {
-  const view = createOpencodeView();
+  const view = await createOpencodeView();
   const runs = [
     { message: 'first', sync: 'Answer A', background: 'Survey A' },
     { message: 'second', sync: 'Answer B', background: 'Survey B' },
@@ -674,7 +771,7 @@ it('shows previous runs of reused OpenCode subagents live and after reload', asy
 
 it.each(['sync', 'async', 'partial-sync'] as const)('records a %s task and its result without transcript elements', async mode => {
   const parent = document.body.createDiv();
-  const plugin = { app: {}, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
   const state = new ChatState();
   const manager = new SubagentManager(info => stream.subagents.onAsyncSubagentStateChange(info), new ClaudeTaskResultInterpreter());
   const renderer = new MessageRenderer(plugin, new Component(), parent);
@@ -712,4 +809,181 @@ it.each(['sync', 'async', 'partial-sync'] as const)('records a %s task and its r
   expect(within(parent).getByRole('button', { name: /(?:Background|Subagent) task:.*Research|Subagent task: Subagent task/ })).toBeTruthy();
   expect(parent.textContent).toContain('Research complete.');
   expect(JSON.stringify(message)).toBe(model);
+});
+
+
+it('renders a managed sync task through child-tool completion and the full SDK result', async () => {
+  const parent = document.body.createDiv();
+  const manager = new SubagentManager(() => undefined, new ClaudeTaskResultInterpreter());
+  cleanups.push(() => manager.clear());
+  const ui = within(parent);
+  expect(manager.handleTaskToolUse('task-sdk', { run_in_background: false, description: 'Read report' }, parent).action)
+    .toBe('created_sync');
+  fireEvent.click(ui.getByRole('button', { name: /Subagent task: Read report/ }));
+  const tool: ToolCallInfo = { id: 'read-1', name: 'Read', input: { file_path: 'test.md' }, status: 'running', isExpanded: false };
+  manager.addSyncToolCall('task-sdk', tool);
+  const read = ui.getByRole('button', { name: /^Read.*test.md/ });
+  expect(read).toBeDefined();
+  manager.updateSyncToolResult('task-sdk', 'read-1', { ...tool, status: 'completed', result: 'file content' });
+  fireEvent.click(read);
+  expect(ui.getByText('file content')).toBeDefined();
+
+  const result = 'Full sync subagent result with multiple lines.\n\nSecond paragraph.';
+  const info = manager.finalizeSyncSubagent('task-sdk', 'truncated', false, {
+    rawOutput: { status: 'completed', content: [{ type: 'text', text: result }], agentId: 'sdk-agent' },
+  });
+  expect(info).toMatchObject({ id: 'task-sdk', status: 'completed', result });
+  expect(manager.getSyncSubagent('task-sdk')).toBeUndefined();
+  fireEvent.click(ui.getByRole('button', { name: /^Result/ }));
+  expect(ui.getByText(/Full sync subagent result with multiple lines/).textContent).toContain(result);
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
+
+it.each(['sync', 'async'] as const)('opens and closes managed %s task details by mouse and keyboard', async mode => {
+  const parent = document.body.createDiv();
+  const manager = new SubagentManager(() => undefined, new ClaudeTaskResultInterpreter());
+  cleanups.push(() => manager.clear());
+  manager.handleTaskToolUse('task', { description: 'Test task', run_in_background: mode === 'async' }, parent);
+  const header = within(parent).getByRole('button', { name: /(?:Subagent|Background) task: Test task/ });
+  const wrapper = header.parentElement!;
+  const content = wrapper.querySelector<HTMLElement>('.claudian-subagent-content')!;
+  expect(header.getAttribute('tabindex')).toBe('0');
+  expect(header.getAttribute('aria-label')).toContain('click to expand');
+  const expectExpanded = (expanded: boolean) => {
+    expect(header.getAttribute('aria-expanded')).toBe(String(expanded));
+    expect(wrapper.classList.contains('expanded')).toBe(expanded);
+    expect(content.classList.contains('claudian-hidden')).toBe(!expanded);
+  };
+  expectExpanded(false);
+  for (const input of ['click', 'Enter', ' '] as const) {
+    if (input === 'click') fireEvent.click(header);
+    else fireEvent.keyDown(header, { key: input });
+    expectExpanded(true);
+    if (input === 'click') fireEvent.click(header);
+    else fireEvent.keyDown(header, { key: input === 'Enter' ? ' ' : 'Enter' });
+    expectExpanded(false);
+  }
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
+
+it('localizes managed task controls and progress while preserving native content', async () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const manager = new SubagentManager(() => undefined, new ClaudeTaskResultInterpreter());
+  cleanups.push(() => manager.clear());
+  manager.handleTaskToolUse('localized', { description: 'Native task', prompt: 'Native prompt', run_in_background: false }, parent);
+  const ui = within(parent);
+  const header = ui.getByRole('button', { name: '子代理任务：Native task - 状态：运行中 - 点击展开' });
+  fireEvent.click(header);
+  fireEvent.keyDown(ui.getByRole('button', { name: '提示词 - 点击展开' }), { key: 'Enter' });
+  expect(ui.getByText('Native prompt')).toBeDefined();
+  const child: ToolCallInfo = { id: 'native-read', name: 'Read', input: { file_path: 'native.md' }, status: 'running' };
+  manager.addSyncToolCall('localized', child);
+  const read = ui.getByRole('button', { name: /^Read.*native.md/ });
+  fireEvent.click(read);
+  expect(ui.getByText('运行中…')).toBeDefined();
+  manager.updateSyncToolResult('localized', child.id, { ...child, status: 'completed', result: 'Native child output' });
+  expect(ui.getByText('Native child output')).toBeDefined();
+  manager.applyProgress({ toolCallId: 'localized', lastToolName: 'Read', toolUses: 1, totalTokens: 999, durationMs: 1500 });
+  expect(ui.getByText('最近工具：Read')).toBeDefined();
+  expect(ui.getByText('1 次工具调用 · 999 个 token · 2s')).toBeDefined();
+  manager.applyProgress({ toolCallId: 'localized', toolUses: 2, totalTokens: 1000 });
+  expect(ui.getByText('2 次工具调用 · 1k 个 token · 2s')).toBeDefined();
+  manager.applyProgress({ toolCallId: 'localized', totalTokens: 100000, summary: 'Native summary' });
+  expect(ui.getByText('Native summary')).toBeDefined();
+  expect(ui.getByText('2 次工具调用 · 100k 个 token · 2s')).toBeDefined();
+  const info = manager.finalizeSyncSubagent('localized', 'Native result', false);
+  expect(info).toMatchObject({ description: 'Native task', prompt: 'Native prompt', result: 'Native result' });
+  expect(header.getAttribute('aria-label')).toBe('子代理任务：Native task - 状态：已完成 - 点击折叠');
+  fireEvent.keyDown(ui.getByRole('button', { name: '结果 - 点击展开' }), { key: ' ' });
+  expect(ui.getByText('Native result')).toBeDefined();
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
+it.each([
+  ['completed', undefined, '已完成'], ['completed', 'DONE', 'DONE'],
+  ['error', undefined, '错误'], ['error', 'ERROR', 'ERROR'],
+] as const)('localizes only absent sync %s results (%s)', async (status, result, expected) => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const info: SubagentInfo = { id: 'localized-sync', description: 'Native task', status, result, isExpanded: false, toolCalls: [] };
+  createSubagentBlock(parent, info);
+  fireEvent.click(within(parent).getByRole('button', { name: status === 'completed'
+    ? '子代理任务：Native task - 状态：已完成 - 点击展开' : '子代理任务：Native task - 状态：错误 - 点击展开' }));
+  fireEvent.click(within(parent).getByRole('button', { name: '结果 - 点击展开' }));
+  expect(within(parent).getByText(expected)).toBeDefined();
+  expect(info.result).toBe(result);
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
+it('localizes background status updates and keeps supplied results as native data', async () => {
+  setLocale('zh-CN');
+  const parent = document.body.createDiv();
+  const info: SubagentInfo = { id: 'localized-async', description: 'Native task', mode: 'async',
+    status: 'running', asyncStatus: 'pending', isExpanded: false, toolCalls: [] };
+  const state = createAsyncSubagentBlock(parent, info);
+  const ui = within(parent);
+  fireEvent.click(ui.getByRole('button', { name: '后台任务：Native task - 初始化中 - 点击展开' }));
+  expect(state.statusTextEl.textContent).toBe('初始化中');
+  expect(state.statusEl.getAttribute('aria-label')).toBe('状态：初始化中');
+  for (const [asyncStatus, label] of [['running', '后台运行中'], ['completed', '已完成']] as const) {
+    updateAsyncSubagentBlock(state, { ...info, asyncStatus, status: asyncStatus });
+    expect(state.statusTextEl.textContent).toBe('');
+    expect(ui.getByRole('button', { name: `后台任务：Native task - ${label} - 点击折叠` })).toBeDefined();
+    expect(state.statusEl.getAttribute('aria-label')).toBe(`状态：${label}`);
+  }
+  expect(state.resultBodyEl!.textContent).toBe('已完成');
+  updateAsyncSubagentBlock(state, { ...info, asyncStatus: 'error', status: 'error' });
+  expect(ui.getByRole('button', { name: '后台任务：Native task - 错误 - 点击折叠' })).toBeDefined();
+  expect(state.statusTextEl.textContent).toBe('错误');
+  expect(state.statusEl.getAttribute('aria-label')).toBe('状态：错误');
+  fireEvent.click(ui.getByRole('button', { name: '结果 - 点击展开' }));
+  expect(within(state.resultBodyEl!).getByText('错误')).toBeDefined();
+  for (const result of [undefined, 'Conversation ended before task completed', '   ']) {
+    updateAsyncSubagentBlock(state, { ...info, asyncStatus: 'orphaned', status: 'error', result });
+    expect(ui.getByRole('button', { name: '后台任务：Native task - 未完成 - 点击折叠' })).toBeDefined();
+    expect(state.statusTextEl.textContent).toBe('未完成');
+    expect(state.statusEl.getAttribute('aria-label')).toBe('状态：未完成');
+    expect(state.resultBodyEl!.textContent).toBe(result || '对话在任务完成前已结束');
+  }
+  for (const [asyncStatus, result] of [['completed', 'DONE'], ['error', 'ERROR']] as const) {
+    updateAsyncSubagentBlock(state, { ...info, asyncStatus, status: asyncStatus, result });
+    expect(state.resultBodyEl!.textContent).toBe(result);
+  }
+  expect(await axe(parent)).toHaveNoViolations();
+});
+
+it('localizes lazy previous runs without copying current or unrelated results', async () => {
+  setLocale('zh-CN');
+  const view = await createCodexLifecycleView();
+  const tool = (id: string, agentId: string): ToolCallInfo => ({
+    id, name: 'spawn_agent', input: {}, status: 'completed',
+    subagent: { id, agentId, lifecycleSource: 'session', description: 'Native task', status: 'completed',
+      prompt: `${id} prompt`, result: `${id} result`, isExpanded: false, toolCalls: [] },
+  });
+  const messages: ChatMessage[] = [
+    { id: 'original', role: 'assistant', content: '', timestamp: testDate().getTime(), toolCalls: [tool('other', 'other-child'), tool('first', 'child')] },
+    { id: 'rebuilt', role: 'assistant', content: '', timestamp: testDate().getTime(), isRebuiltContext: true, toolCalls: [tool('rebuilt', 'child')] },
+    { id: 'current', role: 'assistant', content: '', timestamp: testDate().getTime(), toolCalls: [tool('second', 'child')] },
+  ];
+  const saved = JSON.stringify(messages);
+  view.renderer.renderMessages(messages, () => 'Hello');
+  const current = view.parent.querySelector<HTMLElement>('[data-message-id="current"]')!;
+  expandButton(current, /^子代理任务：/);
+  const history = within(current).getByRole('button', { name: '之前的运行（1）' });
+  expect(within(current).queryByText('first result')).toBeNull();
+  fireEvent.click(history);
+  const run = within(current).getByRole('button', { name: '第 1 次运行 · 已完成' });
+  expect(within(current).queryByText('first result')).toBeNull();
+  fireEvent.click(run);
+  const body = document.getElementById(run.getAttribute('aria-controls')!)!;
+  expect(within(body).getByText('first prompt')).toBeDefined();
+  expect(within(body).getByText('first result')).toBeDefined();
+  expect(body.textContent).not.toContain('second result');
+  expect(body.textContent).not.toContain('other result');
+  expect(body.textContent).not.toContain('rebuilt result');
+  expect(JSON.stringify(messages)).toBe(saved);
+  expect(await axe(view.parent)).toHaveNoViolations();
 });

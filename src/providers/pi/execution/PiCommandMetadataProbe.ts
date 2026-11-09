@@ -1,12 +1,12 @@
 import { parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTargetAsync } from '@/core/process/execution-target/ExecutionTargetResolver';
 import { OwnedProbeRegistry } from '@/core/providers/metadata/OwnedProbeRegistry';
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
-import { getRuntimeEnvironmentText } from '@/core/providers/providerEnvironment';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 import type { SlashCommand } from '@/core/types';
 
+import { decodePiConfig } from '../config';
 import { buildPiLaunchSpec } from '../runtime/PiLaunchSpecBuilder';
-import { getPiProviderSettings } from '../settings';
 import {
   createPiExecutionKernel,
   type PiExecutionKernel,
@@ -29,7 +29,7 @@ export class PiCommandMetadataProbe {
   });
 
   constructor(
-    private readonly host: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly createKernel: PiExecutionKernelFactory =
       createPiExecutionKernel,
   ) {
@@ -41,7 +41,7 @@ export class PiCommandMetadataProbe {
   }
 
   async load(
-    vaultWorkingDirectory: string,
+    workingDirectory: string,
     signal?: AbortSignal,
   ): Promise<SlashCommand[]> {
     if (this.transitionFence.isUnavailable()) {
@@ -51,19 +51,22 @@ export class PiCommandMetadataProbe {
 
     return await this.probes.run({
       create: async (ownedSignal) => {
-        const command = await this.host.getResolvedProviderCliPath('pi') ?? 'pi';
+        const settings = decodePiConfig(this.host.config, this.host.selection);
+        const executionTarget = await resolveExecutionTargetAsync({ settings, hostVaultPath: workingDirectory });
+        const command = await this.host.resolveCliPath({ executionTarget }) ?? 'pi';
         ownedSignal.throwIfAborted();
-        const envText = getRuntimeEnvironmentText(this.host.settings, 'pi');
+        const envText = this.host.environmentText;
         const launchSpec = buildPiLaunchSpec({
+          executionTarget,
           command,
-          cwd: vaultWorkingDirectory,
+          cwd: workingDirectory,
           env: {
             ...process.env,
             ...parseEnvironmentVariables(envText),
           },
           envText,
           noSession: true,
-          settings: getPiProviderSettings(this.host.settings),
+          settings,
         });
         let pushedCommands: SlashCommand[] | null = null;
         const kernel = this.createKernel(

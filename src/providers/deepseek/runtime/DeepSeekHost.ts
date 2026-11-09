@@ -1,20 +1,24 @@
 import { randomUUID } from 'node:crypto';
 
 import { ProviderTransitionFence } from '@/core/providers/metadata/ProviderTransitionFence';
+import type { SessionToolEndpoint } from '@/core/session-tools/SessionToolEndpoint';
+import { createWSLSessionToolRelay } from '@/core/session-tools/WSLSessionToolRelay';
 
 import { type DeepSeekReader, type DeepSeekRemoteClient, DeepSeekRemoteError, isRecord } from '../remote/DeepSeekRemoteClient';
-import type { DeepSeekPreset, DeepSeekProfile } from '../types';
+import type { DeepSeekProfile } from '../types';
 import { DEEPSEEK_EPHEMERAL_PREFIX } from './DeepSeekCompatibility';
+import type { DeepSeekExecutionContext } from './DeepSeekExecutionContext';
 import { getDeepSeekHome } from './DeepSeekHome';
 import type { DeepSeekHostProcess, DeepSeekLaunchOptions } from './DeepSeekHostProcess';
-import { DeepSeekRoster } from './DeepSeekRoster';
+import { DeepSeekRoster, type DeepSeekSessionToolCapture } from './DeepSeekRoster';
 
-export type DeepSeekProcess = Pick<DeepSeekHostProcess, 'client' | 'profile' | 'onExit' | 'dispose' | 'writePrompt' | 'writeCodeMode' | 'offerEphemeralFork' | 'readEphemeralReady'>;
+export type DeepSeekProcess = Pick<DeepSeekHostProcess, 'client' | 'profile' | 'onExit' | 'dispose' | 'writePrompt' | 'removePrompt' | 'writeCodeMode' | 'offerEphemeralFork' | 'readEphemeralReady'>;
 export type DeepSeekProcessFactory = (options: DeepSeekLaunchOptions, signal: AbortSignal) => Promise<DeepSeekProcess>;
 export type DeepSeekHostLoss = 'process-exited' | 'transport';
 
 /** One attachment to the running Host generation. Releasing it never stops native work. */
 export interface DeepSeekHostLease {
+  readonly execution?: DeepSeekExecutionContext;
   readonly client: DeepSeekRemoteClient;
   readonly roster: DeepSeekRoster;
   readonly home: string;
@@ -30,28 +34,31 @@ export interface DeepSeekHostLease {
    * signal only stops the caller waiting: native forks cannot be cancelled, so the Host keeps the token until it settles.
    */
   fork(request: { readonly sessionId: string; readonly atSeq: number }, ephemeral: boolean, signal?: AbortSignal): Promise<string>;
-  writePrompt(preset: DeepSeekPreset, text: string): Promise<void>;
+  /** Literal prompt of a session this lease claims, from its next native turn; releasing the claim removes it. */
+  writePrompt(sessionId: string, text: string): Promise<void>;
   /** Shared by every chat agent of this generation; each applies it at its next turn. */
   writeCodeMode(enabled: boolean): Promise<void>;
   /** Exclusive claim of a native session; its interactions are delivered here until release. */
-  claim(sessionId: string, deliver: (event: Record<string, unknown>) => void): void;
+  claim(sessionId: string, deliver: (event: Record<string, unknown>) => void, sessionTools?: DeepSeekSessionToolCapture): void;
   /** Fires once if the generation dies while attached. */
   onLost(listener: (loss: DeepSeekHostLoss, error: Error) => void): () => void;
   release(): void;
 }
 
-interface Ready { readonly process: DeepSeekProcess; readonly roster: DeepSeekRoster; readonly home: string; readonly ephemeral: boolean }
+interface Ready { readonly execution?: DeepSeekExecutionContext; readonly process: DeepSeekProcess; readonly roster: DeepSeekRoster; readonly home: string; readonly ephemeral: boolean }
 
 interface Generation {
   readonly id: number;
   readonly abort: AbortController;
   readonly ready: Promise<Ready>;
+  /** `ready` carries the started process for callers that must not wait on a startup; `retiring` is terminal. */
+  phase: { readonly kind: 'booting' } | { readonly kind: 'ready'; readonly ready: Ready } | { readonly kind: 'retiring'; readonly retirement: Promise<void> };
   forks: Promise<unknown>;
   readonly lost: Set<(loss: DeepSeekHostLoss, error: Error) => void>;
   users: number;
   idleTimer?: number;
-  retirement?: Promise<void>;
-  reconnect?: Promise<void>;
+  /** A reconnection in flight; `dropped` records a socket drop that outdated its current attempt. */
+  reconnection?: { dropped: boolean };
 }
 
 /** Native reads that never activate a saved session or take its writer. */
@@ -59,7 +66,9 @@ const COLD_METHODS = new Set([
   'session/list', 'session/projections', 'session/page', 'session/attachment',
   'session/modelCatalog', 'skills/list',
 ]);
-const RECONNECT_TIMEOUT_MS = 15_000;
+// Native's heartbeat drops a client that stalls for a few seconds while the live process keeps its work.
+const RECONNECT_BUDGET_MS = 60_000;
+const RECONNECT_BACKOFF_MS = [250, 500, 1_000, 2_000];
 // Covers native MCP discovery during agent composition; a fork still running after it ends with its process.
 const FORK_WATCHDOG_MS = 5 * 60_000;
 
@@ -77,6 +86,7 @@ export class DeepSeekHost {
     private readonly launch: () => Promise<DeepSeekLaunchOptions>,
     private readonly spawn: DeepSeekProcessFactory,
     private readonly idleMs = 60_000,
+    private readonly sessionToolEndpoint?: SessionToolEndpoint,
   ) {}
 
   /** Starts the process ahead of first use; it then follows the ordinary idle policy. */
@@ -90,15 +100,15 @@ export class DeepSeekHost {
     let ready;
     try { ready = await abortable(generation.ready, signal); } catch (error) { this.leave(generation); throw error; }
     // Loss can land between startup and this continuation; its listeners have already run.
-    if (generation.retirement) { this.leave(generation); throw new Error('DeepSeek process exited during startup.'); }
-    const { process, roster, home, ephemeral } = ready;
-    const claims: Array<() => void> = [];
+    if (generation.phase.kind === 'retiring') { this.leave(generation); throw new Error('DeepSeek process exited during startup.'); }
+    const { process, roster, home, ephemeral, execution } = ready;
+    const claims = new Map<string, () => void>();
     const lost = new Set<(loss: DeepSeekHostLoss, error: Error) => void>();
     const relay = (loss: DeepSeekHostLoss, error: Error): void => { for (const listener of [...lost]) listener(loss, error); lost.clear(); };
     generation.lost.add(relay);
     let released = false;
     return {
-      client: process.client, roster, home, profile: process.profile, generation: generation.id, ephemeral,
+      client: process.client, roster, home, execution, profile: process.profile, generation: generation.id, ephemeral,
       ephemeralSessionId: () => {
         if (!ephemeral) throw new Error('DeepSeek cannot keep this session ephemeral.');
         return `${DEEPSEEK_EPHEMERAL_PREFIX}${randomUUID()}`;
@@ -109,7 +119,7 @@ export class DeepSeekHost {
         const run = generation.forks.then(async () => {
           // A fork waiting behind another may outlive its lease or its process; neither may start it.
           if (released) throw new Error('DeepSeek Host lease is released.');
-          if (generation.retirement) throw new Error('DeepSeek process ended before the fork started.');
+          if (generation.phase.kind === 'retiring') throw new Error('DeepSeek process ended before the fork started.');
           const withdraw = ephemeralFork ? await process.offerEphemeralFork(request.sessionId, request.atSeq) : undefined;
           let unresolved = false;
           let forked = false;
@@ -150,17 +160,21 @@ export class DeepSeekHost {
         generation.forks = run.catch(() => undefined);
         return abortable(run, signal);
       },
-      writePrompt: (preset, text) => process.writePrompt(preset, text),
+      writePrompt: (sessionId, text) => {
+        if (released || !claims.has(sessionId)) return Promise.reject(new Error('DeepSeek can only write the prompt of a claimed session.'));
+        return process.writePrompt(sessionId, text);
+      },
       writeCodeMode: enabled => process.writeCodeMode(enabled),
-      claim: (sessionId, deliver) => {
+      claim: (sessionId, deliver, sessionTools) => {
         if (released) throw new Error('DeepSeek Host lease is released.');
-        claims.push(roster.claim(sessionId, deliver));
+        claims.set(sessionId, roster.claim(sessionId, deliver, sessionTools));
       },
       onLost: listener => { lost.add(listener); return () => lost.delete(listener); },
       release: () => {
         if (released) return;
         released = true;
-        for (const off of claims.splice(0)) off();
+        for (const [sessionId, off] of claims) { off(); void process.removePrompt(sessionId).catch(() => undefined); }
+        claims.clear();
         lost.clear(); generation.lost.delete(relay);
         this.leave(generation);
       },
@@ -168,21 +182,25 @@ export class DeepSeekHost {
   }
 
   /** Cold, non-activating reads against the native store at `home`. History browsing never claims a writer. */
-  async read<T>(operation: (reader: DeepSeekReader, home: string) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  async read<T>(operation: (reader: DeepSeekReader, home: string, execution?: DeepSeekExecutionContext) => Promise<T>, signal?: AbortSignal): Promise<T> {
     const generation = await this.enter(signal);
     try {
-      const { process, home } = await abortable(generation.ready, signal);
-      const reader: DeepSeekReader = {
-        call: (method, args, options = {}) => {
-          if (!COLD_METHODS.has(method)) return Promise.reject(new Error(`DeepSeek history reads cannot call ${method}.`));
-          const signals = [signal, options.signal].filter((value): value is AbortSignal => !!value);
-          return process.client.call(method, args, { ...options, ...(signals.length ? { signal: AbortSignal.any(signals) } : {}) });
-        },
-      };
-      return await abortable(operation(reader, home), signal);
+      const { process, home, execution } = await abortable(generation.ready, signal);
+      return await abortable(operation(coldReader(process, signal), home, execution), signal);
     } finally {
       this.leave(generation);
     }
+  }
+
+  /**
+   * Cold reads only while a process is already ready; resolves `undefined` instead of starting, awaiting or
+   * reconnecting one, and leaves its idle lifetime untouched. A retirement mid-read fails the operation.
+   */
+  async readIfRunning<T>(operation: (reader: DeepSeekReader, home: string, execution?: DeepSeekExecutionContext) => Promise<T>): Promise<T | undefined> {
+    const generation = this.current;
+    if (generation?.phase.kind !== 'ready' || this.fence.isUnavailable()) return undefined;
+    const { process, home, execution } = generation.phase.ready;
+    return operation(coldReader(process), home, execution);
   }
 
   async beginTransition(): Promise<void> {
@@ -214,43 +232,101 @@ export class DeepSeekHost {
   private leave(generation: Generation): void {
     generation.users--;
     // A failed startup is already forgotten; only the current process idles out.
-    if (generation.users > 0 || generation.retirement || generation !== this.current) return;
+    if (generation.users > 0 || generation.phase.kind === 'retiring' || generation !== this.current) return;
     generation.idleTimer = window.setTimeout(() => { void this.retire(generation); }, this.idleMs);
   }
 
   private begin(): Generation {
     const abort = new AbortController();
-    const generation: Generation = { id: ++this.generations, abort, lost: new Set(), users: 0, forks: Promise.resolve(), ready: this.boot(abort.signal, () => generation) };
+    const generation: Generation = { id: ++this.generations, abort, phase: { kind: 'booting' }, lost: new Set(), users: 0, forks: Promise.resolve(), ready: this.boot(abort.signal, () => generation) };
     // A failed startup leaves no generation behind; the next caller starts fresh.
-    generation.ready.catch(() => { if (this.current === generation) this.current = undefined; });
+    generation.ready.then(ready => {
+      if (generation.phase.kind === 'booting') generation.phase = { kind: 'ready', ready };
+    }, () => { if (this.current === generation) this.current = undefined; });
     this.current = generation;
     return generation;
   }
 
   private async boot(signal: AbortSignal, self: () => Generation): Promise<Ready> {
     const options = await this.launch();
-    const process = await this.spawn(options, signal);
-    if (signal.aborted) { await process.dispose(); throw new Error('DeepSeek startup cancelled.'); }
-    const roster = new DeepSeekRoster(process.client, error => this.lose(self(), 'transport', error));
-    process.onExit(() => this.lose(self(), 'process-exited', new Error('DeepSeek process exited.')));
-    process.client.onDisconnect(() => this.reconnect(self(), process, roster));
-    try { await roster.start(); } catch (error) { roster.dispose(); await process.dispose(); throw error; }
-    // The plugin reports during native startup; a missing or partial report leaves sessions native.
-    const ephemeral = await process.readEphemeralReady().catch(() => false);
-    return { process, roster, home: getDeepSeekHome(options.environment, options.cwd), ephemeral };
+    let roster: DeepSeekRoster | undefined;
+    // One route for this native Host generation, shared by all its Agents. Claims remain roster-owned.
+    const route = await this.sessionToolEndpoint?.registerCallRoute(request => roster?.callSessionTool(request)
+      ?? Promise.resolve({ isError: true, text: 'DeepSeek session tools are unavailable.' }));
+    const revoke = (): void => { route?.dispose(); };
+    signal.addEventListener('abort', revoke, { once: true });
+    try {
+      signal.throwIfAborted();
+      const sessionToolRelay = route && options.execution?.target.method === 'wsl'
+        ? await createWSLSessionToolRelay({ target: options.execution.target, hostCwd: options.cwd,
+          env: Object.fromEntries(Object.entries(options.environment).filter((entry): entry is [string, string] => entry[1] !== undefined)), route, mode: 'call' })
+        : undefined;
+      const process = await this.spawn({ ...options, sessionToolRelay, ...(route ? { sessionToolRoute: route } : {}) }, signal);
+      try {
+        signal.throwIfAborted();
+        const activeRoster = new DeepSeekRoster(process.client, error => this.lose(self(), 'transport', error));
+        roster = activeRoster;
+        process.onExit(() => this.lose(self(), 'process-exited', new Error('DeepSeek process exited.')));
+        process.client.onDisconnect(() => this.reconnect(self(), process, activeRoster));
+        await roster.start();
+        // The plugin reports during native startup; a missing or partial report leaves sessions native.
+        const ephemeral = await process.readEphemeralReady().catch(() => false);
+        return { process, roster, home: options.execution?.home ?? getDeepSeekHome(options.environment, options.cwd), execution: options.execution, ephemeral };
+      } catch (error) { roster?.dispose(); await process.dispose(); throw error; }
+    } catch (error) {
+      signal.removeEventListener('abort', revoke); revoke(); throw error;
+    }
   }
 
   private reconnect(generation: Generation, process: DeepSeekProcess, roster: DeepSeekRoster): void {
-    if (generation !== this.current || generation.reconnect) return;
-    roster.reset();
-    const signal = AbortSignal.any([generation.abort.signal, AbortSignal.timeout(RECONNECT_TIMEOUT_MS)]);
-    generation.reconnect = process.client.connect(signal).then(() => roster.start())
+    if (generation !== this.current) return;
+    if (generation.reconnection) { generation.reconnection.dropped = true; return; }
+    const reconnection = { dropped: false };
+    generation.reconnection = reconnection;
+    void this.reconnectWithinBudget(generation, process, roster, reconnection)
       .catch(error => this.lose(generation, 'transport', error instanceof Error ? error : new Error('DeepSeek reconnection failed.')))
-      .finally(() => { generation.reconnect = undefined; });
+      .finally(() => { if (generation.reconnection === reconnection) generation.reconnection = undefined; });
+  }
+
+  /** Retiring would end the live process and all its work, so only a transport that stays down past the budget is lost. */
+  private async reconnectWithinBudget(
+    generation: Generation,
+    process: DeepSeekProcess,
+    roster: DeepSeekRoster,
+    reconnection: { dropped: boolean },
+  ): Promise<void> {
+    const budget = new AbortController();
+    const timer = window.setTimeout(() => budget.abort(), RECONNECT_BUDGET_MS);
+    const signal = AbortSignal.any([generation.abort.signal, budget.signal]);
+    let failure: unknown;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        reconnection.dropped = false;
+        roster.reset();
+        try {
+          await process.client.connect(signal);
+          await roster.start(signal);
+          if (signal.aborted) throw new Error('DeepSeek reconnection timed out.');
+          if (!reconnection.dropped) return;
+          failure = new Error('DeepSeek event connection closed.');
+        } catch (error) {
+          if (!signal.aborted || failure === undefined) failure = error;
+        }
+        if (signal.aborted) throw failure;
+        await new Promise<void>(resolve => {
+          const done = (): void => { window.clearTimeout(wait); signal.removeEventListener('abort', done); resolve(); };
+          const wait = window.setTimeout(done, RECONNECT_BACKOFF_MS[Math.min(attempt, RECONNECT_BACKOFF_MS.length - 1)]);
+          signal.addEventListener('abort', done, { once: true });
+        });
+        if (signal.aborted) throw failure;
+      }
+    } finally {
+      window.clearTimeout(timer);
+    }
   }
 
   private lose(generation: Generation, loss: DeepSeekHostLoss, error: Error): void {
-    if (generation.retirement) return;
+    if (generation.phase.kind === 'retiring') return;
     for (const listener of [...generation.lost]) listener(loss, error);
     generation.lost.clear();
     void this.retire(generation);
@@ -262,16 +338,26 @@ export class DeepSeekHost {
   }
 
   private retire(generation: Generation): Promise<void> {
-    if (generation.retirement) return generation.retirement;
+    if (generation.phase.kind === 'retiring') return generation.phase.retirement;
     if (this.current === generation) this.current = undefined;
     if (generation.idleTimer !== undefined) window.clearTimeout(generation.idleTimer);
     generation.abort.abort();
     const retirement = generation.ready.then(({ process, roster }) => { roster.dispose(); return process.dispose(); }, () => undefined);
-    generation.retirement = retirement;
+    generation.phase = { kind: 'retiring', retirement };
     this.retiring.add(retirement);
     void retirement.finally(() => this.retiring.delete(retirement));
     return retirement;
   }
+}
+
+function coldReader(process: DeepSeekProcess, signal?: AbortSignal): DeepSeekReader {
+  return {
+    call: (method, args, options = {}) => {
+      if (!COLD_METHODS.has(method)) return Promise.reject(new Error(`DeepSeek history reads cannot call ${method}.`));
+      const signals = [signal, options.signal].filter((value): value is AbortSignal => !!value);
+      return process.client.call(method, args, { ...options, ...(signals.length ? { signal: AbortSignal.any(signals) } : {}) });
+    },
+  };
 }
 
 function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

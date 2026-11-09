@@ -1,6 +1,7 @@
 import type { Component } from 'obsidian';
 
 import { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
+import { PromptHistoryNavigation } from '@/features/chat/composer/PromptHistoryNavigation';
 import { BrowserSelectionController } from '@/features/chat/input/BrowserSelectionController';
 import { BuiltInCommandController } from '@/features/chat/input/BuiltInCommandController';
 import { CanvasSelectionController } from '@/features/chat/input/CanvasSelectionController';
@@ -45,7 +46,8 @@ export function buildTabRuntimeControllers(
     }, plugin, id, forkRequestCallback, () => !core.session.runtime.isDisposed) : undefined,
     () => getSessionCapabilities(core, plugin),
     { navigate: (id, branchId) => conversationController.navigateBranch(id, branchId),
-      isBusy: () => !core.session.canNavigateConversation });
+      isBusy: () => !core.session.canNavigateConversation },
+    async id => { if (isRuntimeLive(runtimeRef.requirePublished())) await openConversation(id); });
   options.registerCleanup('tab message renderer', () => renderer.dispose());
   const messageQuoteController = new MessageQuoteController({
     messagesEl: dom.messagesEl,
@@ -102,6 +104,13 @@ export function buildTabRuntimeControllers(
     toggleFastMode: () => toggleTabServiceTier(runtimeRef.requirePublished(), plugin),
     onResumeDropdownVisibilityChange: () => ui.promptSuggestion.refresh(),
   });
+  const promptHistoryNavigation = new PromptHistoryNavigation({
+    getMessages: () => conversationController.visibleMessages,
+    input: dom.inputEl,
+    isEnabled: () => sideChatController.destination === 'main'
+      && dom.inputEl.contains(dom.inputEl.ownerDocument.activeElement),
+  });
+  options.registerCleanup('tab prompt history', () => promptHistoryNavigation.destroy());
   const navigationController = new NavigationController({
     getMessagesEl: () => dom.messagesEl,
     getInputEl: () => dom.inputEl,
@@ -110,6 +119,7 @@ export function buildTabRuntimeControllers(
     shouldSkipEscapeHandling: () => {
       if (builtInCommandController.isResumeDropdownVisible()) return true;
       if (ui.composerDropdown.isVisible()) return true;
+      if (promptHistoryNavigation.isRecalling) return true;
       return hasCancellableSelectedWork(runtimeRef.requirePublished());
     },
   });
@@ -143,6 +153,7 @@ export function buildTabRuntimeControllers(
       case 'attention': publishAttention(); break;
       case 'conversation': options.onConversationIdChanged?.(tab, state.currentConversationId); break;
       case 'identity':
+        promptHistoryNavigation.reset();
         ui.promptSuggestion.discard();
         options.onDraftModelChanged?.(tab, tab.draftModel);
         break;
@@ -161,7 +172,9 @@ export function buildTabRuntimeControllers(
         applyProviderUIGating(tab, plugin);
         syncComposerDropdownForProvider(tab, plugin, core.providerCatalogResolver);
         break;
+      case 'project': ui.projectChip.refresh(); break;
       case 'destination':
+        promptHistoryNavigation.reset();
         ui.composerDropdown.setBuiltInsEnabled(sideChatController.destination === 'main');
         refreshTabProviderUI(tab);
         ui.promptSuggestion.refresh();
@@ -180,7 +193,7 @@ export function buildTabRuntimeControllers(
   return {
     renderer,
     controllers: { drafts, composerSelections, inlinePrompts, conversationController, streamController,
-      inputController, builtInCommandController, navigationController, sideChatController },
+      inputController, builtInCommandController, navigationController, promptHistoryNavigation, sideChatController },
     presentation: {
       renderer, messagesEl: dom.messagesEl, queueIndicatorEl: dom.queueIndicatorEl,
       drafts, selections: composerSelections, builtInCommands: builtInCommandController,

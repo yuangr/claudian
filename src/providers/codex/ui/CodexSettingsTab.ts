@@ -1,10 +1,9 @@
-import * as fs from 'fs';
-import { Setting } from 'obsidian';
 
-import { normalizeConfiguredCLIPath, stripSurroundingQuotes } from '@/core/process/cliPath';
 import type { ProviderCLIResolver } from '@/core/providers/types';
 import { OPENAI_PROVIDER_ICON } from '@/shared/icons';
+import { AccessibleSetting } from '@/shared/settings/AccessibleSetting';
 import { renderCLIInstallationSetting } from '@/shared/settings/CLIInstallationSetting';
+import { renderExecutionTargetSettings, validateExecutionTargetCLIPath } from '@/shared/settings/ExecutionTargetSettings';
 
 import type { ProviderModelCatalog } from '../../../core/providers/models/ProviderModelCatalog';
 import { ProviderSettingsCoordinator } from '../../../core/providers/ProviderSettingsCoordinator';
@@ -18,7 +17,6 @@ import {
 } from '../../../shared/settings/ProviderModelEnablementWarning';
 import { renderProviderModelsSection } from '../../../shared/settings/ProviderModelsSection';
 import { getCodexModelOptions } from '../modelOptions';
-import { isWindowsStyleCLIReference } from '../runtime/CodexBinaryLocator';
 import { inspectCodexInstallation } from '../runtime/CodexCLIInstallation';
 import { getCodexProviderSettings, updateCodexProviderSettings } from '../settings';
 
@@ -31,7 +29,6 @@ export function createCodexSettingsTabRenderer(
       const codexSettings = getCodexProviderSettings(settingsBag);
       const hostnameKey = context.plugin.storage.installationKey;
       const isWindowsHost = process.platform === 'win32';
-      let installationMethod = codexSettings.installationMethod;
 
       // --- Setup ---
 
@@ -71,35 +68,11 @@ export function createCodexSettingsTabRenderer(
       const lastProviderWarning = renderLastEnabledProviderWarning(container);
 
       const modelWarning = renderProviderModelEnablementWarning(container, context, {
-        getHasEnabledModels: () => getCodexModelOptions(settingsBag).length > 0,
+        getHasEnabledModels: () => getCodexModelOptions(getCodexProviderSettings(settingsBag)).length > 0,
         getIsEnabled: () => getCodexProviderSettings(settingsBag).enabled,
         providerId: 'codex',
         providerName: 'Codex',
       });
-
-      if (isWindowsHost) {
-        new Setting(container)
-          .setName(t('settings.codex.installationMethod.name'))
-          .setDesc(t('settings.codex.installationMethod.desc'))
-          .addDropdown((dropdown) => {
-            dropdown
-              .addOption('native-windows', t('settings.codex.installationMethod.nativeWindows'))
-              .addOption('wsl', t('settings.codex.installationMethod.wsl'))
-              .setValue(installationMethod)
-              .onChange(async (value) => {
-                installationMethod = value === 'wsl' ? 'wsl' : 'native-windows';
-                await context.plugin.applyProviderRuntimeSettings(
-                  ['codex'],
-                  (settings) => {
-                    updateCodexProviderSettings(settings, { installationMethod });
-                  },
-                  () => codexWorkspace.cliResolver.reset(),
-                );
-                refreshInstallationMethodUI();
-                void cliPathControl.refresh();
-              });
-          });
-      }
 
       const getCliPathCopy = (): { placeholder: string } => {
         if (!isWindowsHost) {
@@ -108,7 +81,7 @@ export function createCodexSettingsTabRenderer(
           };
         }
 
-        if (installationMethod === 'wsl') {
+        if (getCodexProviderSettings(settingsBag).installationMethod === 'wsl') {
           return {
             placeholder: 'codex',
           };
@@ -119,38 +92,10 @@ export function createCodexSettingsTabRenderer(
         };
       };
 
-      const shouldValidateCliPathAsFile = (): boolean => !isWindowsHost || installationMethod !== 'wsl';
-
-      const validatePath = (value: string): string | null => {
-        const trimmed = value.trim();
-        if (!trimmed) return null;
-
-        if (!shouldValidateCliPathAsFile()) {
-          if (isWindowsStyleCLIReference(stripSurroundingQuotes(trimmed))) {
-            return t('settings.codex.cliPath.validation.wslWindowsPath');
-          }
-          return null;
-        }
-
-        const expandedPath = normalizeConfiguredCLIPath(trimmed);
-
-        if (!fs.existsSync(expandedPath)) {
-          return t('settings.cliPath.validation.notExist');
-        }
-        const stat = fs.statSync(expandedPath);
-        if (!stat.isFile()) {
-          return t('settings.cliPath.validation.isDirectory');
-        }
-        return null;
-      };
-
-      let wslDistroSettingEl: HTMLElement | null = null;
-      let wslDistroInputEl: HTMLInputElement | null = null;
-
       const cliPathControl = renderCLIInstallationSetting({
         cliName: 'Codex CLI',
         icon: OPENAI_PROVIDER_ICON,
-        inspect: () => inspectCodexInstallation(context.plugin),
+        inspect: () => inspectCodexInstallation(context.plugin.getRuntimeHost('codex')),
         container: installationContainer,
         enablement,
         getValue: () => {
@@ -177,57 +122,33 @@ export function createCodexSettingsTabRenderer(
           );
         },
         placeholder: getCliPathCopy().placeholder,
-        validate: validatePath,
+        validate: value => validateExecutionTargetCLIPath(value, getCodexProviderSettings(settingsBag)),
       });
 
-      const refreshInstallationMethodUI = (): void => {
-        const cliCopy = getCliPathCopy();
-        cliPathControl.setPlaceholder(cliCopy.placeholder);
-        cliPathControl.revalidate();
-        if (wslDistroSettingEl) {
-          wslDistroSettingEl.toggleClass('claudian-hidden', installationMethod !== 'wsl');
-        }
-        if (wslDistroInputEl) {
-          wslDistroInputEl.disabled = installationMethod !== 'wsl';
-        }
-      };
-
-      if (isWindowsHost) {
-        const wslDistroSetting = new Setting(container)
-          .setName(t('settings.codex.wslDistroOverride.name'))
-          .setDesc(t('settings.codex.wslDistroOverride.desc'));
-
-        wslDistroSettingEl = wslDistroSetting.settingEl;
-        wslDistroSetting.addText((text) => {
-          text
-            .setPlaceholder('Ubuntu')
-            .setValue(codexSettings.wslDistroOverride)
-            .onChange(async (value) => {
-              await context.plugin.applyProviderRuntimeSettings(
-                ['codex'],
-                (settings) => {
-                  updateCodexProviderSettings(settings, { wslDistroOverride: value });
-                },
-                () => codexWorkspace.cliResolver.reset(),
-              );
-              void cliPathControl.refresh();
-            });
-
-          text.inputEl.addClass('claudian-settings-cli-path-input');
-          text.inputEl.disabled = installationMethod !== 'wsl';
-          wslDistroInputEl = text.inputEl;
-        });
-      }
-
-      refreshInstallationMethodUI();
+      renderExecutionTargetSettings({
+        container, providerName: 'Codex',
+        getValue: () => getCodexProviderSettings(settingsBag),
+        onChange: async updates => {
+          await context.plugin.applyProviderRuntimeSettings(
+            ['codex'],
+            settings => { updateCodexProviderSettings(settings, updates); },
+            () => codexWorkspace.cliResolver.reset(),
+          );
+        },
+        onRefresh: () => {
+          cliPathControl.setPlaceholder(getCliPathCopy().placeholder);
+          cliPathControl.revalidate();
+          void cliPathControl.refresh();
+        },
+      });
 
       // --- Models ---
 
-      new Setting(container).setName(t('settings.models')).setHeading();
+      new AccessibleSetting(container).setName(t('settings.models')).setHeading();
 
       const modelPicker = renderProviderModelsSection(container, 'codex', 'Codex', codexWorkspace.modelCatalog, () => modelWarning.refresh());
 
-      new Setting(container)
+      new AccessibleSetting(container)
         .setName(t('settings.codex.ultraEffort.name'))
         .setDesc(t('settings.codex.ultraEffort.desc'))
         .addToggle(toggle => toggle
@@ -243,9 +164,9 @@ export function createCodexSettingsTabRenderer(
 
       // --- Responses ---
 
-      new Setting(container).setName(t('settings.responses')).setHeading();
+      new AccessibleSetting(container).setName(t('settings.responses')).setHeading();
 
-      new Setting(container)
+      new AccessibleSetting(container)
         .setName(t('settings.codex.responseStyle.name'))
         .setDesc(t('settings.codex.responseStyle.desc'))
         .addDropdown((dropdown) => {
@@ -264,7 +185,7 @@ export function createCodexSettingsTabRenderer(
             });
         });
 
-      new Setting(container)
+      new AccessibleSetting(container)
         .setName(t('settings.codex.responseVerbosity.name'))
         .setDesc(t('settings.codex.responseVerbosity.desc'))
         .addDropdown((dropdown) => {
@@ -288,7 +209,7 @@ export function createCodexSettingsTabRenderer(
         { value: 'none', label: t('settings.codex.reasoningSummary.off') },
       ];
 
-      new Setting(container)
+      new AccessibleSetting(container)
         .setName(t('settings.codex.reasoningSummary.name'))
         .setDesc(t('settings.codex.reasoningSummary.desc'))
         .addDropdown((dropdown) => {
@@ -308,9 +229,9 @@ export function createCodexSettingsTabRenderer(
 
       // --- Safety ---
 
-      new Setting(container).setName(t('settings.safety')).setHeading();
+      new AccessibleSetting(container).setName(t('settings.safety')).setHeading();
 
-      new Setting(container)
+      new AccessibleSetting(container)
         .setName(t('settings.codexSandbox.name'))
         .setDesc(t('settings.codexSandbox.desc'))
         .addDropdown((dropdown) => {

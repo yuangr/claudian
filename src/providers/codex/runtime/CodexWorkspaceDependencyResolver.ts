@@ -40,14 +40,14 @@ function targetPathApi(context: CodexRuntimeContext): typeof path {
 function normalizeTargetPath(context: CodexRuntimeContext, value: string): string {
   const targetPath = targetPathApi(context);
   return targetPath === path.posix
-    ? targetPath.normalize(value.replace(/\\/g, '/'))
+    ? targetPath.normalize(value.startsWith('/') ? value : value.replace(/\\/g, '/'))
     : targetPath.normalize(value);
 }
 
 function joinTargetPath(context: CodexRuntimeContext, ...parts: string[]): string {
   const targetPath = targetPathApi(context);
   return targetPath === path.posix
-    ? targetPath.join(...parts.map(part => part.replace(/\\/g, '/')))
+    ? targetPath.join(...parts.map(part => part.startsWith('/') ? part : part.replace(/\\/g, '/')))
     : targetPath.join(...parts);
 }
 

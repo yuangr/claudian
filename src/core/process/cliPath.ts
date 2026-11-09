@@ -67,7 +67,9 @@ function findMatchingNvmVersion(entries: string[], resolvedAlias: string): strin
 function resolveNvmAlias(nvmDir: string, alias: string, depth = 0): string | null {
   if (depth > 5) return null;
 
-  if (/^\d/.test(alias) || alias.startsWith('v')) return alias;
+  // Versions are numeric with an optional "v" prefix ("22", "v24.16.0"); custom
+  // aliases such as "vault-node" resolve through the alias file instead.
+  if (/^\d/.test(alias) || /^v\d/.test(alias)) return alias;
   if (isNvmBuiltInLatestAlias(alias)) return alias;
 
   try {
@@ -108,4 +110,15 @@ export function resolveNvmDefaultBin(home: string): string | null {
   }
 
   return null;
+}
+
+export function isWindowsStyleCLIReference(value: string | null | undefined): boolean {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  return /^[A-Za-z]:[\\/]/.test(trimmed)
+    || trimmed.startsWith('\\\\')
+    || /\.(?:exe|cmd|bat|ps1)$/i.test(trimmed);
 }

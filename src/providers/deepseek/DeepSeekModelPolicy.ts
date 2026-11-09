@@ -1,9 +1,10 @@
 import { DEFAULT_REASONING_VALUE } from '@/core/providers/reasoning';
 import type { ProviderModelPolicy } from '@/core/providers/types';
 
+import { findDeepSeekModel, isDeepSeekModelSelectable } from './config';
 import { decodeDeepSeekModelId } from './models';
 import { DEEPSEEK_PERMISSION_MODE_POLICY } from './permissionModes';
-import { findDeepSeekModel, getDeepSeekProviderSettings, isDeepSeekModelSelectable, updateDeepSeekProviderSettings } from './settings';
+import { getDeepSeekProviderSettings, updateDeepSeekProviderSettings } from './settings';
 
 export const deepseekModelPolicy: ProviderModelPolicy = {
   permissionModes: DEEPSEEK_PERMISSION_MODE_POLICY,
@@ -17,7 +18,7 @@ export const deepseekModelPolicy: ProviderModelPolicy = {
         value: id,
         label: model && model.available !== false
           ? current.modelAliases[id] ?? model.label : `${current.modelAliases[id] ?? model?.label ?? id} (unavailable)`,
-        group: model?.provider,
+        group: model?.providerName ?? model?.provider,
         description: model?.description,
       };
     });
@@ -31,7 +32,7 @@ export const deepseekModelPolicy: ProviderModelPolicy = {
   },
   getReasoningOptions(model, settings) {
     return (findDeepSeekModel(getDeepSeekProviderSettings(settings), model)?.reasoning ?? [])
-      .map(effort => ({ value: effort.id, label: effort.name }));
+      .map(effort => ({ value: effort.id, label: effort.name, ...(effort.description ? { description: effort.description } : {}) }));
   },
   getDefaultReasoningValue(model, settings) {
     const current = getDeepSeekProviderSettings(settings);

@@ -3,8 +3,7 @@ import type {
   ProviderExecutionSession,
   ProviderSessionConfig,
 } from '../../../core/execution';
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
-import { getCodexWorkspaceServices } from '../app/CodexWorkspaceServices';
+import type { ProviderRuntimeHost } from '../../../core/providers/ProviderRuntimeHost';
 import type { CodexAppServerRuntime } from '../runtime/CodexAppServerRuntime';
 import { CodexExecutionSession } from './CodexExecutionSession';
 
@@ -15,11 +14,12 @@ export class CodexExecutionBackend implements ProviderExecutionBackend {
   readonly providerId = 'codex' as const;
 
   constructor(
-    private readonly plugin: ProviderHost,
-    private readonly runtime?: CodexAppServerRuntime,
+    private readonly host: ProviderRuntimeHost,
+    /** Resolved per session so the backend stays cheap before workspace services initialize. */
+    private readonly resolveRuntime: () => CodexAppServerRuntime,
   ) {}
 
   createSession(config: ProviderSessionConfig): ProviderExecutionSession {
-    return new CodexExecutionSession(this.plugin, config, this.runtime ?? getCodexWorkspaceServices().runtime);
+    return new CodexExecutionSession(this.host, config, this.resolveRuntime());
   }
 }

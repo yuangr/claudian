@@ -1,25 +1,24 @@
 export type ACPLogicalMethod =
   | 'initialize'
-  | 'authenticate'
   | 'newSession'
   | 'loadSession'
-  | 'forkSession'
-  | 'listSessions'
+  | 'resumeSession'
+  | 'closeSession'
+  | 'setConfigOption'
   | 'prompt'
   | 'cancel'
   | 'setModel'
-  | 'setMode'
-  | 'setConfigOption';
+  | 'setMode';
+
 
 export const ACP_METHOD_NAMES = {
-  authenticate: 'authenticate',
   cancel: 'session/cancel',
+  closeSession: 'session/close',
   initialize: 'initialize',
-  forkSession: 'session/fork',
-  listSessions: 'session/list',
   loadSession: 'session/load',
   newSession: 'session/new',
   prompt: 'session/prompt',
+  resumeSession: 'session/resume',
   setConfigOption: 'session/set_config_option',
   setModel: 'session/set_model',
   setMode: 'session/set_mode',
@@ -30,12 +29,6 @@ export const ACP_SERVER_NOTIFICATION_METHODS = {
 } as const;
 
 export const ACP_SERVER_REQUEST_METHODS = {
-  createTerminal: 'terminal/create',
-  killTerminal: 'terminal/kill',
-  readTextFile: 'fs/read_text_file',
-  releaseTerminal: 'terminal/release',
+  createElicitation: 'elicitation/create',
   requestPermission: 'session/request_permission',
-  terminalOutput: 'terminal/output',
-  waitForTerminalExit: 'terminal/wait_for_exit',
-  writeTextFile: 'fs/write_text_file',
 } as const;

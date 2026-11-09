@@ -1,3 +1,4 @@
+// @test-ci {"native":true}
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
@@ -10,7 +11,7 @@ import {
   type ManagedStdioProcessOptions,
 } from '@/core/process/ManagedStdioProcess';
 
-jest.setTimeout(45_000);
+vi.setConfig({ testTimeout: 45_000 });
 
 let directory: string;
 const processes: ManagedStdioProcess[] = [];
@@ -129,6 +130,18 @@ it.each([false, true])('delivers opaque arguments, cwd, environment and stdin wi
   expect(managed.isAlive()).toBe(false);
 });
 
+it('keeps a bounded stderr diagnostic well-formed when its tail cuts an emoji', async () => {
+  const retained = 'x'.repeat(7_999);
+  const diagnostic = 'discarded prefix 🚀' + retained;
+  const { managed, closed } = await launch(`process.stderr.write(${JSON.stringify(diagnostic)});`);
+  managed.stdin.end();
+  expect(await withinDeadline(closed, managed)).toMatchObject({ closed: true, code: 0 });
+  const snapshot = managed.getStderrSnapshot();
+  expect(snapshot.codePointAt(0)).toBe('x'.codePointAt(0));
+  expect(snapshot).toHaveLength(retained.length);
+  expect(snapshot.endsWith(retained)).toBe(true);
+});
+
 it('reports a missing executable through the direct spawn error path', async () => {
   const managed = new ManagedStdioProcess({
     command: path.join(directory, 'missing-node.exe'),
@@ -158,6 +171,23 @@ it('terminates a running child when shutdown is requested repeatedly', async () 
   expect(await withinDeadline(closed, managed)).toMatchObject({ closed: true });
   await expectProcessGone(pid);
   expect(managed.isAlive()).toBe(false);
+});
+
+it.each([
+  { behavior: 'exits when stdin closes', onEnd: 'process.exit(0);', graceMs: 20_000, code: 0, signal: null },
+  { behavior: 'outlives its stdin grace', onEnd: '', graceMs: 200, code: null, signal: 'SIGTERM' },
+])('closes stdin before signalling a child that $behavior', async ({ onEnd, graceMs, code, signal }) => {
+  const { managed, closed, readRecord } = await launch(`
+    process.stdin.resume();
+    process.stdin.on('end', () => { process.stderr.write('stdin closed'); ${onEnd} });
+    setInterval(() => {}, 1000);
+    process.stdout.write(JSON.stringify({ pid: process.pid }) + '\\n');
+  `, [], { stdinCloseGraceMs: graceMs });
+  const { pid } = await readRecord();
+  await managed.shutdown();
+  expect(await withinDeadline(closed, managed)).toMatchObject({ code, signal });
+  expect(managed.getStderrSnapshot()).toBe('stdin closed');
+  await expectProcessGone(pid);
 });
 
 const describeOnPOSIX = process.platform === 'win32' ? describe.skip : describe;

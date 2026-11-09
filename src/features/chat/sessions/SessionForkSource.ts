@@ -20,6 +20,11 @@ export interface ForkSourceOwner extends SessionIdentity {
   readonly executionCoordinator: ChatSessionRuntime['executionCoordinator'];
 }
 
+/** A fork source whose main turn owner identifies where its settled history ends. */
+export interface LiveForkSourceOwner extends ForkSourceOwner {
+  settledTranscriptEnd(messages: readonly ChatMessage[]): number | null;
+}
+
 interface ForkSource {
   providerId?: ProviderId;
   sourceSessionId: string;
@@ -27,25 +32,14 @@ interface ForkSource {
   sourceSelectedModel?: string;
   sourceTitle?: string;
   linkedContentPath?: string;
+  projectId?: string;
 }
 
-/** Identifies a transcript's latest completed checkpoint by provider-owned ids, which survive native rehydration. */
-export interface ForkCheckpoint {
-  readonly assistantMessageId: string;
-  readonly userMessages: number;
-  readonly trailingMessages: number;
-}
-
-export function findLatestForkCheckpoint(messages: readonly ChatMessage[]): ForkCheckpoint | null {
+/** Returns the provider-owned id of the transcript's latest completed assistant checkpoint. */
+function findLatestAssistantCheckpoint(messages: readonly ChatMessage[]): string | null {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const assistantMessageId = messages[index].role === 'assistant' ? messages[index].assistantMessageId : undefined;
-    if (assistantMessageId) {
-      return {
-        assistantMessageId,
-        userMessages: messages.filter(isCanonicalUserMessage).length,
-        trailingMessages: messages.length - index - 1,
-      };
-    }
+    if (assistantMessageId) return assistantMessageId;
   }
   return null;
 }
@@ -89,15 +83,17 @@ async function resolveForkSource(
       : getSessionSelectedModel(tab, plugin) ?? undefined,
     sourceTitle: conversation?.title,
     linkedContentPath: conversation?.linkedContentPath,
+    projectId: conversation?.projectId,
   };
 }
 
 /**
  * Captures the source binding at the conversation's latest completed assistant
- * checkpoint and revalidates it across every await. Callers own their own user
- * messaging; this never creates a conversation or provider session.
+ * checkpoint and revalidates it across every await. While a main turn runs, a
+ * checkpoint fork captures only the history before that turn. Callers own their
+ * own user messaging; this never creates a conversation or provider session.
  */
-export async function captureLatestCompletedForkSource<T extends ForkSourceOwner>(
+export async function captureLatestCompletedForkSource<T extends LiveForkSourceOwner>(
   tab: T,
   plugin: ChatFeatureHost,
   isRuntimeLive: (tab: T) => boolean,
@@ -108,33 +104,36 @@ export async function captureLatestCompletedForkSource<T extends ForkSourceOwner
   if (!getSessionCapabilities(tab, plugin).supportsFork) {
     return { ok: false, reason: 'unsupported-provider' };
   }
-  if (state.isStreaming) return { ok: false, reason: 'streaming' };
   if (state.isRewinding) return { ok: false, reason: 'rewinding' };
 
-  const msgs = state.messages;
-  if (msgs.length === 0) return { ok: false, reason: 'no-messages' };
-  const forkMode = getSessionCapabilities(tab, plugin).forkMode;
-  if (forkMode === 'full-session' && msgs.at(-1)?.role !== 'assistant') {
-    return { ok: false, reason: 'not-latest-reply' };
+  const capabilities = getSessionCapabilities(tab, plugin);
+  let msgs = state.messages;
+  if (state.isStreaming) {
+    if (capabilities.supportsForkDuringTurn === false) return { ok: false, reason: 'streaming' };
+    // The running reply can carry its native id before it completes, so only earlier history is settled.
+    const settledEnd = tab.settledTranscriptEnd(msgs);
+    if (settledEnd === null) return { ok: false, reason: 'streaming' };
+    msgs = msgs.slice(0, settledEnd);
   }
+  if (msgs.length === 0) return { ok: false, reason: 'no-messages' };
 
-  const checkpoint = findLatestForkCheckpoint(msgs);
-  if (!checkpoint) return { ok: false, reason: 'no-checkpoint' };
-  const lastAssistantUuid = checkpoint.assistantMessageId;
+  const lastAssistantUuid = findLatestAssistantCheckpoint(msgs);
+  if (!lastAssistantUuid) return { ok: false, reason: 'no-checkpoint' };
+  // Fixed before any await: the source keeps streaming and may settle during preparation.
+  const messages = deepCloneMessages(msgs);
 
   const source = await resolveForkSource(tab, plugin, lastAssistantUuid);
   if (!source) return { ok: false, reason: 'no-session' };
-  if (!isRuntimeLive(tab) || tab.conversationId !== sourceConversationId
-    || (forkMode === 'full-session' && (state.isStreaming || state.messages.at(-1)?.assistantMessageId !== lastAssistantUuid))) {
+  if (!isRuntimeLive(tab) || tab.conversationId !== sourceConversationId) {
     return { ok: false, reason: 'stale-binding' };
   }
 
   return {
     context: {
-      forkMode,
       forkAtUserMessage: msgs.filter(isCanonicalUserMessage).length + 1,
       linkedContentPath: source.linkedContentPath,
-      messages: deepCloneMessages(msgs),
+      messages,
+      projectId: source.projectId,
       providerId: source.providerId,
       resumeAt: lastAssistantUuid,
       sourceConversationId,
@@ -180,11 +179,6 @@ export async function handleForkRequest<T extends ForkSourceOwner>(
     return;
   }
 
-  if (getSessionCapabilities(tab, plugin).forkMode === 'full-session' && assistantIdx !== msgs.length - 1) {
-    new Notice('This provider can fork only from the latest reply.');
-    return;
-  }
-
   const checkpoint = msgs[assistantIdx].assistantMessageId;
   if (!checkpoint) {
     new Notice(t('chat.fork.unavailableNoUuid'));
@@ -196,17 +190,11 @@ export async function handleForkRequest<T extends ForkSourceOwner>(
     new Notice(t('chat.fork.failed', { error: t('chat.fork.errorNoSession') }));
     return;
   }
-  if (
-    !isRuntimeLive(tab)
-    || tab.conversationId !== sourceConversationId
-    || (getSessionCapabilities(tab, plugin).forkMode === 'full-session'
-      && (state.isStreaming || state.messages.at(-1)?.assistantMessageId !== checkpoint))
-  ) return;
+  if (!isRuntimeLive(tab) || tab.conversationId !== sourceConversationId) return;
 
   await forkRequestCallback({
     messages: deepCloneMessages(msgs.slice(0, assistantIdx + 1)),
     providerId: source.providerId,
-    forkMode: getSessionCapabilities(tab, plugin).forkMode,
     sourceConversationId,
     sourceSessionId: source.sourceSessionId,
     sourceProviderState: source.sourceProviderState,
@@ -215,6 +203,7 @@ export async function handleForkRequest<T extends ForkSourceOwner>(
     sourceTitle: source.sourceTitle,
     forkAtUserMessage: msgs.slice(0, assistantIdx + 1).filter(isCanonicalUserMessage).length + 1,
     linkedContentPath: source.linkedContentPath,
+    projectId: source.projectId,
   });
 }
 

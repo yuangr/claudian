@@ -1,21 +1,33 @@
 name: CI
 
 on:
+  # Documentation-only changes skip CI; scripts/ciTestSelection.mjs owns this list.
   push:
     branches: [main, codex/cloud-integration]
+    paths-ignore: &documentation-paths
+      - '**/*.md'
+      - '.github/*.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - 'assets/**'
+      - 'docs/**'
+      - LICENSE
   pull_request:
     branches: [main, codex/cloud-integration]
+    paths-ignore: *documentation-paths
   workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # Gated jobs run only when test-scope selects them; scripts/ciTestSelection.mjs owns that relevance policy.
   workflow-lint:
+    needs: test-scope
+    if: needs.test-scope.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -24,7 +36,9 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint:1.7.12
 
-  lockfile:
+  dependencies:
+    needs: test-scope
+    if: needs.test-scope.outputs.dependencies == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -44,9 +58,11 @@ jobs:
       - name: Check npm lockfile
         run: npm install --package-lock-only --ignore-scripts && git diff --exit-code package-lock.json
 
-  quality:
+  # Advisories can appear without a dependency edit, so every change that triggers CI audits the lockfile.
+  # npm audit reads the lockfile and needs no installed dependencies.
+  dependency-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -54,19 +70,34 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
-          cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Audit dependencies
+        run: npm audit --audit-level=moderate
+
+  # Typecheck and lint each take most of a runner's time, so they run on separate runners.
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-dependencies
 
       - name: Typecheck
         run: npm run typecheck
 
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-dependencies
+
       - name: Lint
         run: npm run lint
-
-      - name: Audit dependencies
-        run: npm audit --audit-level=moderate
 
   diff-hygiene:
     if: github.event_name == 'pull_request'
@@ -83,8 +114,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: git diff --check "$BASE_SHA...$HEAD_SHA"
 
+  # The dependency graph also covers GitHub Actions referenced by workflows.
   dependency-review:
-    if: github.event_name == 'pull_request'
+    needs: test-scope
+    if: github.event_name == 'pull_request' && (needs.test-scope.outputs.dependencies == 'true' || needs.test-scope.outputs.workflows == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -101,46 +134,92 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.test-scope.outputs.test-shards) }}
+        # Vitest shards (`1/4`) plus a `scripts` lane for the Node script checks.
+        lane: ${{ fromJSON(needs.test-scope.outputs.test-lanes) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      # Install libfaketime while Node dependencies are restored; the Test step waits for it.
+      - name: Start libfaketime installation
+        run: |
+          # Detach output so the step finishes without waiting for the installation.
+          {
+            (sudo apt-get install -y --no-install-recommends faketime) > "$RUNNER_TEMP/faketime.log" 2>&1
+            echo "$?" > "$RUNNER_TEMP/faketime.status"
+          } > /dev/null 2>&1 &
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-dependencies
+
+      # Vitest orders files with recorded durations longest-first; without them it orders by
+      # file size, so a slow suite can start last. Each lane prefers its own latest snapshot, and
+      # durations merge into each newer one.
+      # Shard membership hashes file paths and does not depend on these results.
+      - name: Restore Vitest file durations
+        if: matrix.lane != 'scripts'
+        uses: actions/cache/restore@v4
         with:
-          node-version-file: .node-version
-          cache: npm
+          path: node_modules/.vite/vitest
+          key: vitest-results-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vitest-results-${{ matrix.lane }}-
+            vitest-results-
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install libfaketime
-        run: sudo apt-get install -y --no-install-recommends faketime
+      - name: Wait for libfaketime
+        timeout-minutes: 2
+        run: |
+          until [ -f "$RUNNER_TEMP/faketime.status" ]; do sleep 0.2; done
+          if [ "$(cat "$RUNNER_TEMP/faketime.status")" != 0 ]; then cat "$RUNNER_TEMP/faketime.log"; exit 1; fi
 
       # Run about three years ahead so a test that depends on today's date fails here, not on the day its fixture expires.
       - name: Test
         id: tests
+        timeout-minutes: 5
         env:
           FAKETIME_DONT_FAKE_MONOTONIC: '1'
+          # Native process tests kill children. A killed stat() call can leave
+          # libfaketime's shared semaphore locked across the entire process tree.
+          # A relative offset needs no shared ticking clock.
+          FAKETIME_DISABLE_SHM: '1'
           TEST_SELECTION: ${{ needs.test-scope.outputs.test-files }}
-          SCRIPT_SELECTION: ${{ matrix.shard == '2/2' && '[]' || needs.test-scope.outputs.script-tests }}
-          TEST_SHARD: ${{ matrix.shard }}
+          SCRIPT_SELECTION: ${{ needs.test-scope.outputs.script-tests }}
+          TEST_LANE: ${{ matrix.lane }}
         run: |
-          mkdir -p test-results
-          faketime -f +1100d npm run test -- --selection "$TEST_SELECTION" --script-selection "$SCRIPT_SELECTION" --shard="$TEST_SHARD" --maxWorkers=3 --json --outputFile=test-results/jest.json
+          if [ "$TEST_LANE" = scripts ]; then
+            faketime -m -f +1100d npm run test -- --selection '[]' --script-selection "$SCRIPT_SELECTION"
+          else
+            mkdir -p test-results
+            faketime -m -f +1100d npm run test -- --selection "$TEST_SELECTION" --script-selection '[]' --shard="$TEST_LANE" --maxWorkers=4 --reporter=default --reporter=json --outputFile=test-results/vitest.json
+          fi
+
+      - name: Save Vitest file durations
+        if: always() && matrix.lane != 'scripts' && steps.tests.outcome != 'skipped' && hashFiles('node_modules/.vite/vitest/**/results.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: node_modules/.vite/vitest
+          key: vitest-results-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Show interrupted test progress
+        if: always() && steps.tests.outcome != 'success'
+        run: |
+          if [ -f test-results/vitest.json.progress.json ]; then
+            cat test-results/vitest.json.progress.json
+          fi
 
       - name: Summarize test timings
-        if: always() && steps.tests.outcome != 'skipped' && needs.test-scope.outputs.test-files != '[]'
-        run: node scripts/summarize-jest-results.mjs test-results/jest.json test-results/timings
+        if: always() && hashFiles('test-results/vitest.json') != ''
+        run: node scripts/summarize-vitest-results.mjs test-results/vitest.json test-results/timings
 
       - name: Upload test timings
-        if: always() && steps.tests.outcome != 'skipped' && needs.test-scope.outputs.test-files != '[]'
+        if: always() && steps.tests.outcome != 'skipped' && matrix.lane != 'scripts'
         uses: actions/upload-artifact@v7
         with:
-          name: jest-timings-${{ strategy.job-index }}
-          path: test-results/timings/
+          name: vitest-timings-${{ strategy.job-index }}
+          path: |
+            test-results/timings/
+            test-results/vitest.json.progress.json
           if-no-files-found: error
           retention-days: 14
 
@@ -149,26 +228,34 @@ jobs:
     timeout-minutes: 10
     outputs:
       test-files: ${{ steps.scope.outputs.test-files }}
-      test-shards: ${{ steps.scope.outputs.test-shards }}
+      test-lanes: ${{ steps.scope.outputs.test-lanes }}
       script-tests: ${{ steps.scope.outputs.script-tests }}
       cross-platform-tests: ${{ steps.scope.outputs.cross-platform-tests }}
       pi-windows: ${{ steps.scope.outputs.pi-windows }}
+      wsl-windows: ${{ steps.scope.outputs.wsl-windows }}
+      wsl-suites: ${{ steps.scope.outputs.wsl-suites }}
       has-tests: ${{ steps.scope.outputs.has-tests }}
       cross-platform: ${{ steps.scope.outputs.cross-platform }}
+      build: ${{ steps.scope.outputs.build }}
+      dependencies: ${{ steps.scope.outputs.dependencies }}
+      workflows: ${{ steps.scope.outputs.workflows }}
     steps:
+      # Selection diffs trees only, so file contents outside HEAD are never fetched.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          filter: blob:none
 
+      # Release tags select the full suite without the dependency graph.
       - name: Setup Node
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
-          cache: npm
 
-      - name: Install dependencies
+      - name: Set up Node and dependencies
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        run: npm ci
+        uses: ./.github/actions/setup-dependencies
 
       - name: Select affected tests and platform checks
         id: scope
@@ -218,49 +305,42 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # The selected script suite normally includes this check; retain it for script-only changes.
-      - name: Run Windows architecture boundaries
-        if: runner.os == 'Windows' && needs.test-scope.outputs.script-tests != 'null' && !contains(fromJSON(needs.test-scope.outputs.script-tests), 'scripts/check-architecture-boundaries.test.mjs')
-        run: npm run test:architecture
-
-      - name: Run affected Windows script checks
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          SCRIPT_SELECTION: ${{ needs.test-scope.outputs.script-tests }}
-        run: npm run test -- --selection '[]' --script-selection "$SCRIPT_SELECTION"
-
       - name: Build production plugin
         run: npm run build
 
-      - name: Run affected real-process integration tests
+      - name: Run affected platform and real-process tests
         id: native-tests
         shell: bash
         env:
           TEST_SELECTION: ${{ needs.test-scope.outputs.cross-platform-tests }}
+          TEST_WORKERS: ${{ runner.os == 'Windows' && '4' || '3' }}
         run: |
           mkdir -p test-results
-          npm run test:cross-platform -- --selection "$TEST_SELECTION" --maxWorkers=3 --json --outputFile=test-results/native.json
+          npm run test:cross-platform -- --selection "$TEST_SELECTION" --maxWorkers="$TEST_WORKERS" --reporter=default --reporter=json --outputFile=test-results/native.json
 
       - name: Summarize native test timings
         if: always() && steps.native-tests.outcome != 'skipped' && needs.test-scope.outputs.cross-platform-tests != '[]'
-        run: node scripts/summarize-jest-results.mjs test-results/native.json test-results/native-timings
+        run: node scripts/summarize-vitest-results.mjs test-results/native.json test-results/native-timings
 
       - name: Upload native test timings
         if: always() && steps.native-tests.outcome != 'skipped' && needs.test-scope.outputs.cross-platform-tests != '[]'
         uses: actions/upload-artifact@v7
         with:
-          name: jest-native-timings-${{ runner.os }}-${{ strategy.job-index }}
+          name: vitest-native-timings-${{ runner.os }}-${{ strategy.job-index }}
           path: test-results/native-timings/
           if-no-files-found: error
           retention-days: 14
 
       - name: Run Windows Pi launch integration
         if: runner.os == 'Windows' && needs.test-scope.outputs.pi-windows == 'true'
-        run: npm run test:unit -- --runInBand tests/integration/providers/pi/runtime/PiSubprocess.windows.test.ts
+        run: npm run test:unit -- --maxWorkers=1 tests/integration/providers/pi/runtime/PiSubprocess.windows.test.ts
 
-  build-artifacts:
-    runs-on: ubuntu-latest
+  # Script checks do not need the build or native suites, so they run on their own runner in parallel.
+  windows-scripts:
+    needs: test-scope
+    if: needs.test-scope.outputs.cross-platform == 'true'
+    name: Windows script checks
+    runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -273,6 +353,108 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # The selected script suite normally includes this check; retain it for script-only changes.
+      - name: Run Windows architecture boundaries
+        if: needs.test-scope.outputs.script-tests != 'null' && !contains(fromJSON(needs.test-scope.outputs.script-tests), 'scripts/check-architecture-boundaries.test.mjs')
+        run: npm run test:architecture
+
+      - name: Run affected Windows script checks
+        shell: bash
+        env:
+          SCRIPT_SELECTION: ${{ needs.test-scope.outputs.script-tests }}
+        run: npm run test -- --selection '[]' --script-selection "$SCRIPT_SELECTION"
+
+  wsl-native:
+    needs: test-scope
+    if: needs.test-scope.outputs.wsl-windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      # WSL1 avoids a nested virtualization requirement on hosted runners.
+      # This verifies launch/filesystem/env mechanics, not WSL2 NAT networking.
+      # Importing a small provisioned ubuntu-base rootfs is much faster than installing the full Ubuntu WSL image:
+      # WSL1 import time scales with file count. Bump the key's base version together with the URL below.
+      - name: Restore provisioned WSL rootfs
+        id: rootfs
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/claudian-wsl-rootfs.tar
+          key: wsl-rootfs-ubuntu-base-24.04.5-${{ hashFiles('.github/wsl/provision-rootfs.sh') }}
+
+      # Windows dependencies and the WSL distro are independent, so install them concurrently.
+      - name: Install dependencies and import WSL distro
+        shell: pwsh
+        env:
+          ROOTFS_HIT: ${{ steps.rootfs.outputs.cache-hit }}
+        run: |
+          $npmLog = Join-Path $env:RUNNER_TEMP 'npm-ci.log'
+          $npmErr = Join-Path $env:RUNNER_TEMP 'npm-ci.err.log'
+          $npm = Start-Process -FilePath npm.cmd -ArgumentList ci -NoNewWindow -PassThru -RedirectStandardOutput $npmLog -RedirectStandardError $npmErr
+          # Without a cached handle, ExitCode is unavailable after the process exits.
+          $null = $npm.Handle
+          $distro = 'claudian-ci'
+          $rootfs = Join-Path $env:RUNNER_TEMP 'claudian-wsl-rootfs.tar'
+          $location = Join-Path $env:RUNNER_TEMP 'claudian-wsl'
+          if ($env:ROOTFS_HIT -eq 'true') {
+            wsl --import $distro $location $rootfs --version 1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            $base = Join-Path $env:RUNNER_TEMP 'ubuntu-base.tar.gz'
+            curl.exe --fail --silent --show-error --location --retry 3 -o $base https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.5/release/ubuntu-base-24.04.5-base-amd64.tar.gz
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ((Get-FileHash -Algorithm SHA256 $base).Hash -ne 'E77B6F10C2590CEF872B33EE9F635A0E3FD1F57FB074C0E52B5C7F56147A0C86') { throw 'ubuntu-base checksum mismatch' }
+            wsl --import $distro $location $base --version 1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            # Windows checkouts may use CRLF line endings; strip them before sh parses the script.
+            Get-Content -Raw .github/wsl/provision-rootfs.sh | wsl --distribution $distro --exec /bin/sh -c "tr -d '\r' | /bin/sh"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            wsl --export $distro $rootfs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          wsl --set-default $distro
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'for c in bash zsh csh tcsh fish python3 node; do command -v "$c"; done; node --version; /opt/claudian-opencode-v2/opencode --version' | wsl --exec /bin/sh -c "tr -d '\r' | /bin/sh -e"
+          $wslExit = $LASTEXITCODE
+          $npm.WaitForExit()
+          Get-Content $npmLog, $npmErr
+          if ($wslExit -ne 0) { exit $wslExit }
+          if ($npm.ExitCode -ne 0) { exit $npm.ExitCode }
+
+      - name: Save provisioned WSL rootfs
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/claudian-wsl-rootfs.tar
+          key: ${{ steps.rootfs.outputs.cache-primary-key }}
+
+      - name: Exercise native Windows to WSL execution
+        shell: pwsh
+        env:
+          CLAUDIAN_REQUIRE_WSL: '1'
+          CLAUDIAN_OPENCODE_WSL_CLI: /opt/claudian-opencode-v2/opencode
+          # Space-separated repository paths of the affected WSL suites.
+          WSL_TESTS: ${{ join(fromJSON(needs.test-scope.outputs.wsl-suites), ' ') }}
+        # PowerShell, unlike Git Bash, passes the POSIX CLI path through unconverted.
+        run: npm run test:unit -- --maxWorkers=3 @($env:WSL_TESTS -split ' ')
+
+  build-artifacts:
+    needs: test-scope
+    if: needs.test-scope.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node and dependencies
+        uses: ./.github/actions/setup-dependencies
 
       - name: Validate release version
         if: startsWith(github.ref, 'refs/tags/')
@@ -297,17 +479,27 @@ jobs:
           retention-days: 14
 
   build:
-    needs: [quality, test, build-artifacts]
+    needs: [dependencies, dependency-audit, typecheck, lint, test, build-artifacts, test-scope, wsl-native]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require quality, tests and production artifacts
+      - name: Require checks, selected tests and production artifacts
         env:
-          QUALITY_RESULT: ${{ needs.quality.result }}
+          SCOPE_RESULT: ${{ needs.test-scope.result }}
+          AUDIT_RESULT: ${{ needs.dependency-audit.result }}
+          TYPECHECK_RESULT: ${{ needs.typecheck.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
           TEST_RESULT: ${{ needs.test.result }}
-          BUILD_RESULT: ${{ needs.build-artifacts.result }}
+          DEPENDENCIES: ${{ needs.test-scope.outputs.dependencies }}:${{ needs.dependencies.result }}
+          BUILD: ${{ needs.test-scope.outputs.build }}:${{ needs.build-artifacts.result }}
+          WSL: ${{ needs.test-scope.outputs.wsl-windows }}:${{ needs.wsl-native.result }}
         run: |
-          test "$QUALITY_RESULT" = success
+          test "$SCOPE_RESULT" = success
+          test "$AUDIT_RESULT" = success
+          test "$TYPECHECK_RESULT" = success
+          test "$LINT_RESULT" = success
           test "$TEST_RESULT" = success
-          test "$BUILD_RESULT" = success
+          for job in "$DEPENDENCIES" "$BUILD" "$WSL"; do
+            case "$job" in true:success | false:skipped) ;; *) echo "Unexpected selection:result $job"; exit 1 ;; esac
+          done

@@ -1,40 +1,42 @@
-import '@/providers';
+// @test-ci {"inputs":["tests/fixtures/providers/grok/runtime/models-list.json","tests/fixtures/providers/grok/runtime/models-list-byok.json"]}
 
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
+
 import { getProviderSettingsSnapshotWithModel } from '@/core/providers/conversationModel';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
 import { normalizeGrokSessionModelMetadata, normalizeGrokSetModelMetadata } from '@/providers/grok/execution/GrokSessionModelMetadata';
+import { grokProviderRegistration } from '@/providers/grok/registration';
 import { GrokModelCatalogCoordinator } from '@/providers/grok/runtime/GrokModelCatalogCoordinator';
 import { createGrokModels } from '@/providers/grok/runtime/GrokModels';
 import { getGrokProviderSettings, projectGrokModelSettings } from '@/providers/grok/settings';
 import { grokChatUIConfig } from '@/providers/grok/ui/GrokChatUIConfig';
 
+registerProviderModules([claudeProviderRegistration, grokProviderRegistration]);
+
 const nativeCatalog = JSON.parse(readFileSync(
   path.resolve('tests/fixtures/providers/grok/runtime/models-list.json'), 'utf8',
 ));
 
-function makeCatalog(selectedIds: string[] = [], response = nativeCatalog) {
+async function makeCatalog(selectedIds: string[] = [], response = nativeCatalog) {
   const settings: Record<string, unknown> = {
     providerConfigs: { grok: { enabled: true, visibleModels: selectedIds } },
   };
-  const host = {
-    settings,
-    mutateSettings: async (mutation: (settings: Record<string, unknown>) => void) => mutation(settings),
-    mutateSettingsConditionally: async (mutation: (settings: Record<string, unknown>) => boolean) => mutation(settings),
-    notifyProviderChatOptionsChanged: jest.fn(),
-  } as unknown as ProviderHost;
+  const host = (await createProviderHostFixture({ settings, overrides: { notifyProviderChatOptionsChanged: vi.fn() } })).host;
   const discovered = normalizeGrokSessionModelMetadata({ models: response.result });
-  const coordinator = new GrokModelCatalogCoordinator(host, {
+  const runtime = host.getRuntimeHost('grok');
+  const coordinator = new GrokModelCatalogCoordinator(runtime, {
     discoverCatalog: async () => ({ kind: 'completed', fingerprint: 'native', defaultModelId: discovered.currentModelId, models: discovered.models }),
   });
-  return { settings, coordinator, catalog: createGrokModels(host, coordinator) };
+  return { settings: host.settings, coordinator, catalog: createGrokModels(runtime, coordinator) };
 }
 
 it('retains discovered effort choices through selection, persistence, and reload', async () => {
-  const { settings, coordinator, catalog } = makeCatalog();
+  const { settings, coordinator, catalog } = (await makeCatalog());
   await catalog.refresh();
   // Discovery must remain available in memory, but only selected models go to disk.
   expect(Object.values(projectGrokModelSettings(settings).selectedModelsByHost as Record<string, { models: unknown[] }>)
@@ -50,7 +52,7 @@ it('retains discovered effort choices through selection, persistence, and reload
 });
 
 it.each(['session', 'set-model'] as const)('preserves discovered efforts when %s metadata omits reasoning', async source => {
-  const { settings, coordinator, catalog } = makeCatalog(['grok-4.6']);
+  const { settings, coordinator, catalog } = (await makeCatalog(['grok-4.6']));
   await catalog.refresh();
   grokChatUIConfig.applyReasoningSelection?.('grok/grok-4.6', 'xhigh', settings);
   const metadata = { totalContextTokens: 500_000, agentType: 'grok-build-plan' };
@@ -71,7 +73,7 @@ it.each(['session', 'set-model'] as const)('preserves discovered efforts when %s
 
 it.each([{ reasoningEfforts: [] }, { supportsReasoningEffort: false }])(
   'clears choices when native metadata explicitly disables reasoning: %j', async metadata => {
-    const { settings, coordinator, catalog } = makeCatalog(['grok-4.6']);
+    const { settings, coordinator, catalog } = (await makeCatalog(['grok-4.6']));
     await catalog.refresh();
     await coordinator.mergeLiveModels([
       normalizeGrokSetModelMetadata('grok-4.6', { model: metadata })!,
@@ -87,7 +89,7 @@ it.each([undefined, 'low'])('projects the selected model default or preference (
   const byokCatalog = JSON.parse(readFileSync(
     path.resolve('tests/fixtures/providers/grok/runtime/models-list-byok.json'), 'utf8',
   ));
-  const { settings, coordinator, catalog } = makeCatalog(['grok-4.7'], byokCatalog);
+  const { settings, coordinator, catalog } = (await makeCatalog(['grok-4.7'], byokCatalog));
   await catalog.refresh();
   Object.assign(settings, {
     model: 'haiku', effortLevel: 'high',

@@ -15,11 +15,11 @@ import {
   SessionSnapshotState,
   type SteerableExecutionSession,
 } from '@/core/execution';
-import type { SystemPromptSettings } from '@/core/prompt/mainAgent';
 import { ProviderModelUnavailableError } from '@/core/providers/models/ProviderModelUnavailableError';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 import type { StreamChunk } from '@/core/types';
 import { createTurnStats, isTokenCount } from '@/core/types';
+import { resolveCodexReasoningSummary } from '@/providers/codex/config';
 import {
   deriveCodexSessionsRootFromSessionPath,
   findCodexSessionFileAsync,
@@ -41,12 +41,10 @@ import { assertCodexModelAvailable } from '@/providers/codex/runtime/CodexModelA
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
 import { CodexRPCResponseError } from '@/providers/codex/runtime/CodexRPCTransport';
 import {
-  getCodexProviderSettings,
-  getEffectiveCodexReasoningSummary,
-} from '@/providers/codex/settings';
-import type {
-  CodexPendingForkTarget,
-  CodexProviderState,
+  clearCodexResumeState,
+  type CodexPendingForkTarget,
+  type CodexProviderState,
+  getCodexState,
 } from '@/providers/codex/types';
 
 import type { CodexActiveRun } from './CodexActiveRun';
@@ -121,10 +119,11 @@ export class CodexExecutionSession
   private sessionFilePath: string | null;
   private sessionFileLookupThreadId: string | null = null;
   private workspaceDependencyToolVersion: number | null;
+  private sessionToolVersion: number | null;
   private nativeConversationContextEstablished: boolean;
 
   constructor(
-    private readonly plugin: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly config: ProviderSessionConfig,
     private readonly runtime: CodexAppServerRuntime,
   ) {
@@ -137,7 +136,7 @@ export class CodexExecutionSession
       projectProviderState: state => this.#projectProviderState(state),
     });
     this.connection = new CodexSessionConnection({
-      vaultWorkingDirectory: config.vaultWorkingDirectory,
+      workingDirectory: config.workingDirectory,
       observer: {
         notification: (method, params) => this.handleNotification(method, params),
         serverRequest: (id, method, params) => this.serverRequestRouter.handleServerRequest(id, method, params),
@@ -147,18 +146,21 @@ export class CodexExecutionSession
       onExit: () => this.#handleConnectionExit(),
       onRetired: () => this.#releaseRetiredConnection(),
       onRelease: () => {
+        this.serverRequestRouter.abortAll('session-disposed');
         this.subagents.clear();
         this.threads.unload();
         this.serverRequestRouter.setDynamicToolRegistry(null);
       },
-    });
+    }, config.sessionTools);
     this.threads = new CodexThreadBinder(
       {
         threadResumed: thread => this.subagents.seed(thread),
         threadStarted: (active, identity) => {
           this.workspaceDependencyToolVersion = identity.workspaceDependencyToolVersion;
+          this.sessionToolVersion = identity.sessionToolVersion;
           this.threadId = identity.threadId;
           this.sessionFilePath = identity.sessionFilePath;
+          this.#retainUnboundTranscript();
           this.#publishNativeOwnershipSnapshot(active);
         },
         forkTargetAdopted: (active, target) => this.#adoptPendingForkTarget(active, target),
@@ -166,7 +168,8 @@ export class CodexExecutionSession
           for (const key of CODEX_CONSUMED_FORK_STATE_KEYS) {
             this.state.deleteProviderStateValue(key);
           }
-          this.state.setStatus('idle');
+          // Publishes the new provider state mid-run; the run keeps executing.
+          this.state.bumpRevision();
           this.#emitSnapshot(active);
         },
       },
@@ -188,16 +191,26 @@ export class CodexExecutionSession
       ?? null;
     this.workspaceDependencyToolVersion =
       codexState.workspaceDependencyToolVersion ?? null;
+    this.sessionToolVersion = codexState.sessionToolVersion ?? null;
     this.serverRequestRouter = new CodexExecutionServerRequestRouter(
       this.sessionInstanceId,
       config.interactionPort,
       (threadId, turnId) => this.turn.observe(threadId, turnId),
+      () => {
+        const active = this.activeRun;
+        if (!active?.nativeThreadId || !active.nativeTurnId || active.run.isTerminal) return null;
+        return {
+          localTurnId: active.run.turnId,
+          nativeThreadId: active.nativeThreadId,
+          nativeTurnId: active.nativeTurnId,
+          cancellation: active.cancellation,
+          toolPolicy: active.toolPolicy,
+        };
+      },
     );
     this.completionRecovery = new CodexCompletionRecovery({
-      lifecycleGeneration: () => this.lifecycleGeneration,
-      activeRun: () => this.activeRun,
       transport: () => this.connection.transport,
-      replayNotification: (method, params) => this.handleNotification(method, params),
+      replayNotification: (method, params) => this.connection.scope?.notification(method, params),
       fail: (active, message) => this.#finishError(active, 'provider', message, true),
     });
     this.turn = new CodexTurnBinding(
@@ -205,7 +218,6 @@ export class CodexExecutionSession
         activeRun: () => this.activeRun,
         markNativeContextEstablished: active => this.#markNativeConversationContextEstablished(active),
       },
-      this.serverRequestRouter,
       this.completionRecovery,
     );
   }
@@ -227,6 +239,7 @@ export class CodexExecutionSession
         },
       }),
       cancellation: new AbortController(),
+      toolPolicy: request.toolPolicy,
       nativeThreadId: null,
       nativeTurnId: null,
       nativeStartSubmitted: false,
@@ -263,7 +276,7 @@ export class CodexExecutionSession
   }
 
   async steer(request: ProviderExecutionRequest): Promise<boolean> {
-    try { assertCodexModelAvailable(this.plugin.settings, request.configuration.model); }
+    try { assertCodexModelAvailable(this.host, request.configuration.model); }
     catch (error) { if (error instanceof ProviderModelUnavailableError) return false; throw error; }
     const active = this.activeRun;
     const scope = this.connection.scope;
@@ -342,8 +355,8 @@ export class CodexExecutionSession
   ): Promise<void> {
     const generation = this.lifecycleGeneration;
     try {
-      assertCodexModelAvailable(this.plugin.settings, request.configuration.model);
-      let settings = resolveCodexTurnSettings(this.plugin.settings);
+      assertCodexModelAvailable(this.host, request.configuration.model);
+      let settings = resolveCodexTurnSettings(this.host);
       let model = resolveCodexTurnModel(request, settings);
       if (!model) {
         this.#finishError(
@@ -387,21 +400,20 @@ export class CodexExecutionSession
       await this.#ensureConnection(generation, active.cancellation.signal);
       if (!this.#isRunCurrent(active, generation)) return;
       // Connection acquisition can wait out a settings transition.
-      settings = resolveCodexTurnSettings(this.plugin.settings);
+      settings = resolveCodexTurnSettings(this.host);
       model = resolveCodexTurnModel(request, settings)!;
       effort = resolveCodexTurnReasoningEffort(request, settings, model);
 
       const policy = resolveCodexTurnPolicy(request, settings);
       const serviceTier = resolveCodexServiceTier(request, model, settings);
       const replayConversationHistory = !this.nativeConversationContextEstablished;
-      this.turn.setToolPolicy(request.toolPolicy);
       const thread = await this.threads.ensureThread(
         active,
         {
           model,
           policy,
           serviceTier,
-          baseInstructions: resolveCodexBaseInstructions(request, this.#getSystemPromptSettings()),
+          baseInstructions: resolveCodexBaseInstructions(request),
           persistExtendedHistory: this.#resolveNativePersistence(),
           toolPolicy: request.toolPolicy,
         },
@@ -440,7 +452,7 @@ export class CodexExecutionSession
         this.connection.targetWorkingDirectory(),
       ));
 
-      assertCodexModelAvailable(this.plugin.settings, request.configuration.model);
+      assertCodexModelAvailable(this.host, request.configuration.model);
       if (compact && !compact.instructions) {
         if (!await this.#allowRequestedTurn(active, generation)) return;
         active.nativeStartSubmitted = true;
@@ -462,7 +474,6 @@ export class CodexExecutionSession
 
       const turnInput = buildCodexTurnPrompt(
         request,
-        hostPath => this.#mapRequiredHostPath(hostPath),
         thread.forkCheckpoint,
         replayConversationHistory,
       );
@@ -499,8 +510,8 @@ export class CodexExecutionSession
         model,
         serviceTier,
         effort,
-        summary: getEffectiveCodexReasoningSummary(settings, model),
-        personality: getCodexProviderSettings(settings).responseStyle,
+        summary: resolveCodexReasoningSummary(settings.codex, model),
+        personality: settings.codex.responseStyle,
         ...(sandboxPolicy ? { sandboxPolicy } : {}),
         collaborationMode,
       }, this.inputBundles.handOff(bundle));
@@ -508,6 +519,7 @@ export class CodexExecutionSession
         this.threads.confirmSandboxOverride(sandboxRevision, policy.sandbox);
       }
       this.#markNativeConversationContextEstablished(active);
+      // A deferred cancellation still releases this native turn when it settles.
       if (active.run.isCancellationRequested) {
         active.nativeTurnId = result.turn.id;
       }
@@ -652,7 +664,8 @@ export class CodexExecutionSession
   ): void {
     this.threadId = target.threadId;
     this.sessionFilePath = target.sessionFilePath ?? null;
-    this.state.setStatus('idle');
+    // Publishes the adopted target mid-run; the run keeps executing.
+    this.state.bumpRevision();
     this.#emitSnapshot(active);
   }
 
@@ -699,6 +712,7 @@ export class CodexExecutionSession
 
   #finishCancelled(active: CodexActiveRun): void {
     if (this.activeRun !== active || active.run.isTerminal) return;
+    // A deferred cancellation may settle after the process exited; its invalidation stands.
     this.#finishRunState(active);
     active.run.finish({
       type: 'cancelled',
@@ -740,11 +754,15 @@ export class CodexExecutionSession
   }
 
   #finishRunState(active: CodexActiveRun): void {
-    this.state.setStatus('idle');
+    this.state.settleActivity(false);
     this.#emitSnapshot(active);
   }
 
   #releaseRun(active: CodexActiveRun): void {
+    if (active.nativeThreadId && active.nativeTurnId) {
+      this.connection.scope?.releaseTurn(active.nativeThreadId, active.nativeTurnId);
+    }
+    active.cancellation.abort();
     this.completionRecovery.cancel();
     this.turn.release();
     this.serverRequestRouter.abortAll(
@@ -834,15 +852,11 @@ export class CodexExecutionSession
   }
 
   #publishNativeOwnershipSnapshot(active: CodexActiveRun): void {
-    const status = this.state.status;
     const isCurrentExecution = (
       this.activeRun === active
       && !active.run.isTerminal
       && !active.run.isCancellationRequested
-      && !this.disposed
-      && status !== 'invalidated'
-      && status !== 'disposed'
-      && status !== 'cancelling'
+      && this.state.status !== 'invalidated'
     );
     if (isCurrentExecution) {
       this.state.setStatus('executing');
@@ -853,6 +867,27 @@ export class CodexExecutionSession
       this.#emitSnapshot(active);
     } else {
       this.#emitSessionState();
+    }
+  }
+
+  /**
+   * A fresh thread replaces the stored transcript locator. One left without a thread binding
+   * (e.g. by an older missing-thread reset) still holds the earlier turns, so keep it as history.
+   */
+  #retainUnboundTranscript(): void {
+    const stored = getCodexState(this.state.providerState);
+    if (!stored.sessionFilePath || stored.threadId || stored.forkSource) return;
+    const draft = { sessionId: null, providerState: { ...this.state.providerState } };
+    if (!clearCodexResumeState(draft)) return;
+    this.state.setProviderStateValue('previousSegments', draft.providerState.previousSegments);
+    // Recorded deletes override projection, so drop only stale values the new thread does not replace.
+    const replaced = {
+      sessionFilePath: this.sessionFilePath,
+      sessionToolVersion: this.sessionToolVersion,
+      workspaceDependencyToolVersion: this.workspaceDependencyToolVersion,
+    };
+    for (const [key, value] of Object.entries(replaced)) {
+      if (value === null && this.state.hasProviderStateValue(key)) this.state.deleteProviderStateValue(key);
     }
   }
 
@@ -879,19 +914,11 @@ export class CodexExecutionSession
               this.workspaceDependencyToolVersion,
           }
         : {}),
+      ...(this.sessionToolVersion !== null ? { sessionToolVersion: this.sessionToolVersion } : {}),
       ...(pendingForkTarget
         ? { pendingForkTarget: { ...pendingForkTarget } }
         : {}),
     } satisfies CodexProviderState & Record<string, unknown>;
-  }
-
-  #getSystemPromptSettings(): SystemPromptSettings {
-    return {
-      mediaFolder: this.plugin.settings.mediaFolder,
-      customPrompt: this.plugin.settings.systemPrompt,
-      vaultPath: this.config.vaultWorkingDirectory,
-      userName: this.plugin.settings.userName,
-    };
   }
 
   #resolveNativePersistence(): boolean | undefined {

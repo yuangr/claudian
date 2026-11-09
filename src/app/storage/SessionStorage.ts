@@ -12,6 +12,7 @@ import {
 import type { VaultFileAdapter } from '@/core/storage/VaultFileAdapter';
 import type {
   ConversationModelRecoverySource,
+  ConversationOrigin,
   SessionMetadata,
 } from '@/core/types';
 import { mapWithConcurrency } from '@/utils/concurrency';
@@ -255,6 +256,7 @@ export class SessionStorage implements SessionMetadataReader {
     const rawMetadata = parsed as Record<string, unknown>;
     if (
       rawMetadata.id !== expectedId
+      || typeof rawMetadata.title !== 'string'
       || typeof rawMetadata.id !== 'string'
       || !isValidSessionMetadataId(rawMetadata.id)
     ) {
@@ -274,8 +276,14 @@ export class SessionStorage implements SessionMetadataReader {
       modelRecoverySource: rawModelRecoverySource,
       linkedContentPath: _rawLinkedContentPath,
       currentNote: _rawCurrentNote,
+      projectId: rawProjectId,
+      origin: rawOrigin,
       ...metadataFields
     } = rawMetadata;
+    const origin = parseConversationOrigin(rawOrigin);
+    const projectId = typeof rawProjectId === 'string' && isValidSessionMetadataId(rawProjectId)
+      ? rawProjectId
+      : undefined;
     const selectedModel = typeof rawSelectedModel === 'string'
       ? rawSelectedModel
       : undefined;
@@ -286,6 +294,8 @@ export class SessionStorage implements SessionMetadataReader {
       ...(selectedModel !== undefined ? { selectedModel } : {}),
       ...(modelRecoverySource ? { modelRecoverySource } : {}),
       ...(linkedContent.path ? { linkedContentPath: linkedContent.path } : {}),
+      ...(projectId !== undefined ? { projectId } : {}),
+      ...(origin ? { origin } : {}),
       lastActivityAt,
     } as unknown as SessionMetadata;
     const needsMigration = !Number.isFinite(rawMetadata.lastActivityAt)
@@ -294,7 +304,9 @@ export class SessionStorage implements SessionMetadataReader {
       || 'lastResponseAt' in rawMetadata
       || linkedContent.needsMigration
       || (rawSelectedModel !== undefined && selectedModel === undefined)
-      || (rawModelRecoverySource !== undefined && modelRecoverySource === undefined);
+      || (rawModelRecoverySource !== undefined && modelRecoverySource === undefined)
+      || (rawProjectId !== undefined && projectId === undefined)
+      || (rawOrigin !== undefined && origin === undefined);
     const record = { metadata, needsMigration, source };
     if (version) this.readVersions.set(record, version);
     return record;
@@ -370,4 +382,12 @@ export class SessionStorage implements SessionMetadataReader {
     }
     return pathsById;
   }
+}
+
+function parseConversationOrigin(value: unknown): ConversationOrigin | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const { kind, conversationId } = value as Record<string, unknown>;
+  if (kind !== 'fork' && kind !== 'session-tool') return undefined;
+  if (typeof conversationId !== 'string' || !isValidSessionMetadataId(conversationId)) return undefined;
+  return { kind, conversationId };
 }

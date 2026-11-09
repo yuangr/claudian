@@ -1,9 +1,6 @@
 import * as obsidian from 'obsidian';
 
 import {
-  extractBoolean,
-  extractString,
-  extractStringArray,
   parseFrontmatter,
 } from '@/features/agent-skills/frontmatter';
 
@@ -45,7 +42,7 @@ key: value
   });
 
   it('handles empty frontmatter block', () => {
-    jest.spyOn(obsidian, 'parseYaml').mockReturnValueOnce({});
+    vi.spyOn(obsidian, 'parseYaml').mockReturnValueOnce({});
     const content = `---
 
 ---
@@ -80,89 +77,9 @@ Prompt`;
   });
 });
 
-describe('extractString', () => {
-  it('extracts string value', () => {
-    expect(extractString({ key: 'hello' }, 'key')).toBe('hello');
-  });
-
-  it('returns undefined for missing key', () => {
-    expect(extractString({}, 'key')).toBeUndefined();
-  });
-
-  it('returns undefined for non-string value', () => {
-    expect(extractString({ key: 123 }, 'key')).toBeUndefined();
-  });
-
-  it('returns undefined for empty string', () => {
-    expect(extractString({ key: '' }, 'key')).toBeUndefined();
-  });
-});
-
-describe('extractStringArray', () => {
-  it.each([
-    ['null', null],
-    ['empty string', ''],
-    ['whitespace-only string', '   '],
-  ])('returns undefined for a %s field', (_label, value) => {
-    expect(extractStringArray({ tools: value }, 'tools')).toBeUndefined();
-  });
-
-  it('extracts YAML array while trimming and filtering entries', () => {
-    expect(extractStringArray({ tools: ['  Read  ', '', '  Grep  ', ''] }, 'tools'))
-      .toEqual(['Read', 'Grep']);
-  });
-
-  it('splits comma-separated string', () => {
-    expect(extractStringArray({ tools: 'Read, Grep, Glob' }, 'tools'))
-      .toEqual(['Read', 'Grep', 'Glob']);
-  });
-
-  it('wraps single string in array', () => {
-    expect(extractStringArray({ tools: 'Read' }, 'tools'))
-      .toEqual(['Read']);
-  });
-
-  it('returns undefined for missing key', () => {
-    expect(extractStringArray({}, 'tools')).toBeUndefined();
-  });
-
-  it('returns undefined for non-string/array value', () => {
-    expect(extractStringArray({ tools: 123 }, 'tools')).toBeUndefined();
-    expect(extractStringArray({ tools: true }, 'tools')).toBeUndefined();
-  });
-
-  it('filters empty entries from comma-separated string', () => {
-    expect(extractStringArray({ tools: 'Read,,Grep,' }, 'tools'))
-      .toEqual(['Read', 'Grep']);
-  });
-
-  it('converts non-string array elements to strings', () => {
-    expect(extractStringArray({ tools: [123, 'Read'] }, 'tools'))
-      .toEqual(['123', 'Read']);
-  });
-});
-
-describe('extractBoolean', () => {
-  it('extracts true', () => {
-    expect(extractBoolean({ flag: true }, 'flag')).toBe(true);
-  });
-
-  it('extracts false', () => {
-    expect(extractBoolean({ flag: false }, 'flag')).toBe(false);
-  });
-
-  it('returns undefined for missing key', () => {
-    expect(extractBoolean({}, 'flag')).toBeUndefined();
-  });
-
-  it('returns undefined for non-boolean', () => {
-    expect(extractBoolean({ flag: 'yes' }, 'flag')).toBeUndefined();
-  });
-});
-
 describe('parseFrontmatter non-object return', () => {
   it('returns null when parseYaml returns a string', () => {
-    jest.spyOn(obsidian, 'parseYaml').mockReturnValueOnce('just a string' as any);
+    vi.spyOn(obsidian, 'parseYaml').mockReturnValueOnce('just a string');
     const content = `---
 just a string
 ---
@@ -171,7 +88,7 @@ Body`;
   });
 
   it('returns null when parseYaml returns a number', () => {
-    jest.spyOn(obsidian, 'parseYaml').mockReturnValueOnce(42 as any);
+    vi.spyOn(obsidian, 'parseYaml').mockReturnValueOnce(42);
     const content = `---
 42
 ---
@@ -182,13 +99,13 @@ Body`;
 
 describe('parseFrontmatter fallback parser', () => {
   beforeEach(() => {
-    jest.spyOn(obsidian, 'parseYaml').mockImplementation(() => {
+    vi.spyOn(obsidian, 'parseYaml').mockImplementation(() => {
       throw new Error('YAML parse error');
     });
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('falls back to line-by-line parsing when parseYaml throws', () => {

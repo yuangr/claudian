@@ -1,14 +1,17 @@
-/** @jest-environment jsdom */
-import '@/providers';
+/** @vitest-environment jsdom */
 
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
 import { parseGrokHistoryContent } from '@test/helpers/providers/grokHistory';
+import { writeGrokCatalog } from '@test/helpers/providers/grokSettings';
 import { testDate } from '@test/helpers/testClock';
 import { fireEvent, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
 import { Component, Platform } from 'obsidian';
 
 import type { ProviderExecutionEvent, ProviderSessionConfig } from '@/core/execution';
 import type { ProviderHost } from '@/core/providers/ProviderHost';
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ChatMessage, StreamChunk, ToolCallInfo } from '@/core/types';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
@@ -18,8 +21,11 @@ import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { StreamController } from '@/features/chat/turns/StreamController';
 import type { ACPSessionNotification } from '@/providers/acp';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
 import { GrokExecutionBackend, type GrokExecutionNativeConnection } from '@/providers/grok/execution/GrokExecutionBackend';
-import { updateCurrentGrokCatalog } from '@/providers/grok/settings';
+import { grokProviderRegistration } from '@/providers/grok/registration';
+
+registerProviderModules([claudeProviderRegistration, grokProviderRegistration]);
 
 HTMLElement.prototype.empty = function () { this.replaceChildren(); };
 HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
@@ -40,12 +46,9 @@ let liveEvents: ProviderExecutionEvent[] = [];
 /** Native `session/update` payloads for one tool call, as Grok 1.0.46 emits them (paths sanitized). */
 type NativeToolUpdates = Array<Record<string, unknown>>;
 
-function createGrokHost(): ProviderHost {
-  const host = {
-    getResolvedProviderCliPath: async () => 'grok',
-    settings: { model: 'grok/grok-4', providerConfigs: { grok: { enabled: true, visibleModels: ['grok-4'] } } },
-  } as unknown as ProviderHost;
-  updateCurrentGrokCatalog(host.settings, {
+async function createGrokHost(): Promise<ProviderHost> {
+  const host = (await createProviderHostFixture({ settings: { model: 'grok/grok-4', providerConfigs: { grok: { enabled: true, visibleModels: ['grok-4'] } } }, overrides: { getResolvedProviderCliPath: async () => 'grok' } })).host;
+  writeGrokCatalog(host.settings, {
     defaultModelId: 'grok-4', fingerprint: 'fixture', refreshedAt: 1,
     models: [{ rawId: 'grok-4', displayName: 'Grok 4', supportsReasoning: false, reasoningEfforts: [] }],
   });
@@ -73,19 +76,19 @@ async function restoreLive(updates: NativeToolUpdates): Promise<ToolCallInfo> {
     shutdown: async () => undefined,
   };
   const config: ProviderSessionConfig = {
-    interactionPort: { askUserQuestion: jest.fn(), dismissInteraction: jest.fn(), requestApproval: jest.fn() },
+    interactionPort: { askUserQuestion: vi.fn(), dismissInteraction: vi.fn(), requestApproval: vi.fn() },
     lifecycle: 'persistent',
     nativePersistence: 'enabled',
-    vaultWorkingDirectory: '/workspace',
+    workingDirectory: '/workspace',
   };
-  const session = new GrokExecutionBackend(createGrokHost(), { nativeFactory: { create: () => native } })
+  const session = new GrokExecutionBackend((await createGrokHost()).getRuntimeHost('grok'), { nativeFactory: { create: () => native } })
     .createSession(config);
   const output: ProviderExecutionEvent[] = [];
   try {
     for await (const event of session.execute({
       configuration: {
         model: 'grok/grok-4', permissionMode: 'normal', reasoning: null,
-        systemInstructions: { kind: 'explicit', instructions: '' },
+        systemInstructions: { kind: 'explicit', purpose: 'title', instructions: '' },
       },
       input: [{ type: 'text', text: 'run the tool' }],
       signal: new AbortController().signal,
@@ -99,8 +102,8 @@ async function restoreLive(updates: NativeToolUpdates): Promise<ToolCallInfo> {
   const messages = document.body.createDiv();
   const state = new ChatState();
   // Vault refresh after file edits is an Obsidian boundary; this stub keeps it inert.
-  const vault = { adapter: { basePath: '/workspace', list: async () => ({ files: [], folders: [] }) }, getAbstractFileByPath: () => null };
-  const plugin = { app: { vault }, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  vi.spyOn(plugin.app.vault.adapter, 'list').mockImplementation(async () => ({ files: [], folders: [] }));
   const renderer = new MessageRenderer(plugin, new Component(), messages);
   const stream = new StreamController({ plugin, state, renderer,
     subagentManager: new SubagentManager(() => undefined), getMessagesEl: () => messages, updateQueueIndicator: () => undefined,
@@ -200,6 +203,22 @@ function mcpLookupUpdates(): NativeToolUpdates {
 }
 
 describe.each(['live', 'history'] as const)('%s Grok tool presentation', mode => {
+  it.each([{}, { rawInput: null, rawOutput: null }])('keeps a prior directory result across a v1 no-change update: %j', update => {
+    return (async () => {
+      const tool = await restore(mode, [
+        { sessionUpdate: 'tool_call', toolCallId: 'ls-null', title: 'list_dir', rawInput: { target_directory: 'notes' } },
+        { sessionUpdate: 'tool_call_update', toolCallId: 'ls-null', rawOutput: { type: 'ListDir', Content: { content: '- /workspace/\n  - kept.md', absolute_root_path: '/workspace' } } },
+        { sessionUpdate: 'tool_call_update', toolCallId: 'ls-null', status: 'completed', ...update },
+      ]);
+      const block = renderStoredToolCall(document.body.createDiv(), tool);
+      expand(block, /^LS: notes/);
+      expect(tool.input).toMatchObject({ path: 'notes' });
+      expect(tool.providerPayload).toMatchObject({ rawInput: { target_directory: 'notes' }, rawOutput: { type: 'ListDir' } });
+      expect(lines(block)).toEqual(['- /workspace/', '  - kept.md']);
+      expect((await axe(block)).violations).toEqual([]);
+    })();
+  });
+
   it('shows terminal output without the pre-execution description or ANSI escapes', async () => {
     const plain = 'total 16\ndrwxr-xr-x@ 4 user wheel 128 .\n-rw-r--r--@ 1 user wheel 32 notes.txt\n  0%100% done\n';
     const colored = 'total 16\ndrwxr-xr-x@ 4 user wheel 128 \u001b[34m.\u001b[39;49m\u001b[0m\n-rw-r--r--@ 1 user wheel 32 notes.txt\n\r  0%\r100% done\n';
@@ -524,10 +543,12 @@ describe.each(['live', 'history'] as const)('%s Grok tool presentation', mode =>
     expect(within(block).getByRole('img', { name: 'image/png' }).getAttribute('src')).toBe(`data:image/png;base64,${data}`);
   });
 
-  it('shows image-only MCP results without the encoded payload', async () => {
+  it('shows image-only MCP results without stale progress or the encoded payload', async () => {
     const data = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDK+mmyAAAAABJRU5ErkJggg==';
     const tool = await restore(mode, [
       { sessionUpdate: 'tool_call', toolCallId: 'image-only', title: 'use_tool', rawInput: { tool_name: 'probe__snapshot', tool_input: {} } },
+      { sessionUpdate: 'tool_call_update', toolCallId: 'image-only', status: 'in_progress',
+        content: [{ type: 'content', content: { type: 'text', text: 'Preparing screenshot...' } }] },
       { sessionUpdate: 'tool_call_update', toolCallId: 'image-only', status: 'completed', rawOutput: { type: 'MCP', tool_name: 'snapshot', server_name: 'probe',
         output: { OkayOutput: `data:image/png;base64,${data}` } } },
     ]);
@@ -536,7 +557,10 @@ describe.each(['live', 'history'] as const)('%s Grok tool presentation', mode =>
     expand(block, /^mcp__probe__snapshot/);
     expect(within(block).getByRole('img', { name: 'image/png' }).getAttribute('src')).toBe(`data:image/png;base64,${data}`);
     expect(block.textContent).not.toContain(data);
+    expect(block.textContent).not.toContain('Preparing screenshot...');
+    expect(block.textContent).not.toContain('Tool completed');
     expect(within(block).queryByText('No result')).toBeNull();
+    expect(await axe(block)).toHaveNoViolations();
   });
 
   it('keeps a backgrounded command completed when its task reports later output', async () => {

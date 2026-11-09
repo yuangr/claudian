@@ -1,20 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import type { Mock } from 'vitest';
 
+import { getInstallationKey } from '@/core/device/InstallationKey';
 import { GrokCLIResolver } from '@/providers/grok/runtime/GrokCLIResolver';
 
-jest.mock('fs');
-const mockedStat = fs.statSync as jest.Mock;
-
-jest.mock('@/core/device/InstallationKey', () => ({
-  ...jest.requireActual('@/core/device/InstallationKey'),
-  getInstallationKey: () => 'current-host',
-}));
+vi.mock('fs');
+const mockedStat = fs.statSync as Mock;
 
 describe('GrokCLIResolver', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    vi.clearAllMocks();
+    (fs.existsSync as Mock).mockReturnValue(false);
   });
 
   it('prefers the current host path over synced paths and the legacy path', () => {
@@ -28,7 +25,7 @@ describe('GrokCLIResolver', () => {
     expect(new GrokCLIResolver().resolveFromSettings({
       providerConfigs: { grok: {
         cliPathsByHost: {
-          'current-host': '/current/grok',
+          [getInstallationKey()]: '/current/grok',
           'other-host': '/other/grok',
         },
         cliPath: '/legacy/grok',
@@ -69,7 +66,7 @@ describe('GrokCLIResolver', () => {
     const settings = {
       providerConfigs: {
         grok: {
-          cliPathsByHost: { 'current-host': '/configured/grok' },
+          cliPathsByHost: { [getInstallationKey()]: '/configured/grok' },
         },
       },
     };
@@ -102,5 +99,28 @@ describe('GrokCLIResolver', () => {
     resolver.reset();
     expect(resolver.resolveFromSettings(settings)).toBeNull();
     expect(mockedStat.mock.calls.length).toBeGreaterThan(firstCallCount);
+  });
+
+  it('preserves Linux-only WSL paths and skips host filesystem discovery', () => {
+    vi.stubGlobal('process', { ...process, platform: 'win32' });
+    try {
+      const resolver = new GrokCLIResolver();
+      expect(resolver.resolveFromSettings({ providerConfigs: { grok: {
+        installationMethodsByHost: { [getInstallationKey()]: 'wsl' },
+        cliPathsByHost: { [getInstallationKey()]: '"~/grok cli"' },
+      } } })).toBe('~/grok cli');
+      expect(mockedStat).not.toHaveBeenCalled();
+      expect(resolver.resolveFromSettings({ providerConfigs: { grok: {
+        installationMethodsByHost: { [getInstallationKey()]: 'wsl' }, cliPath: 'C:\\grok.cmd',
+      } } })).toBe('grok');
+      // A Windows reference on this device falls through to a Linux legacy path.
+      expect(resolver.resolveFromSettings({ providerConfigs: { grok: {
+        installationMethodsByHost: { [getInstallationKey()]: 'wsl' },
+        cliPathsByHost: { [getInstallationKey()]: 'C:\\grok.exe' }, cliPath: '  /opt/grok  ',
+      } } })).toBe('/opt/grok');
+      expect(resolver.resolveFromSettings({ providerConfigs: { grok: {
+        installationMethodsByHost: { [getInstallationKey()]: 'wsl' }, cliPath: ' "/opt/my grok" ',
+      } } })).toBe('/opt/my grok');
+    } finally { vi.unstubAllGlobals(); }
   });
 });

@@ -1,4 +1,5 @@
 import { useClaudeSessionFiles } from '@test/helpers/providers/claudeHistory';
+import { testTime } from '@test/helpers/testClock';
 
 import { loadSDKSessionMessages } from '@/providers/claude/history/ClaudeHistoryStore';
 
@@ -108,6 +109,35 @@ it('keeps a user response active across a notification received between its nati
   });
 });
 
+// The attachment timestamp records enqueue time; its file position records where Claude folded it.
+it('replays a steer folded mid-turn after the tool call it followed', async () => {
+  const entries = [
+    { type: 'user', uuid: 'u', timestamp: testTime(), message: { content: 'Refactor the parser' } },
+    { type: 'assistant', uuid: 'a1', parentUuid: 'u', timestamp: testTime({ seconds: 2 }),
+      message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'bash', name: 'Bash', input: { command: 'sleep 8' } }] } },
+    { type: 'queue-operation', operation: 'enqueue', timestamp: testTime({ seconds: 1 }), content: 'Use tabs instead' },
+    { type: 'user', uuid: 'r1', parentUuid: 'a1', timestamp: testTime({ seconds: 10 }), toolUseResult: { stdout: 'done' },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'bash', content: 'done' }] } },
+    { type: 'attachment', uuid: 'steer-attachment', parentUuid: 'r1', timestamp: testTime({ seconds: 1 }),
+      attachment: { type: 'queued_command', prompt: 'Use tabs instead', source_uuid: 'steer', commandMode: 'prompt', timestamp: testTime({ seconds: 1 }) } },
+    { type: 'queue-operation', operation: 'remove', timestamp: testTime({ seconds: 10 }), content: 'Use tabs instead' },
+    { type: 'assistant', uuid: 'a2', parentUuid: 'steer-attachment', timestamp: testTime({ seconds: 12 }),
+      message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Switched to tabs.' }] } },
+  ];
+  const sessionPath = writeSession(entries.map(entry => JSON.stringify(entry)).join('\n'));
+
+  const result = await loadSDKSessionMessages('/vault', 'session', undefined, sessionPath);
+
+  expect(result.messages.map(message => [message.role, message.content || message.contentBlocks?.[0]?.type])).toEqual([
+    ['user', 'Refactor the parser'],
+    ['assistant', 'tool_use'],
+    ['user', 'Use tabs instead'],
+    ['assistant', 'Switched to tabs.'],
+  ]);
+  expect(result.messages[2]).toMatchObject({ id: 'steer', timestamp: Date.parse(testTime({ seconds: 10 })) });
+  expect(result.messages[3]).toMatchObject({ durationSeconds: 2 });
+});
+
 it('replays a user prompt absorbed into an automatic response from its queued-command attachment', async () => {
   const entries = [
     { type: 'user', uuid: 'u', message: { content: 'testing follow up' } },
@@ -191,4 +221,34 @@ it.each([false, true])('counts each main response once across blocks and tools (
   const sessionPath = writeSession(entries.map(entry => JSON.stringify(entry)).join('\n'));
   const result = await loadSDKSessionMessages('/vault', 'session', undefined, sessionPath);
   expect(result.messages.at(-1)?.turnStats).toEqual(missing ? undefined : { outputTokens: 125, durationMs: 2500 });
+});
+
+// A native turn split for display (at compaction or a later notification) is still one turn:
+// only its interruption clears the completion the split gave earlier parts.
+it.each([
+  ['compaction', true], ['compaction', false], ['notification', true], ['notification', false],
+] as const)('clears completion of a %s-split turn only when it is interrupted (interrupted: %s)', async (split, interrupted) => {
+  const notification = (id: string) => `<task-notification><task-id>${id}</task-id><status>completed</status><result>${id} result</result></task-notification>`;
+  const entries = [
+    split === 'compaction'
+      ? { type: 'user', uuid: 'u', timestamp: testTime({ seconds: 10 }), message: { content: 'Long task' } }
+      : { type: 'user', uuid: 'u', timestamp: testTime({ seconds: 10 }), message: { content: notification('trigger') } },
+    { type: 'assistant', uuid: 'tool', parentUuid: 'u', timestamp: testTime({ seconds: 11 }),
+      message: { stop_reason: 'tool_use', content: [{ type: 'text', text: 'Before.' }, { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'note.md' } }] } },
+    { type: 'user', uuid: 'read-result', parentUuid: 'tool', timestamp: testTime({ seconds: 12 }),
+      toolUseResult: { type: 'text', file: { content: 'The note.' } },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'read', content: 'The note.' }] } },
+    split === 'compaction'
+      ? { type: 'system', subtype: 'compact_boundary', uuid: 'compact', parentUuid: 'read-result', timestamp: testTime({ seconds: 13 }), content: 'Conversation compacted', compactMetadata: { trigger: 'auto' } }
+      : { type: 'user', uuid: 'compact', parentUuid: 'read-result', timestamp: testTime({ seconds: 13 }), message: { content: notification('later') } },
+    { type: 'assistant', uuid: 'after', parentUuid: 'compact', timestamp: testTime({ seconds: 15 }),
+      message: { ...(!interrupted ? { stop_reason: 'end_turn' } : {}), content: [{ type: 'text', text: 'After.' }] } },
+    ...(interrupted ? [{ type: 'user', uuid: 'stop', parentUuid: 'after', timestamp: testTime({ seconds: 16 }),
+      message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } }] : []),
+  ];
+  const result = await loadSDKSessionMessages('/vault', 'session', undefined, writeSession(entries.map(entry => JSON.stringify(entry)).join('\n')));
+  const before = result.messages.find(message => message.content.includes('Before.'))!;
+  const cleared = before.durationSeconds === undefined && before.completedAt === undefined && before.turnStats === undefined;
+  expect(cleared).toBe(interrupted);
+  expect(result.messages.filter(message => message.role === 'assistant').length).toBeGreaterThan(1);
 });

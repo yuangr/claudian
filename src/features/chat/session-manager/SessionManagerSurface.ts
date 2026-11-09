@@ -92,18 +92,9 @@ export class SessionManagerSurface {
     if (this.deps.isWide()) this.sidebar.render();
   }
 
-  toggleDropdown(): void {
-    this.dropdown.toggle();
-  }
-
-  /** Hides the dropdown and abandons its in-flight render. */
-  closeDropdown(): void {
-    this.dropdown.close();
-  }
-
-  /** Hides the dropdown for an outside click, keeping its rendered list. */
-  dismissDropdown(): void {
-    this.dropdown.dismiss();
+  /** Hides the dropdown when a document click lands outside it, keeping its rendered list. */
+  dismissDropdownFor(event: Event): void {
+    this.dropdown.dismissFor(event);
   }
 
   /** The wide layout replaces the dropdown with the sidebar. */

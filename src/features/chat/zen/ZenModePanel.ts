@@ -8,7 +8,7 @@ import {
   scheduleAnimationFrame,
   type ScheduledAnimationFrame,
 } from '@/features/chat/utils/animationFrame';
-import { formatActivityPreview, type ZenActivityTone } from '@/features/chat/zen/activityPreview';
+import { formatActivityPreview } from '@/features/chat/zen/activityPreview';
 import type { ZenModeSlots, ZenPresentationPort } from '@/features/chat/zen/types';
 import { ZenComposerLayout } from '@/features/chat/zen/ZenComposerLayout';
 import { ZenPanelDock } from '@/features/chat/zen/ZenPanelDock';
@@ -54,7 +54,6 @@ export class ZenModePanel {
   #pendingFrame: ScheduledAnimationFrame | null = null;
   #historyExpanded: boolean;
   #hasHistory = false;
-  #lastTone: ZenActivityTone | null = null;
   readonly #composerLayout: ZenComposerLayout;
   readonly #dock: ZenPanelDock;
   #destroyed = false;
@@ -240,14 +239,8 @@ export class ZenModePanel {
       if (hasHistory && this.#historyExpanded) runtime.restoreScroll();
     }
 
-    if (preview.tone !== this.#lastTone) {
-      if (preview.tone === 'action-required' || preview.tone === 'error') {
-        this.#statusEl.setText(preview.text);
-      } else if (this.#lastTone === 'action-required' || this.#lastTone === 'error') {
-        this.#statusEl.setText('');
-      }
-      this.#lastTone = preview.tone;
-    }
+    const status = preview.tone === 'action-required' || preview.tone === 'error' ? preview.text : '';
+    if (this.#statusEl.textContent !== status) this.#statusEl.setText(status);
   }
 
   #renderPreviewIcon(toolName: string | null): void {

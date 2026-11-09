@@ -1,18 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import * as path from 'node:path';
 
 import { parseCompactCommand } from '@/core/commands/compactCommand';
 import { parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTargetAsync } from '@/core/process/execution-target/ExecutionTargetResolver';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 import {
   buildContextFromHistory,
-  buildPromptWithHistoryContext,
   getHistoryImages,
 } from '@/core/prompt/historyContext';
-import {
-  appendLinkedContent,
-  appendSelectionContexts,
-  appendSessionReferences,
-} from '@/core/prompt/promptContext';
+import { appendExecutionContext } from '@/core/prompt/promptContext';
+import { buildRecoveryPrompt } from '@/core/prompt/recoveryPrompt';
 
 import {
   type ConversationBranchRecoveryRequest,
@@ -21,6 +18,7 @@ import {
   type ConversationBranchState,
   type ProviderBackgroundEventScope,
   type ProviderBackgroundOutputEvent,
+  type ProviderBackgroundTurnCompletionReason,
   type ProviderExecutionErrorCategory,
   type ProviderExecutionRequest,
   type ProviderExecutionRun,
@@ -37,29 +35,28 @@ import {
   type SteerableExecutionSession,
   type WithoutEventScope,
 } from '../../../core/execution';
-import {
-  buildSystemPrompt,
-  type SystemPromptSettings,
-} from '../../../core/prompt/mainAgent';
 import { ProviderModelUnavailableError } from '../../../core/providers/models/ProviderModelUnavailableError';
-import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
-import type { ProviderHost } from '../../../core/providers/ProviderHost';
+import type { ProviderRuntimeHost, ProviderSelectionDefaults } from '../../../core/providers/ProviderRuntimeHost';
 import type {
   ChatMessage,
   StreamChunk,
   TurnStats,
 } from '../../../core/types';
-import type { PiWorkspaceServices } from '../app/PiWorkspaceServices';
+import {
+  decodePiConfig,
+  type PiProviderSettings,
+} from '../config';
 import { PiConversationHistoryService } from '../history/PiConversationHistoryService';
+import { PiHistoryContextResolver } from '../history/PiHistoryContextResolver';
 import {
   isPiSessionPathReference,
   resolvePiSessionFileHint,
 } from '../history/PiHistoryPathResolver';
 import {
   correlatePiUserMessages,
-  type CreatedPiForkSessionFile,
   type createPiForkSessionFile,
   findPiSessionFile,
+  followPiLeafAppends,
   getPiConversationBranches,
   getPiTurnStats,
   parsePiSessionContent,
@@ -68,7 +65,6 @@ import {
   resolvePiTreeCursor,
   type rollbackCreatedPiForkSessionFile,
 } from '../history/PiHistoryStore';
-import { encodePiRecoveryPrompt } from '../history/PiRecoveryPromptCodec';
 import {
   clampPiThinkingLevel,
   decodePiModelId,
@@ -81,6 +77,7 @@ import {
   normalizePiRPCEvent,
   type PiEventNormalizationState,
 } from '../normalization/piEventNormalization';
+import { PiPeepsSubagents } from '../normalization/PiPeepsSubagents';
 import { buildPiUsageInfo } from '../runtime/buildPiUsageInfo';
 import type { PiExtensionUIRenderer } from '../runtime/PiExtensionUIBridge';
 import {
@@ -90,17 +87,13 @@ import {
 import { assertPiModelAvailable } from '../runtime/PiModelAvailability';
 import { buildPiSetModelPayload } from '../runtime/PiRPCPayloads';
 import { type PiRPCRecord, PiRPCResponseError } from '../runtime/PiRPCTransport';
-import { PI_TREE_COMMAND } from '../runtime/PiTreeBridge';
+import { piHostPath, piTargetPath, samePiTargetPath } from '../runtime/piTargetPaths';
 import {
-  getPiProviderSettings,
-  type PiProviderSettings,
-} from '../settings';
-import {
+  clearPiResumeState,
   getPiState,
   type PiProviderState,
   type PiTreeCursor,
 } from '../types';
-import { normalizePiRuntimeCommands } from './PiCommandMetadataProbe';
 import {
   type PiExecutionKernel,
   type PiExecutionKernelFactory,
@@ -113,7 +106,6 @@ interface PiExecutionSessionOptions {
   readonly rollbackForkSessionFile: typeof rollbackCreatedPiForkSessionFile;
 }
 
-type PiExecutionServices = Pick<PiWorkspaceServices, 'commandCatalog'>;
 
 interface EncodedPiRequest {
   readonly input:
@@ -130,21 +122,38 @@ interface PiPromptImage {
   readonly type: 'image';
 }
 
+/**
+ * `preflight` until the prompt or compact request is sent; `dispatched` while native work may
+ * continue; `ended` once the run ended without a retry but before settlement (a later agent_start
+ * reopens it); `settled` once native settlement was observed, after which a later agent_start
+ * belongs to someone else.
+ */
+type ActiveRunPhase = 'preflight' | 'dispatched' | 'ended' | 'settled';
+
+function hasRunEnded(active: ActiveRun): boolean {
+  return active.phase === 'ended';
+}
+
+/** Native work sent for this request may still be running. */
+function isUnsettledDispatch(active: ActiveRun): boolean {
+  return active.phase === 'dispatched' || active.phase === 'ended';
+}
+
 interface ActiveRun {
+  readonly toolPolicy: ProviderToolPolicy;
+  readonly sessionToolController: AbortController;
   readonly abortController: AbortController;
   readonly inputText: string;
   readonly run: RequestedRunChannel;
   accepted: boolean;
   assistantStarted: boolean;
-  nativeRequestDispatched: boolean;
+  phase: ActiveRunPhase;
   nativeAssistantId?: string;
   turnStats?: TurnStats;
   nativeUserMessageId?: string;
   pendingTerminalError: Error | null;
-  endedWithoutRetry: boolean;
+  /** A native run began for this request; a handled command may never start one. */
   runStarted: boolean;
-  /** Native settlement was observed; a later agent_start belongs to someone else. */
-  settled: boolean;
   /** The latest assistant message ended without calling tools. */
   answered: boolean;
   /** Native timestamp of that message, which identifies its persisted entry. */
@@ -198,6 +207,7 @@ const PI_NATIVE_PROVIDER_STATE_KEYS = [
 export class PiExecutionSession
 implements ProviderExecutionSession, SteerableExecutionSession {
   readonly providerId = 'pi' as const;
+  private readonly historyContextResolver = new PiHistoryContextResolver();
   readonly sessionInstanceId = randomUUID();
 
   private activeRun: ActiveRun | null = null;
@@ -205,6 +215,8 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   #backgroundCounter = 0;
   /** Settled background turns still syncing native state before they publish completion. */
   readonly #settlingBackgroundTurns = new Set<BackgroundTurn>();
+  /** Peeps child answers arrive as later custom messages, outside the turn that started the work. */
+  readonly #peeps = new PiPeepsSubagents();
   /** Pi before 1.0 answers prompts without a disposition and never sends agent_settled. */
   #kernelSettlement: PiSettlementSignal | null = null;
   #kernelModel: string | null = null;
@@ -218,6 +230,8 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   private processKey: string | null = null;
   private readonly kernelSessionTargets = new Set<string>();
   private kernelResumeValidationTarget: string | null = null;
+  /** A kernel resumed by session target has not yet been aligned with the shown turn leaf. */
+  #alignResumedLeaf = false;
   private lifecycleError: Error | null = null;
   private normalizationState: PiEventNormalizationState =
     createPiEventNormalizationState();
@@ -229,8 +243,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   private shutdownPromise: Promise<void> | null = null;
 
   constructor(
-    private readonly host: ProviderHost,
-    private readonly services: PiExecutionServices,
+    private readonly host: ProviderRuntimeHost,
     private readonly config: ProviderSessionConfig,
     private readonly options: PiExecutionSessionOptions,
   ) {
@@ -346,7 +359,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       void tracked.catch(() => undefined);
       active.run.close();
       if (this.activeRun === active) this.activeRun = null;
-      if (!this.disposed) this.state.setStatus(this.#hasBackgroundWork() ? 'executing' : 'idle');
+      if (!this.disposed) this.state.settleActivity(this.#hasBackgroundWork());
     }
   }
 
@@ -414,7 +427,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   async #readBranchHistory(model: string, signal: AbortSignal): Promise<Extract<ConversationBranchResult, { status: 'committed' }>> {
     const history = await new PiConversationHistoryService().hydrateConversationHistory({
       sessionId: this.providerSessionId, providerState: this.state.providerState, messages: [],
-    }, this.config.vaultWorkingDirectory);
+    }, this.config.workingDirectory);
     // Pi computes context usage from the selected native branch, including compaction.
     const usage = await this.#fetchUsage(model, signal).catch(() => null);
     return { status: 'committed', messages: history.messages ?? [], usage };
@@ -424,7 +437,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (!this.kernel || signal?.aborted) throw new Error('Pi navigation is unavailable.');
     const state = getPiState(this.state.providerState);
     const result = await this.kernel.request<Record<string, unknown>>('claudian_tree', {
-      ...payload, sessionFile: state.sessionFile, sessionId: state.sessionId,
+      ...payload, sessionFile: state.sessionFile ? piTargetPath(state.sessionFile, this.kernel.launchSpec.executionTarget) : undefined, sessionId: state.sessionId,
     }, 10_000, signal).catch(async (error: unknown) => {
       // A timed-out extension may still be awaiting a native hook. Fence it before accepting more input.
       if (!(error instanceof PiRPCResponseError)) await this.#shutdownKernel();
@@ -435,11 +448,12 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       return { cancelled: true, leafId: null };
     }
     if (result?.cancelled !== false || result.sessionId !== state.sessionId
-      || result.sessionFile !== state.sessionFile || (result.leafId !== null && typeof result.leafId !== 'string')) {
+      || typeof result.sessionFile !== 'string' || !state.sessionFile
+      || !samePiTargetPath(result.sessionFile, state.sessionFile, this.kernel?.launchSpec.executionTarget) || (result.leafId !== null && typeof result.leafId !== 'string')) {
       throw new Error('Invalid Pi branch identity or cursor.');
     }
     if (payload.operation === 'restore' && result.leafId !== payload.leafId) {
-      const parsed = await readPiSessionEntries(state.sessionFile!);
+      const parsed = await readPiSessionEntries(state.sessionFile);
       const anchor = parsed.entries.find(entry => entry.id === result.leafId);
       if (anchor?.type !== 'custom' || anchor.raw.customType !== 'claudian-tree-anchor' || anchor.parentId !== payload.leafId) {
         throw new Error('Pi navigation did not reach the selected branch.');
@@ -450,8 +464,12 @@ implements ProviderExecutionSession, SteerableExecutionSession {
 
   async #restoreTreeCursor(signal: AbortSignal): Promise<void> {
     const state = getPiState(this.state.providerState);
-    let cursor = state.treeCursor;
-    if (!cursor) return;
+    // Alignment stays pending until a restoration succeeds, so a cancelled or failed one is retried.
+    let cursor = state.treeCursor ?? (this.#alignResumedLeaf ? await this.#resumedLeafCursor(state) : undefined);
+    if (!cursor) {
+      this.#alignResumedLeaf = false;
+      return;
+    }
     if (state.sessionFile) {
       const parsed = await readPiSessionEntries(state.sessionFile);
       cursor = resolvePiTreeCursor(parsed.entries, cursor);
@@ -459,9 +477,24 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     const result = await this.#treeRequest({ operation: 'restore', ...cursor }, signal);
     if (result.cancelled) throw new Error('Pi branch restoration was cancelled.');
     if (result.leafId !== cursor.leafId) cursor = { targetId: result.leafId!, leafId: result.leafId, appendId: result.leafId! };
+    this.#alignResumedLeaf = false;
     this.#setProviderStateValue('treeCursor', cursor);
     this.#setOptionalProviderStateValue('leafEntryId', cursor.leafId ?? undefined);
     this.state.bumpRevision();
+  }
+
+  /**
+   * A resumed Pi process continues the session's latest entry. History shows the saved turn leaf unless
+   * the latest entry continues it, so when another Pi client branched away, the process is brought back.
+   */
+  async #resumedLeafCursor(state: ReturnType<typeof getPiState>): Promise<PiTreeCursor | undefined> {
+    const leafId = state.leafEntryId;
+    if (!leafId || !state.sessionFile) return undefined;
+    // Best effort: a transcript the process can resume but this cannot read leaves Pi's own choice.
+    const entries = (await readPiSessionEntries(state.sessionFile).catch(() => null))?.entries;
+    const latest = entries?.at(-1)?.id;
+    if (!entries || !latest || !entries.some(entry => entry.id === leafId) || followPiLeafAppends(entries, leafId) === latest) return undefined;
+    return { targetId: leafId, leafId, appendId: latest };
   }
 
   cancel(): void {
@@ -482,11 +515,44 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       reason: 'Cancelled',
       type: 'cancelled',
     });
-    void this.#shutdownKernel();
+    this.#shutdownAfterStop(active.phase !== 'preflight');
+  }
+
+  /**
+   * Pi keeps a stopped turn's prompt and partial reply. Once its writer exits, resume and reload follow
+   * them as on completion; later starts and branch reads wait on this shutdown. A tree cursor already
+   * follows native appends on reload, and an undispatched prompt appended nothing.
+   */
+  #shutdownAfterStop(dispatched: boolean): void {
+    const shutdown = this.#shutdownKernel();
+    if (!dispatched || getPiState(this.state.providerState).treeCursor) {
+      void shutdown.catch(() => undefined);
+      return;
+    }
+    const followed: Promise<void> = shutdown
+      .catch(() => undefined)
+      .then(() => this.#followStoppedTurn())
+      .finally(() => {
+        if (this.shutdownPromise === followed) this.shutdownPromise = null;
+      });
+    this.shutdownPromise = followed;
+  }
+
+  async #followStoppedTurn(): Promise<void> {
+    const previousLeafId = getPiState(this.state.providerState).leafEntryId;
+    try {
+      await this.#syncNativeLeaf(undefined, () => true);
+    } catch {
+      // Reload still shows the history before the stopped turn.
+      return;
+    }
+    if (getPiState(this.state.providerState).leafEntryId === previousLeafId) return;
+    this.state.bumpRevision();
+    this.#emitSession({ snapshot: this.getSnapshot(), type: 'session_state_changed' });
   }
 
   async steer(request: ProviderExecutionRequest): Promise<boolean> {
-    try { assertPiModelAvailable(this.host.settings, request.configuration.model); }
+    try { assertPiModelAvailable(this.host, request.configuration.model); }
     catch (error) { if (error instanceof ProviderModelUnavailableError) return false; throw error; }
     const active = this.activeRun;
     const kernel = this.kernel;
@@ -556,6 +622,8 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   #createActiveRun(request: ProviderExecutionRequest): ActiveRun {
     const active: ActiveRun = {
       abortController: new AbortController(),
+      toolPolicy: request.toolPolicy,
+      sessionToolController: new AbortController(),
       inputText: getInputText(request),
       run: new RequestedRunChannel({
         onCancel: () => {
@@ -565,11 +633,9 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       }),
       accepted: false,
       assistantStarted: false,
-      nativeRequestDispatched: false,
+      phase: 'preflight',
       pendingTerminalError: null,
-      endedWithoutRetry: false,
       runStarted: false,
-      settled: false,
       answered: false,
       endedAtAnswer: false,
       terminalSignal: createDeferred<void>(),
@@ -582,7 +648,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     request: ProviderExecutionRequest,
   ): Promise<void> {
     try {
-      assertPiModelAvailable(this.host.settings, request.configuration.model);
+      assertPiModelAvailable(this.host, request.configuration.model);
       const encoded = await this.#encodeRequest(active, request);
       if (!this.isActive(active)) return;
       // A stopped background run may still be unwinding; input sent now could be queued behind the abort.
@@ -597,22 +663,23 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       if (!this.isActive(active) || !this.kernel) return;
       await this.#applyModelConfiguration(encoded, active.abortController.signal);
       if (!this.isActive(active)) return;
-      assertPiModelAvailable(this.host.settings, request.configuration.model);
+      assertPiModelAvailable(this.host, request.configuration.model);
       const previousLeafId = getPiState(this.state.providerState).leafEntryId ?? null;
       const input = encoded.input;
       let promptHandled = false;
       if (input.kind === 'compact') {
-        active.nativeRequestDispatched = true;
+        active.phase = 'dispatched';
         await this.kernel.request(
           'compact',
           { customInstructions: input.instructions },
-          undefined,
+          // Unlike prompt admission, compact responds only after model inference finishes.
+          0,
           active.abortController.signal,
         );
         this.#ensureAccepted(active);
         this.#emitRequested(active, { type: 'context_compacted' });
       } else {
-        active.nativeRequestDispatched = true;
+        active.phase = 'dispatched';
         const response = await this.kernel.request<{ disposition?: string } | undefined>(
           'prompt',
           {
@@ -629,7 +696,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         promptHandled = response?.disposition === 'handled';
         if (typeof response?.disposition !== 'string') {
           this.#kernelSettlement = 'agent_end';
-          if (active.endedWithoutRetry) this.#settleRun(active);
+          if (hasRunEnded(active)) this.#settleRun(active);
         } else {
           this.#kernelSettlement = 'agent_settled';
         }
@@ -659,7 +726,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
           usage,
         });
       }
-      this.state.setStatus(this.#hasBackgroundWork() ? 'executing' : 'idle');
+      this.state.settleActivity(this.#hasBackgroundWork());
       this.#emitRequestedState(active);
       this.#finishRequested(active, {
         nativeUserMessageId: active.nativeUserMessageId,
@@ -670,36 +737,9 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         type: 'turn_completed',
       });
     } catch (error) {
-      if (error instanceof PiForkRollbackError) {
-        this.lifecycleError ??= error;
-        if (!active.run.isTerminal) {
-          this.#invalidateForForkRollback(error);
-          this.#emitRequestedState(active);
-          this.#finishRequested(active, {
-            category: 'provider',
-            message: error.message,
-            recoverable: false,
-            type: 'execution_error',
-          });
-        } else if (!this.disposed) {
-          if (this.#invalidateForForkRollback(error)) {
-            this.#emitSession({
-              snapshot: this.getSnapshot(),
-              type: 'session_state_changed',
-            });
-          }
-          this.#emitSession({
-            category: 'provider',
-            message: error.message,
-            recoverable: false,
-            type: 'session_error',
-          });
-        }
-        throw error;
-      }
       if (!active.run.isTerminal) {
         // A lost response cannot prove that native work stopped. Fence that process before allowing a retry.
-        const shouldShutdown = active.nativeRequestDispatched && !active.settled
+        const shouldShutdown = isUnsettledDispatch(active)
           && (active.runStarted || !(error instanceof PiRPCResponseError));
         this.#finishError(active, error);
         try {
@@ -715,29 +755,32 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     active: ActiveRun,
     request: ProviderExecutionRequest,
   ): Promise<EncodedPiRequest> {
-    const settings = getPiProviderSettings(this.host.settings);
+    const settings = decodePiConfig(this.host.config, this.host.selection);
     if (!settings.enabled) {
       throw new PiConfigurationError('Pi is disabled.');
     }
-    const model = resolveSelectedModel(request, settings, this.host.settings);
+    const model = resolveSelectedModel(request, settings, this.host.selection);
     const thinkingLevel = resolveThinkingLevel(
       request,
       settings,
       model,
-      this.host.settings,
+      this.host.selection,
     );
-    await this.#materializePendingFork(active);
-    const envText = getRuntimeEnvironmentText(this.host.settings, 'pi');
+    const executionTarget = await resolveExecutionTargetAsync({ settings, hostVaultPath: this.config.workingDirectory });
+    await this.#materializePendingFork(active, executionTarget);
+    const envText = this.host.environmentText;
     const env = {
       ...process.env,
       ...parseEnvironmentVariables(envText),
     };
-    this.#validateResumeSeed(env);
+    await this.#validateResumeSeed(env, executionTarget);
     const toolProfile = resolveToolProfile(request.toolPolicy);
     const launchSpec = buildPiLaunchSpec({
+      executionTarget,
       enableTreeBridge: !this.#shouldDisableNativePersistence(),
-      command: await this.host.getResolvedProviderCliPath('pi') ?? 'pi',
-      cwd: this.config.vaultWorkingDirectory,
+      enableSessionTools: this.config.sessionTools !== undefined,
+      command: await this.host.resolveCliPath({ executionTarget }) ?? 'pi',
+      cwd: this.config.workingDirectory,
       env,
       envText,
       noSession: this.#shouldDisableNativePersistence(),
@@ -746,11 +789,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       providerState: getPiState(this.state.providerState),
       readOnlyTools: toolProfile.readOnlyTools,
       settings,
-      systemPrompt: resolveSystemPrompt(
-        request,
-        this.host.settings,
-        this.config.vaultWorkingDirectory,
-      ),
+      systemPrompt: request.configuration.systemInstructions.instructions,
     });
     const state = getPiState(this.state.providerState);
     const hasNativeSession = Boolean(state.sessionId || state.sessionFile);
@@ -777,18 +816,23 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     };
   }
 
-  #validateResumeSeed(environment: NodeJS.ProcessEnv): void {
+  async #validateResumeSeed(environment: NodeJS.ProcessEnv, executionTarget: ExecutionTarget): Promise<void> {
     if (!this.resumeSeedNeedsValidation) return;
-    this.resumeSeedNeedsValidation = false;
     const state = getPiState(this.state.providerState);
     const currentTarget = state.sessionFile ?? state.sessionId;
-    if (!currentTarget) return;
+    if (!currentTarget) {
+      this.resumeSeedNeedsValidation = false;
+      return;
+    }
 
+    const pathContext = await this.historyContextResolver.resolve(this.config.workingDirectory, {
+      environment, executionTarget, config: this.host.config, environmentText: this.host.environmentText,
+    });
     const resolvedSessionFile = resolvePiSessionFileHint(
       state.sessionFile,
       state.sessionId,
-      this.config.vaultWorkingDirectory,
-      { environment },
+      this.config.workingDirectory,
+      pathContext,
     );
     if (resolvedSessionFile) {
       let changed = false;
@@ -804,12 +848,17 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         changed = true;
       }
       if (changed) this.state.bumpRevision();
+      this.resumeSeedNeedsValidation = false;
       return;
     }
 
     const pathTarget = state.sessionFile
       ?? (isPiSessionPathReference(state.sessionId) ? state.sessionId : null);
     if (pathTarget) {
+      if (executionTarget.method === 'wsl') {
+        this.#retireNativeBinding();
+        throw new Error(`The Pi WSL session file is missing or outside the current session store: ${pathTarget}`);
+      }
       const fallbackSessionId = state.sessionId
         && !isPiSessionPathReference(state.sessionId)
         ? state.sessionId
@@ -822,11 +871,13 @@ implements ProviderExecutionSession, SteerableExecutionSession {
           this.providerSessionId = fallbackSessionId;
         }
         this.state.bumpRevision();
+        this.resumeSeedNeedsValidation = false;
         return;
       }
       this.nativeConversationContextEstablished = false;
       throw new PiProviderSessionMissingError(pathTarget);
     }
+    this.resumeSeedNeedsValidation = false;
   }
 
   async #ensureKernel(
@@ -850,6 +901,16 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     const kernel = this.options.createKernel(
       launchSpec,
       {
+        getSessionToolInvocation: () => {
+          const owner = this.#requestedOutputTarget();
+          if (!this.#isCurrentKernel(kernel, generation) || this.kernelResumeValidationTarget !== null
+            || !owner) return undefined;
+          return {
+            port: this.config.sessionTools,
+            toolPolicy: owner.toolPolicy,
+            signal: AbortSignal.any([owner.abortController.signal, owner.sessionToolController.signal]),
+          };
+        },
         onClose: error => this.#handleKernelClose(kernel, generation, error),
         onEvent: event => this.#handleRpcEvent(kernel, generation, event),
         onExtensionChunk: chunk =>
@@ -869,39 +930,19 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         ? this.options.extensionUiRenderer
         : null,
     );
-    if (!this.isActive(active) || active.abortController.signal.aborted) {
-      await kernel.shutdown().catch(() => undefined);
-      return;
-    }
     this.kernel = kernel;
     this.#kernelSettlement = null;
     this.#kernelModel = null;
     this.processKey = launchSpec.processKey;
     this.kernelResumeValidationTarget = launchSpec.sessionTarget;
+    this.#alignResumedLeaf = !!launchSpec.sessionTarget;
     this.#replaceKernelSessionTargets(launchSpec.sessionTarget);
-    if (
-      !this.isActive(active)
-      || active.abortController.signal.aborted
-      || !this.#isCurrentKernel(kernel, generation)
-    ) {
-      await this.#shutdownAcquiredKernel(kernel, generation);
-      return;
-    }
     try {
       kernel.start();
     } catch (error) {
-      await this.#shutdownAcquiredKernel(kernel, generation);
+      await this.#shutdownKernel().catch(() => undefined);
       throw error;
     }
-    if (
-      !this.isActive(active)
-      || active.abortController.signal.aborted
-      || !this.#isCurrentKernel(kernel, generation)
-    ) {
-      await this.#shutdownAcquiredKernel(kernel, generation);
-      return;
-    }
-    void this.#publishCommands(kernel, generation);
   }
 
   async #validateKernelResume(signal: AbortSignal): Promise<void> {
@@ -924,9 +965,10 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       expectedTarget,
       getPiState(this.state.providerState),
       reportedIdentity,
+      kernel.launchSpec.executionTarget,
     )) {
       this.kernelResumeValidationTarget = null;
-      if (reportedIdentity.sessionFile) this.#setProviderStateValue('sessionFile', reportedIdentity.sessionFile);
+      if (reportedIdentity.sessionFile) this.#setProviderStateValue('sessionFile', piHostPath(reportedIdentity.sessionFile, kernel.launchSpec.executionTarget));
       if (reportedIdentity.sessionId) {
         this.providerSessionId = reportedIdentity.sessionId;
         this.#setProviderStateValue('sessionId', reportedIdentity.sessionId);
@@ -951,7 +993,16 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (!modelPayload || !this.kernel) {
       throw new PiConfigurationError('The selected Pi model is invalid.');
     }
-    await this.kernel.request('set_model', modelPayload, undefined, signal);
+    try {
+      await this.kernel.request('set_model', modelPayload, undefined, signal);
+    } catch (error) {
+      // Pi only offers models whose provider is authenticated in its current environment.
+      if (!(error instanceof PiRPCResponseError)) throw error;
+      throw new PiConfigurationError(
+        `Pi cannot use ${modelPayload.provider}/${modelPayload.modelId} in its current environment (${error.message}). `
+        + 'Open Claudian settings → Pi, click Discover, and choose an available model.',
+      );
+    }
     this.#kernelModel = encoded.model;
     if (encoded.thinkingLevel) {
       await this.kernel.request(
@@ -995,6 +1046,9 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     } else {
       this.#handleBackgroundRpcEvent(event);
     }
+    for (const subagent of this.#peeps.rpcEvent(event)) {
+      this.#emitSession({ type: 'subagent_updated', subagent });
+    }
   }
 
   #trackAnswer(target: TurnTarget, event: PiRPCRecord): void {
@@ -1022,7 +1076,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (event.type === 'agent_start') {
       // Overflow recovery can start a new run even when agent_end.willRetry was false.
       active.pendingTerminalError = null;
-      active.endedWithoutRetry = false;
+      active.phase = 'dispatched';
       active.runStarted = true;
       this.#ensureAccepted(active);
       return;
@@ -1032,7 +1086,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         active.pendingTerminalError = null;
         return;
       }
-      active.endedWithoutRetry = true;
+      active.phase = 'ended';
       if (this.#kernelSettlement === 'agent_end') this.#settleRun(active);
       return;
     }
@@ -1101,8 +1155,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       && getRecord(event.message).role === 'user'
       && active
       && this.isActive(active)
-      && active.nativeRequestDispatched
-      && !active.settled
+      && isUnsettledDispatch(active)
     ) {
       // Pi delivers queued input at a message boundary; the requested turn owns what follows.
       this.#settleBackgroundTurn(background);
@@ -1129,15 +1182,26 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     }
   }
 
-  /** The requested run owns native output until it settles, unless a background run is still streaming ahead of it. */
+  /**
+   * The requested run owns native output from dispatch until it settles, unless a background run is
+   * still streaming ahead of it. Output before dispatch belongs to a run some extension started.
+   */
   #requestedOutputTarget(): ActiveRun | null {
     const active = this.activeRun;
-    if (!active || active.run.isTerminal || active.settled || this.#backgroundTurn) return null;
+    if (
+      !active
+      || active.phase === 'preflight'
+      || active.phase === 'settled'
+      || active.run.isTerminal
+      || this.#backgroundTurn
+    ) return null;
     return active;
   }
 
   #handleRequestedChunk(active: ActiveRun, chunk: StreamChunk): void {
     if (chunk.type === 'done') return;
+    // The compact RPC owns manual completion, including on Pi versions without this event.
+    if (chunk.type === 'context_compacted' && parseCompactCommand(active.inputText)) return;
     if (chunk.type === 'error') {
       active.terminalSignal.reject(new Error(chunk.content));
       return;
@@ -1305,12 +1369,13 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     if (usage && this.#settlingBackgroundTurns.has(background)) {
       this.#emitBackground(background, { type: 'usage_updated', usage });
     }
-    this.#completeBackgroundTurn(background, background.cancelling ? 'provider-ended' : 'completed');
+    // Pi settles a Stop as an `aborted` reply, which history replays as interrupted.
+    this.#completeBackgroundTurn(background, background.cancelling ? 'interrupted' : 'completed');
   }
 
   #completeBackgroundTurn(
     background: BackgroundTurn,
-    reason: 'completed' | 'provider-ended',
+    reason: ProviderBackgroundTurnCompletionReason,
   ): void {
     if (this.#backgroundTurn === background) {
       this.#backgroundTurn = null;
@@ -1328,7 +1393,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     }
     if (!this.disposed && this.state.status !== 'invalidated') {
       const requested = this.activeRun !== null && !this.activeRun.run.isTerminal;
-      this.state.setStatus(requested || this.#hasBackgroundWork() ? 'executing' : 'idle');
+      this.state.settleActivity(requested || this.#hasBackgroundWork());
     }
     this.#emitBackgroundState(background);
     this.#emitBackground(background, {
@@ -1445,7 +1510,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   }
 
   #ensureAccepted(active: ActiveRun): void {
-    if (!this.isActive(active) || !active.nativeRequestDispatched) return;
+    if (!this.isActive(active) || active.phase === 'preflight') return;
     this.nativeConversationContextEstablished = true;
     if (active.accepted) return;
     active.accepted = true;
@@ -1495,9 +1560,9 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       ?? getPiState(this.state.providerState).parentSession;
     this.providerSessionId = sessionId ?? null;
     this.#setOptionalProviderStateValue('sessionId', sessionId);
-    this.#setOptionalProviderStateValue('sessionFile', sessionFile);
+    this.#setOptionalProviderStateValue('sessionFile', sessionFile ? piHostPath(sessionFile, this.kernel?.launchSpec.executionTarget) : undefined);
     this.#setOptionalProviderStateValue('leafEntryId', leafEntryId);
-    this.#setOptionalProviderStateValue('parentSession', parentSession);
+    this.#setOptionalProviderStateValue('parentSession', isPiSessionPathReference(parentSession) ? piHostPath(parentSession, this.kernel?.launchSpec.executionTarget) : parentSession);
     this.#replaceKernelSessionTargets(sessionFile, sessionId);
     this.#deleteProviderStateValue('forkSource');
     this.#deleteProviderStateValue('forkSourceSessionFile');
@@ -1564,7 +1629,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
 
   async #fetchUsage(model: string, signal?: AbortSignal) {
     if (!this.kernel) return null;
-    const settings = getPiProviderSettings(this.host.settings);
+    const settings = decodePiConfig(this.host.config, this.host.selection);
     const contextWindow = findPiModel(settings, model)?.contextWindow;
     const response = await this.kernel.request(
       'get_session_stats',
@@ -1575,29 +1640,10 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     return buildPiUsageInfo(response, model, contextWindow);
   }
 
-  async #publishCommands(
-    kernel: PiExecutionKernel,
-    generation: number,
-  ): Promise<void> {
-    try {
-      const response = await kernel.request<unknown>('get_commands', {}, 10_000);
-      if (!this.#isCurrentKernel(kernel, generation) || this.disposed) return;
-      this.services.commandCatalog.setCommandSnapshot(
-        normalizePiRuntimeCommands(response).filter(command => command.name !== PI_TREE_COMMAND),
-      );
-    } catch {
-      // Command metadata is non-blocking; the provider-owned probe can retry.
-    }
-  }
-
-  async #materializePendingFork(active: ActiveRun): Promise<void> {
+  async #materializePendingFork(active: ActiveRun, executionTarget: ExecutionTarget): Promise<void> {
     while (this.forkMaterializationFlight) {
       const priorFlight = this.forkMaterializationFlight;
-      try {
-        await priorFlight;
-      } catch (error) {
-        if (error instanceof PiForkRollbackError) throw error;
-      }
+      await priorFlight.catch(() => undefined);
       if (this.forkMaterializationFlight === priorFlight) {
         this.forkMaterializationFlight = null;
       }
@@ -1605,7 +1651,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
         throw new PiExecutionCancelledError();
       }
     }
-    const flight = this.#materializePendingForkForRun(active);
+    const flight = this.#materializePendingForkForRun(active, executionTarget);
     this.forkMaterializationFlight = flight;
     try {
       await flight;
@@ -1619,32 +1665,37 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     }
   }
 
-  async #materializePendingForkForRun(active: ActiveRun): Promise<void> {
+  async #materializePendingForkForRun(active: ActiveRun, executionTarget: ExecutionTarget): Promise<void> {
     if (this.#shouldDisableNativePersistence()) return;
     const state = getPiState(this.state.providerState);
     const forkSource = state.forkSource;
     if (!forkSource) return;
-    const envText = getRuntimeEnvironmentText(this.host.settings, 'pi');
-    const env = parseEnvironmentVariables(envText);
-    const sourceFile = state.forkSourceSessionFile
+    const envText = this.host.environmentText;
+    const env = { ...process.env, ...parseEnvironmentVariables(envText) };
+    const pathContext = await this.historyContextResolver.resolve(this.config.workingDirectory, {
+      environment: env, config: this.host.config, executionTarget, environmentText: envText,
+    });
+    const sourceFile = executionTarget.method === 'wsl'
+      ? resolvePiSessionFileHint(state.forkSourceSessionFile, forkSource.sessionId, this.config.workingDirectory, pathContext)
+      : state.forkSourceSessionFile
       ?? findPiSessionFile(
         forkSource.sessionId,
-        this.config.vaultWorkingDirectory,
+        this.config.workingDirectory,
         getString(env.PI_CODING_AGENT_SESSION_DIR),
       );
     if (!sourceFile) {
+      if (executionTarget.method === 'wsl') this.#retireNativeBinding();
       throw new Error(`Pi fork source session not found: ${forkSource.sessionId}`);
     }
     const fork = await this.options.createForkSessionFile(
       sourceFile,
       forkSource.resumeAt,
-      { targetCwd: this.config.vaultWorkingDirectory },
+      { targetCwd: piTargetPath(this.config.workingDirectory, executionTarget),
+        ...(executionTarget.method === 'wsl' ? { parentSession: piTargetPath(sourceFile, executionTarget) } : {}), },
     );
-    if (isSamePath(fork.sessionFile, sourceFile)) {
-      throw new Error('Pi fork materialization returned the source session as its target.');
-    }
     if (!this.isActive(active) || active.abortController.signal.aborted) {
-      await this.#rollbackCreatedFork(fork);
+      // Best effort: a failed cleanup only leaves an unreferenced fork file behind.
+      await this.options.rollbackForkSessionFile(fork).catch(() => undefined);
       return;
     }
     this.#setProviderStateValue('leafEntryId', fork.leafEntryId);
@@ -1655,34 +1706,6 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     this.#deleteProviderStateValue('forkSourceSessionFile');
     this.providerSessionId = fork.sessionId;
     this.state.bumpRevision();
-  }
-
-  async #rollbackCreatedFork(
-    fork: CreatedPiForkSessionFile,
-  ): Promise<void> {
-    try {
-      await this.options.rollbackForkSessionFile(fork);
-    } catch (error) {
-      throw new PiForkRollbackError(toError(error));
-    }
-  }
-
-  #invalidateForForkRollback(error: PiForkRollbackError): boolean {
-    const invalidation = this.state.invalidation;
-    if (
-      this.disposed
-      || (
-        this.state.status === 'invalidated'
-        && invalidation?.message === error.message
-        && invalidation.recoverable === false
-      )
-    ) return false;
-    this.state.invalidate({
-      message: error.message,
-      reason: 'provider-error',
-      recoverable: false,
-    });
-    return true;
   }
 
   #shouldDisableNativePersistence(): boolean {
@@ -1712,7 +1735,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
       this.kernel?.getStderrSnapshot(),
     );
     if (details.category === 'configuration') {
-      this.state.setStatus(this.#hasBackgroundWork() ? 'executing' : 'idle');
+      this.state.settleActivity(this.#hasBackgroundWork());
     } else {
       this.state.invalidate({
         message: details.message,
@@ -1740,6 +1763,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     active: ActiveRun,
     event: RequestedRunTerminalEvent,
   ): void {
+    active.sessionToolController.abort();
     if (!active.run.finish(event)) return;
     if (this.activeRun === active) {
       this.activeRun = null;
@@ -1802,7 +1826,8 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   }
 
   #settleRun(active: ActiveRun): void {
-    active.settled = true;
+    active.phase = 'settled';
+    active.sessionToolController.abort();
     this.#ensureAccepted(active);
     const pendingTerminalError = active.pendingTerminalError;
     active.pendingTerminalError = null;
@@ -1825,7 +1850,7 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   ): void {
     this.kernelSessionTargets.clear();
     for (const target of targets) {
-      if (target) this.kernelSessionTargets.add(target);
+      if (target) this.kernelSessionTargets.add(isPiSessionPathReference(target) ? piTargetPath(target, this.kernel?.launchSpec.executionTarget) : target);
     }
   }
 
@@ -1856,21 +1881,6 @@ implements ProviderExecutionSession, SteerableExecutionSession {
     return Boolean(state.sessionId || state.sessionFile);
   }
 
-  async #shutdownAcquiredKernel(
-    kernel: PiExecutionKernel,
-    generation: number,
-  ): Promise<void> {
-    if (this.kernel === kernel && this.kernelGeneration === generation) {
-      await this.#shutdownKernel().catch(() => undefined);
-      return;
-    }
-    if (this.shutdownPromise) {
-      await this.shutdownPromise.catch(() => undefined);
-      return;
-    }
-    await kernel.shutdown().catch(() => undefined);
-  }
-
   #setProviderStateValue(
     key: keyof PiProviderState,
     value: unknown,
@@ -1888,6 +1898,22 @@ implements ProviderExecutionSession, SteerableExecutionSession {
   /** Records a persisted deletion only for keys this session actually held. */
   #deleteProviderStateValue(key: keyof PiProviderState): void {
     if (this.state.hasProviderStateValue(key)) this.state.deleteProviderStateValue(key);
+  }
+
+  #retireNativeBinding(): void {
+    const retired = { sessionId: this.providerSessionId, providerState: { ...this.state.providerState } };
+    clearPiResumeState(retired);
+    this.#removeNativeProviderState();
+    for (const key of ['bindingRetired', 'previousSessions'] as const) {
+      const value = retired.providerState?.[key];
+      if (value !== undefined) this.#setProviderStateValue(key, value);
+      else this.#deleteProviderStateValue(key);
+    }
+    this.providerSessionId = null;
+    this.nativeConversationContextEstablished = false;
+    this.resumeSeedNeedsValidation = false;
+    this.kernelSessionTargets.clear();
+    this.state.bumpRevision();
   }
 
   #removeNativeProviderState(): void {
@@ -1918,44 +1944,24 @@ class PiProviderSessionMismatchError extends Error {
   }
 }
 
-class PiForkRollbackError extends Error {
-  constructor(readonly cleanupError: Error) {
-    super(cleanupError.message);
-    this.name = 'PiForkRollbackError';
-  }
-}
-
 function createDeferred<T>(): Deferred<T> {
-  let settled = false;
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (error: Error) => void;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
   });
   void promise.catch(() => undefined);
-  return {
-    promise,
-    reject(error) {
-      if (settled) return;
-      settled = true;
-      rejectPromise(error);
-    },
-    resolve(value?: T) {
-      if (settled) return;
-      settled = true;
-      resolvePromise(value as T);
-    },
-  };
+  return { promise, reject, resolve };
 }
 
 function resolveSelectedModel(
   request: ProviderExecutionRequest,
   settings: PiProviderSettings,
-  hostSettings: Record<string, unknown>,
+  selection: ProviderSelectionDefaults,
 ): string {
   const model = request.configuration.model
-    ?? getString(hostSettings.model);
+    ?? getString(selection.model);
   if (
     !model
     || !decodePiModelId(model)
@@ -1972,11 +1978,11 @@ function resolveThinkingLevel(
   request: ProviderExecutionRequest,
   settings: PiProviderSettings,
   model: string,
-  hostSettings: Record<string, unknown>,
+  selection: ProviderSelectionDefaults,
 ): string | null {
   if (request.configuration.reasoning === null) return null;
   const requested = request.configuration.reasoning
-    ?? getString(hostSettings.effortLevel)
+    ?? getString(selection.effortLevel)
     ?? settings.preferredThinkingByModel[model];
   const discovered = findPiModel(settings, model);
   const resolved = discovered
@@ -2006,22 +2012,6 @@ function resolveToolProfile(policy: ProviderToolPolicy): {
   return { noTools: false };
 }
 
-function resolveSystemPrompt(
-  request: ProviderExecutionRequest,
-  settings: Record<string, unknown>,
-  vaultPath: string,
-): string {
-  if (request.configuration.systemInstructions.kind === 'explicit') {
-    return request.configuration.systemInstructions.instructions;
-  }
-  return buildSystemPrompt({
-    customPrompt: getString(settings.systemPrompt) ?? undefined,
-    mediaFolder: getString(settings.mediaFolder) ?? undefined,
-    userName: getString(settings.userName) ?? undefined,
-    vaultPath,
-  } satisfies SystemPromptSettings);
-}
-
 function encodePrompt(
   request: ProviderExecutionRequest,
   replayConversationHistory: boolean,
@@ -2031,30 +2021,15 @@ function encodePrompt(
   text: string;
 } {
   const inputText = getInputText(request);
-  let text = inputText;
-  const context = request.context;
-  if (context?.linkedContent?.path) {
-    text = appendLinkedContent(text, context.linkedContent.path);
-  }
-  text = appendSelectionContexts(text, context);
-  text = appendSessionReferences(text, context?.sessionReferences);
-  // Pi splits a leading skill name at a literal space, not the context's newline separator.
-  if (text !== inputText && /^\/skill:\S+$/.test(inputText)) {
+  let text = appendExecutionContext(inputText, request.context);
+  // Pi splits skill and extension command names at a literal space, not the context separator.
+  if (text !== inputText && /^\/\S+$/.test(inputText)) {
     text = `${inputText} ${text.slice(inputText.length)}`;
   }
   if (replayConversationHistory && request.conversationHistory?.length) {
     const history = [...request.conversationHistory] as ChatMessage[];
     const historyContext = buildContextFromHistory(history, { preserveCapturedContext });
-    const recoveredPrompt = buildPromptWithHistoryContext(
-      historyContext,
-      text,
-      text,
-      history,
-    );
-    text = encodePiRecoveryPrompt(
-      historyContext,
-      recoveredPrompt === historyContext ? null : text,
-    );
+    text = buildRecoveryPrompt(historyContext, text, history);
   }
   const historyImages: PiPromptImage[] = replayConversationHistory && preserveCapturedContext
     ? getHistoryImages(request.conversationHistory ?? []).map(image => ({
@@ -2096,14 +2071,6 @@ function getFirstRejectedError(
     (result): result is PromiseRejectedResult => result.status === 'rejected',
   );
   return rejected ? toError(rejected.reason) : null;
-}
-
-function isSamePath(left: string, right: string): boolean {
-  const resolvedLeft = path.resolve(left);
-  const resolvedRight = path.resolve(right);
-  return process.platform === 'win32'
-    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
-    : resolvedLeft === resolvedRight;
 }
 
 function toError(error: unknown): Error {
@@ -2182,6 +2149,7 @@ function matchesExpectedPiSession(
   expectedTarget: string,
   expectedState: PiProviderState,
   reported: ReportedPiSessionIdentity,
+  target?: ExecutionTarget,
 ): boolean {
   const expectedFile = expectedState.sessionFile
     ?? (isPiSessionPathReference(expectedState.sessionId)
@@ -2199,7 +2167,7 @@ function matchesExpectedPiSession(
 
   if (expectedFile && reported.sessionFile) {
     compared = true;
-    if (!isSamePath(expectedFile, reported.sessionFile)) return false;
+    if (!samePiTargetPath(expectedFile, reported.sessionFile, target)) return false;
   }
   if (expectedId && reported.sessionId) {
     compared = true;

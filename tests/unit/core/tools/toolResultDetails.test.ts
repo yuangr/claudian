@@ -38,6 +38,15 @@ describe('normalizeToolResultDetails', () => {
   it('returns undefined when nothing usable remains', () => {
     expect(normalizeToolResultDetails({ webSearchResults: [], webSearchSummary: '  ' })).toBeUndefined();
   });
+
+  it('keeps a __proto__ resolved answer own through normalization', () => {
+    const normalized = normalizeToolResultDetails({
+      resolvedAnswers: JSON.parse('{"__proto__":"Blue"}'),
+    } as unknown as ToolResultDetails);
+    expect(normalized).toBeDefined();
+    expect(JSON.stringify(normalized!.resolvedAnswers)).toBe('{"__proto__":"Blue"}');
+    expect(Object.getOwnPropertyDescriptor(normalized!.resolvedAnswers!, '__proto__')).toMatchObject({ value: 'Blue', enumerable: true });
+  });
 });
 
 describe('tool result presentation', () => {

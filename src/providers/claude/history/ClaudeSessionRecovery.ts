@@ -1,7 +1,8 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import type { ProviderHistoryPathContext } from '../../../core/providers/types';
+import type { ClaudeConfigDirContext } from '../config/ClaudeConfigDir';
+import { getClaudeHostPathModule } from '../config/ClaudeConfigDir';
 import {
   encodeVaultPathForSDK,
   getSDKProjectsPath,
@@ -9,6 +10,7 @@ import {
 } from './ClaudeHistoryPathResolver';
 
 const TRANSCRIPT_CHUNK_SIZE = 64 * 1024;
+const MAX_TRANSCRIPT_EDGE_SIZE = 1024 * 1024;
 const TRANSCRIPT_SCAN_CONCURRENCY = 16;
 const RECOVERY_INDEX_TTL_MS = 5_000;
 const MAX_CREATED_AT_DELTA_WITH_ACTIVITY_MS = 2 * 60_000;
@@ -80,11 +82,11 @@ function selectUniqueCandidate(
 export async function recoverSDKSessionIdByTime(
   vaultPath: string,
   fingerprint: ClaudeSessionTimeFingerprint,
-  pathContext?: ProviderHistoryPathContext,
+  pathContext?: ClaudeConfigDirContext,
 ): Promise<string | null> {
-  const projectPath = path.join(
+  const projectPath = getClaudeHostPathModule(pathContext).join(
     getSDKProjectsPath(pathContext),
-    encodeVaultPathForSDK(vaultPath),
+    encodeVaultPathForSDK(vaultPath, pathContext),
   );
   try {
     const candidates = await getRecoveryIndex(projectPath);
@@ -150,39 +152,12 @@ async function readSessionTimeCandidate(
     const { size } = await handle.stat();
     if (size === 0) return null;
 
-    const firstLength = Math.min(size, TRANSCRIPT_CHUNK_SIZE);
-    const lastStart = Math.max(0, size - TRANSCRIPT_CHUNK_SIZE);
-    const lastLength = size - lastStart;
-    const firstBuffer = Buffer.alloc(firstLength);
-    const lastBuffer = Buffer.alloc(lastLength);
-    await Promise.all([
-      handle.read(firstBuffer, 0, firstLength, 0),
-      lastStart === 0
-        ? Promise.resolve()
-        : handle.read(lastBuffer, 0, lastLength, lastStart),
+    const [firstRecords, lastRecords] = await Promise.all([
+      readEdgeRecords(handle, size, false),
+      readEdgeRecords(handle, size, true),
     ]);
-
-    const firstRecords = parseCompleteRecords(
-      firstBuffer.toString('utf8'),
-      firstLength === size,
-      false,
-    );
-    const lastRecords = lastStart === 0
-      ? firstRecords
-      : parseCompleteRecords(lastBuffer.toString('utf8'), true, true);
-    const observedSessionIds = new Set<string>();
-    const timestamps: number[] = [];
     const sampledRecords = [...firstRecords, ...lastRecords];
-    for (const record of sampledRecords) {
-      if (typeof record.sessionId === 'string') {
-        observedSessionIds.add(record.sessionId);
-      }
-      if (typeof record.timestamp === 'string') {
-        const timestamp = Date.parse(record.timestamp);
-        if (Number.isFinite(timestamp)) timestamps.push(timestamp);
-      }
-    }
-    if (!observedSessionIds.has(sessionId) || timestamps.length === 0) return null;
+    if (!sampledRecords.some(record => record.sessionId === sessionId)) return null;
 
     const firstTimestamp = firstTimestampFromRecords(firstRecords);
     const lastTimestamp = lastTimestampFromRecords(lastRecords);
@@ -198,6 +173,54 @@ async function readSessionTimeCandidate(
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+/** Completes the crossing edge record without scanning the transcript's interior. */
+async function readEdgeRecords(
+  handle: fs.FileHandle,
+  size: number,
+  fromEnd: boolean,
+): Promise<Array<{ sessionId?: unknown; timestamp?: unknown; type?: unknown }>> {
+  const initialLength = Math.min(size, TRANSCRIPT_CHUNK_SIZE);
+  let start = fromEnd ? size - initialLength : 0;
+  let end = start + initialLength;
+  const initial = Buffer.alloc(initialLength);
+  await handle.read(initial, 0, initialLength, start);
+  if (initialLength === size) return parseCompleteRecords(initial.toString('utf8'), true, false);
+  if (!fromEnd && initial[initial.length - 1] === 10) {
+    return parseCompleteRecords(initial.toString('utf8'), false, false);
+  }
+
+  const chunks = [initial];
+  let sampledLength = initialLength;
+  while (sampledLength < MAX_TRANSCRIPT_EDGE_SIZE) {
+    const length = Math.min(
+      TRANSCRIPT_CHUNK_SIZE,
+      MAX_TRANSCRIPT_EDGE_SIZE - sampledLength,
+      fromEnd ? start : size - end,
+    );
+    if (length === 0) break;
+    const position = fromEnd ? start - length : end;
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, position);
+    if (bytesRead === 0) break;
+    const chunk = buffer.subarray(0, bytesRead);
+    const boundary = fromEnd ? chunk.lastIndexOf(10) : chunk.indexOf(10);
+    if (fromEnd) {
+      start = position;
+      chunks.unshift(boundary < 0 ? chunk : chunk.subarray(boundary + 1));
+    } else {
+      end += bytesRead;
+      chunks.push(boundary < 0 ? chunk : chunk.subarray(0, boundary + 1));
+    }
+    sampledLength += bytesRead;
+    if (boundary >= 0 || (fromEnd ? start === 0 : end === size)) {
+      return parseCompleteRecords(Buffer.concat(chunks).toString('utf8'), fromEnd || end === size, false);
+    }
+  }
+
+  // An oversized crossing record must not hide complete records already sampled.
+  return parseCompleteRecords(initial.toString('utf8'), fromEnd, fromEnd);
 }
 
 function parseCompleteRecords(

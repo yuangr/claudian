@@ -1,4 +1,5 @@
 import type { ChatRewindMode, ConversationBranchResult } from '@/core/execution';
+import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import type {
   ChatMessage,
   Conversation,
@@ -8,7 +9,9 @@ import type {
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
 import { ConversationBranching } from '@/features/chat/conversation/ConversationBranching';
 import { ConversationRewind, type ConversationSaveOptions } from '@/features/chat/conversation/ConversationRewind';
+import { resolveChatSystemInstructions } from '@/features/chat/execution/chatExecutionConfiguration';
 import type { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExecutionCoordinator';
+import { resolveSessionInstructions } from '@/features/chat/execution/projectInstructions';
 import type { LinkedContentController, LinkedContentSubmissionToken } from '@/features/chat/linked-content';
 import type { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import {
@@ -22,6 +25,13 @@ import type { SubagentManager } from '@/features/chat/subagents/SubagentManager'
 
 /** Longest a progress-only change waits for its coalesced save. */
 const PROGRESS_SAVE_DELAY_MS = 1_000;
+
+export interface ConversationCreationOptions {
+  providerId: ProviderId;
+  selectedModel?: string;
+  /** The frozen draft seed; the repository drops it if it no longer names a live project at creation. */
+  projectId?: string;
+}
 
 export interface ConversationCallbacks {
   onConversationLoaded?: () => void;
@@ -55,6 +65,9 @@ export interface ConversationControllerDeps {
   isConversationHydrated?: () => boolean;
   onConversationHydrated?: () => void;
   onPersistenceChanged?: () => void;
+  onBranchPreviewCancelled?: () => void;
+  /** The blank draft's project seed or its freeze changed; its presentation re-reads them. */
+  onDraftProjectChanged?: () => void;
 }
 
 export class ConversationController {
@@ -63,6 +76,11 @@ export class ConversationController {
   private pendingProgressSave: { supersede: () => void } | null = null;
   private pendingSaves = 0;
   private creation: Promise<void> | null = null;
+  /**
+   * The project a blank draft's Conversation joins at creation; same owner and lifetime as its Linked content.
+   * First-turn admission freezes it until creation settles, so the captured seed and the shown seed cannot diverge.
+   */
+  #draftProject: { readonly projectId: string | null; readonly frozen: boolean } = { projectId: null, frozen: false };
   get hasPendingPersistence(): boolean { return this.pendingSaves > 0 || !!this.pendingProgressSave || !!this.creation; }
   awaitCreation(): Promise<void> { return this.creation ?? Promise.resolve(); }
   readonly #setTransition: ReturnType<ChatState['claimTransitionWriter']>;
@@ -82,10 +100,19 @@ export class ConversationController {
       get renderer() { return deps.renderer; },
       drafts: deps.drafts,
       session: deps.session,
-      getMessagesEl: () => this.deps.getMessagesEl(),
       getExecutionCoordinator: () => this.#getExecutionCoordinator(),
       ensureExecutionInitialized,
       getSelectedModel: () => this.deps.getSelectedModel?.() ?? null,
+      getSystemInstructions: async workingDirectory => {
+        const { plugin, state } = this.deps;
+        const id = state.currentConversationId;
+        const conversation = id ? plugin.getConversationSummary(id) : null;
+        if (!conversation) throw new Error('Conversation is missing.');
+        const promptSettings = { ...plugin.settings };
+        const sessionInstructions = resolveSessionInstructions(plugin.projects, conversation);
+        const executionWorkingDirectory = await ProviderRegistry.resolveExecutionWorkingDirectory(plugin.providerHost, conversation.providerId, workingDirectory);
+        return resolveChatSystemInstructions(promptSettings, executionWorkingDirectory, sessionInstructions);
+      },
       isClosing,
       save: () => this.save(),
       renderTranscript: (messages, syncWelcomeVisibility) => (
@@ -152,8 +179,14 @@ export class ConversationController {
     return this.#branching.navigate(messageId, branchMessageId);
   }
 
-  cancelBranchDraft(): void {
-    this.#branching.cancelDraft();
+  cancelBranchDraft(options?: { render?: boolean }): void {
+    const hadDraft = this.#branching.hasDraft;
+    this.#branching.cancelDraft(options);
+    if (hadDraft && !this.#branching.hasDraft) this.deps.onBranchPreviewCancelled?.();
+  }
+
+  get visibleMessages(): readonly ChatMessage[] {
+    return this.#branching.visibleMessages;
   }
 
   get hasBranchDraft(): boolean {
@@ -165,10 +198,58 @@ export class ConversationController {
     return this.#branching.commitDraft(signal);
   }
 
-  /** Creates the Conversation for its first admitted turn and freezes that turn's Linked content. */
+  /**
+   * The project the composer shows: the bound conversation's raw membership, or the blank draft's seed. Only a
+   * draft's project can change, and not while first-turn admission holds it for the pending creation. Reads the
+   * session's own conversation id, so it is right before any presentation publishes the runtime (draft handoff).
+   */
+  get project(): { projectId: string | undefined; isDraft: boolean; changeable: boolean } {
+    const { plugin, state } = this.deps;
+    const conversationId = state.currentConversationId;
+    if (conversationId) {
+      return { projectId: plugin.getConversationSummary(conversationId)?.projectId, isDraft: false, changeable: false };
+    }
+    return { projectId: this.#draftProject.projectId ?? undefined, isDraft: true, changeable: !this.#draftProject.frozen };
+  }
+
+  /**
+   * Reseeds the blank draft's project, or clears it with null. Resolved when chosen: the draft may have become a
+   * conversation, or frozen its seed, meanwhile; a started session keeps its project here.
+   */
+  selectProject(projectId: string | null): void {
+    if (this.deps.state.currentConversationId || this.#draftProject.frozen) return;
+    this.seedDraftProject(projectId);
+  }
+
+  /** Seeds the project a blank draft joins when its first input creates the Conversation. */
+  seedDraftProject(projectId: string | null): void {
+    if (this.deps.state.currentConversationId) throw new Error('Only a blank draft can be seeded with a project');
+    if (this.#draftProject.frozen) throw new Error('The project seed cannot change while the Conversation is being created');
+    this.#setDraftProject({ projectId, frozen: false });
+  }
+
+  /** Captures the seed for the first turn's creation; it stays frozen until creation or `releaseDraftProject`. */
+  freezeDraftProject(): string | null {
+    this.#setDraftProject({ projectId: this.#draftProject.projectId, frozen: true });
+    return this.#draftProject.projectId;
+  }
+
+  /** Returns the seed to the draft after its first turn failed before creating the Conversation. */
+  releaseDraftProject(): void {
+    this.#setDraftProject({ projectId: this.#draftProject.projectId, frozen: false });
+  }
+
+  #setDraftProject(next: { projectId: string | null; frozen: boolean }): void {
+    const current = this.#draftProject;
+    if (current.projectId === next.projectId && current.frozen === next.frozen) return;
+    this.#draftProject = next;
+    this.deps.onDraftProjectChanged?.();
+  }
+
+  /** Creates the Conversation for its first admitted turn and freezes that turn's Linked content and project. */
   async createConversation(
     token: LinkedContentSubmissionToken,
-    options: { providerId: ProviderId; selectedModel?: string },
+    options: ConversationCreationOptions,
   ): Promise<void> {
     const pending = this.createConversationShell(token, options);
     this.creation = pending;
@@ -178,21 +259,19 @@ export class ConversationController {
 
   private async createConversationShell(
     token: LinkedContentSubmissionToken,
-    options: { providerId: ProviderId; selectedModel?: string },
+    options: ConversationCreationOptions,
   ): Promise<void> {
     const { plugin, state } = this.deps;
     const conversation = await plugin.createConversation({
       providerId: options.providerId,
       ...(options.selectedModel ? { selectedModel: options.selectedModel } : {}),
       ...(token.path ? { linkedContentPath: token.path } : {}),
+      ...(options.projectId ? { projectId: options.projectId } : {}),
     });
     state.currentConversationId = conversation.id;
+    this.#setDraftProject({ projectId: null, frozen: false });
 
-    const settlement = this.deps.getLinkedContentController().commitSubmission(token);
-    for (const event of settlement.queuedEvents) {
-      if (event.kind !== 'rename') continue;
-      await plugin.rewriteLinkedContentPaths(event.oldPath, event.newPath, event.includeDescendants);
-    }
+    this.deps.getLinkedContentController().commitSubmission(token);
   }
 
   /**
@@ -209,7 +288,7 @@ export class ConversationController {
     try { await this.persist(updateLastActivity, options); }
     catch (error) {
       // The unsaved state stays dirty so a later save, such as before release, retries it.
-      this.deps.state.hasPendingConversationSave = true;
+      this.deps.state.markConversationDirty();
       throw error;
     } finally { this.pendingSaves--; this.deps.onPersistenceChanged?.(); }
   }
@@ -232,6 +311,8 @@ export class ConversationController {
       throw new Error('Cannot save messages before the Conversation shell is created');
     }
 
+    // Changes made while the write is pending are not in this snapshot and stay pending.
+    const revision = state.conversationRevision;
     const updates: ConversationMutablePatch = {
       messages: state.messages,
       usage: state.usage ?? undefined,
@@ -250,7 +331,7 @@ export class ConversationController {
     }
 
     await plugin.updateConversation(state.currentConversationId!, updates);
-    state.hasPendingConversationSave = false;
+    state.markConversationSaved(revision);
     await this.#branching.refreshMetadata();
   }
 
@@ -290,7 +371,7 @@ export class ConversationController {
     state.messages = [...conversation.messages];
     state.usage = conversation.usage ?? null;
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
-    state.hasPendingConversationSave = false;
+    state.discardPendingConversationSave();
 
     this.deps.getLinkedContentController().lock(conversation.linkedContentPath);
 
@@ -306,7 +387,7 @@ export class ConversationController {
     state.clearMessages();
     state.usage = null;
     state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
-    state.hasPendingConversationSave = false;
+    state.discardPendingConversationSave();
 
     await this.#getExecutionCoordinator()?.bindConversation(null);
     this.deps.onConversationHydrated?.();

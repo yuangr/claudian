@@ -51,7 +51,7 @@ export class GrokExecutionInteractionRouter {
     const turnId = this.getTurnId();
     const request = parseQuestionRequest(params, this.getSessionId());
     if (!turnId || !request || signal?.aborted) return { outcome: 'cancelled' };
-    const pending = this.#begin(this.#nextId('question'));
+    const pending = this.#begin(this.#nextId('question'), signal);
     const { interactionId } = pending;
     let dismissReason: ProviderInteractionDismissReason = 'cancelled';
     try {
@@ -95,9 +95,9 @@ export class GrokExecutionInteractionRouter {
   }
 
   /** Grok asks one question at a time; a new question supersedes the previous one. */
-  #begin(interactionId: string): PendingInteraction {
+  #begin(interactionId: string, signal?: AbortSignal): PendingInteraction {
     this.dismissAll('superseded');
-    return this.pending.begin(interactionId)!;
+    return this.pending.begin(interactionId, signal)!;
   }
 }
 
@@ -144,17 +144,31 @@ function buildQuestionResponse(
   const answers: Record<string, string[]> = {};
   const annotations: Record<string, { preview: string }> = {};
   for (const question of questions) {
-    const values = rawAnswers[question.id ?? question.question] ?? rawAnswers[question.question];
+    const answerKey = question.id ?? question.question;
+    const values = (Object.hasOwn(rawAnswers, answerKey) ? rawAnswers[answerKey] : undefined)
+      ?? (Object.hasOwn(rawAnswers, question.question) ? rawAnswers[question.question] : undefined);
     if (values === undefined) continue;
     const normalized = (Array.isArray(values) ? values : [values]).filter(Boolean);
-    answers[question.question] = normalized.map(value => (
-      question.options.find(option => option.id === value || option.label === value)?.label ?? value
-    ));
+    Object.defineProperty(answers, question.question, {
+      value: normalized.map(value => (
+        question.options.find(option => option.id === value || option.label === value)?.label ?? value
+      )),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
     if (!question.multiSelect && normalized.length === 1) {
       const selected = question.options.find(
         option => option.id === normalized[0] || option.label === normalized[0],
       );
-      if (selected?.preview) annotations[question.question] = { preview: selected.preview };
+      if (selected?.preview) {
+        Object.defineProperty(annotations, question.question, {
+          value: { preview: selected.preview },
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
     }
   }
   return {

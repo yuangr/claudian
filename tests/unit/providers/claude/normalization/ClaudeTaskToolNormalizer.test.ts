@@ -187,6 +187,63 @@ describe('ClaudeTaskToolNormalizer', () => {
     expect(todosFrom(normalizer.normalizeToolResult('list-2', { tasks: [] }))).toEqual([]);
   });
 
+  it('keeps a later authoritative task list when retiring an unfinished update', () => {
+    const normalizer = new ClaudeTaskToolNormalizer();
+    normalizer.normalizeToolUse('list-before', 'TaskList', {});
+    normalizer.normalizeToolResult('list-before', { tasks: [{ id: '1', subject: 'First title', status: 'pending' }] });
+    normalizer.normalizeToolUse('pending-update', 'TaskUpdate', { taskId: '1', status: 'in_progress' });
+    normalizer.normalizeToolUse('list-after', 'TaskList', {});
+    normalizer.normalizeToolResult('list-after', { tasks: [{ id: '1', subject: 'Current title', status: 'completed' }] });
+
+    normalizer.finishCalls(['list-before', 'pending-update', 'list-after']);
+
+    expect(todosFrom(normalizer.normalizeToolUse('get-current', 'TaskGet', { taskId: '1' }))).toEqual([{
+      id: '1', content: 'Current title', activeForm: 'First title', status: 'completed',
+    }]);
+    expect(normalizer.normalizeToolResult('pending-update', { success: true })).toBeNull();
+  });
+
+  it.each([
+    ['TaskList', 'turn-end'], ['TaskGet', 'turn-end'], ['TaskList', 'tool-error'], ['TaskGet', 'tool-error'],
+  ])('keeps authoritative absence from %s after a pending deletion ends with %s', (reader, ending) => {
+    const normalizer = new ClaudeTaskToolNormalizer();
+    normalizer.normalizeToolUse('list-before', 'TaskList', {});
+    normalizer.normalizeToolResult('list-before', { tasks: [{ id: '1', subject: 'Deleted task', status: 'pending' }] });
+    normalizer.normalizeToolUse('pending-delete', 'TaskUpdate', { taskId: '1', status: 'deleted' });
+    normalizer.normalizeToolUse('read-after', reader, { taskId: '1' });
+    normalizer.normalizeToolResult('read-after', reader === 'TaskList' ? { tasks: [] } : { task: null });
+
+    if (ending === 'tool-error') normalizer.normalizeToolResult('pending-delete', { success: false });
+    else normalizer.finishCalls(['list-before', 'pending-delete', 'read-after']);
+
+    expect(todosFrom(normalizer.normalizeToolUse('get-current', 'TaskGet', { taskId: '1' }))).toEqual([]);
+  });
+
+  it('keeps a later confirmed task mutation when an earlier update fails', () => {
+    const normalizer = new ClaudeTaskToolNormalizer();
+    normalizer.normalizeToolUse('list-before', 'TaskList', {});
+    normalizer.normalizeToolResult('list-before', { tasks: [{ id: '1', subject: 'Task', status: 'pending' }] });
+    normalizer.normalizeToolUse('earlier-update', 'TaskUpdate', { taskId: '1', status: 'in_progress' });
+    normalizer.normalizeToolUse('later-update', 'TaskUpdate', { taskId: '1', status: 'completed' });
+    normalizer.normalizeToolResult('later-update', { success: true, taskId: '1', updatedFields: ['status'],
+      statusChange: { from: 'pending', to: 'completed' } });
+
+    const failed = normalizer.normalizeToolResult('earlier-update', { success: false, taskId: '1', updatedFields: [] });
+
+    expect(todosFrom(failed)).toEqual([{ id: '1', content: 'Task', activeForm: 'Task', status: 'completed' }]);
+  });
+
+  it('rolls back a failed deletion after its streamed task ID was already known', () => {
+    const normalizer = new ClaudeTaskToolNormalizer();
+    normalizer.normalizeToolUse('list-before', 'TaskList', {});
+    normalizer.normalizeToolResult('list-before', { tasks: [{ id: '1', subject: 'Keep task', status: 'pending' }] });
+    normalizer.normalizeToolUse('delete-refined', 'TaskUpdate', { taskId: '1' });
+    normalizer.normalizeToolUse('delete-refined', 'TaskUpdate', { taskId: '1', status: 'deleted' });
+
+    expect(todosFrom(normalizer.normalizeToolResult('delete-refined', { success: false })))
+      .toEqual([{ id: '1', content: 'Keep task', activeForm: 'Keep task', status: 'pending' }]);
+  });
+
   it('keeps state instance-local and clears it on reset', () => {
     const first = new ClaudeTaskToolNormalizer();
     const second = new ClaudeTaskToolNormalizer();

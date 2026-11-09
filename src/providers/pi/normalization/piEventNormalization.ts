@@ -1,3 +1,5 @@
+import { isSessionTool } from '@/core/tools/toolNames';
+
 import type { StreamChunk } from '../../../core/types';
 import { getPiCustomMessageDisplayText } from './piCustomMessageNormalization';
 import {
@@ -52,8 +54,13 @@ export function normalizePiRPCEvent(
     case 'message_end':
     case 'turn_end':
       return normalizeTerminalError(event);
-    case 'compaction_end':
-      return [{ type: 'context_compacted' }];
+    case 'compaction_end': {
+      if (event.aborted === true) return [];
+      const errorMessage = getString(event.errorMessage);
+      return errorMessage
+        ? [{ type: 'notice', content: errorMessage, level: 'warning' }]
+        : [{ type: 'context_compacted' }];
+    }
     case 'auto_retry_start':
       return [{ type: 'notice', content: 'Pi is retrying the turn.', level: 'warning' }];
     case 'auto_retry_end':
@@ -177,6 +184,7 @@ function normalizeToolUse(
     id,
     input: normalizePiToolInput(event.input ?? event.arguments ?? event.args, name),
     name,
+    ...(isSessionTool(name) ? { providerPayload: { rawName: name } } : {}),
   }];
 }
 
@@ -229,9 +237,10 @@ function normalizeToolResult(
     return [];
   }
 
-  const content = extractPiToolResultText(getPiToolName(event), event.result ?? event.output ?? event.content)
-    || state.toolOutputs.get(id)
-    || '';
+  const result = event.result ?? event.output ?? event.content;
+  const content = result === undefined
+    ? state.toolOutputs.get(id) ?? ''
+    : extractPiToolResultText(getPiToolName(event), result);
   state.toolOutputs.delete(id);
   state.divergedToolOutputIds.delete(id);
   const resultDetails = normalizePiToolResultDetails(getPiToolName(event), event.result, state.nestedToolArguments.get(id));

@@ -11,24 +11,29 @@ import {
   SessionSnapshotState,
   type WithoutEventScope,
 } from '@/core/execution';
-import { buildSystemPrompt } from '@/core/prompt/mainAgent';
-import { appendLinkedContent, appendLinkedContentBody, appendSelectionContexts, appendSessionReferences, captureSelectionSnapshots } from '@/core/prompt/promptContext';
-import type { ProviderHost } from '@/core/providers/ProviderHost';
+import { isSessionToolPolicyAllowed } from '@/core/execution/ProviderSessionToolPort';
+import { appendExecutionContext } from '@/core/prompt/promptContext';
+import type { ProviderRuntimeHost } from '@/core/providers/ProviderRuntimeHost';
 import { getActionDescription } from '@/core/security/approvalRules';
+import { invokeSessionTool } from '@/core/session-tools/invokeSessionTool';
+import type { SessionToolRoutedCallRequest } from '@/core/session-tools/SessionToolEndpoint';
+import type { SessionToolResult } from '@/core/session-tools/sessionToolSpecs';
 import type { SlashCommand } from '@/core/types';
 import { t } from '@/i18n/i18n';
 
 import { readDeepSeekCommands } from '../commands/DeepSeekCommandCatalog';
+import { decodeDeepSeekConfig } from '../config';
 import { materializeDeepSeekToolImages } from '../history/DeepSeekImages';
 import { readDeepSeekJournal, readDeepSeekProjection } from '../history/DeepSeekJournal';
 import { decodeDeepSeekModelId } from '../models';
 import { DeepSeekOutput, type DeepSeekOutputEvent, DeepSeekReplayError, deepseekText, type DeepSeekToolCall, deepseekToolName } from '../normalization/DeepSeekOutput';
 import { DeepSeekSubagents } from '../normalization/DeepSeekSubagents';
 import { DeepSeekRemoteError, isRecord } from '../remote/DeepSeekRemoteClient';
+import { toDeepSeekHostPath } from '../runtime/DeepSeekExecutionContext';
 import { isSameDeepSeekHome } from '../runtime/DeepSeekHome';
 import type { DeepSeekHost, DeepSeekHostLease } from '../runtime/DeepSeekHost';
 import { assertDeepSeekModelAvailable } from '../runtime/DeepSeekModels';
-import { getDeepSeekProviderSettings } from '../settings';
+import type { DeepSeekSessionToolAdmission } from '../runtime/DeepSeekRoster';
 import { decodeDeepSeekState, type DeepSeekPreset, type DeepSeekProviderState, encodeDeepSeekCheckpoint, isDeepSeekAuxiliaryPreset, isDeepSeekPreset } from '../types';
 import { applyDeepSeekPermission, type DeepSeekPermission, readDeepSeekPermission } from './DeepSeekPermissions';
 import { DeepSeekSessionObserver } from './DeepSeekSessionObserver';
@@ -53,6 +58,13 @@ interface Turn {
   nativeUserId?: string;
   /** The request native claimed into this turn; prompt hooks can still end the turn before echoing it. */
   claimed?: Request;
+}
+
+interface ChildState {
+  /** Set once from its parent's native creation catalog, never from whichever root turn happens to be running. */
+  origin?: { readonly request: Request | undefined } | { readonly parent: ChildState };
+  lastSeq: number;
+  turn?: { native: number; id: string; sequence: number; interactionScope: boolean; abort: AbortController };
 }
 
 /**
@@ -83,19 +95,28 @@ const WRITER_HANDOFF_MS = 5_000;
 const EPHEMERAL_ENDED = 'This temporary DeepSeek session ended when DeepSeek restarted. Start a new one to continue.';
 
 /** One claimed native session in the shared Host, one requested channel, and independently scoped automatic work. */
+type DeepSeekHostLink =
+  | { readonly phase: 'attaching'; readonly lease: DeepSeekHostLease; readonly observer?: undefined }
+  | { readonly phase: 'bound'; readonly lease: DeepSeekHostLease; readonly observer: DeepSeekSessionObserver }
+  | { readonly phase: 'retained'; readonly lease: DeepSeekHostLease; readonly observer?: DeepSeekSessionObserver };
+
 export class DeepSeekExecutionSession implements ProviderExecutionSession {
   readonly providerId = 'deepseek';
   readonly sessionInstanceId = randomUUID();
   private readonly snapshots: SessionSnapshotState;
   private readonly interactions: PendingInteractionLedger;
   private readonly lifetime = new AbortController();
-  private lease?: DeepSeekHostLease;
-  private observer?: DeepSeekSessionObserver;
+  /**
+   * The link to the shared Host: `attaching` holds a lease before the native session is observed,
+   * `bound` serves the conversation, and `retained` keeps a failed binding only so Stop or closing
+   * can still end the native work the live process keeps (detaching mid-attach retains no observer).
+   */
+  #link: DeepSeekHostLink | null = null;
   private nativeId?: string;
   private binding?: DeepSeekProviderState;
   private requested?: Request;
   private turn?: Turn;
-  private readonly childTurns = new Map<string, { native: number; id: string; sequence: number; interactionScope: boolean }>();
+  private readonly children = new Map<string, ChildState>();
   /** Native interactions awaiting ownership or call details, each with its own reconciliation deadline. */
   private readonly pendingNativeInteractions = new Map<string, { readonly value: Record<string, unknown>; readonly deadline: number }>();
   private interactionTimer?: number;
@@ -105,6 +126,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
   private stopTask?: Promise<void>;
   private disposal?: Promise<void>;
   private detaching?: Promise<void>;
+  private detachingMode?: 'stop' | 'retain' | 'release';
   // Only transcript divergence prevents rebinding after a failure.
   private reloadError?: DeepSeekReplayError;
   private publishedWork = false;
@@ -116,10 +138,10 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
   private readonly inboxPlaces = new Map<string, { readonly target: unknown; index: number }>();
   /** Native generation holding this session's in-memory identity; unset for sessions native stores. */
   private ephemeralGeneration?: number;
-  private readonly subagents = new DeepSeekSubagents(subagent => this.snapshots.emit({ type: 'subagent_updated', subagent }));
+  private readonly subagents = new DeepSeekSubagents(subagent => this.snapshots.emit({ type: 'subagent_updated', subagent }), path => toDeepSeekHostPath(path, this.lease?.execution));
 
   constructor(
-    private readonly host: ProviderHost,
+    private readonly host: ProviderRuntimeHost,
     private readonly config: ProviderSessionConfig,
     private readonly deepseek: DeepSeekHost,
   ) {
@@ -129,6 +151,9 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     });
     this.interactions = new PendingInteractionLedger(config.interactionPort);
   }
+
+  private get lease(): DeepSeekHostLease | undefined { return this.#link?.lease; }
+  private get observer(): DeepSeekSessionObserver | undefined { return this.#link?.observer; }
 
   getCommandSnapshot(): readonly SlashCommand[] | undefined { return this.commands?.map(command => ({ ...command })); }
   getSnapshot() { return this.snapshots.getSnapshot(); }
@@ -150,6 +175,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     if (!this.reloadError) this.snapshots.setStatus('executing');
     channel.attachAbortSignal(input.signal);
     void channel.terminated.then(async () => {
+      requested.abort.abort();
       await requested.admission;
       if (this.requested !== requested) return;
       this.requested = undefined;
@@ -161,7 +187,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
       if (channel.isCancellationRequested && requested.delivery === 'unsent') { channel.finish({ type: 'cancelled' }); return; }
       if (error instanceof AdmissionError) {
         channel.finish({ type: 'execution_error', category: 'configuration', recoverable: true, message: error.message });
-      } else void this.fail(error, error instanceof DeepSeekRemoteError && error.code === 'session/missing' ? 'provider-session-missing' : requested.delivery === 'unsent' ? 'configuration' : 'transport');
+      } else void this.fail(error, isMissingSession(error) ? 'provider-session-missing' : requested.delivery === 'unsent' ? 'configuration' : 'transport');
     });
     return channel;
   }
@@ -170,7 +196,8 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     // A finished request keeps its slot until its prompt is acknowledged; Stop then targets the work it started.
     if (this.requested && !this.requested.channel.isTerminal) { this.requested.channel.cancel(); return; }
     if (this.stopTask || !this.observer || this.lifetime.signal.aborted) return;
-    this.snapshots.setStatus('cancelling');
+    // Stopping retained work does not revive a failed conversation.
+    if (this.snapshots.status !== 'invalidated') this.snapshots.setStatus('cancelling');
     const task = this.stopBackground(this.lifetime.signal).catch(error => this.fail(error, 'transport')).finally(() => {
       if (this.stopTask === task) this.stopTask = undefined;
       if (this.snapshots.status === 'cancelling') this.snapshots.setStatus('idle');
@@ -234,7 +261,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
       this.interactions.dismissAll('session-disposed');
       this.snapshots.setStatus('disposed');
       // Leaving the conversation stops its native work.
-      this.disposal = this.detach(true).finally(() => this.snapshots.clearListeners());
+      this.disposal = this.detach('stop').finally(() => this.snapshots.clearListeners());
     }
     return this.disposal;
   }
@@ -261,12 +288,9 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     const desired = permissionFor(input);
     const current = this.permission ??= await readDeepSeekPermission(lease.client, this.nativeId!);
     if (current !== desired) {
-      const assertBoundary = (): void => {
-        this.assertRequest(requested);
-        if (!observer.permissionBoundaryAvailable()) throw new AdmissionError('DeepSeek cannot change permissions while a turn, tool, or question is active. Use Stop, then resend your draft.');
-      };
-      assertBoundary();
-      this.permission = await applyDeepSeekPermission(lease.client, this.nativeId!, desired, assertBoundary);
+      this.assertRequest(requested);
+      if (!observer.permissionBoundaryAvailable()) throw new AdmissionError('DeepSeek cannot change permissions while a turn, tool, or question is active. Use Stop, then resend your draft.');
+      this.permission = await applyDeepSeekPermission(lease.client, this.nativeId!, desired);
       this.snapshots.bumpRevision();
       requested.channel.emit({ type: 'permission_mode_changed', permissionMode: desired, snapshot: this.getSnapshot() });
     }
@@ -274,8 +298,8 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     await this.selectModel(input);
     this.assertRequest(requested);
     const text = input.input.filter(block => block.type === 'text').map(block => block.text).join('\n');
-    if (/^\/compact(?:\s|$)/.test(text) && this.commands?.some(command => command.kind === 'command' && command.name === 'compact')) {
-      if (input.input.some(block => block.type === 'image') || input.context?.linkedContent || input.context?.sessionReferences?.length || captureSelectionSnapshots(input.context).length) throw new AdmissionError('DeepSeek /compact does not accept attachments or linked context.');
+    if (/^\/compact(?:\s|$)/.test(text)) {
+      if (input.input.some(block => block.type === 'image') || input.context?.linkedContent || input.context?.sessionReferences?.length || input.context?.selections?.length) throw new AdmissionError('DeepSeek /compact does not accept attachments or linked context.');
       if (!observer.permissionBoundaryAvailable()) throw new AdmissionError('Use Stop before compacting an active DeepSeek conversation.');
       requested.command = true;
       requested.delivery = 'claimed';
@@ -291,8 +315,8 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
       }
       return;
     }
-    await lease.writePrompt(this.binding!.preset, prompt);
-    if (!isDeepSeekAuxiliaryPreset(this.binding!.preset)) await lease.writeCodeMode(getDeepSeekProviderSettings(this.host.settings).codeMode);
+    await lease.writePrompt(this.nativeId!, prompt);
+    if (!isDeepSeekAuxiliaryPreset(this.binding!.preset)) await lease.writeCodeMode(decodeDeepSeekConfig(this.host.config).codeMode);
     this.assertRequest(requested);
     requested.delivery = 'sending';
     const response = await lease.client.call('session/prompt', { request: {
@@ -309,13 +333,14 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     if (requested.delivery === 'sending') requested.delivery = 'queued';
   }
 
-  /** Binds this conversation to its native session in the shared Host; returns the preset's literal prompt. */
+  /** Binds this conversation to its native session in the shared Host; returns the session's literal prompt. */
   private async bind(requested: Request): Promise<string> {
-    const settings = this.host.settings;
     const input = requested.input;
     const policy: DeepSeekPreset | undefined = input.toolPolicy.kind === 'passive' ? 'claudian-passive' : input.toolPolicy.kind === 'read-only' ? 'claudian-read-only' : undefined;
-    const prompt = input.configuration.systemInstructions.kind === 'explicit' ? input.configuration.systemInstructions.instructions
-      : buildSystemPrompt({ customPrompt: settings.systemPrompt, mediaFolder: settings.mediaFolder, userName: settings.userName, vaultPath: this.config.vaultWorkingDirectory });
+    const prompt = input.configuration.systemInstructions.instructions;
+    // A retained binding only serves Stop and closing; sending rebinds with fresh native baselines. Its conversation
+    // state already ended with the failure, so releasing it leaves this request alone.
+    if (this.#link?.phase === 'retained') this.release();
     if (!this.lease) await this.attach(requested, policy);
     const preset = this.binding!.preset;
     if ((policy && preset !== policy) || (!policy && isDeepSeekAuxiliaryPreset(preset))) {
@@ -330,18 +355,21 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     // Nothing is bound yet: a failed startup ends this request only, and the next send starts again.
     try { lease = await this.deepseek.attach(signal); } catch (error) { throw new AdmissionError(error instanceof Error ? error.message : 'DeepSeek could not start.'); }
     const generation = ++this.generation;
-    this.lease = lease;
+    this.#link = { lease, phase: 'attaching' };
     try {
       this.assertRequest(requested);
       const saved = this.binding ?? decodeDeepSeekState(this.config.resumeSeed?.providerState);
-      if (saved && !isSameDeepSeekHome(saved.home, lease.home)) throw new AdmissionError('DeepSeek native history belongs to a different store. Restore its native store or select the original DeepSeek environment before continuing.');
+      if (saved && !isSameDeepSeekHome(saved.home, lease.home, lease.execution?.target.platformOs === 'linux' ? 'linux' : undefined)) throw new AdmissionError('DeepSeek native history belongs to a different store. Restore its native store or select the original DeepSeek environment before continuing.');
       this.binding = saved ?? { schemaVersion: 1, home: lease.home, profile: lease.profile, preset: policy ?? 'claudian' };
       if (this.ephemeralGeneration !== undefined && this.ephemeralGeneration !== lease.generation) throw new AdmissionError(EPHEMERAL_ENDED);
-      // The Host retires a lost process, which ends all of its native work.
-      this.offLease.push(lease.onLost((loss, error) => { if (generation === this.generation) void this.fail(error, loss, false); }));
+      // The Host retires a lost process, which ends all of its native work; a retained binding has nothing left to stop.
+      this.offLease.push(lease.onLost((loss, error) => {
+        if (generation === this.generation) void this.fail(error, loss, true);
+        else if (this.#link?.phase === 'retained' && this.#link.lease === lease) this.release();
+      }));
       this.offLease.push(lease.roster.onReset(() => { if (generation === this.generation) this.voidInteractions('superseded'); }));
       const deliver = (event: Record<string, unknown>): void => { if (generation === this.generation) this.remoteEvent(event); };
-      if (this.nativeId) lease.claim(this.nativeId, deliver);
+      if (this.nativeId) lease.claim(this.nativeId, deliver, (call, deadline) => this.captureSessionTool(call, deadline));
       const existingId = this.nativeId ?? this.binding.pendingFork?.sessionId;
       if (existingId) {
         const projection = await readDeepSeekProjection(lease.client, existingId);
@@ -354,7 +382,10 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         // Claudian archive state is authoritative: a native archive left by a failed restore or dsh web would gate every turn.
         // A pending fork's source is another conversation, and its fork is an independent native root.
         // Native never archives an ephemeral session.
-        if (this.nativeId && this.ephemeralGeneration === undefined) await lease.client.call('workspace/unarchiveSession', { request: { sessionId: this.nativeId } });
+        if (this.nativeId && this.ephemeralGeneration === undefined) {
+          await this.assertNativeDirectory(lease, this.nativeId, signal);
+          await lease.client.call('workspace/unarchiveSession', { request: { sessionId: this.nativeId } });
+        }
         this.assertRequest(requested);
       }
       // A new ephemeral identity is chosen once; without the Host's plugin it falls back to a stored session.
@@ -363,17 +394,21 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         // Leaving an ephemeral fork orphans only memory; a durable fork keeps the wait so it is never forked twice.
         this.nativeId = await lease.fork(this.binding.pendingFork, ephemeral, ephemeral ? signal : undefined); this.permission = undefined;
         if (ephemeral) this.ephemeralGeneration = lease.generation;
-        lease.claim(this.nativeId, deliver);
+        lease.claim(this.nativeId, deliver, (call, deadline) => this.captureSessionTool(call, deadline));
         this.binding = { ...this.binding, pendingFork: undefined };
         this.snapshots.deleteProviderStateValue('pendingFork');
       } else {
         const created = await this.createNative(lease, signal, ephemeral ? lease.ephemeralSessionId() : undefined);
-        if (!this.nativeId) lease.claim(created, deliver);
+        if (!this.nativeId) lease.claim(created, deliver, (call, deadline) => this.captureSessionTool(call, deadline));
         this.nativeId = created;
         if (ephemeral) this.ephemeralGeneration = lease.generation;
       }
       this.saveBinding();
-      this.observer = new DeepSeekSessionObserver(lease.client, lease.roster, this.nativeId, (id, frame) => {
+      // Read past the narrowing of the assignment above: awaits may have retained or released it.
+      const link = this.#link as DeepSeekHostLink | null;
+      // Unbinding releases the lease, whose claim above then rejects; reaching here means the lease is still this attach's.
+      if (link?.lease !== lease) throw new Error('DeepSeek connection ended before the session was ready.');
+      const observer = new DeepSeekSessionObserver(lease.client, lease.roster, this.nativeId, (id, frame) => {
         // Detaching ends this generation, so its frames are never applied; the observer then notifies at once for its own state.
         if (generation !== this.generation || this.detaching) return;
         return this.followQueue = this.followQueue.then(async () => {
@@ -398,8 +433,9 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
           if (id === this.nativeId) this.follow(materialized); else this.childFollow(id, materialized);
         }).catch(error => { if (generation === this.generation) return this.fail(error, 'transport'); });
       }, error => { if (generation === this.generation) void this.fail(error, 'transport'); });
-      this.offLease.push(this.observer.onChange(() => { this.publish(); this.drainInteractions(); }));
-      await this.observer.start(signal);
+      this.#link = link.phase === 'retained' ? { ...link, observer } : { lease, observer, phase: 'bound' };
+      this.offLease.push(observer.onChange(() => { this.publish(); this.drainInteractions(); }));
+      await observer.start(signal);
       await this.followQueue;
       this.commands = await readDeepSeekCommands(lease.client, this.nativeId);
       this.snapshots.emit({ type: 'commands_changed' });
@@ -410,20 +446,35 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     }
   }
 
+  /** Native resumes a saved session in its own directory, so one copied with another vault must not run here. */
+  private async assertNativeDirectory(lease: DeepSeekHostLease, sessionId: string, signal: AbortSignal): Promise<void> {
+    const listed = await lease.client.call('session/list', { _request: {} }, { signal });
+    if (!isRecord(listed) || !Array.isArray(listed.items)) throw new Error('Malformed DeepSeek session roster.');
+    const cwd = listed.items.filter(isRecord).find(item => item.sessionId === sessionId)?.cwd;
+    if (cwd !== (lease.execution?.targetCwd ?? this.config.workingDirectory)) {
+      throw new AdmissionError(`This DeepSeek conversation belongs to ${typeof cwd === 'string' ? `another directory (${cwd})` : 'an unknown directory'}. Open it from that vault, or start a new conversation.`);
+    }
+  }
+
   /** Creates or resumes the native session; a reloaded Claudian may still be releasing its writer. */
   private async createNative(lease: DeepSeekHostLease, signal: AbortSignal, ephemeralId?: string): Promise<string> {
-    const sessionId = this.nativeId ?? ephemeralId;
-    const request = { cwd: this.config.vaultWorkingDirectory, agentPreset: this.binding!.preset, ...(sessionId ? { sessionId } : {}) };
+    const resumed = this.nativeId;
+    const request = { cwd: lease.execution?.targetCwd ?? this.config.workingDirectory, agentPreset: this.binding!.preset, ...(ephemeralId ? { sessionId: ephemeralId } : {}) };
     const deadline = Date.now() + WRITER_HANDOFF_MS;
     for (let delay = 100; ; delay = Math.min(delay * 2, 1_000)) {
       try {
+        // Native create reuses a named session only while it is blank; any call addressing a saved session resumes it.
+        if (resumed) {
+          await lease.client.call('commands/list', { agentId: resumed }, { signal });
+          return resumed;
+        }
         const created = await lease.client.call('session/create', { request }, { signal });
-        if (!isRecord(created) || typeof created.sessionId !== 'string' || (sessionId && sessionId !== created.sessionId)) throw new Error('DeepSeek session identity changed during resume.');
+        if (!isRecord(created) || typeof created.sessionId !== 'string' || (ephemeralId && ephemeralId !== created.sessionId)) throw new Error('DeepSeek session identity changed during creation.');
         return created.sessionId;
       } catch (error) {
         // Only chat presets carry the user's additional rows; anything else native cannot mount is Claudian's own fault.
         if (error instanceof DeepSeekRemoteError && error.code === 'agent-preset/invalid' && !isDeepSeekAuxiliaryPreset(this.binding!.preset)
-          && getDeepSeekProviderSettings(this.host.settings).presetPlugins.trim()) {
+          && decodeDeepSeekConfig(this.host.config).presetPlugins.trim()) {
           throw new AdmissionError(`DeepSeek could not load its chat preset: ${error.message}. Check Additional preset plugins in the DeepSeek settings.`);
         }
         if (!(error instanceof DeepSeekRemoteError) || error.code !== 'session/writer-held') throw error;
@@ -440,7 +491,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
       if (input.configuration.reasoning) throw new AdmissionError('Select a DeepSeek model before choosing reasoning effort.');
       return;
     }
-    try { assertDeepSeekModelAvailable(this.host.settings, model); } catch (error) { throw new AdmissionError(error instanceof Error ? error.message : 'DeepSeek model is unavailable.'); }
+    try { assertDeepSeekModelAvailable(this.host, model); } catch (error) { throw new AdmissionError(error instanceof Error ? error.message : 'DeepSeek model is unavailable.'); }
     const selection = decodeDeepSeekModelId(model);
     if (!selection) throw new AdmissionError('The selected model does not belong to DeepSeek Harness.');
     let effort = input.configuration.reasoning ?? undefined;
@@ -452,7 +503,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
       const native = Array.isArray(group?.models) ? group.models.filter(isRecord).find(item => item.id === selection.model) : undefined;
       const reasoning = isRecord(native?.reasoning) ? native.reasoning : undefined;
       const efforts = Array.isArray(reasoning?.efforts) ? reasoning.efforts.filter(isRecord).map(item => item.id) : [];
-      const preferred = getDeepSeekProviderSettings(this.host.settings).preferredReasoningByModel[model];
+      const preferred = decodeDeepSeekConfig(this.host.config).preferredReasoningByModel[model];
       effort = preferred && efforts.includes(preferred) ? preferred : efforts.includes('high') ? 'high' : undefined;
     }
     const response = await this.lease!.client.call('session/selectModel', { request: { sessionId: this.nativeId, ...selection, ...(effort ? { reasoningEffort: effort } : {}) } }).catch(error => {
@@ -508,12 +559,13 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     // Native policy events invalidate the verified proof; ordinary turns need no history scan.
     if (event.type === 'sandbox/mode' || event.type === 'approval/policy') this.permission = undefined;
     this.subagents.parent(event);
+    this.claimChild(event, { request: this.turn?.claimed });
     if (event.type === 'agent/inbox/spliced') { this.trackInbox(data); return; }
     if (event.type === 'turn/start') {
       if (this.turn) throw new Error('DeepSeek opened overlapping native turns.');
       if (typeof data.turn !== 'number') throw new Error('Missing DeepSeek turn identity.');
       const turn: Turn = { native: data.turn, id: randomUUID(), startedAt: typeof event.time === 'number' ? event.time : Date.now(),
-        buffered: [], sequence: 0, output: new DeepSeekOutput(value => this.output(turn, value)),
+        buffered: [], sequence: 0, output: new DeepSeekOutput(value => this.output(turn, value), path => toDeepSeekHostPath(path, this.lease?.execution)),
       };
       this.turn = turn;
       return;
@@ -531,7 +583,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         steer.answer(true); steer.release();
       } else if (source.kind === 'user' && requested && requested.channel.executionId === source.rpcId) {
         if (turn.owner && turn.owner !== requested.channel) throw new Error('DeepSeek request was claimed after output ownership was assigned.');
-        requested.delivery = 'claimed'; turn.owner = requested.channel;
+        requested.delivery = 'claimed'; turn.owner = requested.channel; turn.claimed = requested;
         turn.nativeUserId = typeof data.id === 'string' ? data.id : undefined;
         turn.owner.emit({ type: 'turn_started', accepted: true, nativeTurnId: String(turn.native), nativeUserMessageId: turn.nativeUserId });
         // Core treats the first echo as the submitted input; later ones are steers.
@@ -563,19 +615,21 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         return;
       }
       const completion = reason.kind === 'max-tokens' ? 'max-tokens' : reason.kind === 'completed' ? 'completed' : 'provider-ended';
+      // A stopped turn is interrupted, as its journal's `turn/end` replays it.
+      const stopped = reason.kind === 'aborted' || reason.kind === 'cancelled';
       this.classify();
       const checkpoint = encodeDeepSeekCheckpoint(event.seq);
       this.binding = { ...this.binding!, checkpointSeq: event.seq }; this.saveBinding();
       if (turn.owner instanceof RequestedRunChannel) {
         turn.owner.emit({ type: 'session_state_changed', snapshot: this.getSnapshot() });
-        turn.owner.finish(turn.owner.isCancellationRequested || reason.kind === 'aborted' || reason.kind === 'cancelled' ? { type: 'cancelled' } : {
+        turn.owner.finish(turn.owner.isCancellationRequested || stopped ? { type: 'cancelled' } : {
           type: 'turn_completed', reason: completion, nativeUserMessageId: turn.nativeUserId,
           nativeAssistantId: checkpoint, nativeCheckpointId: checkpoint,
           turnStats: { outputTokens: turn.output.outputTokens, durationMs: Math.max(0, (typeof event.time === 'number' ? event.time : Date.now()) - turn.startedAt) },
         });
-      } else this.background(turn, { type: 'background_turn_completed', reason: completion, nativeAssistantId: checkpoint, nativeCheckpointId: checkpoint, providerSessionId: this.nativeId, snapshotRevision: this.snapshots.revision });
+      } else this.background(turn, { type: 'background_turn_completed', reason: stopped ? 'interrupted' : completion, nativeAssistantId: checkpoint, nativeCheckpointId: checkpoint, providerSessionId: this.nativeId, snapshotRevision: this.snapshots.revision });
       this.turn = undefined; this.publish();
-      if (reason.kind === 'aborted' || reason.kind === 'cancelled') this.recoverAfterAutomaticTurn(turn, 'an automatic turn was stopped');
+      if (stopped) this.recoverAfterAutomaticTurn(turn, 'an automatic turn was stopped');
       return;
     }
     if (event.type.startsWith('assistant/') || event.type.startsWith('tool/')) this.classify();
@@ -643,24 +697,82 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     this.snapshots.notify({ ...event, scope: { kind: 'background', sessionInstanceId: this.sessionInstanceId, turnId: turn.id, sequence: ++turn.sequence } } as ProviderSessionEvent);
   }
 
+  private child(id: string): ChildState {
+    let child = this.children.get(id);
+    if (!child) { child = { lastSeq: -1 }; this.children.set(id, child); }
+    return child;
+  }
+
+  private claimChild(event: Record<string, unknown>, origin: NonNullable<ChildState['origin']>): void {
+    if (event.type !== 'subagent/catalog' || !isRecord(event.data) || typeof event.data.childId !== 'string') return;
+    const child = this.child(event.data.childId);
+    // Keep the creating parent's identity even when its own catalog has not arrived on the independent stream.
+    child.origin ??= origin;
+  }
+
   private childFollow(id: string, frame: Record<string, unknown>): void {
     this.subagents.child(id, frame);
+    const child = this.child(id);
     const records = frame.type === 'snapshot' && Array.isArray(frame.records)
       ? frame.records.filter(isRecord).map(record => record.event).filter(isRecord)
       : frame.type === 'event' && isRecord(frame.event) ? [frame.event] : [];
     for (const event of records) {
-      if (!isRecord(event.data)) continue;
+      if (typeof event.seq !== 'number' || event.seq <= child.lastSeq || !isRecord(event.data)) continue;
+      child.lastSeq = event.seq;
+      if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') continue;
+      this.claimChild(event, { parent: child });
       if (event.type === 'turn/start' && typeof event.data.turn === 'number') {
-        const previous = this.childTurns.get(id);
-        if (previous?.native === event.data.turn) continue;
-        this.childTurns.set(id, { native: event.data.turn, id: randomUUID(), sequence: 0, interactionScope: false });
+        child.turn?.abort.abort();
+        child.turn = { native: event.data.turn, id: randomUUID(), sequence: 0, interactionScope: false, abort: new AbortController() };
       } else if (event.type === 'turn/end') {
-        const turn = this.childTurns.get(id);
+        const turn = child.turn;
         if (!turn || turn.native !== event.data.turn) continue;
         if (turn.interactionScope) this.background(turn, { type: 'background_turn_completed', reason: 'completed' });
-        this.childTurns.delete(id);
+        turn.abort.abort();
+        child.turn = undefined;
       }
     }
+  }
+
+  private childRequest(child: ChildState | undefined): Request | undefined {
+    const seen = new Set<ChildState>();
+    while (child && !seen.has(child)) {
+      seen.add(child);
+      const origin = child.origin;
+      if (!origin) return undefined;
+      if ('request' in origin) return origin.request;
+      child = origin.parent;
+    }
+    return undefined;
+  }
+
+  private captureSessionTool(call: SessionToolRoutedCallRequest, deadline: number): DeepSeekSessionToolAdmission | undefined {
+    const requested = this.requested;
+    if (!requested || !this.config.sessionTools || !this.observer || this.detaching
+      || requested.channel.isTerminal || requested.channel.isCancellationRequested || !isSessionToolPolicyAllowed(requested.input.toolPolicy)) return undefined;
+    const signal = AbortSignal.any([call.signal, this.lifetime.signal, requested.abort.signal, requested.input.signal]);
+    if (signal.aborted) return undefined;
+    return { signal, invoke: () => this.callSessionTool(call, requested, signal, deadline) };
+  }
+
+  private async callSessionTool(call: SessionToolRoutedCallRequest, requested: Request, signal: AbortSignal, deadline: number): Promise<SessionToolResult> {
+    // The roster captured this request before discovery; the caller's owning run, once the follow stream knows it, must be that request.
+    const denied = (): Promise<SessionToolResult> => invokeSessionTool(call.name, call.args, { port: this.config.sessionTools, toolPolicy: undefined, signal });
+    if (!this.observer) return denied();
+    const isRoot = call.callerNativeId === this.nativeId;
+    const owner = () => isRoot ? this.turn?.claimed : this.childRequest(this.children.get(call.callerNativeId));
+    const active = () => Date.now() < deadline && !signal.aborted && !requested.channel.isTerminal && !requested.channel.isCancellationRequested && !this.detaching;
+    try {
+      await this.observer.waitUntil(() => !active() || owner() !== undefined, Math.max(0, deadline - Date.now()), signal);
+    } catch {
+      return { isError: true, text: 'DeepSeek session tool call ended or did not reconcile before the deadline.' };
+    }
+    if (!active() || owner() !== requested) return denied();
+    const childTurn = isRoot ? undefined : this.children.get(call.callerNativeId)?.turn;
+    return invokeSessionTool(call.name, call.args, {
+      port: this.config.sessionTools, toolPolicy: requested.input.toolPolicy,
+      signal: childTurn ? AbortSignal.any([signal, childTurn.abort.signal]) : signal,
+    });
   }
 
   private remoteEvent(value: unknown): void {
@@ -703,7 +815,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         this.declineApproval(id);
         continue;
       }
-      const child = root ? undefined : this.childTurns.get(agentId);
+      const child = root ? undefined : this.children.get(agentId)?.turn;
       if (root ? !this.turn || (!this.turn.owner && this.requested) : !child) continue;
       // Approvals and tool calls arrive on separate streams; wait for the call until the deadline.
       const callId = value.event === 'approval/request' && isRecord(value.request) && typeof value.request.callId === 'string' ? value.request.callId : undefined;
@@ -748,7 +860,7 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
         ...question, ...(!Array.isArray(question.options) || !question.options.length ? { isOther: true } : {}),
       })) : [],
     };
-    const reason = localizedReason(nativeRequest, this.host.settings.locale);
+    const reason = localizedReason(nativeRequest, this.host.locale);
     const presentation = call
       ? { toolName: call.name, input: { ...call.input }, description: getActionDescription(call.name, call.input), ...(reason ? { decisionReason: reason } : {}) }
       : { toolName: typeof nativeRequest.toolName === 'string' ? deepseekToolName(nativeRequest.toolName) : 'DeepSeek tool', input: {}, description: reason ?? t('chat.approval.deepseekRequest') };
@@ -765,8 +877,9 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
   }
 
   private cancelRequest(requested: Request): void {
+    requested.abort.abort();
     if (requested.delivery === 'unsent' || requested.command) {
-      requested.abort.abort(); requested.channel.finish({ type: 'cancelled' }); return;
+      requested.channel.finish({ type: 'cancelled' }); return;
     }
     this.withdraw(requested);
   }
@@ -850,87 +963,135 @@ export class DeepSeekExecutionSession implements ProviderExecutionSession {
     return steer.withdrawal;
   }
 
-  private async stopBackground(signal: AbortSignal): Promise<void> {
+  private async stopBackground(signal?: AbortSignal): Promise<void> {
     const observer = this.observer!;
-    const deadline = Date.now() + 10_000;
-    const options = { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) };
+    const roster = this.lease!.roster;
+    // Host recovery pauses Stop's deadline: the Host either reconnects, so Stop resumes, or retires
+    // the process, which ends its work.
+    const remaining = observer.connectedBudget(10_000);
+    const options = (): { signal: AbortSignal } => ({ signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) });
     const killed = new Set<string>();
     while (observer.hasWork()) {
-      if (Date.now() >= deadline) throw new Error('DeepSeek background Stop did not settle. Reopen the conversation to recover its native state.');
+      if (roster.disposed) throw new Error('DeepSeek process ended before background Stop settled.');
+      if (remaining() <= 0) throw new Error('DeepSeek background Stop did not settle. Reopen the conversation to recover its native state.');
       const agents = [...observer.activeAgents()].reverse();
       for (const agent of agents) {
         if (agent.running && (!agent.parent || agent.mode === 'continuable')) await this.lease!.client.call(agent.parent ? 'subagents/interruptByParent' : 'session/cancel', agent.parent
           ? { childSessionId: agent.id, parentSessionId: agent.parent, mode: 'continuable' }
-          : { request: { sessionId: agent.id } }, options);
+          : { request: { sessionId: agent.id } }, options());
         for (const item of observer.queuedItems(agent.id)) {
           const steer = agent.id === this.nativeId && item.source?.rpcId ? this.steers.get(item.source.rpcId) : undefined;
           if (steer) { await this.withdrawSteer(steer); continue; }
-          await this.removeQueued(agent.id, item.id, options);
+          await this.removeQueued(agent.id, item.id, options());
         }
       }
       for (const job of observer.ownedJobs()) {
         const key = `${job.owner}:${job.id}`;
         if (killed.has(key)) continue;
-        await this.lease!.client.call('job/kill', { request: { sessionId: job.owner, jobId: job.id } }, options); killed.add(key);
+        await this.lease!.client.call('job/kill', { request: { sessionId: job.owner, jobId: job.id } }, options()); killed.add(key);
       }
       if (!observer.hasWork()) break;
       // Yield until authoritative native updates arrive; the deadline bounds stalled producers.
       await new Promise<void>(resolve => {
         const finish = (): void => { window.clearTimeout(timer); off(); resolve(); };
         const off = observer.onChange(finish);
-        const timer = window.setTimeout(finish, Math.min(100, Math.max(1, deadline - Date.now())));
+        const timer = window.setTimeout(finish, Math.min(100, Math.max(1, remaining())));
       });
     }
     this.interactions.dismissAll('cancelled');
   }
 
-  private async fail(error: unknown, category: 'configuration' | 'transport' | 'process-exited' | 'provider-session-missing', stopWork = true): Promise<void> {
+  /**
+   * Failing ends this conversation's binding, never its native work: the live process keeps that work and rebinding
+   * observes it again. Only the user's intent stops work: a Stop still in progress here, or closing the conversation.
+   */
+  private async fail(error: unknown, category: 'configuration' | 'transport' | 'process-exited' | 'provider-session-missing', processEnded = false): Promise<void> {
     if (this.snapshots.status === 'disposed' || this.snapshots.status === 'invalidated') return;
+    // Decided before finishing the requested run, whose pending Stop is part of the intent.
+    const mode = processEnded || this.observer?.failed ? 'release' : this.stopInProgress() ? 'stop' : 'retain';
     if (error instanceof DeepSeekReplayError) this.reloadError = error;
     const message = error instanceof Error ? error.message : 'DeepSeek execution failed.';
     this.requested?.channel.finish({ type: 'execution_error', category, message, recoverable: true, ...(category === 'provider-session-missing' ? { missingProviderSessionId: this.nativeId } : {}) });
     this.snapshots.invalidate({ reason: category === 'process-exited' ? 'process-exited' : category === 'provider-session-missing' ? 'provider-session-missing' : 'transport-closed', recoverable: true, message });
     this.snapshots.emit({ type: 'session_error', category, message, recoverable: true });
     this.interactions.dismissAll('native-rejected');
-    // The shared Host stays up for other conversations; stop this one's native work when still observable.
-    await this.detach(stopWork);
+    await this.detach(mode);
   }
 
-  private detach(stopWork: boolean): Promise<void> {
-    if (this.detaching) return this.detaching;
+  /** A background Stop, or a Stop of the requested run that has not ended; a cancelled request that already ended authorizes nothing. */
+  private stopInProgress(): boolean {
+    const channel = this.requested?.channel;
+    return !!this.stopTask || (!!channel && channel.isCancellationRequested && !channel.isTerminal);
+  }
+
+  /**
+   * Ends this binding. `stop` first stops its native work; `retain` keeps the lease, claim and observer so a later Stop or
+   * closing can; `release` lets go of a binding with nothing left to stop.
+   */
+  private detach(mode: 'stop' | 'retain' | 'release'): Promise<void> {
+    if (this.detaching) {
+      // Closing during a failure's retain or release still stops what that detach leaves behind.
+      if (mode !== 'stop' || this.detachingMode === 'stop') return this.detaching;
+      const escalated = this.detaching.then(() => {
+        this.detaching = undefined;
+        this.detachingMode = undefined;
+        return this.detach('stop');
+      });
+      this.detaching = escalated;
+      this.detachingMode = 'stop';
+      return escalated;
+    }
     const observer = this.observer;
     const task = (async () => {
-      if (!stopWork || !observer) return;
+      if (mode !== 'stop' || !observer) return;
       try {
         // Job rows refresh after every turn; decide only on reconciled state.
         await observer.waitUntil(() => observer.isReady(), 5_000);
-        if (observer.hasWork()) await this.stopBackground(AbortSignal.timeout(10_000));
+        if (observer.hasWork()) await this.stopBackground();
       } catch {
         // Unconfirmed native work ends with the shared Host; the session is already retired.
       }
     })().finally(() => {
-      if (this.detaching === task) this.detaching = undefined;
-      this.unbind();
+      if (this.detaching === task) { this.detaching = undefined; this.detachingMode = undefined; }
+      const link = this.#link;
+      if (mode === 'retain' && link) { this.endBinding(); this.#link = { ...link, phase: 'retained' }; } else this.unbind();
     });
     this.detaching = task;
+    this.detachingMode = mode;
     this.publish();
     return task;
   }
 
   private unbind(): void {
+    this.endBinding();
+    this.release();
+  }
+
+  /** Lets go of the lease, claim and observer. */
+  private release(): void {
+    const link = this.#link;
+    this.#link = null;
+    for (const off of this.offLease.splice(0)) off();
+    link?.observer?.dispose();
+    link?.lease.release();
+    if (this.commands) { this.commands = undefined; this.snapshots.emit({ type: 'commands_changed' }); }
+    this.publish();
+  }
+
+  /** Ends this conversation's view of the binding; the observer keeps tracking native work while it is retained. */
+  private endBinding(): void {
     ++this.generation;
+    this.requested?.abort.abort();
     for (const steer of [...this.steers.values()]) { steer.answer(new Error('DeepSeek connection ended before the steered message was confirmed.')); steer.release(); }
     if (this.turn?.owner === 'background') this.background(this.turn, { type: 'background_turn_completed', reason: 'provider-ended' });
-    for (const turn of this.childTurns.values()) {
-      if (turn.interactionScope) this.background(turn, { type: 'background_turn_completed', reason: 'provider-ended' });
+    for (const child of this.children.values()) {
+      child.turn?.abort.abort();
+      if (child.turn?.interactionScope) this.background(child.turn, { type: 'background_turn_completed', reason: 'provider-ended' });
     }
     this.turn = undefined; this.permission = undefined; this.lastSequence = -1; this.followQueue = Promise.resolve();
-    this.childTurns.clear(); this.subagents.clear(); this.inboxPlaces.clear();
+    this.children.clear(); this.subagents.clear(); this.inboxPlaces.clear();
     this.voidInteractions();
-    for (const off of this.offLease.splice(0)) off();
-    this.observer?.dispose(); this.observer = undefined;
-    this.lease?.release(); this.lease = undefined;
-    if (this.commands) { this.commands = undefined; this.snapshots.emit({ type: 'commands_changed' }); }
+    this.observer?.clearInteractions();
     this.publish();
   }
 
@@ -967,10 +1128,7 @@ function permissionFor(input: ProviderExecutionRequest): DeepSeekPermission {
 }
 
 function encodeInput(input: ProviderExecutionRequest): unknown[] {
-  let text = input.input.filter(block => block.type === 'text').map(block => block.text).join('\n');
-  const linked = input.context?.linkedContent;
-  if (linked) text = linked.content === undefined ? appendLinkedContent(text, linked.path) : appendLinkedContentBody(text, linked.path, linked.content);
-  text = appendSessionReferences(appendSelectionContexts(text, input.context), input.context?.sessionReferences);
+  const text = appendExecutionContext(input.input.filter(block => block.type === 'text').map(block => block.text).join('\n'), input.context);
   return [{ type: 'text', text }, ...input.input.flatMap(block => block.type === 'image' ? [{ type: 'image', mediaType: block.image.mediaType, data: block.image.data, name: block.image.name }] : [])];
 }
 
@@ -986,11 +1144,20 @@ function localizedReason(request: Record<string, unknown>, locale: string): stri
 function questionAnswers(request: Record<string, unknown>, answers: Record<string, string | string[]> | null): unknown {
   return { answers: Array.isArray(request.questions) ? request.questions.filter(isRecord).map(question => {
     const id = typeof question.id === 'string' ? question.id : '';
-    const value = answers?.[id] ?? (typeof question.question === 'string' ? answers?.[question.question] : undefined);
+    const text = typeof question.question === 'string' ? question.question : '';
+    // Own-key reads keep inherited entries out; the string check and ?? retain the
+    // original question-text fallback, including an own empty-string text key.
+    const value = (answers && Object.hasOwn(answers, id) ? answers[id] : undefined)
+      ?? (answers && typeof question.question === 'string' && Object.hasOwn(answers, text) ? answers[text] : undefined);
     const values = Array.isArray(value) ? value : value ? [value] : [];
     const options = Array.isArray(question.options) ? question.options.filter(isRecord).map(option => option.label) : [];
     const selected = values.filter(value => options.includes(value));
     const custom = values.filter(value => !options.includes(value)).join('\n');
     return { id, selected, ...(custom ? { custom } : {}) };
   }) : [] };
+}
+
+/** Projections report a missing session as `session/missing`; resolving one to resume it reports `session/not-found`. */
+function isMissingSession(error: unknown): boolean {
+  return error instanceof DeepSeekRemoteError && (error.code === 'session/missing' || error.code === 'session/not-found');
 }

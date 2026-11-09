@@ -14,8 +14,17 @@
     "none": "Aucun"
   },
   "chat": {
+    "queue": {
+      "queued": "En file d’attente",
+      "steering": "Réorientation en cours",
+      "steerNow": "Réorienter maintenant",
+      "edit": "Modifier le message en file d’attente",
+      "discard": "Supprimer le message en file d’attente",
+      "images": "[images]"
+    },
     "promptSuggestionHint": "Tab pour accepter",
     "selectAvailableModel": "Sélectionnez un modèle disponible avant d’envoyer.",
+    "reloadingHistory": "Cette conversation a changé en dehors de Claudian et se recharge. Renvoyez une fois le rechargement terminé.",
     "selectAvailableTitleModel": "Sélectionnez un modèle de titre disponible dans les paramètres de Claudian.",
     "rewind": {
       "confirmMessage": "Rembobiner jusqu'à ce point ? Les modifications de fichiers postérieures à ce message peuvent être écrasées ou supprimées. Cette action est irréversible.",
@@ -104,9 +113,57 @@
       "showLess": "Afficher moins",
       "moreItems": "+{count} de plus"
     },
+    "welcome": {
+      "sunday": "Bon dimanche",
+      "sundayNamed": "Bon dimanche, {name}",
+      "monday": "Bon lundi",
+      "mondayNamed": "Bon lundi, {name}",
+      "tuesday": "Bon mardi",
+      "tuesdayNamed": "Bon mardi, {name}",
+      "wednesday": "Bon mercredi",
+      "wednesdayNamed": "Bon mercredi, {name}",
+      "thursday": "Bon jeudi",
+      "thursdayNamed": "Bon jeudi, {name}",
+      "friday": "Bon vendredi",
+      "fridayNamed": "Bon vendredi, {name}",
+      "saturday": "Bon samedi !",
+      "saturdayNamed": "Bon samedi, {name}",
+      "backAtIt": "On s’y remet !",
+      "backAtItNamed": "On s’y remet, {name}",
+      "fridayFeeling": "Ça sent le vendredi",
+      "fridayFeelingNamed": "Ça sent le vendredi, {name}",
+      "weekend": "Bienvenue dans le week-end",
+      "weekendNamed": "Bienvenue dans le week-end, {name}",
+      "sundaySession": "Une session du dimanche ?",
+      "morning": "Bonjour",
+      "morningNamed": "Bonjour, {name}",
+      "coffee": "Un café et un peu de {brand} ?",
+      "afternoon": "Bon après-midi",
+      "afternoonNamed": "Bon après-midi, {name}",
+      "hey": "Salut",
+      "heyNamed": "Salut, {name}",
+      "howGoing": "Comment ça se passe ?",
+      "howGoingNamed": "Comment ça se passe, {name} ?",
+      "evening": "Bonsoir",
+      "eveningNamed": "Bonsoir, {name}",
+      "eveningShort": "Bonne soirée",
+      "eveningShortNamed": "Bonne soirée, {name}",
+      "howDay": "Comment s’est passée ta journée ?",
+      "howDayNamed": "Comment s’est passée ta journée, {name} ?",
+      "nightOwl": "Salut, oiseau de nuit",
+      "hiHow": "Salut, comment vas-tu ?",
+      "hiHowNamed": "Salut {name}, comment vas-tu ?",
+      "welcomeBack": "Bon retour !",
+      "welcomeBackNamed": "Bon retour, {name} !",
+      "whatsNew": "Quoi de neuf ?",
+      "whatsNewNamed": "Quoi de neuf, {name} ?",
+      "returnsNamed": "{name} est de retour !",
+      "right": "Tu as tout à fait raison !"
+    },
     "worked": "Travail effectué",
     "taskNotification": "Notification de tâche",
     "copyMessage": "Copier le message",
+    "showEarlierMessages": "Afficher les messages précédents",
     "renderFailed": "Impossible d’afficher le contenu du message.",
     "interruptedHint": "· Que doit faire Claudian à la place ?",
     "sessions": {
@@ -184,6 +241,10 @@
       "enteringPlan": "Passage en mode planification",
       "planComplete": "Plan terminé",
       "messageAgent": "Envoyer un message à l’agent",
+      "listDestinations": "Lister les destinations",
+      "messageSession": "Envoyer un message à la session",
+      "stopSession": "Arrêter la session",
+      "readSession": "Lire la session",
       "continueAgent": "Continuer l’agent",
       "listAgents": "Lister les agents",
       "interruptAgent": "Interrompre l’agent",
@@ -194,6 +255,27 @@
       "toolsPlaceholder": "outils",
       "agentCount": "{count} agent",
       "agentCountPlural": "{count} agents"
+    },
+    "subagentUI": {
+      "prompt": "Instruction",
+      "result": "Résultat",
+      "taskLabel": "Tâche du sous-agent : {description} - {status}",
+      "backgroundTaskLabel": "Tâche en arrière-plan : {description} - {status}",
+      "statusLabel": "Statut : {status}",
+      "initializing": "Initialisation",
+      "error": "Erreur",
+      "orphaned": "Inachevé",
+      "completed": "Terminé",
+      "runningInBackground": "En cours en arrière-plan",
+      "running": "En cours",
+      "orphanedResult": "La conversation a pris fin avant la fin de la tâche",
+      "lastTool": "Dernier outil : {name}",
+      "toolUse": "{count} appel d’outil",
+      "toolUses": "{count} appels d’outil",
+      "tokens": "{value} tokens",
+      "compactTokens": "{value}k tokens",
+      "previousRuns": "Exécutions précédentes ({count})",
+      "runLabel": "Exécution {number} · {status}"
     },
     "citations": {
       "memoryUsed": "Mémoire utilisée",
@@ -245,6 +327,11 @@
       "active": "Réflexion depuis {seconds}s…",
       "completed": "Réflexion pendant {seconds}s",
       "label": "Réflexion"
+    },
+    "contextUsage": {
+      "label": "Utilisation du contexte",
+      "details": "Utilisation du contexte : {details}",
+      "nearLimit": " (Limite presque atteinte, exécutez {command} pour continuer)"
     },
     "suggestions": {
       "loading": "Chargement…",
@@ -314,6 +401,169 @@
     "pi": {
       "extension": "Extension Pi",
       "notification": "Notification de l’extension Pi."
+    },
+    "sessionMessage": {
+      "undelivered": "Les messages de {senders} n’ont pas pu être remis.",
+      "fromLabel": "De la session :"
+    },
+    "sessionTools": {
+      "noSessions": "Aucune session",
+      "thisSession": "Cette session",
+      "truncated": "D’autres sessions ne sont pas affichées",
+      "recipient": "Destinataire",
+      "model": "Modèle",
+      "reasoning": "Raisonnement",
+      "message": "Message",
+      "openSession": "Ouvrir la session {sessionId}",
+      "openProviderSession": "Ouvrir la session {provider} {sessionId}",
+      "sessionMissing": "Cette session n’existe plus.",
+      "openFailed": "Impossible d’ouvrir la session : {message}",
+      "openUnavailable": "Les sessions ne peuvent pas être ouvertes ici.",
+      "providersIncluded": "Fournisseurs et modèles disponibles inclus",
+      "newSession": "Nouvelle session",
+      "session": "Session",
+      "turns": "Tours",
+      "turnRange": "{from}–{to} sur {total}",
+      "noTurns": "Aucun pour l’instant",
+      "mode": "Remise",
+      "modeSteer": "Orienter le tour en cours",
+      "modeInterrupt": "Interrompre le travail en cours"
+    },
+    "modelPicker": {
+      "options": "Options du modèle",
+      "provider": "Fournisseur",
+      "modelLabel": "Modèle : {label}",
+      "unavailable": "Modèle indisponible",
+      "setup": "Configurer les modèles",
+      "guidance": "Choisissez un modèle activé dans les paramètres du fournisseur. Si la détection a échoué, actualisez la liste des modèles.",
+      "model": "Modèle",
+      "empty": "Aucun modèle disponible. Vérifiez les paramètres du fournisseur et actualisez la liste des modèles si la détection a échoué.",
+      "changeModelFailed": "Impossible de changer de modèle",
+      "defaultEffort": "Par défaut",
+      "effortLabel": "effort de réflexion {label}",
+      "thinking": "Réflexion",
+      "changeEffortFailed": "Impossible de modifier le niveau de réflexion",
+      "fastActive": "mode rapide activé",
+      "fast": "Rapide",
+      "fastLabel": "Mode rapide : {label}",
+      "changeTierFailed": "Impossible de modifier le niveau de service"
+    },
+    "navigation": {
+      "scrollToTop": "Défiler vers le haut",
+      "previousMessage": "Message précédent",
+      "directory": "Sommaire de la conversation",
+      "nextMessage": "Message suivant",
+      "scrollToBottom": "Défiler vers le bas",
+      "emptyDirectory": "Aucun prompt utilisateur dans cette conversation"
+    },
+    "tabNavigation": {
+      "tabName": "Nom de l’onglet",
+      "renameTab": "Renommer l’onglet…",
+      "resetName": "Réinitialiser le nom de l’onglet",
+      "showNumber": "Afficher le numéro",
+      "showName": "Afficher le nom",
+      "showTitle": "Afficher le titre",
+      "closeTab": "Fermer l’onglet",
+      "active": "actif",
+      "needsInput": "nécessite votre intervention",
+      "working": "en cours",
+      "errorReview": "arrêté à la suite d’une erreur, prêt à être examiné",
+      "finishedReview": "terminé, prêt à être examiné",
+      "idle": "inactif",
+      "badge": "{title}, {status}",
+      "namedBadge": "{label} ({title}), {status}",
+      "newTab": "Nouvel onglet",
+      "newConversation": "Nouvelle conversation",
+      "showWideFailed": "Impossible d’afficher la session dans la disposition large",
+      "createTabFailed": "Impossible de créer l’onglet",
+      "createConversationFailed": "Impossible de créer la conversation",
+      "startConversationFailed": "Impossible de démarrer une nouvelle conversation",
+      "switchFailed": "Impossible de changer d’onglet",
+      "closeFailed": "Impossible de fermer l’onglet",
+      "resize": "Redimensionner les panneaux de conversation",
+      "previewCloseFailed": "Impossible de fermer l’aperçu provisoire de la session",
+      "commandNew": "Nouveau",
+      "commandReplace": "Remplacer la conversation actuelle",
+      "commandClose": "Fermer l’onglet actuel",
+      "commandRename": "Renommer l’onglet actuel"
+    },
+    "projects": {
+      "header": "Projets",
+      "noSessions": "Aucune session",
+      "newSessionIn": "Nouvelle session dans {name}",
+      "actionsFor": "Actions pour {name}",
+      "newProjectAction": "Nouveau projet",
+      "chipLabel": "Projet : {name}",
+      "noProject": "Aucun projet",
+      "menu": {
+        "edit": "Modifier le projet",
+        "openMemory": "Ouvrir la mémoire du projet",
+        "archive": "Archiver le projet",
+        "restore": "Restaurer le projet",
+        "pin": "Épingler le projet",
+        "unpin": "Désépingler le projet",
+        "delete": "Supprimer le projet",
+        "moveTo": "Déplacer vers un projet…",
+        "moveSelectionTo": "Déplacer {count} sessions vers un projet…",
+        "removeFrom": "Retirer du projet",
+        "removeSelectionFrom": "Retirer {count} session du projet",
+        "removeSelectionFromPlural": "Retirer {count} sessions du projet",
+        "newProject": "Nouveau projet…"
+      },
+      "deleteConfirm": "Supprimer le projet « {name} » et placer son fichier de mémoire dans la corbeille ? Les sessions sont conservées, hors de tout projet.",
+      "errors": {
+        "create": "Impossible de créer le projet",
+        "update": "Impossible de mettre à jour le projet",
+        "delete": "Impossible de supprimer le projet",
+        "archive": "Impossible d’archiver le projet",
+        "restore": "Impossible de restaurer le projet",
+        "pin": "Impossible de modifier l’épinglage du projet",
+        "reorder": "Impossible de réorganiser les projets",
+        "move": "Impossible de déplacer les sessions vers le projet",
+        "remove": "Impossible de retirer les sessions du projet",
+        "start": "Impossible de démarrer une session dans ce projet"
+      },
+      "editor": {
+        "titleNew": "Nouveau projet",
+        "titleEdit": "Modifier le projet",
+        "name": "Nom",
+        "nameDesc": "Affiché dans le gestionnaire de sessions et dans les sessions membres.",
+        "namePlaceholder": "Nom du projet",
+        "iconButton": "Icône du projet : {icon}",
+        "iconDefault": "Dossier par défaut",
+        "iconPicker": "Choisir l’icône du projet",
+        "iconSearch": "Rechercher des icônes",
+        "iconNoMatches": "Aucune icône ne correspond.",
+        "instructions": "Instructions",
+        "instructionsDesc": "Ajoutées au prompt système de chaque session membre à partir de son prochain tour.",
+        "memoryPath": "Fichier de mémoire",
+        "memoryPathDesc": "Chemin dans le coffre du fichier de mémoire du projet. L’extension .md est ajoutée si elle manque. Le modifier déplace le fichier.",
+        "memoryPathPlaceholder": "Dossier/MEMORY.md",
+        "memoryPathInvalid": "Saisissez un chemin de fichier situé dans le coffre, par exemple Projects/MEMORY.md.",
+        "memoryPathTaken": "{path} est déjà utilisé par un fichier ou un autre projet.",
+        "openMemory": "Ouvrir",
+        "nameRequired": "Saisissez un nom de projet."
+      },
+      "memory": {
+        "title": "Mémoire du projet : {name}",
+        "reload": "Recharger",
+        "overwrite": "Écraser",
+        "recreate": "Recréer à partir du modèle",
+        "edit": "Modifier",
+        "preview": "Aperçu",
+        "missing": "Le fichier de mémoire du projet est introuvable.",
+        "conflict": "Le fichier de mémoire a changé depuis son chargement. Rechargez pour abandonner vos modifications, ou écrasez pour les conserver.",
+        "loadFailed": "Impossible de charger la mémoire du projet",
+        "saveFailed": "Impossible d’enregistrer la mémoire du projet",
+        "saved": "Mémoire du projet enregistrée",
+        "loading": "Chargement…",
+        "updated": "Mis à jour {time}",
+        "changedOutside": "Le fichier de mémoire a été modifié hors de cette fenêtre, probablement par un agent.",
+        "keepMine": "Garder mes modifications",
+        "discardConfirm": "Abandonner les modifications non enregistrées de la mémoire du projet ?",
+        "discard": "Abandonner",
+        "emptyHint": "Les agents le complètent au fil du projet."
+      }
     }
   },
   "settings": {
@@ -558,21 +808,8 @@
       }
     },
     "codex": {
-      "installationMethod": {
-        "name": "Méthode d’installation",
-        "desc": "Comment Claudian doit lancer Codex sous Windows. Windows natif utilise un chemin d’exécutable Windows. WSL lance la CLI Linux dans une distribution choisie.",
-        "nativeWindows": "Windows natif",
-        "wsl": "WSL"
-      },
       "cliPath": {
-        "name": "Chemin de Codex CLI",
-        "validation": {
-          "wslWindowsPath": "Le mode WSL attend une commande Linux ou un chemin absolu Linux, pas un chemin d’exécutable Windows."
-        }
-      },
-      "wslDistroOverride": {
-        "name": "Remplacement de distribution WSL",
-        "desc": "Remplacement avancé facultatif. Laissez vide pour déduire la distribution depuis un chemin d’espace de travail WSL si possible, sinon utiliser la distribution WSL par défaut."
+        "name": "Chemin de Codex CLI"
       },
       "safeMode": {
         "workspaceWrite": "Écriture dans l’espace de travail",
@@ -648,12 +885,13 @@
       }
     },
     "opencode": {
+      "emptyModels": "Le serveur OpenCode n’a renvoyé aucun modèle activé pour ce coffre. Vérifiez .opencode/opencode.json dans le coffre et les journaux OpenCode (opencode debug paths indique leur emplacement). Avec OpenCode v2, les plugins V1 configurés peuvent être incompatibles. Comparez avec opencode models --standalone dans le coffre, puis relancez la découverte.",
       "environment": {
         "name": "Variables d'environnement OpenCode",
         "desc": "Variables d'environnement supplémentaires transmises à OpenCode."
       },
       "migrationNotice": {
-        "text": "Claudian prend désormais en charge OpenCode v2. La prise en charge d'OpenCode v1 prend fin le 30 octobre 2026.",
+        "text": "OpenCode v1 n'est plus pris en charge. Passez à OpenCode v2 pour l'utiliser dans Claudian.",
         "link": "Migrer vers OpenCode v2"
       }
     },
@@ -661,6 +899,9 @@
       "environment": {
         "name": "Variables d'environnement Pi",
         "desc": "Variables d'environnement transmises uniquement à Pi."
+      },
+      "models": {
+        "desc": "Claudian conserve sa propre liste de modèles, distincte des enabledModels de Pi. Discover liste tous les modèles que Pi peut authentifier dans son environnement actuel, regroupés par la route de fournisseur que Pi appellera. La route détermine les identifiants et la facturation."
       }
     },
     "grok": {
@@ -669,16 +910,21 @@
         "desc": "Variables d'environnement transmises uniquement à Grok Build. Les secrets des modèles personnalisés restent dans la portée de ce fournisseur et sont référencés depuis la configuration native par env_key."
       }
     },
+    "antigravity": {
+      "environment": {
+        "name": "Variables d’environnement d’Antigravity",
+        "desc": "Variables d’environnement transmises uniquement à Antigravity (agy), comme GEMINI_API_KEY."
+      }
+    },
     "deepseek": {
       "installation": {
         "desc": "La détection automatique privilégie dsh, puis cherche Desktop sur macOS ou Windows. Si les deux sont installés, saisissez le chemin .app de Desktop ou son dossier d’installation Windows pour le choisir. Ouvrez d’abord Desktop pour terminer sa configuration.",
-        "desktop": "Utilisation de votre profil Desktop natif.",
-        "web": "Utilisation de votre profil Web natif."
+        "wslDesc": "WSL nécessite Node.js pour Linux et npm dsh dans la distribution sélectionnée, avec son profil Web natif configuré. DeepSeek Harness Desktop ne fournit pas d’installation WSL. Installez @deepseek-ai/dsh dans la distribution ou sélectionnez Windows natif pour utiliser Desktop."
       },
       "preset": "Preset",
       "codeMode": {
         "name": "Activer le mode code",
-        "desc": "S'applique à partir du prochain tour de chaque conversation, y compris les conversations existantes. Ajoute run_code natif aux outils directs."
+        "desc": "S'applique à partir du prochain tour de chaque conversation, y compris les conversations existantes. Le modèle appelle les outils depuis des programmes run_code natifs plutôt que directement."
       },
       "presetPlugins": {
         "name": "Plugins de preset supplémentaires",
@@ -772,6 +1018,19 @@
         "failed": "Échec de la synchronisation : {message}",
         "summary": "Déplacés {moved}, convertis {converted}, à la corbeille {trashed}, {unlinked} lien(s) supprimé(s)."
       }
+    },
+    "executionTarget": {
+      "installationMethod": {
+        "name": "Méthode d’installation",
+        "desc": "Comment Claudian doit lancer {provider} sous Windows. Windows natif utilise un chemin d’exécutable Windows. WSL lance la CLI Linux dans une distribution choisie.",
+        "nativeWindows": "Windows natif",
+        "wsl": "WSL"
+      },
+      "wslDistroOverride": {
+        "name": "Remplacement de distribution WSL",
+        "desc": "Remplacement avancé facultatif. Laissez vide pour déduire la distribution depuis un chemin d’espace de travail WSL si possible, sinon utiliser la distribution WSL par défaut."
+      },
+      "wslWindowsPath": "Le mode WSL attend une commande Linux ou un chemin absolu Linux, pas un chemin d’exécutable Windows."
     }
   }
 }

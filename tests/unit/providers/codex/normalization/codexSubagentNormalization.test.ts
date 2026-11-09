@@ -49,7 +49,7 @@ describe('codexSubagentNormalization', () => {
       status: 'completed', result: 'Review complete.',
     });
     expect(codexSubagentLifecycleAdapter.resolveSpawnToolIds(close, new Map([['agent', 'spawn']]))).toEqual(['spawn']);
-    for (const status of ['shutdown', 'notFound']) {
+    for (const status of ['shutdown', 'notFound', 'not_found']) {
       const list: ToolCallInfo = {
         id: 'list', name: 'list_agents', input: {}, status: 'completed',
         result: JSON.stringify({ status: { agent: { status, message: null } } }),

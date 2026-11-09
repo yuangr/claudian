@@ -1,7 +1,11 @@
+import { DesktopVault } from '@test/helpers/core/DesktopVault';
 import { DEFAULT_CLAUDIAN_SETTINGS } from '@test/helpers/defaultSettings';
+import { createObsidianPlugin } from '@test/helpers/ObsidianSettingsHost';
+import { App } from 'obsidian';
 
 import { SettingsCoordinator } from '@/app/settings/SettingsCoordinator';
 import { type ApplicationDomains, startApplication } from '@/app/startup/ApplicationStartup';
+import { ProviderExecutionLifecycleRegistry } from '@/core/execution/ProviderExecutionLifecycleRegistry';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
 import { ProviderSettingsCoordinator } from '@/core/providers/ProviderSettingsCoordinator';
 import { isVersionedRuntimeInputFingerprint } from '@/core/providers/settings/RuntimeInputFingerprint';
@@ -9,76 +13,95 @@ import * as sdkSession from '@/providers/claude/history/ClaudeHistoryStore';
 import { getCodexProviderSettings } from '@/providers/codex/settings';
 
 // Provider history readers touch the filesystem through Node's fs.
-jest.mock('fs');
+vi.mock('fs');
 
 import '@/providers';
 
+
+
+
 describe('startApplication', () => {
-  let mockApp: any;
-  let plugin: { app: any; loadData: jest.Mock; saveData: jest.Mock };
+  let mockApp: ReturnType<typeof createApp>;
+  let plugin: ReturnType<typeof createPlugin>;
+  function createPlugin() {
+    const plugin = createObsidianPlugin(mockApp);
+    return Object.assign(plugin, { loadData: vi.fn<() => Promise<unknown>>().mockResolvedValue({}), saveData: vi.fn<(data: unknown) => Promise<void>>().mockResolvedValue(undefined) });
+  }
   const disposals: Array<() => Promise<void>> = [];
 
+  function createApp() {
+    const app = new App();
+    return Object.assign(app, {
+      vault: Object.assign(app.vault, {
+        adapter: Object.assign(app.vault.adapter, {
+          basePath: '/test/vault',
+          exists: vi.fn<import('obsidian').DataAdapter['exists']>().mockResolvedValue(false),
+          read: vi.fn<import('obsidian').DataAdapter['read']>().mockResolvedValue(''),
+          write: vi.fn<import('obsidian').DataAdapter['write']>().mockResolvedValue(undefined),
+          remove: vi.fn<import('obsidian').DataAdapter['remove']>().mockResolvedValue(undefined),
+          mkdir: vi.fn<import('obsidian').DataAdapter['mkdir']>().mockResolvedValue(undefined),
+          list: vi.fn<import('obsidian').DataAdapter['list']>().mockResolvedValue({ files: [], folders: [] }),
+          stat: vi.fn<import('obsidian').DataAdapter['stat']>().mockResolvedValue(null),
+          rename: vi.fn<import('obsidian').DataAdapter['rename']>().mockResolvedValue(undefined),
+        }),
+      }),
+      workspace: Object.assign(app.workspace, {
+        layoutReady: true,
+        onLayoutReady: vi.fn((callback: () => void) => callback()),
+      }),
+    });
+  }
+
   async function loadApplication(
-    overrides: { providers?: typeof ProviderRegistry } = {},
+    overrides: { providers?: typeof ProviderRegistry; onAllMetadataLoaded?: () => void } = {},
   ): Promise<ApplicationDomains> {
     const domains = await startApplication({
-      plugin: plugin as never,
+      plugin,
       defaultSettings: DEFAULT_CLAUDIAN_SETTINGS,
       providers: overrides.providers ?? ProviderRegistry,
       providerSettings: ProviderSettingsCoordinator,
-      deferNonRestoredSessionMetadata: false,
+      executionLifecycle: new ProviderExecutionLifecycleRegistry(),
       isUnloading: () => false,
       publishCommittedSettings: async () => undefined,
       onConversationDeleted: async () => undefined,
       onConversationListChanged: () => undefined,
-      onAllMetadataLoaded: () => undefined,
+      onAllMetadataLoaded: overrides.onAllMetadataLoaded ?? (() => undefined),
       ensureProviderWorkspace: async () => undefined,
       getSessionArchive: async () => null,
     });
     disposals.push(async () => {
       await domains.sessionMetadata.dispose();
       await domains.nativeSessionArchives.dispose();
+      await domains.projects?.dispose();
     });
     return domains;
   }
 
+  /** Starts the application and runs the deferred background metadata scan to completion. */
+  async function loadApplicationWithMetadata(): Promise<ApplicationDomains> {
+    let markLoaded!: () => void;
+    const loaded = new Promise<void>(resolve => { markLoaded = resolve; });
+    const domains = await loadApplication({ onAllMetadataLoaded: markLoaded });
+    domains.sessionMetadata.scheduleRemainingLoad();
+    await loaded;
+    return domains;
+  }
+
   beforeEach(() => {
-    jest.restoreAllMocks();
-    jest.clearAllMocks();
-    jest.spyOn(sdkSession, 'locateSDKSession').mockImplementation(async (_vaultPath, sessionId) => ({
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+    vi.spyOn(sdkSession, 'locateSDKSession').mockImplementation(async (_vaultPath, sessionId) => ({
       availability: 'available',
       sessionPath: `/test/claude-project/${sessionId}.jsonl`,
     }));
-    jest.spyOn(sdkSession, 'locateSDKSessions').mockImplementation(async (_vaultPath, sessionIds) => new Map(
+    vi.spyOn(sdkSession, 'locateSDKSessions').mockImplementation(async (_vaultPath, sessionIds) => new Map(
       sessionIds.map(sessionId => [sessionId, {
         availability: 'available' as const,
         sessionPath: `/test/claude-project/${sessionId}.jsonl`,
       }]),
     ));
-    mockApp = {
-      vault: {
-        adapter: {
-          basePath: '/test/vault',
-          exists: jest.fn().mockResolvedValue(false),
-          read: jest.fn().mockResolvedValue(''),
-          write: jest.fn().mockResolvedValue(undefined),
-          remove: jest.fn().mockResolvedValue(undefined),
-          mkdir: jest.fn().mockResolvedValue(undefined),
-          list: jest.fn().mockResolvedValue({ files: [], folders: [] }),
-          stat: jest.fn().mockResolvedValue(null),
-          rename: jest.fn().mockResolvedValue(undefined),
-        },
-      },
-      workspace: {
-        layoutReady: true,
-        onLayoutReady: jest.fn(),
-      },
-    };
-    plugin = {
-      app: mockApp,
-      loadData: jest.fn().mockResolvedValue({}),
-      saveData: jest.fn().mockResolvedValue(undefined),
-    };
+    mockApp = createApp();
+    plugin = createPlugin();
   });
 
   afterEach(async () => {
@@ -143,7 +166,7 @@ describe('startApplication', () => {
         return '';
       });
 
-      const saveSpy = jest.spyOn(SettingsCoordinator.prototype, 'persistCurrent');
+      const saveSpy = vi.spyOn(SettingsCoordinator.prototype, 'persistCurrent');
       const domains = await loadApplication();
 
       expect(domains.settings.getCommittedSettings().model).toBe(DEFAULT_CLAUDIAN_SETTINGS.model);
@@ -198,7 +221,7 @@ describe('startApplication', () => {
         return '';
       });
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       expect(domains.conversations.getCachedConversation(sessionMetadata.id)).toMatchObject({
         sessionId: sessionMetadata.sessionId,
@@ -245,7 +268,7 @@ describe('startApplication', () => {
         return '';
       });
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       expect(domains.conversations.getConversationList()).toHaveLength(1);
       expect(mockApp.vault.adapter.remove).not.toHaveBeenCalledWith(
@@ -294,7 +317,7 @@ describe('startApplication', () => {
       // data.json is minimal (no state - already migrated)
       plugin.loadData.mockResolvedValue({});
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       const loaded = await domains.conversations.getConversationById('conv-saved-1');
       expect(loaded?.id).toBe('conv-saved-1');
@@ -338,12 +361,12 @@ describe('startApplication', () => {
       // data.json is minimal (already migrated)
       plugin.loadData.mockResolvedValue({});
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       const loaded = await domains.conversations.getConversationById('conv-saved-1');
       expect(loaded?.sessionId).toBeNull();
 
-      const sessionWrite = (mockApp.vault.adapter.write as jest.Mock).mock.calls.find(
+      const sessionWrite = mockApp.vault.adapter.write.mock.calls.find(
         ([path]) => path === '.claudian/sessions/conv-saved-1.meta.json'
       );
       expect(sessionWrite).toBeDefined();
@@ -361,7 +384,7 @@ describe('startApplication', () => {
         migrationVersion: 2,
       });
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       expect(domains.conversations.getConversationList()).toHaveLength(0);
     });
@@ -405,11 +428,44 @@ describe('startApplication', () => {
 
       plugin.loadData.mockResolvedValue({});
 
-      const domains = await loadApplication();
+      const domains = await loadApplicationWithMetadata();
 
       const loaded = await domains.conversations.getConversationById('conv-multi-session');
-      expect((loaded?.providerState as any)?.previousProviderSessionIds).toEqual(['session-A']);
-      expect((loaded?.providerState as any)?.providerSessionId).toBe('session-B');
+      expect((loaded?.providerState)?.previousProviderSessionIds).toEqual(['session-A']);
+      expect((loaded?.providerState)?.providerSessionId).toBe('session-B');
+    });
+  });
+  describe('projects', () => {
+    it('loads project records before startup completes and keeps member metadata, preserving unparsable files', async () => {
+      const timestamp = Date.now();
+      const vault = await DesktopVault.create();
+      disposals.push(() => vault.dispose());
+      await vault.write('.claudian/projects/project-a.json', JSON.stringify({
+        id: 'project-a', name: 'Launch', instructions: 'Ship.', memoryPath: '.claudian/projects/launch-project.md',
+        isPinned: true, createdAt: timestamp,
+      }));
+      await vault.write('.claudian/projects/broken.json', '{"id": "broken"');
+      await vault.write('.claudian/sessions/conv-member.meta.json', JSON.stringify({
+        id: 'conv-member', title: 'Member', createdAt: timestamp, lastActivityAt: timestamp,
+        sessionId: null, projectId: 'project-a',
+      }));
+      plugin.app.vault = vault.app.vault;
+      const projectFiles = async () => new Map([...await vault.snapshot()].filter(([path]) => (
+        path.startsWith('.claudian/projects/')
+      )));
+      const projectsBefore = await projectFiles();
+
+      let markLoaded!: () => void;
+      const metadataLoaded = new Promise<void>(resolve => { markLoaded = resolve; });
+      const domains = await loadApplication({ onAllMetadataLoaded: markLoaded });
+
+      expect(domains.projects.list()).toEqual([expect.objectContaining({ id: 'project-a', name: 'Launch' })]);
+      domains.sessionMetadata.scheduleRemainingLoad();
+      await metadataLoaded;
+      expect(domains.conversations.getConversationList()).toEqual([
+        expect.objectContaining({ id: 'conv-member', projectId: 'project-a' }),
+      ]);
+      expect(await projectFiles()).toEqual(projectsBefore);
     });
   });
 });

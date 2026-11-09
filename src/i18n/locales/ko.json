@@ -14,8 +14,17 @@
     "none": "없음"
   },
   "chat": {
+    "queue": {
+      "queued": "대기 중",
+      "steering": "방향 조정 중",
+      "steerNow": "지금 방향 조정",
+      "edit": "대기 중인 메시지 편집",
+      "discard": "대기 중인 메시지 삭제",
+      "images": "[이미지]"
+    },
     "promptSuggestionHint": "Tab으로 수락",
     "selectAvailableModel": "전송하기 전에 사용 가능한 모델을 선택하세요.",
+    "reloadingHistory": "이 채팅이 Claudian 외부에서 변경되어 다시 불러오는 중입니다. 완료되면 다시 보내세요.",
     "selectAvailableTitleModel": "Claudian 설정에서 사용 가능한 제목 생성 모델을 선택하세요.",
     "rewind": {
       "confirmMessage": "이 시점으로 되감으시겠습니까? 이 메시지 이후의 파일 변경 사항이 덮어쓰이거나 삭제될 수 있습니다. 이 작업은 실행 취소할 수 없습니다.",
@@ -104,9 +113,57 @@
       "showLess": "접기",
       "moreItems": "+{count}개 더"
     },
+    "welcome": {
+      "sunday": "즐거운 일요일 보내세요",
+      "sundayNamed": "{name}님, 즐거운 일요일 보내세요",
+      "monday": "즐거운 월요일 보내세요",
+      "mondayNamed": "{name}님, 즐거운 월요일 보내세요",
+      "tuesday": "즐거운 화요일 보내세요",
+      "tuesdayNamed": "{name}님, 즐거운 화요일 보내세요",
+      "wednesday": "즐거운 수요일 보내세요",
+      "wednesdayNamed": "{name}님, 즐거운 수요일 보내세요",
+      "thursday": "즐거운 목요일 보내세요",
+      "thursdayNamed": "{name}님, 즐거운 목요일 보내세요",
+      "friday": "즐거운 금요일 보내세요",
+      "fridayNamed": "{name}님, 즐거운 금요일 보내세요",
+      "saturday": "즐거운 토요일 보내세요!",
+      "saturdayNamed": "{name}님, 즐거운 토요일 보내세요",
+      "backAtIt": "다시 시작해 봐요!",
+      "backAtItNamed": "{name}님, 다시 시작해 봐요",
+      "fridayFeeling": "금요일이라 기분이 좋네요",
+      "fridayFeelingNamed": "{name}님, 금요일이라 기분이 좋네요",
+      "weekend": "주말이 왔어요",
+      "weekendNamed": "{name}님, 주말이 왔어요",
+      "sundaySession": "일요일에도 함께할까요?",
+      "morning": "좋은 아침이에요",
+      "morningNamed": "{name}님, 좋은 아침이에요",
+      "coffee": "커피와 함께 {brand} 할 시간인가요?",
+      "afternoon": "좋은 오후예요",
+      "afternoonNamed": "{name}님, 좋은 오후예요",
+      "hey": "안녕하세요",
+      "heyNamed": "{name}님, 안녕하세요",
+      "howGoing": "어떻게 지내세요?",
+      "howGoingNamed": "{name}님, 어떻게 지내세요?",
+      "evening": "좋은 저녁이에요",
+      "eveningNamed": "{name}님, 좋은 저녁이에요",
+      "eveningShort": "저녁 인사드려요",
+      "eveningShortNamed": "{name}님, 저녁 인사드려요",
+      "howDay": "오늘 하루는 어땠나요?",
+      "howDayNamed": "{name}님, 오늘 하루는 어땠나요?",
+      "nightOwl": "안녕하세요, 올빼미족 여러분",
+      "hiHow": "안녕, 잘 지내세요?",
+      "hiHowNamed": "{name}님, 잘 지내세요?",
+      "welcomeBack": "다시 오신 걸 환영해요!",
+      "welcomeBackNamed": "{name}님, 다시 오신 걸 환영해요!",
+      "whatsNew": "새로운 소식 있나요?",
+      "whatsNewNamed": "{name}님, 새로운 소식 있나요?",
+      "returnsNamed": "{name}님이 돌아왔어요!",
+      "right": "정말 맞는 말씀이에요!"
+    },
     "worked": "작업 완료",
     "taskNotification": "작업 알림",
     "copyMessage": "메시지 복사",
+    "showEarlierMessages": "이전 메시지 표시",
     "renderFailed": "메시지 내용을 표시하지 못했습니다.",
     "interruptedHint": "· Claudian이 대신 무엇을 해야 하나요?",
     "sessions": {
@@ -184,6 +241,10 @@
       "enteringPlan": "계획 모드로 전환 중",
       "planComplete": "계획 완료",
       "messageAgent": "에이전트에 메시지 보내기",
+      "listDestinations": "대상 목록 보기",
+      "messageSession": "세션에 메시지 보내기",
+      "stopSession": "세션 중지",
+      "readSession": "세션 읽기",
       "continueAgent": "에이전트 계속",
       "listAgents": "에이전트 목록",
       "interruptAgent": "에이전트 중단",
@@ -194,6 +255,27 @@
       "toolsPlaceholder": "도구",
       "agentCount": "에이전트 {count}개",
       "agentCountPlural": "에이전트 {count}개"
+    },
+    "subagentUI": {
+      "prompt": "프롬프트",
+      "result": "결과",
+      "taskLabel": "하위 에이전트 작업: {description} - {status}",
+      "backgroundTaskLabel": "백그라운드 작업: {description} - {status}",
+      "statusLabel": "상태: {status}",
+      "initializing": "초기화 중",
+      "error": "오류",
+      "orphaned": "미완료",
+      "completed": "완료",
+      "runningInBackground": "백그라운드에서 실행 중",
+      "running": "실행 중",
+      "orphanedResult": "작업이 완료되기 전에 대화가 종료되었습니다",
+      "lastTool": "마지막 도구: {name}",
+      "toolUse": "도구 사용 {count}회",
+      "toolUses": "도구 사용 {count}회",
+      "tokens": "{value} 토큰",
+      "compactTokens": "{value}k 토큰",
+      "previousRuns": "이전 실행 ({count})",
+      "runLabel": "실행 {number} · {status}"
     },
     "citations": {
       "memoryUsed": "사용된 메모리",
@@ -245,6 +327,11 @@
       "active": "생각 중 {seconds}초…",
       "completed": "{seconds}초 동안 생각함",
       "label": "생각"
+    },
+    "contextUsage": {
+      "label": "컨텍스트 사용량",
+      "details": "컨텍스트 사용량: {details}",
+      "nearLimit": " (한도에 가까워지고 있습니다. 계속하려면 {command}를 실행하세요)"
     },
     "suggestions": {
       "loading": "불러오는 중…",
@@ -314,6 +401,169 @@
     "pi": {
       "extension": "Pi 확장",
       "notification": "Pi 확장 알림."
+    },
+    "sessionMessage": {
+      "undelivered": "{senders}의 메시지를 전달하지 못했습니다.",
+      "fromLabel": "보낸 세션:"
+    },
+    "sessionTools": {
+      "noSessions": "세션 없음",
+      "thisSession": "이 세션",
+      "truncated": "표시되지 않은 세션이 더 있습니다",
+      "recipient": "받는 세션",
+      "model": "모델",
+      "reasoning": "추론",
+      "message": "메시지",
+      "openSession": "세션 {sessionId} 열기",
+      "openProviderSession": "{provider} 세션 {sessionId} 열기",
+      "sessionMissing": "해당 세션이 더 이상 존재하지 않습니다.",
+      "openFailed": "세션을 열지 못했습니다: {message}",
+      "openUnavailable": "여기에서는 세션을 열 수 없습니다.",
+      "providersIncluded": "사용 가능한 공급자와 모델 포함",
+      "newSession": "새 세션",
+      "session": "세션",
+      "turns": "턴",
+      "turnRange": "{from}–{to} / {total}",
+      "noTurns": "아직 없음",
+      "mode": "전달",
+      "modeSteer": "실행 중인 턴에 추가",
+      "modeInterrupt": "현재 작업 중단"
+    },
+    "modelPicker": {
+      "options": "모델 옵션",
+      "provider": "공급자",
+      "modelLabel": "모델: {label}",
+      "unavailable": "모델을 사용할 수 없음",
+      "setup": "모델 설정",
+      "guidance": "공급자 설정에서 활성화된 모델을 선택하세요. 검색에 실패했다면 모델 목록을 새로고침하세요.",
+      "model": "모델",
+      "empty": "사용 가능한 모델이 없습니다. 공급자 설정을 확인하고 검색에 실패했다면 모델 목록을 새로고침하세요.",
+      "changeModelFailed": "모델을 변경하지 못했습니다",
+      "defaultEffort": "기본값",
+      "effortLabel": "사고 수준 {label}",
+      "thinking": "사고",
+      "changeEffortFailed": "사고 수준을 변경하지 못했습니다",
+      "fastActive": "빠른 모드 켜짐",
+      "fast": "빠름",
+      "fastLabel": "빠른 모드: {label}",
+      "changeTierFailed": "서비스 등급을 변경하지 못했습니다"
+    },
+    "navigation": {
+      "scrollToTop": "맨 위로 스크롤",
+      "previousMessage": "이전 메시지",
+      "directory": "대화 목차",
+      "nextMessage": "다음 메시지",
+      "scrollToBottom": "맨 아래로 스크롤",
+      "emptyDirectory": "이 대화에는 사용자 프롬프트가 없습니다"
+    },
+    "tabNavigation": {
+      "tabName": "탭 이름",
+      "renameTab": "탭 이름 바꾸기…",
+      "resetName": "탭 이름 초기화",
+      "showNumber": "번호 표시",
+      "showName": "이름 표시",
+      "showTitle": "제목 표시",
+      "closeTab": "탭 닫기",
+      "active": "활성",
+      "needsInput": "사용자 입력 필요",
+      "working": "작업 중",
+      "errorReview": "오류로 중지됨, 검토 가능",
+      "finishedReview": "완료됨, 검토 가능",
+      "idle": "대기 중",
+      "badge": "{title}, {status}",
+      "namedBadge": "{label}({title}), {status}",
+      "newTab": "새 탭",
+      "newConversation": "새 대화",
+      "showWideFailed": "넓은 레이아웃에서 세션을 표시하지 못했습니다",
+      "createTabFailed": "탭을 만들지 못했습니다",
+      "createConversationFailed": "대화를 만들지 못했습니다",
+      "startConversationFailed": "새 대화를 시작하지 못했습니다",
+      "switchFailed": "탭을 전환하지 못했습니다",
+      "closeFailed": "탭을 닫지 못했습니다",
+      "resize": "대화 패널 너비 조절",
+      "previewCloseFailed": "임시 세션 미리보기를 닫지 못했습니다",
+      "commandNew": "새로 만들기",
+      "commandReplace": "현재 대화 바꾸기",
+      "commandClose": "현재 탭 닫기",
+      "commandRename": "현재 탭 이름 바꾸기"
+    },
+    "projects": {
+      "header": "프로젝트",
+      "noSessions": "세션 없음",
+      "newSessionIn": "{name}에서 새 세션",
+      "actionsFor": "{name} 작업",
+      "newProjectAction": "새 프로젝트",
+      "chipLabel": "프로젝트: {name}",
+      "noProject": "프로젝트 없음",
+      "menu": {
+        "edit": "프로젝트 편집",
+        "openMemory": "프로젝트 메모리 열기",
+        "archive": "프로젝트 보관",
+        "restore": "프로젝트 복원",
+        "pin": "프로젝트 고정",
+        "unpin": "프로젝트 고정 해제",
+        "delete": "프로젝트 삭제",
+        "moveTo": "프로젝트로 이동…",
+        "moveSelectionTo": "세션 {count}개를 프로젝트로 이동…",
+        "removeFrom": "프로젝트에서 제거",
+        "removeSelectionFrom": "세션 {count}개를 프로젝트에서 제거",
+        "removeSelectionFromPlural": "세션 {count}개를 프로젝트에서 제거",
+        "newProject": "새 프로젝트…"
+      },
+      "deleteConfirm": "“{name}” 프로젝트를 삭제하고 메모리 파일을 휴지통으로 옮길까요? 세션은 프로젝트 없이 유지됩니다.",
+      "errors": {
+        "create": "프로젝트를 만들지 못했습니다",
+        "update": "프로젝트를 업데이트하지 못했습니다",
+        "delete": "프로젝트를 삭제하지 못했습니다",
+        "archive": "프로젝트를 보관하지 못했습니다",
+        "restore": "프로젝트를 복원하지 못했습니다",
+        "pin": "프로젝트 고정 상태를 업데이트하지 못했습니다",
+        "reorder": "프로젝트 순서를 변경하지 못했습니다",
+        "move": "세션을 프로젝트로 이동하지 못했습니다",
+        "remove": "세션을 프로젝트에서 제거하지 못했습니다",
+        "start": "이 프로젝트에서 세션을 시작하지 못했습니다"
+      },
+      "editor": {
+        "titleNew": "새 프로젝트",
+        "titleEdit": "프로젝트 편집",
+        "name": "이름",
+        "nameDesc": "세션 관리자와 멤버 세션에 표시됩니다.",
+        "namePlaceholder": "프로젝트 이름",
+        "iconButton": "프로젝트 아이콘: {icon}",
+        "iconDefault": "기본 폴더",
+        "iconPicker": "프로젝트 아이콘 선택",
+        "iconSearch": "아이콘 검색",
+        "iconNoMatches": "일치하는 아이콘이 없습니다.",
+        "instructions": "지침",
+        "instructionsDesc": "다음 턴부터 모든 멤버 세션의 시스템 프롬프트에 추가됩니다.",
+        "memoryPath": "메모리 파일",
+        "memoryPathDesc": "프로젝트 메모리 파일의 볼트 경로입니다. .md 확장자가 없으면 추가됩니다. 변경하면 파일이 이동됩니다.",
+        "memoryPathPlaceholder": "폴더/MEMORY.md",
+        "memoryPathInvalid": "볼트 안의 파일 경로를 입력하세요(예: Projects/MEMORY.md).",
+        "memoryPathTaken": "{path}은(는) 이미 파일 또는 다른 프로젝트에서 사용 중입니다.",
+        "openMemory": "열기",
+        "nameRequired": "프로젝트 이름을 입력하세요."
+      },
+      "memory": {
+        "title": "프로젝트 메모리: {name}",
+        "reload": "다시 불러오기",
+        "overwrite": "덮어쓰기",
+        "recreate": "템플릿에서 다시 만들기",
+        "edit": "편집",
+        "preview": "미리보기",
+        "missing": "프로젝트 메모리 파일이 없습니다.",
+        "conflict": "불러온 뒤 메모리 파일이 변경되었습니다. 다시 불러오면 편집 내용이 사라지고, 덮어쓰면 편집 내용이 유지됩니다.",
+        "loadFailed": "프로젝트 메모리를 불러오지 못했습니다",
+        "saveFailed": "프로젝트 메모리를 저장하지 못했습니다",
+        "saved": "프로젝트 메모리를 저장했습니다",
+        "loading": "불러오는 중…",
+        "updated": "{time} 업데이트됨",
+        "changedOutside": "메모리 파일이 이 창 밖에서 업데이트되었습니다. 에이전트가 수정했을 가능성이 높습니다.",
+        "keepMine": "내 편집 유지",
+        "discardConfirm": "프로젝트 메모리의 저장되지 않은 변경 사항을 버릴까요?",
+        "discard": "버리기",
+        "emptyHint": "프로젝트가 진행되면서 에이전트가 채워 넣습니다."
+      }
     }
   },
   "settings": {
@@ -558,21 +808,8 @@
       }
     },
     "codex": {
-      "installationMethod": {
-        "name": "설치 방식",
-        "desc": "Windows에서 Claudian이 Codex를 실행하는 방식입니다. 네이티브 Windows는 Windows 실행 파일 경로를 사용하고, WSL은 선택한 배포판 안에서 Linux CLI를 실행합니다.",
-        "nativeWindows": "네이티브 Windows",
-        "wsl": "WSL"
-      },
       "cliPath": {
-        "name": "Codex CLI 경로",
-        "validation": {
-          "wslWindowsPath": "WSL 모드에는 Windows 실행 파일 경로가 아니라 Linux 명령 또는 Linux 절대 경로가 필요합니다."
-        }
-      },
-      "wslDistroOverride": {
-        "name": "WSL 배포판 재정의",
-        "desc": "선택적 고급 재정의입니다. 비워 두면 가능한 경우 WSL 작업공간 경로에서 배포판을 추론하고, 그렇지 않으면 기본 WSL 배포판을 사용합니다."
+        "name": "Codex CLI 경로"
       },
       "safeMode": {
         "workspaceWrite": "작업공간 쓰기",
@@ -648,12 +885,13 @@
       }
     },
     "opencode": {
+      "emptyModels": "OpenCode 서버가 이 보관함에서 활성화된 모델을 반환하지 않았습니다. 보관함의 .opencode/opencode.json과 OpenCode 로그를 확인하세요(opencode debug paths로 위치 확인). OpenCode v2에서는 설정된 V1 플러그인이 호환되지 않을 수 있습니다. 보관함에서 opencode models --standalone을 실행해 비교한 후 다시 검색하세요.",
       "environment": {
         "name": "OpenCode 환경 변수",
         "desc": "OpenCode에 전달되는 추가 환경 변수입니다."
       },
       "migrationNotice": {
-        "text": "Claudian이 이제 OpenCode v2를 지원합니다. OpenCode v1 지원은 2026년 10월 30일에 종료됩니다.",
+        "text": "OpenCode v1은 더 이상 지원되지 않습니다. Claudian에서 사용하려면 OpenCode v2로 업데이트하세요.",
         "link": "OpenCode v2로 마이그레이션"
       }
     },
@@ -661,6 +899,9 @@
       "environment": {
         "name": "Pi 환경 변수",
         "desc": "Pi에만 전달되는 환경 변수입니다."
+      },
+      "models": {
+        "desc": "Claudian은 Pi의 enabledModels와 별도로 자체 모델 목록을 유지합니다. Discover는 Pi가 현재 환경에서 인증할 수 있는 모든 모델을 Pi가 호출할 제공자 경로별로 표시합니다. 경로에 따라 자격 증명과 청구가 결정됩니다."
       }
     },
     "grok": {
@@ -669,16 +910,21 @@
         "desc": "Grok Build에만 전달되는 환경 변수입니다. 사용자 지정 모델의 비밀 값은 이 제공자 범위에 남아 있으며 네이티브 구성에서 env_key로 참조됩니다."
       }
     },
+    "antigravity": {
+      "environment": {
+        "name": "Antigravity 환경 변수",
+        "desc": "Antigravity(agy)에만 전달되는 환경 변수입니다(예: GEMINI_API_KEY)."
+      }
+    },
     "deepseek": {
       "installation": {
         "desc": "자동 감지는 dsh를 우선하고 다음으로 macOS 또는 Windows의 Desktop을 찾습니다. 둘 다 설치된 경우 Desktop의 .app 경로 또는 Windows 설치 폴더를 입력하면 선택할 수 있습니다. 먼저 Desktop을 열어 초기 설정을 완료하세요.",
-        "desktop": "네이티브 Desktop 프로필을 사용합니다.",
-        "web": "네이티브 Web 프로필을 사용합니다."
+        "wslDesc": "WSL을 사용하려면 선택한 배포판에 Linux Node.js와 npm dsh를 설치하고 기본 Web 프로필을 설정해야 합니다. DeepSeek Harness Desktop은 WSL 설치로 사용할 수 없습니다. 배포판에 @deepseek-ai/dsh를 설치하거나 Desktop을 사용하려면 네이티브 Windows를 선택하세요."
       },
       "preset": "프리셋",
       "codeMode": {
         "name": "코드 모드 사용",
-        "desc": "기존 대화를 포함해 각 대화의 다음 턴부터 적용됩니다. 직접 도구와 함께 네이티브 run_code를 추가합니다."
+        "desc": "기존 대화를 포함해 각 대화의 다음 턴부터 적용됩니다. 모델이 도구를 직접 호출하지 않고 네이티브 run_code 프로그램에서 호출합니다."
       },
       "presetPlugins": {
         "name": "추가 프리셋 플러그인",
@@ -772,6 +1018,19 @@
         "failed": "동기화 실패: {message}",
         "summary": "이동 {moved}, 변환 {converted}, 휴지통 {trashed}, 링크 제거 {unlinked}."
       }
+    },
+    "executionTarget": {
+      "installationMethod": {
+        "name": "설치 방식",
+        "desc": "Windows에서 Claudian이 {provider}를 실행하는 방식입니다. 네이티브 Windows는 Windows 실행 파일 경로를 사용하고, WSL은 선택한 배포판 안에서 Linux CLI를 실행합니다.",
+        "nativeWindows": "네이티브 Windows",
+        "wsl": "WSL"
+      },
+      "wslDistroOverride": {
+        "name": "WSL 배포판 재정의",
+        "desc": "선택적 고급 재정의입니다. 비워 두면 가능한 경우 WSL 작업공간 경로에서 배포판을 추론하고, 그렇지 않으면 기본 WSL 배포판을 사용합니다."
+      },
+      "wslWindowsPath": "WSL 모드에는 Windows 실행 파일 경로가 아니라 Linux 명령 또는 Linux 절대 경로가 필요합니다."
     }
   }
 }

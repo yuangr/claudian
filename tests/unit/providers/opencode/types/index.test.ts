@@ -10,7 +10,7 @@ describe('OpenCode provider state', () => {
     '   ',
     null,
     ['not-a-path'],
-  ])('ignores a malformed database path without losing unknown state: %p', async (databasePath) => {
+  ])('ignores a malformed database path without losing unknown state: %o', async (databasePath) => {
     const conversation = createConversation({
       databasePath,
       futureResumeCursor: { token: 'cursor-1' },
@@ -21,7 +21,7 @@ describe('OpenCode provider state', () => {
     Object.assign(conversation, await service.hydrateConversationHistory(
       conversation,
       null,
-      { environment: { HOME: '/missing-home', XDG_DATA_HOME: '/missing-data' } },
+      { config: {}, environment: { HOME: '/missing-home', XDG_DATA_HOME: '/missing-data' }, environmentText: '' },
     ));
     expect(service.buildPersistedProviderState(conversation)).toEqual({
       futureResumeCursor: { token: 'cursor-1' },
@@ -40,7 +40,7 @@ describe('OpenCode provider state', () => {
   });
 
   it.each([true, false])(
-    'normalizes the durable native-context marker: %p',
+    'normalizes the durable native-context marker: %o',
     (nativeConversationContextEstablished) => {
       expect(getOpencodeState({
         futureResumeCursor: { token: 'cursor-1' },
@@ -53,7 +53,7 @@ describe('OpenCode provider state', () => {
   );
 
   it.each([null, 'true', 1, {}])(
-    'drops a malformed native-context marker: %p',
+    'drops a malformed native-context marker: %o',
     (nativeConversationContextEstablished) => {
       expect(getOpencodeState({
         futureResumeCursor: { token: 'cursor-1' },
@@ -64,7 +64,7 @@ describe('OpenCode provider state', () => {
     },
   );
 
-  it.each([null, 'source', {}, { sessionId: 'source', resumeAt: '' }, { sessionId: 1, resumeAt: 'reply' }])('drops an invalid deferred fork: %p', forkSource => {
+  it.each([null, 'source', {}, { sessionId: 'source', resumeAt: '' }, { sessionId: 1, resumeAt: 'reply' }])('drops an invalid deferred fork: %o', forkSource => {
     expect(getOpencodeState({ forkSource })).toEqual({});
   });
 
@@ -72,8 +72,26 @@ describe('OpenCode provider state', () => {
     expect(getOpencodeState({ forkSource: { sessionId: 'source', resumeAt: 'reply' } })).toEqual({ forkSource: { sessionId: 'source', resumeAt: 'reply' } });
   });
 
+  it('normalizes history-only previous sessions and drops malformed entries', () => {
+    expect(getOpencodeState({
+      previousSessions: [
+        { sessionId: ' first ', databasePath: ' /tmp/opencode.db ', nativeVersion: 2 },
+        { sessionId: 'second', databasePath: 42, nativeVersion: 1 },
+        { sessionId: '  ' },
+        'third',
+        null,
+      ],
+    })).toEqual({
+      previousSessions: [
+        { sessionId: 'first', databasePath: '/tmp/opencode.db' },
+        { sessionId: 'second' },
+      ],
+    });
+    expect(getOpencodeState({ previousSessions: 'invalid' })).toEqual({});
+  });
+
   it.each([undefined, null, [], 'invalid', 42])(
-    'treats a non-record provider state as empty: %p',
+    'treats a non-record provider state as empty: %o',
     (providerState) => {
       expect(getOpencodeState(providerState)).toEqual({});
     },

@@ -1,27 +1,35 @@
-/** @jest-environment jsdom */
-import '@/providers';
+// @test-ci {"inputs":["tests/fixtures/providers/pi/**"]}
+/** @vitest-environment jsdom */
 
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { axe } from '@test/helpers/accessibility';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { createProviderHostFixture } from '@test/helpers/providerRuntimeHost';
 import { testDate } from '@test/helpers/testClock';
-import { fireEvent, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
-import { Component } from 'obsidian';
+import { fireEvent, waitFor, within } from '@testing-library/dom';
+import { Component, MarkdownRenderer } from 'obsidian';
 
+import { registerProviderModules } from '@/core/providers/registerProviderModules';
 import { getToolIcon } from '@/core/tools/toolIcons';
 import type { ChatMessage, ToolCallInfo } from '@/core/types';
 import { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
 import { providerOutputEventToStreamChunk } from '@/features/chat/rendering/providerOutputChunks';
 import { renderStoredToolCall } from '@/features/chat/rendering/tools/ToolCallRenderer';
+import { renderStoredWriteEdit } from '@/features/chat/rendering/tools/WriteEditRenderer';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import { StreamController } from '@/features/chat/turns/StreamController';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
 import { PiExecutionBackend } from '@/providers/pi/execution/PiExecutionBackend';
 import { PiRPCSessionKernel } from '@/providers/pi/execution/PiExecutionKernel';
 import { parsePiSessionContent } from '@/providers/pi/history/PiHistoryStore';
 import { createPiEventNormalizationState, normalizePiRPCEvent } from '@/providers/pi/normalization/piEventNormalization';
+import { piProviderRegistration } from '@/providers/pi/registration';
+
+registerProviderModules([claudeProviderRegistration, piProviderRegistration]);
 
 HTMLElement.prototype.empty = function () { this.replaceChildren(); };
 HTMLElement.prototype.addClass = function (...classes) { this.classList.add(...classes); };
@@ -33,7 +41,7 @@ HTMLElement.prototype.scrollIntoView = function () {};
 HTMLElement.prototype.setText = function (text) { this.textContent = String(text); };
 
 // Vault refresh after file edits is an Obsidian boundary; the listing spy observes it.
-const listVaultFolder = jest.fn(async (_dir: string) => ({ files: [], folders: [] }));
+const listVaultFolder = vi.fn(async (_dir: string) => ({ files: [], folders: [] }));
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -59,11 +67,11 @@ const contentParts = (call: NativeToolCall) => [
 ];
 
 /** A chat stream over a fresh assistant message, rendering into a detached message list. */
-function createChatStream() {
+async function createChatStream() {
   const messages = document.body.createDiv();
   const state = new ChatState();
-  const vault = { adapter: { basePath: '/workspace', list: listVaultFolder }, getAbstractFileByPath: () => null };
-  const plugin = { app: { vault }, settings: { mediaFolder: '', showMessageTimestamps: false } } as any;
+  const plugin = await createChatFeatureHost({ settings: { mediaFolder: '', showMessageTimestamps: false } });
+  vi.spyOn(plugin.app.vault.adapter, 'list').mockImplementation(listVaultFolder);
   const renderer = new MessageRenderer(plugin, new Component(), messages);
   const stream = new StreamController({ plugin, state, renderer,
     subagentManager: new SubagentManager(() => undefined), getMessagesEl: () => messages, updateQueueIndicator: () => undefined,
@@ -71,11 +79,16 @@ function createChatStream() {
   const response: ChatMessage = { id: 'response', role: 'assistant', timestamp: testDate().getTime(), content: '', contentBlocks: [] };
   state.addMessage(response);
   state.currentContentEl = renderer.addMessage(response).querySelector('.claudian-message-content');
-  return { stream, response, close: () => messages.remove() };
+  return { stream, response, messages, close: () => messages.remove() };
 }
 
 /** Replays native RPC execution events through Pi normalization and the chat stream. */
-async function restoreLive(call: NativeToolCall): Promise<ToolCallInfo> {
+async function restoreLive(call: NativeToolCall, observe?: (messages: HTMLElement) => void | Promise<void>): Promise<ToolCallInfo> {
+  return (await restoreLiveWithCard(call, observe)).tool;
+}
+
+/** The same replay, keeping the write/edit card the live stream rendered before teardown. */
+async function restoreLiveWithCard(call: NativeToolCall, observe?: (messages: HTMLElement) => void | Promise<void>): Promise<{ tool: ToolCallInfo; liveCard?: HTMLElement }> {
   const normalization = createPiEventNormalizationState();
   const result = { content: contentParts(call), details: call.details ?? {} };
   const chunks = [
@@ -84,11 +97,13 @@ async function restoreLive(call: NativeToolCall): Promise<ToolCallInfo> {
     { type: 'tool_execution_end', toolCallId: 'tool', toolName: call.name, result, isError: call.isError ?? false },
   ].flatMap(event => normalizePiRPCEvent(event, normalization));
 
-  const { stream, response, close } = createChatStream();
+  const { stream, response, messages, close } = (await createChatStream());
   for (const chunk of chunks) await stream.handleStreamChunk(chunk, response);
+  await observe?.(messages);
+  const liveCard = messages.querySelector<HTMLElement>('.claudian-write-edit-block') ?? undefined;
   close();
   expect(response.toolCalls).toHaveLength(1);
-  return response.toolCalls![0];
+  return { tool: response.toolCalls![0], liveCard };
 }
 
 /** Restores the same call from Pi's session JSONL, as written by the native session manager. */
@@ -110,9 +125,47 @@ function restoreHistory(call: NativeToolCall): ToolCallInfo {
   return message.toolCalls![0];
 }
 
+it.each([
+  { name: 'an empty text block', content: [{ type: 'text', text: '' }], expectedImages: undefined },
+  { name: 'an empty content array', content: [], expectedImages: undefined },
+  { name: 'an image-only result', content: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }], expectedImages: [{ kind: 'data', mediaType: 'image/png', data: 'aGVsbG8=' }] },
+])('replaces live progress with $name at native completion', async ({ content, expectedImages }) => {
+  const normalization = createPiEventNormalizationState();
+  const { stream, response, messages, close } = (await createChatStream());
+  const send = async (event: Record<string, unknown>) => {
+    for (const chunk of normalizePiRPCEvent(event, normalization)) await stream.handleStreamChunk(chunk, response);
+  };
+  try {
+    await send({ type: 'tool_execution_start', toolCallId: 'tool', toolName: 'preview', args: {} });
+    await send({ type: 'tool_execution_update', toolCallId: 'tool', toolName: 'preview',
+      partialResult: { content: [{ type: 'text', text: 'Temporary progress' }] } });
+    expect(response.toolCalls?.[0].result).toBe('Temporary progress');
+    await send({ type: 'tool_execution_end', toolCallId: 'tool', toolName: 'preview', isError: false,
+      result: { content, details: {} } });
+    expect(response.toolCalls?.[0]).toMatchObject({ status: 'completed', result: '' });
+    expect(messages.textContent).not.toContain('Temporary progress');
+    expect(response.toolCalls?.[0].resultImages).toEqual(expectedImages);
+    expect((await axe(messages)).violations).toEqual([]);
+  } finally {
+    close();
+  }
+});
+
 const restore = (mode: 'live' | 'history', call: NativeToolCall) => mode === 'live'
   ? restoreLive(call)
   : Promise.resolve(restoreHistory(call));
+
+const restoreWithCard = (mode: 'live' | 'history', call: NativeToolCall): Promise<{ tool: ToolCallInfo; liveCard?: HTMLElement }> => mode === 'live'
+  ? restoreLiveWithCard(call)
+  : Promise.resolve({ tool: restoreHistory(call) });
+
+/** The card surface this mode actually shows: the live stream's captured card, or the stored renderer's card. */
+function writeCardForMode(mode: 'live' | 'history', tool: ToolCallInfo, liveCard?: HTMLElement): HTMLElement {
+  if (mode === 'history') return renderStoredWriteEdit(document.body.createDiv(), tool);
+  expect(liveCard).toBeDefined();
+  document.body.append(liveCard!);
+  return liveCard!;
+}
 
 const expand = (block: HTMLElement, name: RegExp) => {
   const header = within(block).getByRole('button', { name });
@@ -229,6 +282,34 @@ describe.each(['live', 'history'] as const)('%s Pi tool presentation', mode => {
     expect((await axe(block)).violations).toEqual([]);
   });
 
+  it('keeps an unknown tool name colliding with prototype keys on its generic card', async () => {
+    const call: NativeToolCall = { name: 'constructor', args: {}, text: 'prototype tool output' };
+
+    const assertGenericCard = async (block: HTMLElement | null | undefined) => {
+      expect(block).toBeDefined();
+      const card = block!;
+      const header = within(card).getByRole('button', { name: /constructor/ });
+      expect(within(card).getByText('constructor')).toBeDefined();
+      fireEvent.keyDown(header, { key: 'Enter' });
+      expect(header.getAttribute('aria-expanded')).toBe('true');
+      expect(within(card).getByText('prototype tool output')).toBeDefined();
+      fireEvent.keyDown(header, { key: ' ' });
+      expect(header.getAttribute('aria-expanded')).toBe('false');
+      fireEvent.click(header);
+      expect(header.getAttribute('aria-expanded')).toBe('true');
+      expect((await axe(card)).violations).toEqual([]);
+    };
+
+    if (mode === 'live') {
+      // The live stream card is asserted before teardown; no stored card stands in for it.
+      await restoreLive(call, async messages => {
+        await assertGenericCard(messages.querySelector<HTMLElement>('.claudian-tool-call'));
+      });
+    } else {
+      await assertGenericCard(renderStoredToolCall(document.body.createDiv(), restoreHistory(call)));
+    }
+  });
+
   describe('codemode', () => {
     const code = 'const [notes, plan] = await Promise.all([\n  tools.read({ path: "notes.md" }),\n  tools.read({ path: "plan.md" }),\n]);\nawait tools.edit({ path: "plan.md", edits: [{ oldText: "Draft", newText: "Final" }] });\ntext(`notes=${notes.length} plan=${plan.length}`);';
     // Captured from Pi 0.99.2 `--mode json`: nested calls stream as their own events, tagged with the script's call ID.
@@ -294,28 +375,86 @@ describe.each(['live', 'history'] as const)('%s Pi tool presentation', mode => {
       expect(within(call).getByText(failure)).toBeDefined();
     });
   });
+
+  describe('raw write line boundaries', () => {
+    it.each([
+      { caseName: 'a final LF terminates the last line', content: 'a\n', texts: ['a'], rows: ['a'], stats: { added: 1, removed: 0 } },
+      { caseName: 'a lone LF is exactly one blank row', content: '\n', texts: [''], rows: [' '], stats: { added: 1, removed: 0 } },
+      { caseName: 'an interior blank line survives the final LF', content: 'a\n\n', texts: ['a', ''], rows: ['a', ' '], stats: { added: 2, removed: 0 } },
+      { caseName: 'unterminated lines have no separator to drop', content: 'a\nb', texts: ['a', 'b'], rows: ['a', 'b'], stats: { added: 2, removed: 0 } },
+      { caseName: 'CRLF keeps its CR in the row text', content: 'a\r\n', texts: ['a\r'], rows: ['a\r'], stats: { added: 1, removed: 0 } },
+      { caseName: 'a lone CR is one row', content: '\r', texts: ['\r'], rows: ['\r'], stats: { added: 1, removed: 0 } },
+      { caseName: 'spaces stay row content', content: ' ', texts: [' '], rows: [' '], stats: { added: 1, removed: 0 } },
+    ])('renders a native write $caseName', async ({ content, texts, rows, stats }) => {
+      const { tool, liveCard } = await restoreWithCard(mode, {
+        name: 'write',
+        args: { path: 'notes/todo.md', content },
+        text: 'Successfully wrote to notes/todo.md.',
+      });
+
+      const card = writeCardForMode(mode, tool, liveCard);
+      const header = expand(card, /^Write: notes\/todo\.md/);
+      expect(header.getAttribute('aria-label')).toContain('click to collapse');
+      expect(within(card).getByText(`+${stats.added}`)).toBeDefined();
+      expect([...card.querySelectorAll('.claudian-diff-text')].map(line => line.textContent)).toEqual(rows);
+      expect((await axe(card)).violations).toEqual([]);
+
+      // Metadata follows the rendered result so a wrong render fails on the actual card first.
+      expect(tool).toMatchObject({ name: 'Write', status: 'completed' });
+      expect(tool.diffData).toMatchObject({ filePath: 'notes/todo.md', stats });
+      expect(tool.diffData?.diffLines.map(line => line.text)).toEqual(texts);
+    });
+
+    it('renders an empty write without phantom rows on the existing empty surfaces', async () => {
+      const { tool, liveCard } = await restoreWithCard(mode, {
+        name: 'write',
+        args: { path: 'notes/empty.md', content: '' },
+        text: 'Successfully wrote to notes/empty.md.',
+      });
+
+      const card = writeCardForMode(mode, tool, liveCard);
+      expand(card, /^Write: notes\/empty\.md/);
+      // The two existing empty surfaces keep their own wording.
+      const expectedEmptyLabel = mode === 'live' ? 'No changes' : 'DONE';
+      expect(within(card).getByText(expectedEmptyLabel)).toBeDefined();
+      expect([...card.querySelectorAll('.claudian-diff-text')]).toEqual([]);
+      expect(within(card).queryByText(/\+\d/)).toBeNull();
+      expect((await axe(card)).violations).toEqual([]);
+
+      expect(tool).toMatchObject({ name: 'Write', status: 'completed' });
+      expect(tool.diffData).toEqual({ filePath: 'notes/empty.md', diffLines: [], stats: { added: 0, removed: 0 } });
+
+      // A nonempty write grounds the absence queries above, through the same mode seam.
+      const control = await restoreWithCard(mode, {
+        name: 'write',
+        args: { path: 'notes/control.md', content: 'x\n' },
+        text: 'Successfully wrote to notes/control.md.',
+      });
+      const controlCard = writeCardForMode(mode, control.tool, control.liveCard);
+      expand(controlCard, /^Write: notes\/control\.md/);
+      expect(within(controlCard).getByText(/\+\d/)).toBeDefined();
+      expect([...controlCard.querySelectorAll('.claudian-diff-text')].map(line => line.textContent)).toEqual(['x']);
+    });
+  });
 });
 
 it('streams a running script\'s nested calls through the Pi session and refreshes files written before cancellation', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-script-progress-'));
-  const configuration = { model: 'pi:anthropic/claude-sonnet-4', reasoning: null, systemInstructions: { kind: 'provider-default' as const } };
-  const host = {
-    getResolvedProviderCliPath: async () => process.execPath,
-    settings: { model: configuration.model, effortLevel: 'off', systemPrompt: '', userName: '',
+  const configuration = { model: 'pi:anthropic/claude-sonnet-4', reasoning: null, systemInstructions: { kind: 'main-agent' as const, instructions: 'Main Agent prompt.' } };
+  const host = (await createProviderHostFixture({ settings: { model: configuration.model, effortLevel: 'off', systemPrompt: '', userName: '',
       providerConfigs: { pi: { enabled: true, visibleModels: [configuration.model],
-        discoveredModels: [{ encodedId: configuration.model, id: 'claude-sonnet-4', provider: 'anthropic', label: 'Sonnet', input: ['text'], reasoning: false, thinkingLevels: ['off'] }] } } },
-  };
-  const backend = new PiExecutionBackend(host as any, { commandCatalog: { setCommandSnapshot: jest.fn() } } as any, {
+        discoveredModels: [{ encodedId: configuration.model, id: 'claude-sonnet-4', provider: 'anthropic', label: 'Sonnet', input: ['text'], reasoning: false, thinkingLevels: ['off'] }] } } }, overrides: { getResolvedProviderCliPath: async () => process.execPath } })).host;
+  const backend = new PiExecutionBackend(host.getRuntimeHost('pi'), {
     createKernel: (spec, callbacks) => new PiRPCSessionKernel({ ...spec, command: process.execPath,
       args: [path.resolve('tests/fixtures/providers/pi/PiSessionProcess.mjs'), ...spec.args],
       env: { ...spec.env, CLAUDIAN_TEST_PI_ROOT: root },
     }, callbacks, null),
   });
   const session = backend.createSession({
-    lifecycle: 'ephemeral', nativePersistence: 'disabled-if-supported', vaultWorkingDirectory: root,
-    interactionPort: { askUserQuestion: jest.fn(), requestApproval: jest.fn(), dismissInteraction: jest.fn() },
+    lifecycle: 'ephemeral', nativePersistence: 'disabled-if-supported', workingDirectory: root,
+    interactionPort: { askUserQuestion: vi.fn(), requestApproval: vi.fn(), dismissInteraction: vi.fn() },
   });
-  const { stream, response, close } = createChatStream();
+  const { stream, response, close } = (await createChatStream());
   try {
     // Captured from Pi 0.99.2: the script wrote out/new.md and is still running `sleep 2` through bash.
     const run = session.execute({ configuration, toolPolicy: { kind: 'provider-default' },
@@ -328,9 +467,7 @@ it('streams a running script\'s nested calls through the Pi session and refreshe
       if (response.toolCalls?.[0]?.scriptToolCalls?.length === 2) run.cancel();
     }
     clearTimeout(fallback);
-    await new Promise(resolve => setTimeout(resolve, 250));
-
-    expect(listVaultFolder).toHaveBeenCalledWith('out');
+    await waitFor(() => expect(listVaultFolder).toHaveBeenCalledWith('out'));
     expect(response.toolCalls).toHaveLength(1);
     const block = renderStoredToolCall(document.body.createDiv(), { ...response.toolCalls![0], status: 'running' });
     const calls = within(within(block).getByRole('list', { name: 'Tool calls' })).getAllByRole('listitem');
@@ -343,4 +480,20 @@ it('streams a running script\'s nested calls through the Pi session and refreshe
     await session.dispose();
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+it('presents a native Pi retry as a warning rather than a blocked action', async () => {
+  const { stream, response, messages, close } = (await createChatStream());
+  const render = vi.spyOn(MarkdownRenderer, 'render').mockImplementation(async (_app, markdown, element) => { element.textContent = markdown; });
+  try {
+    const state = createPiEventNormalizationState();
+    for (const chunk of normalizePiRPCEvent({ type: 'auto_retry_start' }, state)) {
+      await stream.handleStreamChunk(chunk, response);
+    }
+    await stream.finalizeCurrentTextBlock(response);
+    expect(response.contentBlocks).toContainEqual({ type: 'text', content: '\n\n⚠️ **Warning:** Pi is retrying the turn.' });
+    expect(messages.textContent).toContain('Pi is retrying the turn.');
+    expect(messages.textContent).not.toContain('Blocked:');
+    expect((await axe(messages)).violations).toEqual([]);
+  } finally { render.mockRestore(); close(); }
 });

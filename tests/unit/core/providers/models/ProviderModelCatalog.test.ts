@@ -1,13 +1,31 @@
-import { ProviderModelCatalogController, type ProviderModelSelectionChange } from '@/core/providers/models/ProviderModelCatalog';
+import {
+  ProviderModelCatalogController,
+  type ProviderModelCatalogState,
+  type ProviderModelCatalogStore,
+  type ProviderModelSelectionChange,
+} from '@/core/providers/models/ProviderModelCatalog';
+
+/** A store whose writes apply the patch to a mutable state, as provider configuration writers do. */
+function memoryStore(state: ProviderModelCatalogState, notify = vi.fn()): ProviderModelCatalogStore {
+  return {
+    read: () => state,
+    write: async change => {
+      const patch = change(state);
+      if (patch.visibleModels) state.selectedIds = patch.visibleModels;
+      if (patch.modelAliases) state.aliases = patch.modelAliases;
+    },
+    notifyChatOptionsChanged: notify,
+  };
+}
 
 function fixture() {
   let models = [{ id: 'selected', name: 'Selected' }];
-  const discover = jest.fn(async () => ({ changed: true }));
+  const discover = vi.fn(async () => ({ changed: true }));
   const catalog = new ProviderModelCatalogController({
-    providerId: 'example', providerName: 'Example',
-    read: () => ({ enabled: true, models, selectedIds: ['selected', 'missing'], aliases: {} }),
-    discover, update: jest.fn(),
-    host: { mutateSettings: async mutate => { await mutate({} as any); }, notifyProviderChatOptionsChanged: jest.fn() },
+    providerName: 'Example',
+    store: { ...memoryStore({ enabled: true, models, selectedIds: ['selected', 'missing'], aliases: {} }),
+      read: () => ({ enabled: true, models, selectedIds: ['selected', 'missing'], aliases: {} }) },
+    discover,
   });
   return { catalog, discover, replace: (next: typeof models) => { models = next; } };
 }
@@ -98,13 +116,11 @@ it('starts a new forced discovery after abort and drains the old request on disp
 });
 
 it('notifies only for committed selection and alias writes, not discovery or status', async () => {
-  const notify = jest.fn();
+  const notify = vi.fn();
   const catalog = new ProviderModelCatalogController({
-    providerId: 'example', providerName: 'Example',
-    read: () => ({ enabled: true, models: [], selectedIds: [], aliases: {} }),
+    providerName: 'Example',
+    store: memoryStore({ enabled: true, models: [], selectedIds: [], aliases: {} }, notify),
     discover: async () => ({ changed: true }),
-    update: jest.fn(),
-    host: { mutateSettings: async mutate => { await mutate({} as any); }, notifyProviderChatOptionsChanged: notify },
   });
   await catalog.refresh();
   catalog.markStale();
@@ -117,8 +133,8 @@ it('notifies only for committed selection and alias writes, not discovery or sta
 
 it('unsubscribes a settings observer without removing other subscribers', () => {
   const { catalog } = fixture();
-  const closed = jest.fn();
-  const active = jest.fn();
+  const closed = vi.fn();
+  const active = vi.fn();
   const unsubscribe = catalog.observe(closed);
   catalog.observe(active);
   expect(typeof unsubscribe).toBe('function');
@@ -143,27 +159,81 @@ it('does not retry a failed initial discovery when settings reopen', async () =>
 
 
 it.each<{ change: ProviderModelSelectionChange; expected: string[] }>([
-  { change: { type: 'move', modelId: 'c', target: 'a' }, expected: ['c', 'a', 'b'] },
-  { change: { type: 'move', modelId: 'a', target: 'c' }, expected: ['b', 'c', 'a'] },
+  { change: { type: 'move', modelId: 'c', target: 'a', placement: 'before' }, expected: ['c', 'a', 'b'] },
+  { change: { type: 'move', modelId: 'a', target: 'c', placement: 'before' }, expected: ['b', 'a', 'c'] },
+  { change: { type: 'move', modelId: 'a', target: 'c', placement: 'after' }, expected: ['b', 'c', 'a'] },
+  { change: { type: 'move', modelId: 'c', target: 'a', placement: 'after' }, expected: ['a', 'c', 'b'] },
   { change: { type: 'move', modelId: 'a', target: -1 }, expected: ['a', 'b', 'c'] },
   { change: { type: 'move', modelId: 'c', target: 1 }, expected: ['a', 'b', 'c'] },
-  { change: { type: 'move', modelId: 'missing', target: 'a' }, expected: ['a', 'b', 'c'] },
-  { change: { type: 'move', modelId: 'a', target: 'missing' }, expected: ['a', 'b', 'c'] },
+  { change: { type: 'move', modelId: 'missing', target: 'a', placement: 'before' }, expected: ['a', 'b', 'c'] },
+  { change: { type: 'move', modelId: 'a', target: 'missing', placement: 'before' }, expected: ['a', 'b', 'c'] },
   { change: { type: 'set', modelId: ' b ', selected: true }, expected: ['a', 'b', 'c'] },
   { change: { type: 'set', modelId: ' b ', selected: false }, expected: ['a', 'c'] },
 ])('applies selection intent $change without changing other identities', async ({ change, expected }) => {
-  const settings = { visibleModels: ['a', 'b', 'c'] };
+  const state = { enabled: true, models: [], selectedIds: ['a', 'b', 'c'], aliases: {} };
   const catalog = new ProviderModelCatalogController({
-    providerId: 'example', providerName: 'Example',
-    read: (draft = settings) => ({ enabled: true, models: [], selectedIds: draft.visibleModels as string[], aliases: {} }),
-    discover: async () => ({ changed: false }),
-    update: (draft, patch) => { Object.assign(draft, patch); },
-    host: {
-      mutateSettings: async mutate => { await mutate(settings as any); },
-      notifyProviderChatOptionsChanged: jest.fn(),
-    },
+    providerName: 'Example', store: memoryStore(state), discover: async () => ({ changed: false }),
   });
   await catalog.changeSelection(change);
-  expect(settings.visibleModels).toEqual(expected);
+  expect(state.selectedIds).toEqual(expected);
   await catalog.dispose();
+});
+
+it('creates an own __proto__ alias through the shared catalog writer', async () => {
+  const state = { enabled: true, models: [], selectedIds: [], aliases: { other: 'Keep' } as Record<string, string> };
+  const catalog = new ProviderModelCatalogController({
+    providerName: 'Example', store: memoryStore(state), discover: async () => ({ changed: false }),
+  });
+  try {
+    await catalog.setAlias('__proto__', ' Friendly ');
+    expect(Object.hasOwn(state.aliases, '__proto__')).toBe(true);
+    expect(JSON.parse(JSON.stringify(state.aliases))).toEqual(JSON.parse('{"other":"Keep","__proto__":"Friendly"}'));
+    expect(Object.getPrototypeOf(state.aliases)).toBe(Object.prototype);
+    await catalog.setAlias('__proto__', '');
+    expect(state.aliases).toEqual({ other: 'Keep' });
+  } finally {
+    await catalog.dispose();
+  }
+});
+
+it('publishes successful background recovery with ready status and no stale failure', async () => {
+  const state: ProviderModelCatalogState = { enabled: true, models: [], selectedIds: [], aliases: {} };
+  let publishSuccess!: () => void;
+  const catalog = new ProviderModelCatalogController({
+    providerName: 'Example',
+    store: memoryStore(state),
+    discover: async () => ({ changed: false, diagnostics: 'Offline' }),
+    observeChanges: observer => { publishSuccess = observer; return () => undefined; },
+  });
+  try {
+    catalog.markStale();
+    await catalog.refresh({ force: true });
+    expect(catalog.getSnapshot()).toMatchObject({ status: 'failed', stale: true, error: 'Offline' });
+    const snapshots: ReturnType<typeof catalog.getSnapshot>[] = [];
+    catalog.observe(() => snapshots.push(catalog.getSnapshot()));
+    state.models = [{ id: 'recovered', name: 'Recovered' }];
+    publishSuccess();
+    expect(snapshots).toEqual([expect.objectContaining({
+      status: 'ready', stale: false, error: undefined, models: state.models,
+    })]);
+  } finally { await catalog.dispose(); }
+});
+
+it('keeps an explicit refresh loading while an older background snapshot is published', async () => {
+  let publishSuccess!: () => void;
+  let finish!: () => void;
+  const catalog = new ProviderModelCatalogController({
+    providerName: 'Example',
+    store: memoryStore({ enabled: true, models: [], selectedIds: [], aliases: {} }),
+    discover: () => new Promise(resolve => { finish = () => resolve({ changed: true }); }),
+    observeChanges: observer => { publishSuccess = observer; return () => undefined; },
+  });
+  try {
+    const pending = catalog.refresh();
+    publishSuccess();
+    expect(catalog.getSnapshot().status).toBe('loading');
+    finish();
+    await pending;
+    expect(catalog.getSnapshot().status).toBe('ready');
+  } finally { finish(); await catalog.dispose(); }
 });

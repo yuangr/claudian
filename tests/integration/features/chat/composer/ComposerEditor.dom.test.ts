@@ -1,9 +1,12 @@
-/** @jest-environment jsdom */
+/** @vitest-environment jsdom */
 
+import { EditorView } from '@codemirror/view';
+import { axe } from '@test/helpers/accessibility';
+import { startNodeInsertAnimations } from '@test/helpers/dom/nodeInsertion';
+import { createPopoutDocument } from '@test/helpers/dom/popoutDocument';
 import { testDate } from '@test/helpers/testClock';
-import { fireEvent, waitFor, within } from '@testing-library/dom';
-import { axe } from 'jest-axe';
-import { type App, type Component, MarkdownRenderer, Platform, TFile } from 'obsidian';
+import { createEvent, fireEvent, waitFor, within } from '@testing-library/dom';
+import { type App, Component, MarkdownRenderer, Notice, Platform, TFile } from 'obsidian';
 
 import { createCatalogCommandDiscoveryStore } from '@/core/providers/commands/catalogCommandDiscovery';
 import type { ProviderCommandDiscoveryResult } from '@/core/providers/commands/ProviderCommandDiscoveryResult';
@@ -46,24 +49,19 @@ function createApp(): App {
     metadataCache: { getFirstLinkpathDest: () => file },
     vault: {
       getFiles: () => [file], getAllLoadedFiles: () => [file],
-      getAbstractFileByPath: () => file, on: jest.fn(), offref: jest.fn(),
+      getAbstractFileByPath: () => file, on: vi.fn(), offref: vi.fn(),
     },
-    workspace: { iterateAllLeaves: jest.fn(), openLinkText: jest.fn().mockResolvedValue(undefined) },
+    workspace: { iterateAllLeaves: vi.fn(), openLinkText: vi.fn().mockResolvedValue(undefined) },
   } as unknown as App;
 }
 
 function createEditor(parent: HTMLElement): ComposerEditor {
-  return new ComposerEditor(parent, createApp(), {} as Component);
+  return new ComposerEditor(parent, createApp(), new Component());
 }
 
 beforeEach(() => {
-  HTMLElement.prototype.empty = function () { this.replaceChildren(); };
-  HTMLElement.prototype.addClass = function (...names) { this.classList.add(...names); };
-  HTMLElement.prototype.removeClass = function (...names) { this.classList.remove(...names); };
-  HTMLElement.prototype.hasClass = function (name) { return this.classList.contains(name); };
-  HTMLElement.prototype.toggleClass = function (name, enabled) { for (const cls of Array.isArray(name) ? name : [name]) this.classList.toggle(cls, enabled); };
-  HTMLElement.prototype.scrollIntoView = jest.fn();
-  jest.mocked(MarkdownRenderer.render).mockReset().mockImplementation(async (_app, markdown, container) => {
+
+  vi.mocked(MarkdownRenderer.render).mockReset().mockImplementation(async (_app, markdown, container) => {
     const fixture = nativeLinks[markdown];
     if (!fixture) throw new Error(`No native rendering fixture for ${markdown}`);
     (container as HTMLElement).createEl('p').createEl('a', {
@@ -74,11 +72,11 @@ beforeEach(() => {
 
 it('renders a wikilink through Obsidian and opens it without changing the source text', async () => {
   const parent = document.body.createDiv();
-  const openLinkText = jest.fn().mockResolvedValue(undefined);
+  const openLinkText = vi.fn().mockResolvedValue(undefined);
   const app = createApp();
   app.workspace.openLinkText = openLinkText;
-  const component = {} as Component;
-  jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, markdown, container) => {
+  const component = new Component();
+  vi.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, markdown, container) => {
     expect(markdown).toBe('[[Notes/A note.md]]');
     (container as HTMLElement).createEl('a', {
       cls: 'internal-link', text: 'A note', attr: { href: 'Notes/A note.md', 'data-href': 'Notes/A note.md' },
@@ -99,6 +97,61 @@ it('renders a wikilink through Obsidian and opens it without changing the source
   }
 });
 
+it.each(['delete', 'destroy', 'parent unload'] as const)(
+  'releases wikilink render resources on %s, including late embeds', async release => {
+    const parent = document.body.createDiv();
+    const owner = new Component();
+    owner.load();
+    const editor = new ComposerEditor(parent, createApp(), owner);
+    let finishRender!: () => void;
+    const pendingRender = new Promise<void>(resolve => { finishRender = resolve; });
+    let liveResources = 0;
+    const registerResource = (component: Component) => {
+      liveResources++;
+      component.register(() => { liveResources--; });
+    };
+    vi.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, _markdown, container, _path, scope) => {
+      (container as HTMLElement).createEl('a', {
+        cls: 'internal-link', text: 'A note', attr: { href: 'Notes/A note.md' },
+      });
+      const registerEmbed = () => {
+        const embed = new Component();
+        registerResource(embed);
+        scope.addChild(embed);
+      };
+      registerResource(scope);
+      registerEmbed();
+      await pendingRender;
+      registerResource(scope);
+      registerEmbed();
+    });
+    try {
+      editor.element.value = 'Read [[Notes/A note.md]] today';
+      editor.element.focus();
+      await waitFor(() => within(parent).getByRole('link', { name: 'A note' }));
+      expect(liveResources).toBe(2);
+      // Rebuilding equivalent decorations must retain the displayed chip's owner.
+      editor.element.replaceText!(editor.element.value.length, editor.element.value.length, '!');
+      expect(vi.mocked(MarkdownRenderer.render)).toHaveBeenCalledTimes(1);
+      expect(liveResources).toBe(2);
+      expect(await axe(parent)).toHaveNoViolations();
+      if (release === 'delete') editor.element.value = 'A replacement draft';
+      else if (release === 'destroy') editor.destroy();
+      else owner.unload();
+      expect(liveResources).toBe(0);
+      finishRender();
+      await pendingRender;
+      await Promise.resolve();
+      expect(liveResources).toBe(0);
+    } finally {
+      finishRender();
+      editor.destroy();
+      owner.unload();
+      parent.remove();
+    }
+  },
+);
+
 it.each<[string, Locale, string]>([
   ['click', 'en', 'Input suggestions'],
   ['Enter', 'en', 'Input suggestions'],
@@ -108,7 +161,7 @@ it.each<[string, Locale, string]>([
   setLocale(locale);
   const parent = document.body.createDiv();
   const app = createApp();
-  const editor = new ComposerEditor(parent, app, {} as Component);
+  const editor = new ComposerEditor(parent, app, new Component());
   const files = new FileContextManager(new VaultMentionDataProvider(app));
   const dropdown = new ComposerDropdownController(parent, editor.element, [files.getMentionSource()]);
   try {
@@ -152,7 +205,7 @@ it.each<[string, Locale, string]>([
 it('renders identical labels while keeping each aliased link target distinct', async () => {
   const parent = document.body.createDiv();
   const app = createApp();
-  const editor = new ComposerEditor(parent, app, {} as Component);
+  const editor = new ComposerEditor(parent, app, new Component());
   try {
     const source = 'Compare [[DEMO.md|DEMO]] and [[- Bases/DEMO.md|DEMO]]';
     editor.element.value = source;
@@ -209,7 +262,7 @@ it('copies wikilink source and reconstructs links through paste, undo, redo, and
     const draft = input.value;
     input.selectionStart = 0;
     input.selectionEnd = draft.length;
-    const clipboardData = { clearData: jest.fn(), setData: jest.fn() };
+    const clipboardData = { clearData: vi.fn(), setData: vi.fn() };
     fireEvent.copy(content, { clipboardData });
     expect(clipboardData.setData).toHaveBeenCalledWith('text/plain', '[[Notes/A note.md#Heading|My alias]]');
     fireEvent.keyDown(content, { key: 'z', code: 'KeyZ', ctrlKey: true });
@@ -248,7 +301,7 @@ it('refreshes native link resolution after vault changes', async () => {
     editor.element.value = '[[Notes/B.md]]';
     editor.element.focus();
     await waitFor(() => within(parent).getByRole('link', { name: 'B' }));
-    jest.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, _markdown, container) => {
+    vi.mocked(MarkdownRenderer.render).mockImplementationOnce(async (_app, _markdown, container) => {
       (container as HTMLElement).createEl('a', {
         cls: 'internal-link is-unresolved', text: 'B', attr: { href: 'Notes/B.md' },
       });
@@ -304,11 +357,36 @@ it('leaves native spellcheck and text replacement enabled in the focused textbox
   parent.remove();
 });
 
+it('reports whether the caret is on the first or last rendered row, including soft wraps', () => {
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  editor.element.focus();
+  editor.element.value = 'a'.repeat(30);
+  // jsdom has no layout: render ten characters per 20px row; a wrap point belongs to the row the side faces.
+  let measurable = true;
+  vi.spyOn(EditorView.prototype, 'coordsAtPos').mockImplementation((pos: number, side = 1) => {
+    if (!measurable) return null;
+    const row = side < 0 && pos > 0 && pos % 10 === 0 ? pos / 10 - 1 : Math.floor(pos / 10);
+    return { top: row * 20, bottom: row * 20 + 18, left: 0, right: 0 };
+  });
+  const caretOn = (pos: number) => {
+    editor.element.selectionStart = editor.element.selectionEnd = pos;
+    return [editor.element.isCaretOnEdgeRow!('up'), editor.element.isCaretOnEdgeRow!('down')];
+  };
+  expect(caretOn(5)).toEqual([true, false]);
+  expect(caretOn(15)).toEqual([false, false]);
+  expect(caretOn(30)).toEqual([false, true]);
+  measurable = false;
+  expect(caretOn(5)).toEqual([null, null]);
+  editor.destroy();
+  parent.remove();
+});
+
 it('keeps the explicit send shortcut focused inside the editor', () => {
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
   editor.element.focus();
-  const sendMessage = jest.fn().mockResolvedValue(undefined);
+  const sendMessage = vi.fn().mockResolvedValue(undefined);
   const tab = { dom: { inputEl: editor.element }, controllers: { inputController: { sendMessage } } };
   const event = new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: !Platform.isMacOS, metaKey: Platform.isMacOS, cancelable: true });
   expect(sendTabInputMessageFromExplicitEnterShortcut(tab as never, event, { requireInputFocus: true })).toBe(true);
@@ -320,7 +398,7 @@ it('keeps the explicit send shortcut focused inside the editor', () => {
 it('lets image attachment handling consume image paste before the rich editor inserts fallback text', () => {
   const parent = document.body.createDiv({ cls: 'claudian-input-wrapper' });
   const editor = createEditor(parent);
-  const images = new ImageContextManager(parent, editor.element, {});
+  const images = new ImageContextManager({ pushScope: vi.fn(), popScope: vi.fn() }, parent, editor.element, {});
   editor.element.value = 'Keep this';
   editor.element.focus();
   const clipboardData = {
@@ -333,16 +411,164 @@ it('lets image attachment handling consume image paste before the rich editor in
   parent.remove();
 });
 
+describe('image batch admission through the composer', () => {
+  function createFixture() {
+    const parent = document.body.createDiv();
+    const wrapper = parent.createDiv({ cls: 'claudian-input-wrapper' });
+    const editor = createEditor(wrapper);
+    const changed = vi.fn();
+    const images = new ImageContextManager({ pushScope: vi.fn(), popScope: vi.fn() }, parent, editor.element, {
+      onUserImagesChanged: changed,
+    });
+    editor.element.value = 'Keep this draft';
+    editor.element.focus();
+    editor.element.selectionStart = editor.element.selectionEnd = editor.element.value.length;
+    const textbox = within(parent).getByRole('textbox', { name: 'Message' });
+    const escapedDrop = vi.fn();
+    parent.addEventListener('drop', escapedDrop);
+    vi.mocked(Notice).mockClear();
+    return {
+      parent, wrapper, editor, images, changed, textbox, escapedDrop,
+      destroy: () => { images.destroy(); editor.destroy(); parent.remove(); },
+    };
+  }
+
+  function imageFile(name: string, type: string, bytes: number[]) {
+    const data = new Uint8Array(bytes);
+    const file = new File([data], name, { type });
+    const read = vi.fn(async () => data.buffer);
+    Object.defineProperty(file, 'arrayBuffer', { value: read });
+    return { file, read };
+  }
+
+  function dispatchBatch(fixture: ReturnType<typeof createFixture>, operation: 'paste' | 'drop', files: File[]) {
+    const event = operation === 'paste'
+      ? createEvent.paste(fixture.textbox, {
+        clipboardData: {
+          items: files.map(file => ({ type: file.type, getAsFile: () => file })),
+          files, getData: () => 'image fallback',
+        },
+      })
+      : createEvent.drop(fixture.wrapper, { dataTransfer: { types: ['Files'], files } });
+    const preventDefault = vi.spyOn(event, 'preventDefault');
+    fireEvent(operation === 'paste' ? fixture.textbox : fixture.wrapper, event);
+    return { event, preventDefault };
+  }
+
+  it.each(['paste', 'drop'] as const)('reports one unsupported Notice for a disabled two-image %s batch', async operation => {
+    const fixture = createFixture();
+    const first = imageFile('first.png', 'image/png', [1, 2, 3]);
+    const second = imageFile('second.jpg', 'image/jpeg', [4, 5]);
+    try {
+      fixture.images.setEnabled(false);
+      if (operation === 'drop') fireEvent.dragEnter(fixture.wrapper, { dataTransfer: { types: ['Files'] } });
+      const overlay = fixture.parent.querySelector('.claudian-drop-overlay');
+      expect(overlay?.classList.contains('visible')).toBe(operation === 'drop');
+      const { event, preventDefault } = dispatchBatch(fixture, operation, [first.file, second.file]);
+      // Rejected files settle synchronously through microtasks; observe the whole event, not its first Notice.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(event.defaultPrevented).toBe(true);
+      expect(preventDefault).toHaveBeenCalledTimes(1);
+      expect(fixture.escapedDrop).not.toHaveBeenCalled();
+      expect(overlay?.classList.contains('visible')).toBe(false);
+      expect(fixture.images.getAttachedImages()).toEqual([]);
+      expect(within(fixture.parent).queryAllByRole('button', { name: /image attachment/i })).toEqual([]);
+      expect(fixture.changed).not.toHaveBeenCalled();
+      expect(first.read).not.toHaveBeenCalled();
+      expect(second.read).not.toHaveBeenCalled();
+      expect(fixture.editor.element.value).toBe('Keep this draft');
+      expect(Notice).toHaveBeenCalledTimes(1);
+      expect(Notice).toHaveBeenCalledWith('Image attachments are not supported by this provider.');
+    } finally { fixture.destroy(); }
+  });
+
+  it.each(['', 'image/png'])('attaches a dropped PNG with MIME %j by its supported filename', async type => {
+    const fixture = createFixture();
+    const image = imageFile('screenshot.PNG', type, [1, 2, 3]);
+    const unsupported = imageFile('notes.txt', '', [4, 5]);
+    const conflicting = imageFile('renamed.png', 'text/plain', [6, 7]);
+    try {
+      dispatchBatch(fixture, 'drop', [unsupported.file, conflicting.file, image.file]);
+      await waitFor(() => expect(fixture.images.getAttachedImages()).toHaveLength(1));
+      expect(fixture.images.getAttachedImages()).toEqual([
+        { id: expect.any(String), name: 'screenshot.PNG', mediaType: 'image/png', data: 'AQID', size: 3, source: 'drop' },
+      ]);
+      expect(within(fixture.parent).getByRole('button', { name: 'Image attachment: screenshot.PNG · 3 B' })).toBeTruthy();
+      expect(fixture.changed).toHaveBeenCalledTimes(1);
+      expect(image.read).toHaveBeenCalledTimes(1);
+      expect(unsupported.read).not.toHaveBeenCalled();
+      expect(conflicting.read).not.toHaveBeenCalled();
+      expect(fixture.editor.element.value).toBe('Keep this draft');
+      expect(Notice).not.toHaveBeenCalled();
+    } finally { fixture.destroy(); }
+  });
+
+  it.each(['paste', 'drop'] as const)('attaches an enabled %s batch once in byte and selection order', async operation => {
+    const fixture = createFixture();
+    const first = imageFile(operation === 'paste' ? 'screenshot' : 'first.png', 'image/png', [1, 2, 3]);
+    const second = imageFile('second.jpg', 'image/jpeg', [4, 5]);
+    try {
+      const { event, preventDefault } = dispatchBatch(fixture, operation, [first.file, second.file]);
+      await waitFor(() => expect(fixture.images.getAttachedImages()).toHaveLength(2));
+      expect(fixture.images.getAttachedImages()).toEqual([
+        { id: expect.any(String), name: first.file.name, mediaType: 'image/png', data: 'AQID', size: 3, source: operation },
+        { id: expect.any(String), name: 'second.jpg', mediaType: 'image/jpeg', data: 'BAU=', size: 2, source: operation },
+      ]);
+      expect(first.read).toHaveBeenCalledTimes(1);
+      expect(second.read).toHaveBeenCalledTimes(1);
+      expect(fixture.changed).toHaveBeenCalledTimes(2);
+      expect(within(fixture.parent).getAllByRole('button', { name: /^Image attachment:/ }).map(button => button.getAttribute('aria-label')))
+        .toEqual([`Image attachment: ${first.file.name} \u00b7 3 B`, 'Image attachment: second.jpg \u00b7 2 B']);
+      expect(event.defaultPrevented).toBe(true);
+      expect(preventDefault).toHaveBeenCalledTimes(1);
+      expect(fixture.editor.element.value).toBe('Keep this draft');
+      expect(Notice).not.toHaveBeenCalled();
+    } finally { fixture.destroy(); }
+  });
+
+  it.each(['text', 'empty', 'null-clipboard', 'null-image', 'empty-drop', 'ineligible-drop'] as const)(
+    'does not notify for a disabled %s operation without eligible images', async kind => {
+      const fixture = createFixture();
+      try {
+        fixture.images.setEnabled(false);
+        let event: Event;
+        if (kind === 'empty-drop' || kind === 'ineligible-drop') {
+          const files = kind === 'empty-drop' ? [] : [new File(['not an eligible extension'], 'image.svg', { type: 'image/png' })];
+          event = createEvent.drop(fixture.wrapper, { dataTransfer: { files } });
+          fireEvent(fixture.wrapper, event);
+        } else {
+          const items = kind === 'text' ? [{ type: 'text/plain', getAsFile: () => null }]
+            : kind === 'null-image' ? [{ type: 'image/png', getAsFile: () => null }] : [];
+          event = createEvent.paste(fixture.textbox, {
+            clipboardData: kind === 'null-clipboard' ? null : {
+              items, files: [], getData: () => kind === 'text' ? ' plain text' : '',
+            },
+          });
+          fireEvent(fixture.textbox, event);
+        }
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(Notice).not.toHaveBeenCalled();
+        expect(fixture.images.getAttachedImages()).toEqual([]);
+        expect(fixture.changed).not.toHaveBeenCalled();
+        expect(fixture.editor.element.value).toBe(kind === 'text' ? 'Keep this draft plain text' : 'Keep this draft');
+        expect(event.defaultPrevented).toBe(kind !== 'null-clipboard');
+      } finally { fixture.destroy(); }
+    },
+  );
+});
+
 it('focuses an already open note when its composer link is clicked', async () => {
   const parent = document.body.createDiv();
   const app = createApp();
   const leaf = {
+    getRoot: () => ({}),
+
     getViewState: () => ({ type: 'markdown', state: { file: 'Notes/A note.md' } }),
-    setEphemeralState: jest.fn(),
+    setEphemeralState: vi.fn(),
   };
-  jest.mocked(app.workspace.iterateAllLeaves).mockImplementation(visit => visit(leaf as never));
-  app.workspace.revealLeaf = jest.fn().mockResolvedValue(undefined);
-  const editor = new ComposerEditor(parent, app, {} as Component);
+  vi.mocked(app.workspace.iterateAllLeaves).mockImplementation(visit => visit(leaf as never));
+  app.workspace.revealLeaf = vi.fn().mockResolvedValue(undefined);
+  const editor = new ComposerEditor(parent, app, new Component());
   try {
     editor.element.value = 'Read [[Notes/A note.md|A note]] today';
     editor.element.focus();
@@ -449,8 +675,33 @@ it('upgrades to the editor when a focusin reaches the composer host', () => {
   }
 });
 
+it('keeps focus and the caret in a pop-out window the mounted composer moves to', () => {
+  const parent = document.body.createDiv();
+  const editor = createEditor(parent);
+  const popout = createPopoutDocument();
+  try {
+    editor.element.value = 'abcde';
+    editor.element.focus();
+    popout.body.append(parent);
+    startNodeInsertAnimations(parent);
+    const textbox = within(popout.body).getByRole('textbox', { name: 'Message' });
+    textbox.focus();
+    for (let i = 0; i < 3; i++) fireEvent.keyDown(textbox, { key: 'Backspace', code: 'Backspace' });
+
+    expect(editor.element.value).toBe('ab');
+    expect(parent.querySelector('.cm-editor')!.classList.contains('cm-focused')).toBe(true);
+    const selection = popout.getSelection()!;
+    expect(textbox.contains(selection.focusNode)).toBe(true);
+    expect(selection.focusNode!.textContent!.slice(0, selection.focusOffset)).toBe('ab');
+  } finally {
+    editor.destroy();
+    parent.remove();
+    popout.defaultView!.frameElement!.remove();
+  }
+});
+
 it.each([
-  ['Draft ] \\ review', '@[Draft \\] \\\\ review](claudian-session:conv-1-abc)'],
+  ['Draft ] \\ review','@[Draft \\] \\\\ review](claudian-session:conv-1-abc)'],
   ['Fix `bug`', '@[Fix `bug`](claudian-session:conv-1-abc)'],
 ])('renders session title %s accessibly and deletes its token', async (title, token) => {
   const parent = document.body.createDiv();
@@ -540,7 +791,7 @@ it('reloads Codex skills for typed tokens while keeping completed chips atomic',
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
   let name = 'first-skill';
-  const nativeRequest = jest.fn(async () => ({ data: [{ cwd: '/vault', skills: [{
+  const nativeRequest = vi.fn(async () => ({ data: [{ cwd: '/vault', skills: [{
     name, path: '/skills/SKILL.md', scope: 'user', enabled: true,
   }] }] }));
   const skills = new CodexSkillListingService({
@@ -556,9 +807,10 @@ it('reloads Codex skills for typed tokens while keeping completed chips atomic',
   const catalog = new CodexCommandCatalog(skills);
   const dropdown = new MainChatComposerDropdown(parent, editor.element, new FileContextManager(new VaultMentionDataProvider(createApp())), {
     providerId: 'codex', providerConfig: catalog.getDropdownConfig(),
-    providerDiscovery: createCatalogCommandDiscoveryStore(catalog),
+    // Codex has no command loader; its catalog discovers skills itself.
+    providerDiscovery: createCatalogCommandDiscoveryStore(catalog, async () => ({ result: { status: 'empty' } })),
   });
-  const handleInput = jest.fn(() => dropdown.handleInputChange());
+  const handleInput = vi.fn(() => dropdown.handleInputChange());
   editor.element.addEventListener('input', handleInput);
   try {
     editor.element.value = '$';
@@ -609,7 +861,7 @@ it('accepts a visible prompt suggestion with Tab only, without sending', async (
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
   const suggestion = new ComposerPromptSuggestion(editor.element, () => true, parent);
-  const send = jest.fn();
+  const send = vi.fn();
   editor.element.addEventListener('keydown', event => {
     if (suggestion.handleKeydown(event)) return;
     if (event.key === 'Enter') send();
@@ -835,8 +1087,8 @@ it('localizes the linked content removal button through the info row', async () 
   setLocale('zh-CN');
   const parent = document.body.createDiv();
   const row = new ComposerInfoRow(parent);
-  const remove = jest.fn();
-  const chip = new LinkedContentChip(row, jest.fn(), remove);
+  const remove = vi.fn();
+  const chip = new LinkedContentChip(row, vi.fn(), remove);
   try {
     chip.render({ path: 'Notes/A.md', kind: 'file', label: 'A', icon: 'file-text', missing: false, target: null }, true);
     const button = within(parent).getByRole('button', { name: '移除关联内容：Notes/A.md' });
@@ -856,7 +1108,7 @@ it('localizes image attachment labels and removal controls', async () => {
   setLocale('zh-CN');
   const parent = document.body.createDiv();
   const editor = createEditor(parent);
-  const images = new ImageContextManager(parent, editor.element, {});
+  const images = new ImageContextManager({ pushScope: vi.fn(), popScope: vi.fn() }, parent, editor.element, {});
   try {
     images.setImages([{ id: 'image', name: 'photo.png', mediaType: 'image/png', data: 'dGVzdA==', size: 500, source: 'paste' }]);
     fireEvent.click(within(parent).getByRole('button', { name: '图片附件：photo.png · 500 B' }));
@@ -886,7 +1138,7 @@ it('localizes image overflow controls and updates their accessible names on expa
   const editor = createEditor(parent);
   const trayEl = parent.createDiv();
   const tray = new ComposerContextTray(trayEl);
-  const images = new ImageContextManager(parent, editor.element, {}, undefined, tray);
+  const images = new ImageContextManager({ pushScope: vi.fn(), popScope: vi.fn() }, parent, editor.element, {}, undefined, tray);
   try {
     images.setImages(Array.from({ length: 4 }, (_, index) => ({
       id: `image-${index}`, name: `photo-${index}.png`, mediaType: 'image/png' as const,

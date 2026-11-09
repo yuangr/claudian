@@ -9,6 +9,9 @@ import { getEditorView } from '@/utils/obsidianCompat';
 
 const INPUT_HANDOFF_GRACE_MS = 1500;
 const HIGHLIGHT_KEY = 'claudian-selection';
+// Gates the ::highlight() rule while the highlight is registered: an ungated rule makes Chromium
+// resolve a highlight style for every element on every restyle, even with no highlight registered.
+const HIGHLIGHT_ACTIVE_CLASS = 'claudian-selection-highlight-active';
 
 type CustomHighlightRegistry = {
   delete: (name: string) => boolean;
@@ -27,6 +30,7 @@ export class SelectionController {
   private storedSelection: StoredSelection | null = null;
   private inputHandoffGraceUntil: number | null = null;
   private started = false;
+  private highlightGateEl: HTMLElement | null = null;
   private readonly focusScopePointerDownHandler = () => {
     if (!this.storedSelection) return;
     this.inputHandoffGraceUntil = Date.now() + INPUT_HANDOFF_GRACE_MS;
@@ -98,7 +102,7 @@ export class SelectionController {
       }
       // Keep the captured selection only while focus is transitioning into
       // the chat UI; any other leaf switch should drop stale prompt context.
-      this.#clearWhenFileContextIsUnavailable();
+      this.#releaseUnlessHandingOff();
       return;
     }
 
@@ -111,7 +115,7 @@ export class SelectionController {
     const editor = view.editor;
     const editorView = getEditorView(editor);
     if (!editorView) {
-      this.#clearWhenFileContextIsUnavailable();
+      this.#releaseUnlessHandingOff();
       return;
     }
 
@@ -148,14 +152,14 @@ export class SelectionController {
         this.onUserSelectionChanged?.();
       }
     } else {
-      this.#handleDeselection();
+      this.#releaseUnlessHandingOff();
     }
   }
 
   #pollDOMSelection(view: FileView): void {
     const containerEl = view.containerEl;
     if (!containerEl) {
-      this.#clearWhenFileContextIsUnavailable();
+      this.#releaseUnlessHandingOff();
       return;
     }
 
@@ -169,7 +173,7 @@ export class SelectionController {
         (!anchorNode || !containerEl.contains(anchorNode))
         && (!focusNode || !containerEl.contains(focusNode))
       ) {
-        this.#handleDeselection();
+        this.#releaseUnlessHandingOff();
         return;
       }
 
@@ -199,7 +203,7 @@ export class SelectionController {
         this.onUserSelectionChanged?.();
       }
     } else {
-      this.#handleDeselection();
+      this.#releaseUnlessHandingOff();
     }
   }
 
@@ -340,7 +344,8 @@ export class SelectionController {
     return this.#selectionMatchesRanges(this.#getDocumentSelection(this.#getFocusScopeOwnerDocument()), ranges);
   }
 
-  #clearWhenFileContextIsUnavailable(): void {
+  /** Drops the stored selection the user left, unless focus is moving into the chat input. */
+  #releaseUnlessHandingOff(): void {
     if (!this.storedSelection) return;
     if (this.#isFocusWithinChatSidebar()) {
       this.inputHandoffGraceUntil = null;
@@ -350,28 +355,7 @@ export class SelectionController {
       return;
     }
 
-    this.inputHandoffGraceUntil = null;
-    this.#clearHighlight();
-    this.storedSelection = null;
-    this.updateIndicator();
-    this.onUserSelectionChanged?.();
-  }
-
-  #handleDeselection(): void {
-    if (!this.storedSelection) return;
-    if (this.#isFocusWithinChatSidebar()) {
-      this.inputHandoffGraceUntil = null;
-      return;
-    }
-
-    if (this.inputHandoffGraceUntil !== null && Date.now() <= this.inputHandoffGraceUntil) {
-      return;
-    }
-
-    this.inputHandoffGraceUntil = null;
-    this.#clearHighlight();
-    this.storedSelection = null;
-    this.updateIndicator();
+    this.clear();
     this.onUserSelectionChanged?.();
   }
 
@@ -399,23 +383,33 @@ export class SelectionController {
     if (sel.domRanges?.length) {
       if (this.#isNativePreviewSelectionVisible(sel.domRanges)) {
         // Native is showing — clear any stale mock
-        this.cssHighlights?.delete(HIGHLIGHT_KEY);
+        this.#deletePreviewHighlight();
         return;
       }
       // Native selection not visible (e.g., input has focus) — show mock
       const validRanges = sel.domRanges.filter(r => r.startContainer.isConnected);
       const HighlightCtor = this.highlightConstructor;
-      if (validRanges.length && HighlightCtor) {
-        this.cssHighlights?.set(HIGHLIGHT_KEY, new HighlightCtor(...validRanges));
+      const highlights = this.cssHighlights;
+      if (validRanges.length && HighlightCtor && highlights) {
+        highlights.set(HIGHLIGHT_KEY, new HighlightCtor(...validRanges));
+        this.highlightGateEl?.removeClass(HIGHLIGHT_ACTIVE_CLASS);
+        this.highlightGateEl = validRanges[0].startContainer.ownerDocument?.body ?? null;
+        this.highlightGateEl?.addClass(HIGHLIGHT_ACTIVE_CLASS);
       }
     }
+  }
+
+  #deletePreviewHighlight(): void {
+    this.cssHighlights?.delete(HIGHLIGHT_KEY);
+    this.highlightGateEl?.removeClass(HIGHLIGHT_ACTIVE_CLASS);
+    this.highlightGateEl = null;
   }
 
   #clearHighlight(): void {
     if (this.storedSelection?.editorView) {
       hideSelectionHighlight(this.storedSelection.editorView);
     }
-    this.cssHighlights?.delete(HIGHLIGHT_KEY);
+    this.#deletePreviewHighlight();
   }
 
   // ============================================

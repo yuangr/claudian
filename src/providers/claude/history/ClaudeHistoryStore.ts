@@ -1,7 +1,10 @@
 import * as fs from 'fs/promises';
 
-import type { ProviderHistoryPathContext } from '../../../core/providers/types';
 import type { ChatMessage, SubagentInfo, ToolCallInfo } from '../../../core/types';
+import { settleInterruptedTurn } from '../../../core/types';
+import type { ClaudeConfigDirContext } from '../config/ClaudeConfigDir';
+import { getClaudeExecutionTarget } from '../config/ClaudeConfigDir';
+import { mapClaudeHistoryToolPaths } from '../normalization/claudePaths';
 import { ClaudeTaskToolNormalizer } from '../normalization/ClaudeTaskToolNormalizer';
 import { ClaudeTaskResultInterpreter } from '../runtime/ClaudeTaskResultInterpreter';
 import { isClaudeSubagentToolName } from '../subagentToolNames';
@@ -16,33 +19,41 @@ import {
 } from './ClaudeHistoryPathResolver';
 import { ClaudeTurnStats } from './ClaudeTurnStats';
 import { buildAsyncSubagentInfo } from './sdkAsyncSubagent';
-import { filterActiveBranch } from './sdkBranchFilter';
+import { filterActiveBranch, type SDKCheckpointPolicy } from './sdkBranchFilter';
 import type { SDKNativeMessage, SDKSessionLoadResult, SDKSessionReadResult } from './sdkHistoryTypes';
 import {
   collectAsyncSubagentResults,
   collectStructuredPatchResults,
   collectToolResults,
+  getSDKUserMessageTimestamp,
   hydrateStructuredToolResults,
   isCanonicalSDKUserMessage,
+  isQueuedPromptAttachment,
+  isStopHookFeedback,
   isSystemInjectedMessage,
   mergeAssistantMessage,
   parseSDKMessageToChat,
   parseTaskNotification,
 } from './sdkMessageParsing';
 import {
+  hasSubagentSidecar,
   isValidAgentId,
   loadSubagentFinalResult,
   loadSubagentToolCalls,
+  readSubagentToolUseIndex,
+  type SubagentRunWindow,
 } from './sdkSubagentSidecar';
 
 export { recoverSDKSessionIdByTime } from './ClaudeSessionRecovery';
 export {
   encodeVaultPathForSDK,
   getSDKProjectsPath,
+  hasSubagentSidecar,
   loadSubagentFinalResult,
   loadSubagentToolCalls,
   locateSDKSession,
   locateSDKSessions,
+  readSubagentToolUseIndex,
 };
 
 /**
@@ -63,7 +74,7 @@ function resolveSessionPath(
   vaultPath: string,
   sessionId: string,
   sessionPath: string | undefined,
-  pathContext: ProviderHistoryPathContext | undefined,
+  pathContext: ClaudeConfigDirContext | undefined,
 ): string | null {
   if (sessionPath) return sessionPath;
   try {
@@ -92,7 +103,7 @@ async function readSessionEntries(
   vaultPath: string,
   sessionId: string,
   sessionPath: string | undefined,
-  pathContext: ProviderHistoryPathContext | undefined,
+  pathContext: ClaudeConfigDirContext | undefined,
 ): Promise<SDKSessionReadResult> {
   return sessionPath
     ? readSDKSessionFile(sessionPath)
@@ -111,7 +122,8 @@ export async function loadSDKSessionMessages(
   sessionId: string,
   resumeAtMessageId?: string,
   sessionPath?: string,
-  pathContext?: ProviderHistoryPathContext,
+  pathContext?: ClaudeConfigDirContext,
+  checkpointPolicy: SDKCheckpointPolicy = 'latest-branch',
 ): Promise<SDKSessionLoadResult> {
   const result = await takePendingModelRead(resolveSessionPath(vaultPath, sessionId, sessionPath, pathContext))
     ?? await readSessionEntries(vaultPath, sessionId, sessionPath, pathContext);
@@ -120,7 +132,7 @@ export async function loadSDKSessionMessages(
     return { messages: [], skippedLines: result.skippedLines, error: result.error };
   }
 
-  const filteredEntries = filterActiveBranch(result.messages.filter(entry => !entry.isSidechain), resumeAtMessageId);
+  const filteredEntries = filterActiveBranch(result.messages.filter(entry => !entry.isSidechain), resumeAtMessageId, checkpointPolicy);
 
   const toolResults = collectToolResults(filteredEntries);
   const toolUseResults = collectStructuredPatchResults(filteredEntries);
@@ -132,6 +144,19 @@ export async function loadSDKSessionMessages(
   let turnStartedAt: number | undefined;
   let lastAssistantAt: number | undefined;
   let requestedResponsePending = false;
+  /**
+   * The native turn being read. Claude Code (2.1.274+) stamps every user-type record of a
+   * turn with its `promptId`: the prompt or the notification that starts it, tool results,
+   * Stop-hook and `max_tokens` continuations, compaction summaries and the interrupt marker.
+   * Assistant, attachment and compaction records sit among their turn's records. Older
+   * transcripts lack it; there a canonical prompt starts the next turn, and a notification
+   * one after the running turn ended: a reply stopping for anything but tool use tentatively
+   * ends it, further output or a blocking Stop hook's feedback continues it.
+   */
+  let turnId = 'transcript-start';
+  let turnAutomatic = true;
+  let nativeTurn = false;
+  let legacyTurnEnded = true;
   let turnStats = new ClaudeTurnStats();
   const taskToolNormalizer = new ClaudeTaskToolNormalizer();
 
@@ -160,9 +185,30 @@ export async function loadSDKSessionMessages(
     turnStats = new ClaudeTurnStats();
   };
 
+  // Resolve over every record, as live turn stats do: the active branch drops the progress
+  // records a fold can follow. Parents precede their children in file order.
+  const effectiveTimestamps = new Map<string, string | undefined>();
+  for (const entry of result.messages) {
+    if (entry.isSidechain || !entry.uuid) continue;
+    effectiveTimestamps.set(entry.uuid, getSDKUserMessageTimestamp(
+      entry, entry.parentUuid ? effectiveTimestamps.get(entry.parentUuid) : undefined,
+    ));
+  }
   // Preserve task notification boundaries without ending an unfinished requested response.
-  for (const sdkMsg of filteredEntries) {
+  for (const entry of filteredEntries) {
+    const timestamp = isQueuedPromptAttachment(entry) && entry.uuid && effectiveTimestamps.has(entry.uuid)
+      ? effectiveTimestamps.get(entry.uuid) : entry.timestamp;
+    const sdkMsg = timestamp === entry.timestamp ? entry : { ...entry, timestamp };
     const notification = parseTaskNotification(sdkMsg);
+    if (entry.promptId !== undefined && entry.promptId !== turnId) {
+      turnId = entry.promptId;
+      turnAutomatic = notification !== null;
+      nativeTurn = true;
+    } else if (notification !== null && !nativeTurn && legacyTurnEnded) {
+      turnId = `notification:${sdkMsg.uuid ?? chatMessages.length}`;
+      turnAutomatic = true;
+      legacyTurnEnded = false;
+    }
     if (notification !== null) {
       if (pendingAssistant && requestedResponsePending) {
         pendingAssistant.contentBlocks?.push({ type: 'task_notification', content: notification });
@@ -176,12 +222,14 @@ export async function loadSDKSessionMessages(
         id: sdkMsg.uuid ?? `task-notification-${chatMessages.length}`,
         role: 'assistant',
         isAutomaticResponse: requestedStartedAt === undefined,
+        turnId,
         content: '',
         timestamp: parseNativeTimestamp(sdkMsg.timestamp) ?? 0,
         contentBlocks: [{ type: 'task_notification', content: notification }],
       };
       continue;
     }
+    if (isStopHookFeedback(sdkMsg)) legacyTurnEnded = false;
     if (isSystemInjectedMessage(sdkMsg)) continue;
 
     // Skip synthetic assistant messages (e.g., "No response requested." after /compact)
@@ -190,6 +238,7 @@ export async function loadSDKSessionMessages(
     const chatMsg = parseSDKMessageToChat(sdkMsg, toolResults);
     if (!chatMsg) continue;
     normalizeTaskToolCalls(chatMsg, taskToolNormalizer, toolUseResults);
+    if (chatMsg.role === 'assistant' || chatMsg.isInterrupt) chatMsg.turnId = turnId;
 
     if (chatMsg.role === 'assistant') {
       // context_compacted must not merge with previous assistant (it's a standalone separator)
@@ -204,14 +253,28 @@ export async function loadSDKSessionMessages(
           pendingAssistant = chatMsg;
         }
         turnStats.add(sdkMsg);
+        const stopReason = sdkMsg.message?.stop_reason;
+        legacyTurnEnded = Boolean(stopReason) && stopReason !== 'tool_use';
         lastAssistantAt = parseNativeTimestamp(sdkMsg.timestamp);
         requestedResponsePending = turnStartedAt !== undefined
           && sdkMsg.message?.stop_reason === 'tool_use';
       }
     } else {
+      // An interrupted turn displays as one response, whichever splits showed it in parts.
+      if (chatMsg.isInterrupt) {
+        settleInterruptedTurn([...chatMessages, ...(pendingAssistant ? [pendingAssistant] : [])]
+          .filter(message => message.turnId === turnId), turnAutomatic);
+      }
       flushPendingAssistant(!chatMsg.isInterrupt);
-      if (isCanonicalSDKUserMessage(sdkMsg)) {
+      const prompt = isCanonicalSDKUserMessage(sdkMsg);
+      legacyTurnEnded = !prompt;
+      if (prompt) {
         turnStartedAt = parseNativeTimestamp(sdkMsg.timestamp);
+        if (sdkMsg.type === 'user' && sdkMsg.promptId === undefined) {
+          turnId = `prompt:${sdkMsg.uuid ?? chatMessages.length}`;
+          turnAutomatic = false;
+          nativeTurn = false;
+        }
       }
       chatMessages.push(chatMsg);
     }
@@ -219,7 +282,29 @@ export async function loadSDKSessionMessages(
 
   flushPendingAssistant(true);
 
-  const taskResults = new ClaudeTaskResultInterpreter();
+  const taskResults = new ClaudeTaskResultInterpreter(pathContext);
+  // TaskOutput-era transcripts can still refer to Linux temp files. Recover them
+  // while the current store's target context is available, before neutral replay.
+  if (getClaudeExecutionTarget(pathContext)?.method === 'wsl') {
+    for (const message of chatMessages) {
+      for (const tool of message.toolCalls ?? []) {
+        if (tool.name !== 'TaskOutput' || tool.result === undefined) continue;
+        tool.result = taskResults.interpretResult(tool.result, tool.status === 'error', {
+          mode: 'async', agentId: taskResults.getOutputTaskId(tool.input) ?? undefined,
+        }, { rawOutput: toolUseResults.get(tool.id) }).result;
+      }
+    }
+  }
+  const sidecarLoads: Array<{ subagent: SubagentInfo; promise: Promise<ToolCallInfo[]> }> = [];
+  const loadSidecarToolCalls = (subagent: SubagentInfo, runWindow?: SubagentRunWindow): void => {
+    if (!subagent.agentId || !isValidAgentId(subagent.agentId)) return;
+    sidecarLoads.push({
+      subagent,
+      promise: loadSubagentToolCalls(vaultPath, sessionId, subagent.agentId, sessionPath, pathContext, runWindow),
+    });
+  };
+  const reportLoads: Array<{ subagent: SubagentInfo; toolCall: ToolCallInfo; promise: Promise<string | null> }> = [];
+  const toolTimes = collectToolTimes(filteredEntries);
   for (const message of chatMessages) {
     for (const toolCall of message.toolCalls ?? []) {
       if (!isClaudeSubagentToolName(toolCall.name) || toolCall.input.run_in_background === true
@@ -229,17 +314,35 @@ export async function loadSDKSessionMessages(
       const mode = taskResults.describeTask(toolCall.input).mode
         ?? taskResults.interpretLaunch(toolCall.result, toolCall.status === 'error', payload).mode;
       if (mode === 'async') continue;
+      // Older results identify the agent only in the hand-back text, as live handling accepts.
+      const agentId = taskResults.interpretLaunch(toolCall.result, toolCall.status === 'error', payload).agentId;
       const result = taskResults.interpretResult(toolCall.result, toolCall.status === 'error',
         { mode: 'sync' }, payload);
       toolCall.result = result.result;
+      if (!toolCall.subagent && agentId) {
+        toolCall.subagent = {
+          id: toolCall.id,
+          description: (toolCall.input.description as string) || 'Subagent task',
+          prompt: (toolCall.input.prompt as string) || '',
+          mode: 'sync',
+          isExpanded: false,
+          status: result.status,
+          result: result.result,
+          toolCalls: [],
+          agentId,
+        };
+        // Continuations and reuse append later runs; replay only this invocation's activity.
+        const startedAt = toolTimes.uses.get(toolCall.id);
+        const endedAt = toolTimes.results.get(toolCall.id);
+        loadSidecarToolCalls(toolCall.subagent, startedAt !== undefined && endedAt !== undefined
+          ? { startedAt, endedAt } : undefined);
+      }
     }
   }
   hydrateStructuredToolResults(chatMessages, toolUseResults);
 
   // Build SubagentInfo for async Agent tool calls from toolUseResult + queue-operation data
   if (toolUseResults.size > 0 || asyncSubagentResults.size > 0) {
-    const sidecarLoads: Array<{ subagent: SubagentInfo; promise: Promise<ToolCallInfo[]> }> = [];
-
     for (const msg of chatMessages) {
       if (msg.role !== 'assistant' || !msg.toolCalls) continue;
       for (const toolCall of msg.toolCalls) {
@@ -259,33 +362,33 @@ export async function loadSDKSessionMessages(
             toolCall.result = subagent.result;
           }
           toolCall.status = subagent.status;
-
-          // Load tool calls from subagent sidecar JSONL in parallel
-          if (subagent.agentId && isValidAgentId(subagent.agentId)) {
-            const promise = loadSubagentToolCalls(
-              vaultPath,
-              sessionId,
-              subagent.agentId,
-              sessionPath,
-              pathContext,
-            );
-            sidecarLoads.push({ subagent, promise });
+          loadSidecarToolCalls(subagent);
+          if (subagent.agentId && isValidAgentId(subagent.agentId)
+            && asyncSubagentResults.get(subagent.agentId)?.summaryOnly) {
+            reportLoads.push({
+              subagent,
+              toolCall,
+              promise: loadSubagentFinalResult(vaultPath, sessionId, subagent.agentId, sessionPath, pathContext),
+            });
           }
         }
       }
     }
-
-    // Hydrate subagent tool calls from sidecar files
-    if (sidecarLoads.length > 0) {
-      const results = await Promise.all(sidecarLoads.map(s => s.promise));
-      for (let i = 0; i < sidecarLoads.length; i++) {
-        const toolCalls = results[i];
-        if (toolCalls.length > 0) {
-          sidecarLoads[i].subagent.toolCalls = toolCalls;
-        }
-      }
-    }
   }
+
+  // Hydrate subagent tool calls from sidecar files in parallel
+  const sidecarToolCalls = await Promise.all(sidecarLoads.map(load => load.promise));
+  sidecarLoads.forEach(({ subagent }, index) => {
+    if (sidecarToolCalls[index].length > 0) subagent.toolCalls = sidecarToolCalls[index];
+  });
+  // A summary-only notice defers to the sidecar's final report, as live completion recovery does.
+  const reports = await Promise.all(reportLoads.map(load => load.promise));
+  reportLoads.forEach(({ subagent, toolCall }, index) => {
+    const report = reports[index]?.trim();
+    if (!report) return;
+    subagent.result = report;
+    toolCall.result = report;
+  });
 
   // Notification timestamps record enqueue time, not consumption. Pin their
   // transcript boundaries while retaining timestamp ordering (e.g. /compact)
@@ -299,7 +402,27 @@ export async function loadSDKSessionMessages(
     sectionStart = index + 1;
   }
 
+  const target = getClaudeExecutionTarget(pathContext);
+  for (const message of chatMessages) {
+    for (const tool of message.toolCalls ?? []) mapClaudeHistoryToolPaths(tool, target);
+  }
   return { messages: chatMessages, skippedLines: result.skippedLines };
+}
+
+/** Native timestamps of each tool call and of its result, which bound a sync subagent run. */
+function collectToolTimes(entries: SDKNativeMessage[]): { uses: Map<string, number>; results: Map<string, number> } {
+  const uses = new Map<string, number>();
+  const results = new Map<string, number>();
+  for (const entry of entries) {
+    const timestamp = parseNativeTimestamp(entry.timestamp);
+    const content = entry.message?.content;
+    if (timestamp === undefined || !Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block.type === 'tool_use' && block.id) uses.set(block.id, timestamp);
+      if (block.type === 'tool_result' && block.tool_use_id) results.set(block.tool_use_id, timestamp);
+    }
+  }
+  return { uses, results };
 }
 
 function parseNativeTimestamp(value: string | undefined): number | undefined {
@@ -365,8 +488,9 @@ function resolveTurnDurationAssistantUuid(
 export function getLastSDKSessionModel(
   entries: SDKNativeMessage[],
   resumeAtMessageId?: string,
+  checkpointPolicy: SDKCheckpointPolicy = 'latest-branch',
 ): string | null {
-  const activeBranch = filterActiveBranch(entries, resumeAtMessageId);
+  const activeBranch = filterActiveBranch(entries, resumeAtMessageId, checkpointPolicy);
   if (
     resumeAtMessageId
     && !activeBranch.some(entry => entry.uuid === resumeAtMessageId)
@@ -391,7 +515,8 @@ export async function loadSDKSessionModel(
   sessionId: string,
   resumeAtMessageId?: string,
   sessionPath?: string,
-  pathContext?: ProviderHistoryPathContext,
+  pathContext?: ClaudeConfigDirContext,
+  checkpointPolicy: SDKCheckpointPolicy = 'latest-branch',
 ): Promise<string | null> {
   const resolvedPath = resolveSessionPath(vaultPath, sessionId, sessionPath, pathContext);
   const fingerprint = resolvedPath ? await getSessionFingerprint(resolvedPath) : null;
@@ -408,7 +533,7 @@ export async function loadSDKSessionModel(
       deletePendingModelRead(oldest);
     }
   }
-  return getLastSDKSessionModel(result.messages, resumeAtMessageId);
+  return getLastSDKSessionModel(result.messages, resumeAtMessageId, checkpointPolicy);
 }
 
 function normalizeTaskToolCalls(

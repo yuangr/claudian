@@ -38,16 +38,26 @@ export function findCLIBinaryPath(
     ? parsePathEntries(getEnhancedPath(additionalPath))
     : parseCLIPathEntries(additionalPath, platform);
 
-  return findBinaryInDirectories(searchEntries, binaryNames);
+  return findBinaryInDirectories(searchEntries, binaryNames, platform);
 }
 
-export function findBinaryInDirectories(entries: string[], binaryNames: string[]): string | null {
+/** PATH lookup skips files the current Unix user cannot execute, just as native PATH search does. */
+export function findBinaryInDirectories(
+  entries: string[], binaryNames: string[], platform: NodeJS.Platform = process.platform,
+): string | null {
   for (const dir of entries) {
     if (!dir) continue;
 
     for (const candidateName of binaryNames) {
       const candidate = path.join(dir, candidateName);
       if (isExistingFile(candidate)) {
+        if (platform !== 'win32') {
+          try {
+            fs.accessSync(candidate, fs.constants.X_OK);
+          } catch {
+            continue;
+          }
+        }
         return candidate;
       }
     }
@@ -90,5 +100,5 @@ function translateMsysPathForPlatform(value: string, platform: NodeJS.Platform):
   const restOfPath = msysMatch[2] ?? '';
   return restOfPath
     ? `${driveLetter}:\\${restOfPath.replace(/\//g, '\\')}`
-    : `${driveLetter}:`;
+    : `${driveLetter}:\\`;
 }

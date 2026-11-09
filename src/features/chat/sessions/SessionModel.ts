@@ -18,7 +18,7 @@ import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRun
 import { SessionComposer } from '@/features/chat/sessions/SessionComposer';
 import { SessionEvents } from '@/features/chat/sessions/SessionEvents';
 import { createConversationExecutionBinding } from '@/features/chat/sessions/sessionExecution';
-import { captureLatestCompletedForkSource, findLatestForkCheckpoint } from '@/features/chat/sessions/SessionForkSource';
+import { captureLatestCompletedForkSource } from '@/features/chat/sessions/SessionForkSource';
 import { requireSessionProviderId } from '@/features/chat/sessions/sessionProvider';
 import { getSessionChatUIConfig, getSessionSelectedModel, getSessionSettingsSnapshot, updateSessionProviderSettings } from '@/features/chat/sessions/sessionSettings';
 import { SessionTranscript } from '@/features/chat/sessions/SessionTranscript';
@@ -31,7 +31,7 @@ import { StreamController } from '@/features/chat/turns/StreamController';
 import type { ComposerInputElement } from '@/shared/composer-dropdown/types';
 import { getVaultPath } from '@/utils/path';
 
-export type SessionChange = 'streaming' | 'rewinding' | 'attention' | 'conversation' | 'identity' | 'usage' | 'scroll' | 'work' | 'commands' | 'settings' | 'destination';
+export type SessionChange = 'streaming' | 'rewinding' | 'attention' | 'conversation' | 'identity' | 'usage' | 'scroll' | 'work' | 'commands' | 'settings' | 'destination' | 'project';
 
 /** The current view only. No execution dependency may retain an earlier instance. */
 export interface SessionPresentation {
@@ -71,11 +71,11 @@ export class SessionModel {
   private hydration: Promise<void> | null = null;
   private readonly titleWork = new Set<Promise<void>>();
   private readonly recovery: AsyncSubagentHistoryRecovery;
-  hydrationState: 'idle' | 'loading' | 'ready' | 'failed';
+  #hydrationState: 'idle' | 'loading' | 'ready' | 'failed';
 
   constructor(readonly session: ChatSessionRuntime, private readonly plugin: ChatFeatureHost) {
     const getRenderer = () => this.transcript?.renderer ?? null;
-    this.hydrationState = session.conversationId ? 'idle' : 'ready';
+    this.#hydrationState = session.conversationId ? 'idle' : 'ready';
     this.state = new ChatState({
       onStreamingStateChanged: streaming => {
         if (streaming) this.presentation?.suggestions.beginTurn();
@@ -162,8 +162,11 @@ export class SessionModel {
       getSelectedModel: () => getSessionSelectedModel(session, plugin),
       isClosing: () => session.isDisposed,
       isConversationHydrated: () => this.hydrationState === 'ready',
-      onConversationHydrated: () => { this.hydrationState = 'ready'; },
+      onConversationHydrated: () => { this.#hydrationState = 'ready'; },
       onPersistenceChanged: () => session.notifyChanged(),
+      onBranchPreviewCancelled: () => this.publish('work'),
+      // Presentation-only: the seed is no session status, so only the attached composer hears it.
+      onDraftProjectChanged: () => this.presentation?.onChanged('project'),
       ensureExecutionForConversation: async conversation => {
         this.publish('commands');
         const sameIdentity = session.conversationId === (conversation?.id ?? null);
@@ -198,6 +201,7 @@ export class SessionModel {
       isClosing: () => session.isDisposed,
       getSideChatController: () => session.sideChat,
       ensureExecutionInitialized: () => this.ensureExecutionInitialized(),
+      historyRefresh: () => this.historyRefresh,
       captureReviewableSettlement: outcome => this.captureReview(outcome),
     });
     this.events = new SessionEvents({
@@ -207,14 +211,7 @@ export class SessionModel {
       persistence: this.conversationController,
       createMessageId: createSessionMessageId,
       captureReviewableSettlement: outcome => this.captureReview(outcome),
-      updatePermissionMode: async mode => {
-        await updateSessionProviderSettings(session, plugin, settings => {
-          const ui = getSessionChatUIConfig(session, plugin);
-          if (ui.applyPermissionMode) ui.applyPermissionMode(mode, settings);
-          else settings.permissionMode = mode;
-        });
-        this.publish('settings');
-      },
+      updatePermissionMode: mode => this.updatePermissionMode(mode),
       receiveSuggestion: (id, suggestion) => {
         if (this.presentation?.isVisible()) this.presentation.suggestions.receive(id, suggestion);
       },
@@ -231,7 +228,7 @@ export class SessionModel {
 
   /** Admitted input and async subagents keep the session working without a foreground turn. */
   get hasPendingWork(): boolean {
-    return this.subagentManager.hasActiveAsyncSubagents() || this.inputController.isPreparingMainTurn || !!this.state.queuedMessage;
+    return this.subagentManager.hasActiveAsyncSubagents() || this.inputController.hasUnsettledMainWork || !!this.state.queuedMessage;
   }
 
   get hasPendingInteraction(): boolean {
@@ -249,9 +246,49 @@ export class SessionModel {
    * conversation that can be reattached; nothing can acquire a detached draft again.
    */
   get canEvict(): boolean {
-    return !this.presentation && !this.hydration && this.titleWork.size === 0 && !this.recovery.hasPendingWork
+    return !this.presentation && this.canRefreshHistory;
+  }
+
+  /** Nothing but the presentation depends on the loaded history, so it can be read again in place. */
+  get canRefreshHistory(): boolean {
+    return !this.hydration && this.titleWork.size === 0 && !this.recovery.hasPendingWork
       && !this.conversationController.hasPendingPersistence && !this.conversationController.hasBranchDraft
       && (!this.composer.hasRecovery || !this.session.conversationId);
+  }
+
+  /**
+   * Checks the shown history and, when `reload` drops it (returning true), loads it again. Until a load has
+   * succeeded, main sends are refused and session messages wait: nothing can reach a provider session that
+   * predates the history, or be replaced by a later load. A failed load stays refused for the presentation
+   * to show and retry.
+   */
+  async refreshHistory(reload: () => Promise<boolean>): Promise<void> {
+    const previous = this.historyRefresh;
+    this.historyRefresh = 'checking';
+    this.publish('work');
+    try {
+      if (!await reload()) return;
+      if (this.#hydrationState === 'ready') this.#hydrationState = 'idle';
+      this.historyRefresh = 'reloading';
+      await this.hydrate().catch(() => undefined);
+    } finally {
+      // An unchanged check keeps a failed reload refused.
+      if (this.historyRefresh === 'checking') this.historyRefresh = previous;
+      this.publish('work');
+    }
+  }
+
+  /** `reloading` lasts until a load of the dropped history succeeds. */
+  private historyRefresh: 'checking' | 'reloading' | null = null;
+
+  /** Applies native permission changes through the same owner as toolbar selections. */
+  async updatePermissionMode(mode: string): Promise<void> {
+    await updateSessionProviderSettings(this.session, this.plugin, settings => {
+      const ui = getSessionChatUIConfig(this.session, this.plugin);
+      if (ui.applyPermissionMode) ui.applyPermissionMode(mode, settings);
+      else settings.permissionMode = mode;
+    });
+    this.publish('settings');
   }
 
   syncProvider(): void {
@@ -300,8 +337,8 @@ export class SessionModel {
 
   detach(expected?: SessionPresentation): void {
     if (expected && this.presentation !== expected) return;
-    // A branch preview exists only in the presentation showing it; reattachment shows the full transcript.
-    if (this.presentation) this.conversationController.cancelBranchDraft();
+    // A branch preview exists only in the presentation showing it; reattachment renders the full transcript.
+    if (this.presentation) this.conversationController.cancelBranchDraft({ render: false });
     this.session.sideChat.detachPresentation();
     this.inlinePrompts.detachPresentation();
     this.linkedContentController.unmountWelcome();
@@ -310,13 +347,25 @@ export class SessionModel {
     this.presentation = null;
   }
 
+  /** Whether the shown transcript is loaded; only this model's loads and conversation changes move it. */
+  get hydrationState(): 'idle' | 'loading' | 'ready' | 'failed' {
+    return this.#hydrationState;
+  }
+
   async hydrate(): Promise<void> {
-    if (this.hydrationState === 'ready') return;
+    if (this.#hydrationState === 'ready') return;
     if (this.hydration) return this.hydration;
-    this.hydrationState = 'loading';
+    this.#hydrationState = 'loading';
     this.hydration = this.conversationController.loadActive()
-      .then(() => { this.hydrationState = 'ready'; })
-      .catch(error => { this.hydrationState = 'failed'; throw error; })
+      .then(() => {
+        this.#hydrationState = 'ready';
+        if (this.historyRefresh === 'reloading') {
+          this.historyRefresh = null;
+          this.publish('work');
+        }
+        this.session.notifyHydrated();
+      })
+      .catch(error => { this.#hydrationState = 'failed'; throw error; })
       .finally(() => { this.hydration = null; });
     return this.hydration;
   }
@@ -376,14 +425,13 @@ export function createSessionSideChat(session: ChatSessionRuntime, plugin: ChatF
       get conversationId() { return session.conversationId; },
       get providerId() { return session.providerId; },
       get isLive() { return !session.isDisposed; },
-      get isStreaming() { return session.turns.isInFlight; },
-      // Transcript reads hold a hydrated model; an evicted parent must not answer from an empty one.
-      readLatestForkCheckpoint: () => session.withModel(async model => findLatestForkCheckpoint(model.state.messages)),
+      getSettings: () => getSessionSettingsSnapshot(session, plugin),
       captureForkSource: async () => {
         const capture = (model: SessionModel) => captureLatestCompletedForkSource({
           get conversationId() { return session.conversationId; },
           get providerId() { return session.providerId; },
           get draftModel() { return session.draftModel; },
+          settledTranscriptEnd: messages => model.inputController.settledTranscriptEnd(messages),
           state: model.state, executionCoordinator: session.executionCoordinator,
         }, plugin, () => !session.isDisposed);
         if (session.isDisposed) return { ok: false, reason: 'stale-binding' };
@@ -399,5 +447,6 @@ export function createSessionSideChat(session: ChatSessionRuntime, plugin: ChatF
       model.publish('destination');
     },
     onStatusChanged: () => session.notifyChanged(),
+    onSettingsChanged: () => session.peekModel?.publish('settings'),
   });
 }

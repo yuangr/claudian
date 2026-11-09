@@ -113,7 +113,7 @@ const TOOL_STATUS_KEYS = {
 } as const satisfies Record<ToolCallInfo['status'], string>;
 
 function firstNonEmptyLine(text: string): string {
-  const head = text.length > MAX_SCAN_LENGTH ? text.slice(0, MAX_SCAN_LENGTH) : text;
+  const head = boundedPrefix(text, MAX_SCAN_LENGTH);
   for (const rawLine of head.split('\n')) {
     const line = toPreviewText(rawLine.replace(/^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)/, ''));
     if (line) return line;
@@ -122,9 +122,20 @@ function firstNonEmptyLine(text: string): string {
 }
 
 function toPreviewText(text: string): string {
-  const head = text.length > MAX_SCAN_LENGTH ? text.slice(0, MAX_SCAN_LENGTH) : text;
+  const head = boundedPrefix(text, MAX_SCAN_LENGTH);
   const collapsed = head.replace(/\s+/g, ' ').trim();
   return collapsed.length > MAX_PREVIEW_LENGTH
-    ? `${collapsed.slice(0, MAX_PREVIEW_LENGTH - 1)}…`
+    ? `${boundedPrefix(collapsed, MAX_PREVIEW_LENGTH - 1)}…`
     : collapsed;
+}
+
+function boundedPrefix(text: string, length: number): string {
+  if (text.length <= length) return text;
+  const before = text.charCodeAt(length - 1);
+  const after = text.charCodeAt(length);
+  // Drop only a crossing pair; preexisting isolated surrogates stay unchanged.
+  const end = before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF
+    ? length - 1
+    : length;
+  return text.slice(0, end);
 }

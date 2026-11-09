@@ -1,5 +1,7 @@
 import { getInstallationKey } from '@/core/device/InstallationKey';
 import { parseEnvironmentVariables } from '@/core/process/env';
+import { resolveExecutionTarget } from '@/core/process/execution-target/ExecutionTargetResolver';
+import type { ExecutionTarget } from '@/core/process/execution-target/types';
 
 import {
   type CLIPathFingerprintInputs,
@@ -8,15 +10,17 @@ import {
 } from '../../../core/providers/cli/CLIPathFingerprintInputs';
 import { getRuntimeEnvironmentText } from '../../../core/providers/providerEnvironment';
 import { createRuntimeInputFingerprint } from '../../../core/providers/settings/RuntimeInputFingerprint';
-import type { ProviderSettingsReconciler } from '../../../core/providers/types';
+import type { ProviderEnvironmentReconciliation, ProviderSettingsReconciler, ProviderSettingsReconciliationContext } from '../../../core/providers/types';
 import type { Conversation } from '../../../core/types';
 import {
   getOpencodeProviderSettings,
   updateOpencodeProviderSettings
 } from '../settings';
-import { getOpencodeState } from '../types';
+import { clearOpencodeResumeState, getOpencodeState } from '../types';
 
 const OPENCODE_ENV_HASH_KEYS = [
+  'HOME',
+  'OPENCODE_CONFIG_CONTENT',
   'OPENCODE_CONFIG',
   'OPENCODE_DB',
   'OPENCODE_DISABLE_PROJECT_CONFIG',
@@ -27,33 +31,40 @@ const OPENCODE_ENV_HASH_KEYS = [
 function computeOpencodeRuntimeFingerprint(
   environmentText: string,
   cliPathInputs: CLIPathFingerprintInputs,
+  target: ExecutionTarget,
 ): string {
   return createRuntimeInputFingerprint({
-    additionalInputs: cliPathInputs,
+    additionalInputs: { ...cliPathInputs, target: JSON.stringify(target) },
     environmentKeys: OPENCODE_ENV_HASH_KEYS,
     environmentText,
   });
 }
 
+/**
+ * The one rule for what an environment change keeps: a binding resumes against its recorded
+ * persistent database, including while the old launch drains, and a conversation without native
+ * state has nothing to retire (a shared-runtime first run captures its database as it starts).
+ * A binding without a recorded database would follow the new default, so it is retired. Whether
+ * the native session still exists is answered by `opencode serve` at use time. The workspace hook
+ * keeps running sessions by the same rule, so a kept session always keeps its binding.
+ */
+export function preservesOpencodeConversationSession(
+  conversation: Pick<Conversation, 'sessionId' | 'providerState'>,
+): boolean {
+  const state = getOpencodeState(conversation.providerState);
+  if (state.databasePath) return state.databasePath !== ':memory:';
+  return !conversation.sessionId && !state.sessionId && !state.forkSource;
+}
+
 function invalidateOpencodeConversationSessions(conversations: Conversation[]): Conversation[] {
   const invalidatedConversations: Conversation[] = [];
   for (const conversation of conversations) {
-    if (conversation.providerId !== 'opencode') {
+    if (conversation.providerId !== 'opencode' || preservesOpencodeConversationSession(conversation)) {
       continue;
     }
-
-    const state = getOpencodeState(conversation.providerState);
-    // V2 resumes against its captured database, including while the old launch drains.
-    if (state.nativeVersion === 2 && state.databasePath && state.databasePath !== ':memory:') {
-      continue;
+    if (clearOpencodeResumeState(conversation, { releaseDatabase: true })) {
+      invalidatedConversations.push(conversation);
     }
-    if (!conversation.sessionId && !state.databasePath) {
-      continue;
-    }
-
-    conversation.sessionId = null;
-    conversation.providerState = undefined;
-    invalidatedConversations.push(conversation);
   }
   return invalidatedConversations;
 }
@@ -62,37 +73,35 @@ export const opencodeSettingsReconciler = {
 
   invalidateConversationSessions: invalidateOpencodeConversationSessions,
 
-  reconcileModelWithEnvironment(
-    settings: Record<string, unknown>,
-    conversations: Conversation[],
-  ): { changed: boolean; invalidatedConversations: Conversation[] } {
+  preservesConversationSession: preservesOpencodeConversationSession,
+
+  reconcileModelWithEnvironment(settings: Record<string, unknown>, context?: ProviderSettingsReconciliationContext): ProviderEnvironmentReconciliation {
     const envText = getRuntimeEnvironmentText(settings, 'opencode');
     const opencodeSettings = getOpencodeProviderSettings(settings);
     const cliPathInputs = createCLIPathFingerprintInputs(
       opencodeSettings.cliPathsByHost[getInstallationKey()],
       opencodeSettings.cliPath,
     );
-    const currentHash = computeOpencodeRuntimeFingerprint(envText, cliPathInputs);
+    const target = resolveExecutionTarget({ settings: opencodeSettings, hostVaultPath: context?.vaultPath });
+    const currentHash = computeOpencodeRuntimeFingerprint(envText, cliPathInputs, target);
     const savedHash = opencodeSettings.environmentHash;
 
     const environment = parseEnvironmentVariables(envText);
     const hasFingerprintInputs = Boolean(
-      hasCLIPathFingerprintInputs(cliPathInputs)
+      target.method === 'wsl' || hasCLIPathFingerprintInputs(cliPathInputs)
       || OPENCODE_ENV_HASH_KEYS.some(
         key => Object.prototype.hasOwnProperty.call(environment, key),
       )
     );
     if (!savedHash && !hasFingerprintInputs) {
-      return { changed: false, invalidatedConversations: [] };
+      return { changed: false };
     }
     if (currentHash === savedHash) {
-      return { changed: false, invalidatedConversations: [] };
+      return { changed: false };
     }
 
-    const invalidatedConversations = invalidateOpencodeConversationSessions(conversations);
-
     updateOpencodeProviderSettings(settings, { environmentHash: currentHash });
-    return { changed: true, invalidatedConversations };
+    return { changed: true };
   },
 
 } satisfies ProviderSettingsReconciler;

@@ -1,9 +1,12 @@
 import { TFile, TFolder } from 'obsidian';
+import type { Mock } from 'vitest';
 
 import {
   LinkedContentController,
   type LinkedContentControllerOptions,
 } from '@/features/chat/linked-content/LinkedContentController';
+
+
 
 function createFile(path: string): TFile {
   const file = new TFile();
@@ -27,18 +30,18 @@ function createHarness(initialFiles: Array<TFile | TFolder> = []) {
   let activeFile: TFile | null = null;
   const app = {
     vault: {
-      getRoot: jest.fn(() => createFolder('')),
-      getAbstractFileByPath: jest.fn((path: string) => entries.get(path) ?? null),
+      getRoot: vi.fn(() => createFolder('')),
+      getAbstractFileByPath: vi.fn((path: string) => entries.get(path) ?? null),
     },
     workspace: {
-      getActiveFile: jest.fn(() => activeFile),
-      getLeaf: jest.fn(() => ({ openFile: jest.fn().mockResolvedValue(undefined) })),
-      getLeavesOfType: jest.fn(() => []),
-      getLeftLeaf: jest.fn(() => null),
-      revealLeaf: jest.fn().mockResolvedValue(undefined),
+      getActiveFile: vi.fn(() => activeFile),
+      getLeaf: vi.fn(() => ({ openFile: vi.fn().mockResolvedValue(undefined) })),
+      getLeavesOfType: vi.fn(() => []),
+      getLeftLeaf: vi.fn(() => null),
+      revealLeaf: vi.fn().mockResolvedValue(undefined),
     },
     metadataCache: {
-      getFileCache: jest.fn(() => null),
+      getFileCache: vi.fn(() => null),
     },
   };
   const options: LinkedContentControllerOptions = {
@@ -95,6 +98,31 @@ describe('LinkedContentController', () => {
     expect(harness.controller.getSnapshot().path).toBe('Notes/First.md');
   });
 
+  it('reopens any editable draft to the active Note', () => {
+    const stale = createFile('Notes/Stale.md');
+    const note = createFile('Notes/Focus.md');
+    const harness = createHarness([stale, note, createFolder('Projects')]);
+    harness.setActiveFile(stale);
+    harness.controller.resetAutoDraft();
+    harness.setActiveFile(note);
+    harness.controller.reopenAutoDraft();
+    expect(harness.controller.getSnapshot()).toEqual({ mode: 'auto-draft', path: 'Notes/Focus.md' });
+
+    harness.controller.selectExplicit('Projects');
+    harness.controller.reopenAutoDraft();
+    expect(harness.controller.getSnapshot()).toEqual({ mode: 'auto-draft', path: 'Notes/Focus.md' });
+
+    harness.controller.selectExplicit(null);
+    harness.controller.reopenAutoDraft();
+    expect(harness.controller.getSnapshot()).toEqual({ mode: 'auto-draft', path: 'Notes/Focus.md' });
+
+    harness.controller.selectExplicit(null);
+    const token = harness.controller.beginSubmission();
+    harness.controller.reopenAutoDraft();
+    harness.controller.commitSubmission(token);
+    expect(harness.controller.getSnapshot()).toEqual({ mode: 'locked', path: null });
+  });
+
   it('normalizes every explicit selection through the core Linked content codec', () => {
     const harness = createHarness();
 
@@ -111,7 +139,7 @@ describe('LinkedContentController', () => {
     const markdown = createFile('Notes/Private.md');
     const image = createFile('Images/Diagram.png');
     const harness = createHarness([markdown, image]);
-    (harness.app.metadataCache.getFileCache as jest.Mock).mockReturnValue({
+    (harness.app.metadataCache.getFileCache as Mock).mockReturnValue({
       tags: [{ tag: '#private' }],
     });
     const excludedController = new LinkedContentController({
@@ -129,11 +157,36 @@ describe('LinkedContentController', () => {
     expect(excludedController.getSnapshot().path).toBeNull();
   });
 
+  it.each([
+    ['inline', { tags: [{ tag: '#PrIvAtE' }] }, 'private'],
+    ['frontmatter list', { frontmatter: { tags: ['Private'] } }, '#PRIVATE'],
+    ['frontmatter string', { frontmatter: { tags: 'PRIVATE' } }, 'private'],
+  ])('excludes case variants of %s tags before freezing submission', (_kind, cache, excludedTag) => {
+    const markdown = createFile('Notes/Private.md');
+    const harness = createHarness([markdown]);
+    (harness.app.metadataCache.getFileCache as Mock).mockReturnValue({ tags: [] });
+    const controller = new LinkedContentController({
+      app: harness.app as never,
+      getExcludedTags: () => [excludedTag],
+      getCachedVaultFiles: () => [],
+      getCachedVaultFolders: () => [],
+    });
+    harness.setActiveFile(markdown);
+    controller.resetAutoDraft();
+    expect(controller.getSnapshot().path).toBe(markdown.path);
+
+    (harness.app.metadataCache.getFileCache as Mock).mockReturnValue(cache);
+    controller.handleActiveFileMetadataChanged(markdown);
+
+    expect(controller.getSnapshot()).toEqual({ mode: 'auto-draft', path: null });
+    expect(controller.beginSubmission()).toEqual({});
+  });
+
   it('waits for metadata before auto-linking when excluded tags are configured', () => {
     const markdown = createFile('Notes/Startup.md');
     const harness = createHarness([markdown]);
     let cache: unknown = null;
-    (harness.app.metadataCache.getFileCache as jest.Mock).mockImplementation(() => cache);
+    (harness.app.metadataCache.getFileCache as Mock).mockImplementation(() => cache);
     const controller = new LinkedContentController({
       app: harness.app as never,
       getExcludedTags: () => ['private'],
@@ -156,7 +209,7 @@ describe('LinkedContentController', () => {
     const markdown = createFile('Notes/Public.md');
     const harness = createHarness([markdown]);
     let cache: unknown = { tags: [] };
-    (harness.app.metadataCache.getFileCache as jest.Mock).mockImplementation(() => cache);
+    (harness.app.metadataCache.getFileCache as Mock).mockImplementation(() => cache);
     const controller = new LinkedContentController({
       app: harness.app as never,
       getExcludedTags: () => ['private'],
@@ -186,11 +239,7 @@ describe('LinkedContentController', () => {
       'Linked content cannot be changed while submitting',
     );
 
-    const settlement = harness.controller.commitSubmission(token);
-    expect(settlement).toEqual({
-      linkedContentPath: 'Projects',
-      queuedEvents: [],
-    });
+    harness.controller.commitSubmission(token);
     expect(harness.controller.getSnapshot()).toMatchObject({
       mode: 'locked',
       path: 'Projects',
@@ -231,12 +280,7 @@ describe('LinkedContentController', () => {
     expect(harness.controller.getSnapshot().path).toBe('Projects/Old');
 
     harness.entries.delete('Projects/Old');
-    const settlement = harness.controller.commitSubmission(token);
-    expect(settlement.linkedContentPath).toBe('Projects/New');
-    expect(settlement.queuedEvents).toEqual([
-      { kind: 'rename', oldPath: 'Projects/Old', newPath: 'Projects/New', includeDescendants: true },
-      { kind: 'delete', path: 'Projects/New', includeDescendants: true },
-    ]);
+    harness.controller.commitSubmission(token);
     expect(harness.controller.getSnapshot()).toEqual({
       mode: 'locked',
       path: 'Projects/New',

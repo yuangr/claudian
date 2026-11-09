@@ -1,56 +1,40 @@
+import { createExecutionPersistence } from '@test/helpers/ChatExecutionHarness';
+import { createChatFeatureHost } from '@test/helpers/features/chat/ChatFeatureHostFixture';
+import { conversationRecord } from '@test/helpers/features/chat/ConversationFixture';
+import { createProjectsFake } from '@test/helpers/features/chat/ProjectsFake';
+import { createSessionRuntimePool } from '@test/helpers/features/chat/SessionRuntimePoolHarness';
 import { FakeSideBackend } from '@test/helpers/features/chat/SideChatSessionHarness';
-import { waitFor } from '@testing-library/dom';
+import { testDate } from '@test/helpers/testClock';
 import { Component } from 'obsidian';
 
-import { ProviderExecutionLifecycleRegistry } from '@/core/execution';
 import { ProviderRegistry } from '@/core/providers/ProviderRegistry';
-import type { ProviderCapabilities, ProviderConversationHistoryService, ProviderRegistration } from '@/core/providers/types';
+import type { ProviderConversationHistoryService, ProviderRegistration } from '@/core/providers/types';
+import type { ChatMessage } from '@/core/types';
+import { getChatSettingsSnapshot } from '@/features/chat/ChatSettings';
 import { ComposerDraftController } from '@/features/chat/composer/ComposerDraftController';
-import { captureLatestCompletedForkSource, findLatestForkCheckpoint } from '@/features/chat/sessions/SessionForkSource';
+import { ImageContextManager } from '@/features/chat/composer/ImageContextManager';
+import { SessionMessagingService } from '@/features/chat/session-messaging/SessionMessagingService';
+import {
+  captureLatestCompletedForkSource,
+} from '@/features/chat/sessions/SessionForkSource';
+import { getSessionSelectedModel } from '@/features/chat/sessions/sessionSettings';
 import { SideChatController } from '@/features/chat/side-chat/SideChatController';
-import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
-
-Object.assign(HTMLElement.prototype, {
-  appendText(this: HTMLElement, text: string) { this.appendChild(this.ownerDocument.createTextNode(text)); },
-  addClass(this: HTMLElement, ...names: string[]) { this.classList.add(...names); },
-  createDiv(this: HTMLElement, options?: Record<string, unknown>) { return createChild(this, 'div', options); },
-  createEl(this: HTMLElement, tag: string, options?: Record<string, unknown>) { return createChild(this, tag, options); },
-  createSpan(this: HTMLElement, options?: Record<string, unknown>) { return createChild(this, 'span', options); },
-  empty(this: HTMLElement) { this.replaceChildren(); },
-  hasClass(this: HTMLElement, name: string) { return this.classList.contains(name); },
-  removeClass(this: HTMLElement, ...names: string[]) { this.classList.remove(...names); },
-  setCssProps(this: HTMLElement, props: Record<string, string>) {
-    for (const [key, value] of Object.entries(props)) this.style.setProperty(key, value);
-  },
-  setText(this: HTMLElement, text: string) { this.textContent = text; },
-  scrollIntoView() {},
-  toggleClass(this: HTMLElement, name: string, enabled: boolean) { this.classList.toggle(name, enabled); },
-});
-
-function createChild(parent: HTMLElement, tag: string, options?: Record<string, unknown>): HTMLElement {
-  const el = parent.ownerDocument.createElement(tag);
-  const cls = options?.cls;
-  if (typeof cls === 'string') el.className = cls;
-  const text = options?.text;
-  if (typeof text === 'string') el.textContent = text;
-  const attrs = options?.attr as Record<string, string> | undefined;
-  for (const [key, value] of Object.entries(attrs ?? {})) el.setAttribute(key, value);
-  parent.appendChild(el);
-  return el;
-}
+import { destroyTab } from '@/features/chat/tabs/TabLifecycle';
+import { createTabRuntime } from '@/features/chat/tabs/TabRuntimeFactory';
+import { claudeProviderRegistration } from '@/providers/claude/registration';
+import { VaultMentionDataProvider } from '@/shared/mention/VaultMentionDataProvider';
 
 const cleanups: Array<() => Promise<void>> = [];
 
 export async function releaseSideChatHarnesses(): Promise<void> {
   for (const cleanup of cleanups.splice(0)) await cleanup();
   document.body.replaceChildren();
-  jest.clearAllMocks();
+  vi.clearAllMocks();
 }
 
-export function createHarness(options: {
+export async function createHarness(options: {
   formatQuestionReply?: ProviderRegistration['formatQuestionReply'];
-  getConversationCapabilities?: ProviderRegistration['getConversationCapabilities'];
-  providerState?: Record<string, unknown>;
+  resolveExecutionWorkingDirectory?: ProviderRegistration['resolveExecutionWorkingDirectory'];
   onDestinationChanged?: () => void;
   subagentAdapter?: ProviderRegistration['subagentAdapter'];
   taskResultInterpreter?: ProviderRegistration['taskResultInterpreter'];
@@ -58,29 +42,30 @@ export function createHarness(options: {
   checkpoint?: string | null;
   settings?: Record<string, unknown>;
   supportsEphemeralFork?: boolean;
-  forkMode?: ProviderCapabilities['forkMode'];
+  supportsForkDuringTurn?: boolean;
   buildForkProviderState?: ProviderConversationHistoryService['buildForkProviderState'];
 } = {}) {
   const backend = new FakeSideBackend();
-  const lifecycleRegistry = new ProviderExecutionLifecycleRegistry();
   const forkState = { forkSource: { resumeAt: 'checkpoint-1', sessionId: 'main-session' } };
   ProviderRegistry.register('claude', {
+    ...claudeProviderRegistration,
     formatQuestionReply: options.formatQuestionReply,
-    getConversationCapabilities: options.getConversationCapabilities,
-    capabilities: { providerId: 'claude', supportsFork: options.supportsFork ?? true, supportsEphemeralSessions: true, supportsEphemeralFork: options.supportsEphemeralFork, forkMode: options.forkMode },
+    resolveExecutionWorkingDirectory: options.resolveExecutionWorkingDirectory,
+    capabilities: { ...claudeProviderRegistration.capabilities, providerId: 'claude', supportsFork: options.supportsFork ?? true, supportsEphemeralSessions: true, supportsEphemeralFork: options.supportsEphemeralFork, supportsForkDuringTurn: options.supportsForkDuringTurn },
     modelPolicy: ProviderRegistry.getModelPolicy('claude'),
     chatUIConfig: ProviderRegistry.getChatUIConfig('claude'),
     createExecutionBackend: () => backend,
     subagentAdapter: options.subagentAdapter,
-    taskResultInterpreter: options.taskResultInterpreter,
+    taskResultInterpreter: options.taskResultInterpreter ?? claudeProviderRegistration.taskResultInterpreter,
     historyService: {
+      ...claudeProviderRegistration.historyService,
       buildForkProviderState: options.buildForkProviderState ?? (() => forkState),
       hydrateConversationHistory: async () => ({}),
       isPendingForkConversation: () => false,
       resolveSessionIdForConversation: () => 'main-session',
     },
     isEnabled: () => true,
-  } as unknown as ProviderRegistration);
+  });
 
   const composerEl = document.body.appendChild(document.createElement('div'));
   composerEl.className = 'claudian-input-composer';
@@ -91,45 +76,47 @@ export function createHarness(options: {
   const inputEl = inputWrapperEl.appendChild(document.createElement('textarea'));
   inputEl.placeholder = 'Ask to make changes';
 
-  let images: unknown[] = [];
-  const imageContextManager = {
-    clearImages: () => { images = []; },
-    getAttachedImages: () => images,
-    hasImages: () => images.length > 0,
-    setImages: (next: unknown[]) => { images = next; },
-  };
-
   const checkpoint = options.checkpoint === undefined ? 'checkpoint-1' : options.checkpoint;
-  const messages = [
-    { content: 'Remember A', id: 'u1', role: 'user', timestamp: 1 },
+  const messages: ChatMessage[] = [
+    { content: 'Remember A', id: 'u1', role: 'user', timestamp: testDate().getTime() },
     {
       ...(checkpoint ? { assistantMessageId: checkpoint } : {}),
-      content: 'Noted A', id: 'a1', role: 'assistant', timestamp: 2,
+      content: 'Noted A', id: 'a1', role: 'assistant', timestamp: testDate({ seconds: 1 }).getTime(),
     },
   ];
-  const tab = {
-    conversationId: 'conversation-1',
-    controllers: {},
-    executionCoordinator: { resolveForkSource: async () => ({ resumeAt: checkpoint, sessionId: 'main-session' }) },
-    id: 'tab-1',
-    providerId: 'claude',
-    state: { isRewinding: false, isStreaming: false, messages },
-  } as unknown as AssembledTabRuntime;
+  const conversation = conversationRecord('conversation-1', { sessionId: 'main-session', messages });
+  const pool = createSessionRuntimePool(() => plugin);
+  const messaging = new SessionMessagingService({
+    getHost: () => plugin,
+    getActiveConversationId: () => tab.conversationId,
+    refreshModelControls: () => undefined,
+  });
+  const plugin = await createChatFeatureHost({
+    sessionRuntimes: pool, executionPersistence: createExecutionPersistence(),
+    bindSessionTools: id => messaging.bindSessionTools(id),
+    getConversationSync: () => conversation,
+    getConversationById: async () => conversation,
+    updateConversation: async () => undefined,
+    renameConversation: async () => undefined,
+    getConversationSummary: id => plugin.getConversationSync(id),
+    settings: { enableAutoTitleGeneration: false, ...options.settings },
+    projects: createProjectsFake(),
+  });
 
-  const app = { vault: { adapter: { basePath: '/vault' }, getFiles: () => [] } };
-  const settings = options.settings ?? {};
-  const plugin = {
-    getSessionSnapshotDirectory: () => '/tmp/claudian-sessions',
-    app,
-    getConversationSummary(id: string) { return (this as unknown as { getConversationSync: (id: string) => any }).getConversationSync(id); },
-    getConversationSync: () => options.providerState ? { id: 'conversation-1', providerId: 'claude', providerState: options.providerState } : null,
-    providerHost: { app, settings, executionLifecycleRegistry: lifecycleRegistry },
-    settings,
-  } as never;
-
+  const component = new Component();
+  const tab = await createTabRuntime({
+    plugin, component, containerEl: document.createElement('div'), conversation, tabId: 'tab-1',
+    mentionDataProvider: new VaultMentionDataProvider(plugin.app), getProviderCatalogConfig: () => null,
+    isRuntimeLive: () => true, openConversation: async () => undefined, startNewConversation: async () => undefined,
+  });
+  await tab.session.runtime.model.hydrate();
+  tab.state.messages = messages;
+  const imageContextManager = new ImageContextManager(plugin.app.keymap, inputWrapperEl, inputEl, {});
+  const settings = plugin.settings;
+  const lifecycleRegistry = plugin.providerHost.executionLifecycleRegistry;
   const destinationChanges: string[] = [];
   const drafts: ComposerDraftController = new ComposerDraftController({
-    getInput: () => inputEl, getImages: () => imageContextManager as never, getDestination: () => controller.destination,
+    getInput: () => inputEl, getImages: () => imageContextManager, getDestination: () => controller.destination,
   });
   const controller = new SideChatController({
     drafts,
@@ -137,17 +124,24 @@ export function createHarness(options: {
       get conversationId() { return tab.conversationId; },
       get providerId() { return tab.providerId; },
       get isLive() { return true; },
-      get isStreaming() { return tab.state.isStreaming; },
-      readLatestForkCheckpoint: async () => findLatestForkCheckpoint(tab.state.messages),
-      captureForkSource: () => captureLatestCompletedForkSource(tab, plugin, () => true),
+      getSettings: () => getChatSettingsSnapshot(settings, tab.providerId!, getSessionSelectedModel(tab, plugin)),
+      captureForkSource: () => captureLatestCompletedForkSource({
+        ...tab, settledTranscriptEnd: messages => tab.controllers.inputController.settledTranscriptEnd(messages),
+      }, plugin, () => true),
     },
     onDestinationChanged: () => { destinationChanges.push(controller.destination); options.onDestinationChanged?.(); },
     plugin,
   });
-  controller.attachPresentation({ component: new Component(), composerEl, inputWrapperEl, getInputEl: () => inputEl as never });
+  controller.attachPresentation({ component: new Component(), composerEl, inputWrapperEl, getInputEl: () => inputEl });
   cleanups.push(async () => {
     await controller.dispose();
+    imageContextManager.destroy();
+    await destroyTab(tab);
+    await pool.dispose();
+    component.unload();
+    await messaging.dispose();
     await lifecycleRegistry.dispose();
+    ProviderRegistry.register('claude', claudeProviderRegistration);
   });
   return {
     backend, composerEl, controller, drafts, destinationChanges, imageContextManager,
@@ -160,11 +154,10 @@ export async function startSideChat(
   harness: SideChatDOMHarness,
   prompt = 'Explore B',
 ): Promise<{ started: Promise<boolean> }> {
+  const request = harness.backend.nextRequest(request => request.toolPolicy.kind === 'provider-default');
   const started = harness.controller.handleCommandSubmission(prompt, []);
-  await waitFor(() => expect(harness.backend.sessions.some(
-    session => session.requests[0]?.toolPolicy.kind === 'provider-default',
-  )).toBe(true));
+  expect((await request).toolPolicy.kind).toBe('provider-default');
   return { started };
 }
 
-export type SideChatDOMHarness = ReturnType<typeof createHarness>;
+export type SideChatDOMHarness = Awaited<ReturnType<typeof createHarness>>;

@@ -45,18 +45,13 @@ export class MessageActions {
     private readonly messagesEl: HTMLElement,
     private readonly getCapabilities: () => ProviderCapabilities,
     private readonly callbacks: MessageActionCallbacks,
+    /** Whether prompts precede the first rendered one, so it is not the conversation's first. */
+    private readonly hasEarlierMessages: () => boolean,
   ) {}
 
   /** Image-only prompts keep a bubble only when it can carry branch controls. */
   get branchesEnabled(): boolean {
     return !!this.callbacks.branches && !!this.getCapabilities().supportsConversationBranches;
-  }
-
-  /** A full-session fork is offered only on the latest response. */
-  retireFullSessionForks(): void {
-    if (this.getCapabilities().forkMode === 'full-session') {
-      this.messagesEl.querySelectorAll('.claudian-message-fork-btn').forEach(button => button.remove());
-    }
   }
 
   /**
@@ -89,13 +84,15 @@ export class MessageActions {
     this.appendTimestamp(msgEl, msg.timestamp);
   }
 
-  /** The response toolbar copies the final answer, leaving per-block copy inside history. */
+  /**
+   * The response toolbar copies and forks from the final answer, leaving per-block
+   * copy inside history. A response without an answer (interrupted) offers neither.
+   */
   decorateResponse(
     msgEl: HTMLElement,
     contentEl: HTMLElement,
     msg: ChatMessage,
-    messages: ChatMessage[],
-    copyText: string,
+    answer: string | null,
   ): void {
     const toolbar = this.#getOrCreateToolbar(msgEl);
     toolbar.empty();
@@ -104,9 +101,8 @@ export class MessageActions {
         child.querySelector('.claudian-text-copy-btn')?.remove();
       }
     }
-    if (copyText.trim()) this.addTextCopyButton(toolbar, copyText);
-    if (this.callbacks.fork && msg.assistantMessageId
-      && (this.getCapabilities().forkMode !== 'full-session' || messages.at(-1)?.id === msg.id)) {
+    if (answer?.trim()) this.addTextCopyButton(toolbar, answer);
+    if (answer !== null && this.callbacks.fork && msg.assistantMessageId) {
       this.#addForkButton(msgEl, msg.id);
     }
     const stats = msg.turnStats;
@@ -216,11 +212,13 @@ export class MessageActions {
       () => {
         copyBtn.empty();
         copyBtn.setText(t('chat.codeBlock.copied'));
+        copyBtn.setAttribute('aria-label', t('chat.codeBlock.copied'));
         copyBtn.classList.add('copied');
       },
       () => {
         copyBtn.empty();
         setIcon(copyBtn, 'copy');
+        copyBtn.setAttribute('aria-label', t('chat.copyMessage'));
         copyBtn.classList.remove('copied');
       },
     );
@@ -239,14 +237,16 @@ export class MessageActions {
     const branchActions = this.callbacks.branches;
     if (!branchActions || !this.getCapabilities().supportsConversationBranches
       || message.role !== 'user' || (!message.treeBranches && !pendingNativeIdentity)) return;
+    const active = element.ownerDocument.activeElement as HTMLElement | null;
+    const focusedAction = active && element.contains(active) ? active.dataset.branchAction : undefined;
     element.querySelectorAll('[data-branch-action], .claudian-branch-position, .claudian-branch-marker').forEach(child => child.remove());
     element.classList.remove('claudian-message-branched');
     const toolbar = this.#getOrCreateToolbar(element);
-    if (element === this.messagesEl.querySelector('[data-role="user"]')) return;
+    if (element === this.messagesEl.querySelector('[data-role="user"]') && !this.hasEarlierMessages()) return;
     const anchor = toolbar.querySelector('.claudian-user-msg-copy-btn, .claudian-message-timestamp');
     const addButton = (label: string, icon: string, target?: string, unavailable = false, reason = '') => {
       const button = toolbar.createEl('button', {
-        attr: { type: 'button', 'aria-label': label, 'data-branch-action': 'true', 'data-branch-unavailable': String(unavailable), 'data-branch-unavailable-reason': reason },
+        attr: { type: 'button', 'aria-label': label, 'data-branch-action': label, 'data-branch-unavailable': String(unavailable), 'data-branch-unavailable-reason': reason },
       });
       toolbar.insertBefore(button, anchor);
       setIcon(button, icon);
@@ -273,6 +273,11 @@ export class MessageActions {
     }
     addButton('Branch from this prompt', 'git-branch', undefined, !message.userMessageId,
       'Branching is available after this prompt is saved.');
+    if (focusedAction) {
+      Array.from(toolbar.querySelectorAll<HTMLButtonElement>('[data-branch-action]'))
+        .find(button => button.dataset.branchAction === focusedAction && !button.disabled)
+        ?.focus({ preventScroll: true });
+    }
   }
 
   #getOrCreateToolbar(msgEl: HTMLElement): HTMLElement {

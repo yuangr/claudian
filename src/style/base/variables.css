@@ -1,6 +1,14 @@
+/* Type scale: one design pixel at Obsidian's default 16px note text, so chat sizes follow the note font size.
+   Defined beside Obsidian's own body token so surfaces mounted on document.body resolve it too. */
+body {
+  --claudian-font-px: calc(var(--font-text-size) / 16);
+}
+
 /* Brand & semantic color tokens */
 .claudian-container,
-.claudian-settings {
+.claudian-settings,
+.claudian-inline-input-container,
+.claudian-inline-menu-layer {
   --claudian-brand: #D97757;
   --claudian-brand-rgb: 217, 119, 87;
   --claudian-provider-logo: var(--claudian-brand-claude);
@@ -17,8 +25,8 @@
   --claudian-brand-grok: #fff;
   --claudian-brand-grok-rgb: 255, 255, 255;
   --claudian-brand-deepseek: #4D6BFE;
+  --claudian-brand-antigravity: #3186FF;
   --claudian-error: #dc3545;
-  --claudian-compact: #5bc0de;
 
   /* Shared side-chat accent. */
   --claudian-side-chat: #60a5fa;
@@ -27,7 +35,9 @@
   --claudian-selection-check: #86efac;
 }
 
-body.theme-light .claudian-container {
+body.theme-light .claudian-container,
+body.theme-light .claudian-inline-input-container,
+body.theme-light .claudian-inline-menu-layer {
   --claudian-brand-neutral: #000;
   --claudian-brand-neutral-rgb: 0, 0, 0;
   --claudian-brand-codex: #000;
@@ -41,45 +51,74 @@ body.theme-light .claudian-container {
   --claudian-selection-check: #16a34a;
 }
 
-/* Active-provider aliases: `--claudian-provider-logo` colours provider icons, `--claudian-brand` the other accents.
-   A model row that names its provider takes that provider's. */
+/* Active-provider aliases (chat, zen, and the inline edit composer and its menu layer): `--claudian-provider-logo` colours provider icons, `--claudian-brand` the other accents.
+   A provider tab in the model menu or settings takes its own provider's. */
 .claudian-container[data-provider="claude"],
-.claudian-container .claudian-model-option[data-provider="claude"] {
+.claudian-inline-input-container[data-provider="claude"],
+.claudian-inline-menu-layer[data-provider="claude"],
+.claudian-model-provider-tab[data-provider="claude"],
+.claudian-settings-provider-tab[data-provider="claude"] {
   --claudian-brand: var(--claudian-brand-claude);
   --claudian-brand-rgb: var(--claudian-brand-claude-rgb);
   --claudian-provider-logo: var(--claudian-brand-claude);
 }
 
 .claudian-container[data-provider="codex"],
-.claudian-container .claudian-model-option[data-provider="codex"] {
+.claudian-inline-input-container[data-provider="codex"],
+.claudian-inline-menu-layer[data-provider="codex"],
+.claudian-model-provider-tab[data-provider="codex"],
+.claudian-settings-provider-tab[data-provider="codex"] {
   --claudian-brand: var(--claudian-brand-codex);
   --claudian-brand-rgb: var(--claudian-brand-codex-rgb);
   --claudian-provider-logo: var(--claudian-brand-codex);
 }
 
 .claudian-container[data-provider="opencode"],
-.claudian-container .claudian-model-option[data-provider="opencode"] {
+.claudian-inline-input-container[data-provider="opencode"],
+.claudian-inline-menu-layer[data-provider="opencode"],
+.claudian-model-provider-tab[data-provider="opencode"],
+.claudian-settings-provider-tab[data-provider="opencode"] {
   --claudian-brand: var(--claudian-brand-opencode);
   --claudian-brand-rgb: var(--claudian-brand-opencode-rgb);
   --claudian-provider-logo: var(--claudian-brand-opencode);
 }
 
 .claudian-container[data-provider="pi"],
-.claudian-container .claudian-model-option[data-provider="pi"] {
+.claudian-inline-input-container[data-provider="pi"],
+.claudian-inline-menu-layer[data-provider="pi"],
+.claudian-model-provider-tab[data-provider="pi"],
+.claudian-settings-provider-tab[data-provider="pi"] {
   --claudian-brand: var(--claudian-brand-pi);
   --claudian-brand-rgb: var(--claudian-brand-pi-rgb);
   --claudian-provider-logo: var(--claudian-brand-pi);
 }
 
 .claudian-container[data-provider="grok"],
-.claudian-container .claudian-model-option[data-provider="grok"] {
+.claudian-inline-input-container[data-provider="grok"],
+.claudian-inline-menu-layer[data-provider="grok"],
+.claudian-model-provider-tab[data-provider="grok"],
+.claudian-settings-provider-tab[data-provider="grok"] {
   --claudian-brand: var(--claudian-brand-grok);
   --claudian-brand-rgb: var(--claudian-brand-grok-rgb);
   --claudian-provider-logo: var(--claudian-brand-grok);
 }
 
+.claudian-container[data-provider="antigravity"],
+.claudian-inline-input-container[data-provider="antigravity"],
+.claudian-inline-menu-layer[data-provider="antigravity"],
+.claudian-model-provider-tab[data-provider="antigravity"],
+.claudian-settings-provider-tab[data-provider="antigravity"] {
+  /* Antigravity blue marks only its logo; its other accents read as normal text. */
+  --claudian-brand: var(--claudian-brand-neutral);
+  --claudian-brand-rgb: var(--claudian-brand-neutral-rgb);
+  --claudian-provider-logo: var(--claudian-brand-antigravity);
+}
+
 .claudian-container[data-provider="deepseek"],
-.claudian-container .claudian-model-option[data-provider="deepseek"] {
+.claudian-inline-input-container[data-provider="deepseek"],
+.claudian-inline-menu-layer[data-provider="deepseek"],
+.claudian-model-provider-tab[data-provider="deepseek"],
+.claudian-settings-provider-tab[data-provider="deepseek"] {
   /* DeepSeek blue marks only its logo; its other accents read as normal text. */
   --claudian-brand: var(--claudian-brand-neutral);
   --claudian-brand-rgb: var(--claudian-brand-neutral-rgb);

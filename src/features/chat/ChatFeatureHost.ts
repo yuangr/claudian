@@ -1,7 +1,18 @@
 import type { ProviderId } from '@/core/providers/types';
-import type { Conversation, ConversationMeta, ConversationMutablePatch, ConversationSummary, StoredChatModelSelection } from '@/core/types';
+import type {
+  Conversation,
+  ConversationMeta,
+  ConversationMutablePatch,
+  ConversationOrigin,
+  ConversationSummary,
+  ProjectMemoryOperations,
+  ProjectMutations,
+  ProjectReader,
+  StoredChatModelSelection,
+} from '@/core/types';
 import type { ConversationLifecycle } from '@/features/chat/conversation/ConversationLifecycle';
 import type { ChatExecutionPersistence } from '@/features/chat/execution/ChatExecutionCoordinator';
+import type { SessionToolBinding } from '@/features/chat/session-messaging/SessionMessagingService';
 import type { SessionRuntimePool } from '@/features/chat/sessions/SessionRuntimePool';
 import type { ChatTab, TabId, TabManagerViewHost } from '@/features/chat/tabs/ChatTab';
 import type { TabIdentity } from '@/features/chat/tabs/TabIdentity';
@@ -63,19 +74,24 @@ export interface ChatViewHost extends ChatViewRefreshHost, TabManagerViewHost {
 }
 
 /** Session attachment and lookup; retirement and shutdown stay with the pool's main-owned callers. */
-export type ChatSessionRuntimes = Pick<SessionRuntimePool, 'acquire' | 'ensure' | 'release' | 'get' | 'getAttachment' | 'holdDraft'>;
+export type ChatSessionRuntimes = Pick<SessionRuntimePool, 'awaitConversationCreations' | 'acquire' | 'revalidate' | 'ensure' | 'release' | 'get' | 'getAttachment' | 'holdDraft'>;
+
+/** Live project records, their mutations and memory; membership is written through `ConversationLifecycle`. */
+export type ChatProjects = ProjectReader & ProjectMutations & ProjectMemoryOperations;
 
 /** Application capabilities chat needs on top of the feature-neutral `FeatureHost`. */
 export interface ChatFeatureHost extends FeatureHost {
   readonly sessionRuntimes: ChatSessionRuntimes;
-  writeSessionSnapshot(conversationId: string, markdown: string): Promise<string>;
-  getSessionSnapshotDirectory(): string;
+  bindSessionTools(conversationId: string): SessionToolBinding;
   readonly chatModelSelection: ChatModelSelectionPort;
   createConversation(options?: {
     providerId?: ProviderId;
     sessionId?: string;
     selectedModel?: string;
     linkedContentPath?: string;
+    /** Kept only when it names a live project at creation. */
+    projectId?: string;
+    origin?: ConversationOrigin;
   }): Promise<Conversation>;
   switchConversation(id: string): Promise<Conversation | null>;
   assignConversationToCurrentDevice(id: string): Promise<boolean>;
@@ -91,11 +107,6 @@ export interface ChatFeatureHost extends FeatureHost {
   /** Completes generation atomically; null records failure. A changed title takes precedence. */
   completeConversationTitleGeneration(id: string, expectedTitle: string, title: string | null): Promise<void>;
   setLinkedContentPinned(contentPath: string, isPinned: boolean): Promise<void>;
-  rewriteLinkedContentPaths(
-    oldPath: string,
-    newPath: string,
-    includeDescendants: boolean,
-  ): Promise<void>;
   /** Sessions held by any chat pane's tabs, including unloaded panes and pending restoration. */
   getWorkspaceConversationIds(): ReadonlySet<string>;
   updateConversation(id: string, updates: ConversationMutablePatch): Promise<void>;
@@ -107,6 +118,8 @@ export interface ChatFeatureHost extends FeatureHost {
   ensureConversationMetadataLoaded(conversationIds: readonly string[]): Promise<void>;
 
   readonly executionPersistence: ChatExecutionPersistence;
+  /** Resolve a conversation's raw `projectId` through `projects.get`; null means no project. */
+  readonly projects: ChatProjects;
 
   /** Offers a view's presentation to the single zen workspace owner; returns its unregistration. */
   registerZenModeSource(source: ZenModeSource): () => void;

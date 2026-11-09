@@ -1,3 +1,5 @@
+import '@/providers';
+
 import * as sdk from '@anthropic-ai/claude-agent-sdk';
 import { createForkTestEnvironment, type ForkTestEnvironment } from '@test/helpers/features/chat/ProviderForkTestHarness';
 
@@ -8,7 +10,7 @@ function createNativeClaude() {
   const launches: sdk.Options[] = [];
   const prompts: Array<{ sessionId: string; context: string[] }> = [];
   let ordinal = 0;
-  jest.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
+  vi.spyOn(sdk, 'query').mockImplementation(({ prompt, options }) => {
     const config = options!;
     launches.push(config);
     const generator = async function* () {
@@ -55,11 +57,11 @@ describe('Claude fork integration', () => {
   beforeEach(async () => {
     env = await createForkTestEnvironment();
   });
-  afterEach(async () => { await env.dispose(); jest.restoreAllMocks(); });
+  afterEach(async () => { await env.dispose(); vi.restoreAllMocks(); });
 
   it('resumes at the live SDK UUID in a new session and preserves the source and accepted input prefix', async () => {
     const native = createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const selected = await env.send(source, 'Remember apples');
     await env.send(source, 'Remember pears');
@@ -80,7 +82,7 @@ describe('Claude fork integration', () => {
 
   it('surfaces an unavailable SDK checkpoint without sending a child prompt or altering the source', async () => {
     const native = createNativeClaude();
-    const backend = new ClaudeExecutionBackend(env.host);
+    const backend = new ClaudeExecutionBackend(env.host.getRuntimeHost('claude'));
     const source = await env.open(backend);
     const selected = await env.send(source, 'Remember apples');
     const child = await env.fork(source, selected);
