@@ -1,6 +1,6 @@
 import type { AppTabManagerState } from '@/core/bootstrap/tabManagerState';
 import type { ProviderId } from '@/core/providers/types';
-import type { TabId } from '@/features/chat/tabs/ChatTab';
+import type { TabId } from '@/features/chat/ChatFeatureHost';
 import type { BlankTabSelection, TabIdentity } from '@/features/chat/tabs/TabIdentity';
 import type { AssembledTabRuntime, TabMembershipView } from '@/features/chat/tabs/types';
 
@@ -237,6 +237,26 @@ export class TabMembership implements TabMembershipView {
     if ((member.identity.label ?? null) === label) return false;
     if (label === null) delete member.identity.label;
     else member.identity.label = label;
+    return true;
+  }
+
+  /**
+   * Moves a tab before another member, or to the end (null), keeping its record so admission,
+   * activation history and the runtime are untouched. Returns whether membership order changed.
+   */
+  move(tabId: TabId, beforeTabId: TabId | null): boolean {
+    const record = this.#records.get(tabId);
+    if (!record?.member || tabId === beforeTabId) return false;
+    if (beforeTabId !== null && !this.#records.get(beforeTabId)?.member) return false;
+    const memberIds = [...this.#records].flatMap(([id, candidate]) => (candidate.member ? [id] : []));
+    const target = beforeTabId === null ? memberIds.length : memberIds.indexOf(beforeTabId);
+    if (target === memberIds.indexOf(tabId) + 1) return false;
+
+    const entries = [...this.#records].filter(([id]) => id !== tabId);
+    const insertAt = beforeTabId === null ? entries.length : entries.findIndex(([id]) => id === beforeTabId);
+    entries.splice(insertAt, 0, [tabId, record]);
+    this.#records.clear();
+    for (const [id, entry] of entries) this.#records.set(id, entry);
     return true;
   }
 

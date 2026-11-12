@@ -12,13 +12,14 @@ import type {
   DualPaneSide,
   SessionAutoArchiveAfter,
 } from '@/core/types/settings';
-import { SkillsSettingsTab } from '@/features/agent-skills/SkillsSettingsTab';
+import { type SkillsSettingsHost, SkillsSettingsTab } from '@/features/agent-skills/SkillsSettingsTab';
 import type { FeatureHost } from '@/features/FeatureHost';
 import { buildNavMappingText, parseNavMappings } from '@/features/settings/keyboardNavigation';
 import { getAvailableLocales, getLocaleDisplayName, setLocale, t } from '@/i18n/i18n';
 import type { Locale } from '@/i18n/types';
 import { createProviderIconSvg } from '@/shared/icons';
 import { AccessibleSetting } from '@/shared/settings/AccessibleSetting';
+import { bindCommittedControl } from '@/shared/settings/CommittedControl';
 import { formatContextLimit, parseContextLimit } from '@/shared/settings/contextLimit';
 import { DebouncedSettingsWriter } from '@/shared/settings/DebouncedSettingsWriter';
 import { renderEnvironmentSettingsSection } from '@/shared/settings/EnvironmentSettingsSection';
@@ -26,34 +27,11 @@ import { frameSettingsGroups } from '@/shared/settings/SettingsGroups';
 
 type SettingsTabId = 'general' | 'providers' | 'skills';
 
-/** Keep native controls aligned with the serialized settings owner's committed snapshot. */
-function bindCommittedControl<T>(
-  control: { setValue(value: T): unknown; onChange(callback: (value: T) => Promise<void>): unknown },
-  getValue: () => T,
-  save: (value: T) => Promise<void>,
-  onChanged?: () => void,
-): void {
-  let synchronizing = false;
-  control.setValue(getValue());
-  control.onChange(async value => {
-    if (synchronizing) return;
-    const previous = getValue();
-    try {
-      await save(value);
-    } finally {
-      synchronizing = true;
-      try {
-        control.setValue(getValue());
-      } finally {
-        synchronizing = false;
-      }
-      if (getValue() !== previous) onChanged?.();
-    }
-  });
-}
+/** The shared host plus the capabilities of panels this tab renders. */
+export type SettingsFeatureHost = FeatureHost & SkillsSettingsHost;
 
 export class ClaudianSettingTab extends PluginSettingTab {
-  private readonly host: FeatureHost;
+  private readonly host: SettingsFeatureHost;
   private activeTab: SettingsTabId = 'general';
   private activeProviderTab: ProviderId | null = null;
   private refreshTitleModelOptions: (() => void) | null = null;
@@ -64,7 +42,7 @@ export class ClaudianSettingTab extends PluginSettingTab {
   private readonly textEdits: DebouncedSettingsWriter<ClaudianSettings>;
   private readonly customAliasDrafts = new Map<string, string>();
 
-  constructor(app: App, plugin: Plugin, host: FeatureHost) {
+  constructor(app: App, plugin: Plugin, host: SettingsFeatureHost) {
     super(app, plugin);
     this.host = host;
     this.textEdits = new DebouncedSettingsWriter(async (mutation) => {

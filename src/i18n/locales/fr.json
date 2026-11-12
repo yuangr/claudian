@@ -25,6 +25,7 @@
     "promptSuggestionHint": "Tab pour accepter",
     "selectAvailableModel": "Sélectionnez un modèle disponible avant d’envoyer.",
     "reloadingHistory": "Cette conversation a changé en dehors de Claudian et se recharge. Renvoyez une fois le rechargement terminé.",
+    "changedOutsideWithBackgroundTask": "Cette conversation s'est poursuivie en dehors de Claudian alors qu'une tâche en arrière-plan de sa session précédente est toujours en cours. Arrêtez la tâche ou attendez qu'elle se termine, puis renvoyez.",
     "selectAvailableTitleModel": "Sélectionnez un modèle de titre disponible dans les paramètres de Claudian.",
     "rewind": {
       "confirmMessage": "Rembobiner jusqu'à ce point ? Les modifications de fichiers postérieures à ce message peuvent être écrasées ou supprimées. Cette action est irréversible.",
@@ -172,7 +173,12 @@
       "resume": "Reprendre la conversation",
       "loading": "Chargement de la conversation…",
       "current": "Session actuelle",
-      "loadFailed": "Impossible de charger la conversation"
+      "loadFailed": "Impossible de charger la conversation",
+      "search": "Rechercher des sessions",
+      "searchArchived": "Rechercher des sessions archivées",
+      "clearSearch": "Effacer la recherche",
+      "showArchive": "Afficher les sessions archivées",
+      "showSessions": "Afficher les sessions actives"
     },
     "linkedContent": {
       "label": "Contenu lié :",
@@ -184,6 +190,12 @@
       "noContent": "Aucun contenu lié",
       "missingNotice": "Contenu lié manquant : {path}",
       "openFailed": "Impossible d’ouvrir le contenu lié : {error}"
+    },
+    "selectedContext": {
+      "line": "{count} ligne sélectionnée",
+      "lines": "{count} lignes sélectionnées",
+      "node": "{count} nœud sélectionné",
+      "nodes": "{count} nœuds sélectionnés"
     },
     "questions": {
       "title": "Question",
@@ -303,6 +315,10 @@
       "label": "Mode d’autorisation",
       "current": "Mode d’autorisation : {mode}",
       "changeFailed": "Impossible de modifier le mode d’autorisation",
+      "antigravity": {
+        "auto": "Auto",
+        "autoDesc": "Autoriser les modifications de l’espace de travail et les commandes isolées ; examiner les accès supplémentaires"
+      },
       "claude": {
         "auto": "Automatique",
         "manual": "Manuel",
@@ -328,6 +344,87 @@
       "completed": "Réflexion pendant {seconds}s",
       "label": "Réflexion"
     },
+    "busyIndicator": {
+      "flavors": {
+        "thinking": "Réflexion en cours…",
+        "pondering": "Je cogite…",
+        "processing": "Traitement en cours…",
+        "analyzing": "Analyse en cours…",
+        "considering": "J’y songe…",
+        "workingOnIt": "Je m’en occupe…",
+        "vibing": "Je prends le rythme…",
+        "oneMoment": "Un instant…",
+        "onIt": "Je m’y mets…",
+        "ruminating": "Je rumine…",
+        "contemplating": "Je contemple…",
+        "reflecting": "Je médite…",
+        "mullingItOver": "J’y réfléchis à fond…",
+        "letMeThink": "Laisse-moi réfléchir…",
+        "hmm": "Hmm…",
+        "cogitating": "Je fais travailler mes méninges…",
+        "deliberating": "Je délibère…",
+        "weighingOptions": "Je pèse les options…",
+        "gatheringThoughts": "Je rassemble mes idées…",
+        "brewingIdeas": "Je fais mijoter des idées…",
+        "connectingDots": "Je relie les points…",
+        "assemblingThoughts": "J’assemble les pensées…",
+        "spinningUpNeurons": "Je mets les neurones en route…",
+        "loadingBrilliance": "Je charge le génie…",
+        "consultingTheOracle": "Je consulte l’oracle…",
+        "summoningKnowledge": "J’invoque le savoir…",
+        "crunchingThoughts": "Je mouline mes pensées…",
+        "dustingOffNeurons": "Je dépoussière les neurones…",
+        "wranglingIdeas": "J’apprivoise les idées…",
+        "herdingThoughts": "Je rassemble le troupeau de pensées…",
+        "jugglingConcepts": "Je jongle avec les concepts…",
+        "untanglingThis": "Je démêle tout ça…",
+        "piecingItTogether": "Je recolle les morceaux…",
+        "sippingCoffee": "Je sirote un café…",
+        "warmingUp": "Je m’échauffe…",
+        "gettingCozyWithThis": "Je prends mes aises…",
+        "settlingIn": "Je m’installe…",
+        "makingTea": "Je prépare du thé…",
+        "grabbingASnack": "Je grignote un morceau…",
+        "parsing": "Analyse syntaxique en cours…",
+        "compilingThoughts": "Compilation des pensées…",
+        "runningInference": "Inférence en cours…",
+        "queryingTheVoid": "J’interroge le vide…",
+        "defragmentingBrain": "Je défragmente le cerveau…",
+        "allocatingMemory": "Allocation de mémoire…",
+        "optimizing": "Optimisation en cours…",
+        "indexing": "Indexation en cours…",
+        "syncingNeurons": "Synchronisation des neurones…",
+        "breathing": "Je respire…",
+        "findingClarity": "Je cherche la clarté…",
+        "channelingFocus": "Je canalise mon attention…",
+        "centering": "Je me recentre…",
+        "aligningChakras": "J’aligne les chakras…",
+        "meditatingOnThis": "Je médite sur la question…",
+        "askingTheStars": "J’interroge les étoiles…",
+        "readingTeaLeaves": "Je lis les feuilles de thé…",
+        "shakingTheMagic8Ball": "Je secoue la boule 8 magique…",
+        "consultingAncientScrolls": "Je consulte d’anciens parchemins…",
+        "decodingTheMatrix": "Je décode la matrice…",
+        "communingWithTheEther": "Je communie avec l’éther…",
+        "peeringIntoTheAbyss": "Je scrute l’abîme…",
+        "channelingTheCosmos": "Je canalise le cosmos…",
+        "divingIn": "Je plonge…",
+        "rollingUpSleeves": "Je retrousse mes manches…",
+        "gettingToWork": "Je me mets au travail…",
+        "tacklingThis": "Je m’attaque au problème…",
+        "onTheCase": "Je suis sur le coup…",
+        "investigating": "Je mène l’enquête…",
+        "exploring": "J’explore…",
+        "diggingDeeper": "Je creuse plus loin…",
+        "bearWithMe": "Un peu de patience…",
+        "hangTight": "Tiens bon…",
+        "justASec": "Une seconde…",
+        "workingMyMagic": "Je fais un peu de magie…",
+        "almostThere": "Presque fini…",
+        "giveMeAMoment": "Donne-moi un instant…"
+      },
+      "hint": " (Échap pour interrompre · {duration})"
+    },
     "contextUsage": {
       "label": "Utilisation du contexte",
       "details": "Utilisation du contexte : {details}",
@@ -339,7 +436,14 @@
       "loadFailed": "Impossible de charger les suggestions",
       "retryHint": "Saisissez à nouveau pour réessayer",
       "providerLoading": "Chargement des commandes du fournisseur…",
-      "providerRetry": "Réessayer la découverte des commandes du fournisseur"
+      "providerRetry": "Réessayer la découverte des commandes du fournisseur",
+      "builtInDescriptions": {
+        "new": "Démarrer une nouvelle conversation",
+        "compact": "Compacter l’historique de la conversation",
+        "sessions": "Reprendre une conversation précédente",
+        "fast": "Basculer le mode rapide",
+        "side": "Poser une question temporaire à partir de la dernière réponse"
+      }
     },
     "approval": {
       "title": "Autorisation requise",
@@ -385,6 +489,15 @@
     },
     "removeItem": "Retirer {item}",
     "agent": "Agent : {agent}",
+    "executionNotices": {
+      "initializeFailed": "Impossible d’initialiser l’exécution de l’agent. Réessayez.",
+      "unavailable": "L’exécution de l’agent n’est pas disponible. Rechargez le plugin.",
+      "missingDeleted": "La session du fournisseur n’existe plus. Son enregistrement dans Claudian a été supprimé. Renvoyez le message pour démarrer une nouvelle session.",
+      "missingReset": "La session du fournisseur n’existe plus. Claudian a conservé l’historique récupérable. Renvoyez le message pour reconstruire la session.",
+      "missingPreserved": "La session du fournisseur n’existe plus. Claudian a conservé son enregistrement, car l’historique restant n’a pas pu être vérifié.",
+      "missingNotFound": "La session du fournisseur n’existe plus. Renvoyez le message pour démarrer une nouvelle session.",
+      "unsentFallback": "Le message n’a pas été envoyé. Réessayez."
+    },
     "images": {
       "unsupportedProvider": "Ce fournisseur ne prend pas en charge les images jointes.",
       "tooLarge": "L’image dépasse la limite de {size}.",
@@ -463,6 +576,8 @@
       "showNumber": "Afficher le numéro",
       "showName": "Afficher le nom",
       "showTitle": "Afficher le titre",
+      "moveLeft": "Déplacer vers la gauche",
+      "moveRight": "Déplacer vers la droite",
       "closeTab": "Fermer l’onglet",
       "active": "actif",
       "needsInput": "nécessite votre intervention",
@@ -565,6 +680,33 @@
         "emptyHint": "Les agents le complètent au fil du projet."
       }
     }
+  },
+  "inlineEdit": {
+    "commandName": "Modification en ligne",
+    "viewUnavailable": "Modification en ligne indisponible : impossible d’accéder à la vue Markdown active.",
+    "inserted": "Insertion effectuée",
+    "applied": "Modification appliquée",
+    "editorUnavailable": "Modification en ligne indisponible : impossible d’accéder à l’éditeur actif. Essayez de rouvrir la note.",
+    "stale": "La modification en ligne n’a pas été appliquée, car le document source ou la sélection a changé.",
+    "initialProviderFailed": "Modification en ligne indisponible : impossible de démarrer le fournisseur {provider}.",
+    "vaultFailed": "Impossible de charger les fichiers du coffre. Les mentions @ du coffre peuvent être indisponibles.",
+    "editLabel": "Instructions de modification",
+    "insertLabel": "Instructions d’insertion",
+    "editPlaceholder": "Instructions de modification…",
+    "insertPlaceholder": "Instructions d’insertion…",
+    "modelUnavailable": "Sélectionnez un modèle disponible dans les paramètres de Claudian.",
+    "providerFailed": "Impossible de démarrer le fournisseur {provider}.",
+    "actionsLabel": "Actions de modification en ligne",
+    "lineOne": "ligne",
+    "lineOther": "lignes",
+    "reject": "Refuser",
+    "accept": "Accepter",
+    "rejectLabel": "Refuser la modification en ligne",
+    "acceptLabel": "Accepter la modification en ligne",
+    "retryFallback": "Une erreur est survenue. Réessayez",
+    "replyPlaceholder": "Répondez pour continuer…",
+    "noResponseFallback": "Aucune réponse de l’agent",
+    "followUpPlaceholder": "Demandez des modifications ou appuyez sur Entrée pour accepter"
   },
   "settings": {
     "tabs": {

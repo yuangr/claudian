@@ -13,11 +13,11 @@ import type {
   SubagentProgress,
   ToolCallInfo,
 } from '@/core/types';
+import type { AsyncSubagentHistoryRecovery } from '@/features/chat/rendering/subagents/AsyncSubagentHistoryRecovery';
+import { resolveSubagentAdapter } from '@/features/chat/rendering/subagents/subagentAdapterResolution';
+import { renderSubagentHistory } from '@/features/chat/rendering/subagents/SubagentHistoryRenderer';
+import type { AsyncSubagentCompletion, SubagentManager } from '@/features/chat/rendering/subagents/SubagentManager';
 import type { ChatState } from '@/features/chat/state/ChatState';
-import type { AsyncSubagentHistoryRecovery } from '@/features/chat/subagents/AsyncSubagentHistoryRecovery';
-import { resolveSubagentAdapter } from '@/features/chat/subagents/subagentAdapterResolution';
-import { renderSubagentHistory } from '@/features/chat/subagents/SubagentHistoryRenderer';
-import type { AsyncSubagentCompletion, SubagentManager } from '@/features/chat/subagents/SubagentManager';
 import type { ThinkingIndicator } from '@/features/chat/turns/ThinkingIndicator';
 import {
   applyToolCompletion,
@@ -45,7 +45,6 @@ export interface SubagentStreamRouterDeps {
   /** Subagent cards replace or hide the main tool cards they take over. */
   tools: Pick<ToolCallStream, 'flush' | 'flushBefore' | 'detach' | 'remove'>;
   indicator: Pick<ThinkingIndicator, 'show'>;
-  scrollToBottom: () => void;
 }
 
 /**
@@ -213,7 +212,6 @@ export class SubagentStreamRouter {
         break;
       }
     }
-    this.deps.scrollToBottom();
   }
 
   /** Releases this stream's agent tasks from the shared manager when its response ends. */

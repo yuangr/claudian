@@ -3,13 +3,13 @@ import '@/providers';
 
 import { TOOL_SUBAGENT } from '@/core/tools/toolNames';
 import type { SubagentInfo } from '@/core/types';
-import { ChatState } from '@/features/chat/state/ChatState';
 import {
   AsyncSubagentHistoryRecovery,
   type AsyncSubagentHistoryRecoveryDeps,
-} from '@/features/chat/subagents/AsyncSubagentHistoryRecovery';
-import { SubagentManager } from '@/features/chat/subagents/SubagentManager';
-import { SubagentStreamRouter } from '@/features/chat/subagents/SubagentStreamRouter';
+} from '@/features/chat/rendering/subagents/AsyncSubagentHistoryRecovery';
+import { SubagentManager } from '@/features/chat/rendering/subagents/SubagentManager';
+import { ChatState } from '@/features/chat/state/ChatState';
+import { SubagentStreamRouter } from '@/features/chat/turns/SubagentStreamRouter';
 
 
 
@@ -25,7 +25,6 @@ function createHarness() {
     providerSessionId: 'session-1' as string | null,
     historyRecovery: undefined as unknown as AsyncSubagentHistoryRecoveryDeps,
     indicator: { show: vi.fn() },
-    scrollToBottom: vi.fn(),
     state,
     subagentManager,
     router: undefined as unknown as SubagentStreamRouter,
@@ -47,7 +46,6 @@ function createHarness() {
     asyncSubagentHistoryRecovery: new AsyncSubagentHistoryRecovery(harness.historyRecovery),
     tools: { flush: vi.fn(), flushBefore: vi.fn(), detach: vi.fn(), remove: vi.fn() },
     indicator: harness.indicator,
-    scrollToBottom: harness.scrollToBottom,
   });
   return harness;
 }
@@ -87,7 +85,6 @@ describe('SubagentStreamRouter', () => {
       expect(taskTool.status).toBe('completed');
       expect(taskTool.subagent?.status).toBe('completed');
       expect(taskTool.subagent?.result).toBe('done');
-      expect(harness.scrollToBottom).toHaveBeenCalled();
     });
 
     it('should not crash when subagent not found in messages', () => {

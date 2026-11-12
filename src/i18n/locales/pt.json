@@ -25,6 +25,7 @@
     "promptSuggestionHint": "Tab para aceitar",
     "selectAvailableModel": "Selecione um modelo disponível antes de enviar.",
     "reloadingHistory": "Este chat mudou fora do Claudian e está sendo recarregado. Envie novamente quando terminar.",
+    "changedOutsideWithBackgroundTask": "Este chat continuou fora do Claudian enquanto uma tarefa em segundo plano da sessão anterior ainda está em execução. Pare a tarefa ou aguarde até que termine e envie novamente.",
     "selectAvailableTitleModel": "Selecione um modelo de título disponível nas configurações do Claudian.",
     "rewind": {
       "confirmMessage": "Retroceder até este ponto? As alterações de arquivos após esta mensagem podem ser sobrescritas ou removidas. Esta ação não pode ser desfeita.",
@@ -172,7 +173,12 @@
       "resume": "Retomar conversa",
       "loading": "Carregando conversa…",
       "current": "Sessão atual",
-      "loadFailed": "Não foi possível carregar a conversa"
+      "loadFailed": "Não foi possível carregar a conversa",
+      "search": "Pesquisar sessões",
+      "searchArchived": "Pesquisar sessões arquivadas",
+      "clearSearch": "Limpar pesquisa",
+      "showArchive": "Mostrar sessões arquivadas",
+      "showSessions": "Mostrar sessões ativas"
     },
     "linkedContent": {
       "label": "Conteúdo vinculado:",
@@ -184,6 +190,12 @@
       "noContent": "Nenhum conteúdo vinculado",
       "missingNotice": "Conteúdo vinculado ausente: {path}",
       "openFailed": "Não foi possível abrir o conteúdo vinculado: {error}"
+    },
+    "selectedContext": {
+      "line": "{count} linha selecionada",
+      "lines": "{count} linhas selecionadas",
+      "node": "{count} nó selecionado",
+      "nodes": "{count} nós selecionados"
     },
     "questions": {
       "title": "Pergunta",
@@ -303,6 +315,10 @@
       "label": "Modo de permissões",
       "current": "Modo de permissões: {mode}",
       "changeFailed": "Não foi possível alterar o modo de permissões",
+      "antigravity": {
+        "auto": "Automático",
+        "autoDesc": "Aprovar edições no espaço de trabalho e comandos isolados; revisar acessos adicionais"
+      },
       "claude": {
         "auto": "Automático",
         "manual": "Manual",
@@ -328,6 +344,87 @@
       "completed": "Pensou por {seconds}s",
       "label": "Raciocínio"
     },
+    "busyIndicator": {
+      "flavors": {
+        "thinking": "Pensando…",
+        "pondering": "Ponderando…",
+        "processing": "Processando…",
+        "analyzing": "Analisando…",
+        "considering": "Considerando…",
+        "workingOnIt": "Trabalhando nisso…",
+        "vibing": "Entrando no ritmo…",
+        "oneMoment": "Um momento…",
+        "onIt": "Já estou cuidando disso…",
+        "ruminating": "Remoendo…",
+        "contemplating": "Contemplando…",
+        "reflecting": "Refletindo…",
+        "mullingItOver": "Pensando com calma…",
+        "letMeThink": "Deixe-me pensar…",
+        "hmm": "Hmm…",
+        "cogitating": "Matutando…",
+        "deliberating": "Deliberando…",
+        "weighingOptions": "Pesando as opções…",
+        "gatheringThoughts": "Organizando os pensamentos…",
+        "brewingIdeas": "Elaborando ideias…",
+        "connectingDots": "Ligando os pontos…",
+        "assemblingThoughts": "Juntando pensamentos…",
+        "spinningUpNeurons": "Colocando os neurônios para funcionar…",
+        "loadingBrilliance": "Carregando a genialidade…",
+        "consultingTheOracle": "Consultando o oráculo…",
+        "summoningKnowledge": "Invocando conhecimento…",
+        "crunchingThoughts": "Triturando pensamentos…",
+        "dustingOffNeurons": "Tirando a poeira dos neurônios…",
+        "wranglingIdeas": "Domando ideias…",
+        "herdingThoughts": "Reunindo o rebanho de pensamentos…",
+        "jugglingConcepts": "Fazendo malabarismo com conceitos…",
+        "untanglingThis": "Desembaraçando tudo…",
+        "piecingItTogether": "Encaixando as peças…",
+        "sippingCoffee": "Tomando um café…",
+        "warmingUp": "Aquecendo…",
+        "gettingCozyWithThis": "Ficando à vontade com isso…",
+        "settlingIn": "Acomodando-me…",
+        "makingTea": "Preparando chá…",
+        "grabbingASnack": "Pegando um lanche…",
+        "parsing": "Analisando a sintaxe…",
+        "compilingThoughts": "Compilando pensamentos…",
+        "runningInference": "Executando a inferência…",
+        "queryingTheVoid": "Consultando o vazio…",
+        "defragmentingBrain": "Desfragmentando o cérebro…",
+        "allocatingMemory": "Alocando memória…",
+        "optimizing": "Otimizando…",
+        "indexing": "Indexando…",
+        "syncingNeurons": "Sincronizando neurônios…",
+        "breathing": "Respirando…",
+        "findingClarity": "Buscando clareza…",
+        "channelingFocus": "Canalizando o foco…",
+        "centering": "Centrando a mente…",
+        "aligningChakras": "Alinhando os chacras…",
+        "meditatingOnThis": "Meditando sobre isso…",
+        "askingTheStars": "Perguntando às estrelas…",
+        "readingTeaLeaves": "Lendo folhas de chá…",
+        "shakingTheMagic8Ball": "Sacudindo a bola 8 mágica…",
+        "consultingAncientScrolls": "Consultando pergaminhos antigos…",
+        "decodingTheMatrix": "Decifrando a matriz…",
+        "communingWithTheEther": "Comungando com o éter…",
+        "peeringIntoTheAbyss": "Espreitando o abismo…",
+        "channelingTheCosmos": "Canalizando o cosmos…",
+        "divingIn": "Mergulhando de cabeça…",
+        "rollingUpSleeves": "Arregaçando as mangas…",
+        "gettingToWork": "Começando o trabalho…",
+        "tacklingThis": "Enfrentando o desafio…",
+        "onTheCase": "Seguindo a pista…",
+        "investigating": "Investigando…",
+        "exploring": "Explorando…",
+        "diggingDeeper": "Indo mais fundo…",
+        "bearWithMe": "Um pouco de paciência…",
+        "hangTight": "Aguente firme…",
+        "justASec": "Só um segundo…",
+        "workingMyMagic": "Fazendo um pouco de magia…",
+        "almostThere": "Quase pronto…",
+        "giveMeAMoment": "Dê-me um momento…"
+      },
+      "hint": " (pressione Esc para interromper · {duration})"
+    },
     "contextUsage": {
       "label": "Uso do contexto",
       "details": "Uso do contexto: {details}",
@@ -339,7 +436,14 @@
       "loadFailed": "Não foi possível carregar as sugestões",
       "retryHint": "Digite novamente para tentar de novo",
       "providerLoading": "Carregando comandos do provedor…",
-      "providerRetry": "Tentar novamente a descoberta de comandos do provedor"
+      "providerRetry": "Tentar novamente a descoberta de comandos do provedor",
+      "builtInDescriptions": {
+        "new": "Iniciar uma nova conversa",
+        "compact": "Compactar o histórico da conversa",
+        "sessions": "Retomar uma conversa anterior",
+        "fast": "Alternar o modo rápido",
+        "side": "Fazer uma pergunta temporária a partir da última resposta"
+      }
     },
     "approval": {
       "title": "Permissão necessária",
@@ -385,6 +489,15 @@
     },
     "removeItem": "Remover {item}",
     "agent": "Agente: {agent}",
+    "executionNotices": {
+      "initializeFailed": "Não foi possível inicializar a execução do agente. Tente novamente.",
+      "unavailable": "A execução do agente não está disponível. Recarregue o plugin.",
+      "missingDeleted": "A sessão do provedor não existe mais. O registro dela no Claudian foi removido. Envie a mensagem novamente para iniciar uma nova sessão.",
+      "missingReset": "A sessão do provedor não existe mais. O Claudian preservou o histórico recuperável. Envie a mensagem novamente para reconstruir a sessão.",
+      "missingPreserved": "A sessão do provedor não existe mais. O Claudian manteve o registro porque não foi possível verificar o histórico restante.",
+      "missingNotFound": "A sessão do provedor não existe mais. Envie a mensagem novamente para iniciar uma nova sessão.",
+      "unsentFallback": "A mensagem não foi enviada. Tente novamente."
+    },
     "images": {
       "unsupportedProvider": "Este provedor não suporta imagens anexadas.",
       "tooLarge": "A imagem excede o limite de {size}.",
@@ -463,6 +576,8 @@
       "showNumber": "Mostrar número",
       "showName": "Mostrar nome",
       "showTitle": "Mostrar título",
+      "moveLeft": "Mover para a esquerda",
+      "moveRight": "Mover para a direita",
       "closeTab": "Fechar aba",
       "active": "ativa",
       "needsInput": "precisa da sua resposta",
@@ -565,6 +680,33 @@
         "emptyHint": "Os agentes preenchem isto conforme o projeto avança."
       }
     }
+  },
+  "inlineEdit": {
+    "commandName": "Edição em linha",
+    "viewUnavailable": "Edição em linha indisponível: não foi possível acessar a visualização Markdown ativa.",
+    "inserted": "Inserção concluída",
+    "applied": "Edição aplicada",
+    "editorUnavailable": "Edição em linha indisponível: não foi possível acessar o editor ativo. Tente reabrir a nota.",
+    "stale": "A edição em linha não foi aplicada porque o documento de origem ou a seleção mudou.",
+    "initialProviderFailed": "Edição em linha indisponível: não foi possível iniciar o provedor {provider}.",
+    "vaultFailed": "Não foi possível carregar os arquivos do cofre. As menções com @ do cofre podem estar indisponíveis.",
+    "editLabel": "Instruções de edição",
+    "insertLabel": "Instruções de inserção",
+    "editPlaceholder": "Instruções de edição…",
+    "insertPlaceholder": "Instruções de inserção…",
+    "modelUnavailable": "Selecione um modelo disponível nas configurações do Claudian.",
+    "providerFailed": "Não foi possível iniciar o provedor {provider}.",
+    "actionsLabel": "Ações de edição em linha",
+    "lineOne": "linha",
+    "lineOther": "linhas",
+    "reject": "Rejeitar",
+    "accept": "Aceitar",
+    "rejectLabel": "Rejeitar edição em linha",
+    "acceptLabel": "Aceitar edição em linha",
+    "retryFallback": "Ocorreu um erro. Tente novamente",
+    "replyPlaceholder": "Responda para continuar…",
+    "noResponseFallback": "O agente não respondeu",
+    "followUpPlaceholder": "Peça alterações ou pressione Enter para aceitar"
   },
   "settings": {
     "tabs": {

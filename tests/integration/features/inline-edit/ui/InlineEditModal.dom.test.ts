@@ -393,20 +393,27 @@ it('shows only the newest clarification when an older render finishes last', asy
   expect(within(container).queryByText('First question?')).toBeNull();
 });
 
-it('previews the selected source as deleted and the replacement as inserted Markdown', async () => {
+it.each(['replacement', 'insertion'] as const)(
+  'previews the selected source as deleted and a %s reply as inserted Markdown', async wrapper => {
   const h = await createHarness();
   vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, element) => {
     (element as HTMLElement).textContent = markdown;
   });
   h.createSession().show();
-  await showReplacementPreview(h, 'Hi');
+  // A selection is always replaced on accept, whichever wrapper the model chose, so the preview must show that.
+  submitInstruction();
+  await waitFor(() => expect(h.backend.sessions[0]?.getStatus()).toBe('executing'));
+  h.backend.sessions[0].emitText(`<${wrapper}>Hi</${wrapper}>`);
+  h.backend.sessions[0].complete();
+  await screen.findByRole('button', { name: 'Accept inline edit' });
   const preview = screen.getByRole('toolbar', { name: 'Inline edit actions' }).parentElement!;
   await waitFor(() => expect(Array.from(preview.querySelectorAll('.claudian-diff-block'), block => [
     block.classList.contains('claudian-diff-del') ? 'delete' : block.classList.contains('claudian-diff-ins') ? 'insert' : 'equal',
     block.textContent,
   ])).toEqual([['delete', 'hello'], ['insert', 'Hi']]));
-  // The previewed source is hidden from the editor until the edit settles.
-  expect(h.editorView.contentDOM.textContent).toBe(`${preview.textContent} world`);
+  // The previewed source is hidden from the editor until the edit settles; the composer stays above it.
+  const composer = input().closest('.claudian-inline-input-container')!;
+  expect(h.editorView.contentDOM.textContent).toBe(`${composer.textContent}${preview.textContent} world`);
 });
 
 it('releases Markdown resources when clarification previews are replaced and the edit closes', async () => {

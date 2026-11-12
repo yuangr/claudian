@@ -11,6 +11,7 @@ import type { ProviderPermissionModeOption } from '@/core/providers/types';
 import { createInputToolbar } from '@/features/chat/composer/toolbar/InputToolbar';
 import type { ToolbarCallbacks } from '@/features/chat/composer/toolbar/types';
 import { setLocale } from '@/i18n/i18n';
+import { antigravityChatUIConfig } from '@/providers/antigravity/ui/AntigravityChatUIConfig';
 import { claudeChatUIConfig } from '@/providers/claude/ui/ClaudeChatUIConfig';
 import { codexChatUIConfig } from '@/providers/codex/ui/CodexChatUIConfig';
 
@@ -33,7 +34,6 @@ interface FixtureOptions {
   permissionToggle?: boolean;
   permissionModes?: readonly ProviderPermissionModeOption[];
   serviceTier?: boolean;
-  modeSelector?: boolean;
   providerIcon?: Record<string, unknown>;
 }
 
@@ -43,7 +43,6 @@ function renderToolbar(fixture: FixtureOptions = {}) {
     reasoning: 'high',
     serviceTier: 'default',
     permissionMode: 'normal',
-    selectedMode: 'build',
     ...fixture.settings,
   };
   const uiConfig = {
@@ -67,19 +66,9 @@ function renderToolbar(fixture: FixtureOptions = {}) {
       isActive: current.serviceTier === 'fast',
       description: '1.5x speed, 2x credits',
     } : null),
-    getModeSelector: (current: Record<string, unknown>) => (fixture.modeSelector ? {
-      activeValue: 'build',
-      label: 'Mode',
-      options: [
-        { value: 'build', label: 'Build', description: 'Default editing agent' },
-        { value: 'plan', label: 'Plan', description: 'Planning-first agent' },
-      ],
-      value: current.selectedMode as string,
-    } : null),
   };
   const callbacks = {
     onModelChange: vi.fn(async (model: string) => { settings.model = model; }),
-    onModeChange: vi.fn(async (mode: string) => { settings.selectedMode = mode; }),
     onEffortLevelChange: vi.fn(async (effort: string) => { settings.reasoning = effort; }),
     onServiceTierChange: vi.fn(async (tier: string) => { settings.serviceTier = tier; }),
     onPermissionModeChange: vi.fn(async (mode: string) => { settings.permissionMode = mode; }),
@@ -521,6 +510,19 @@ describe('permission button', () => {
     expect(ui.getByRole('button', { name: 'Permission mode: YOLO' })).toBe(button);
   });
 
+  it('selects Antigravity Auto without marking it as bypassing approvals', async () => {
+    const { callbacks, host, ui } = renderToolbar({
+      permissionModes: antigravityChatUIConfig.getPermissionModeOptions?.() ?? undefined,
+    });
+    fireEvent.click(ui.getByRole('button', { name: 'Permission mode: Ask' }));
+    fireEvent.click(ui.getByRole('menuitemradio', { name: /^Auto/ }));
+    await flush();
+    expect(callbacks.onPermissionModeChange).toHaveBeenCalledWith('auto');
+    const button = ui.getByRole('button', { name: 'Permission mode: Auto' });
+    expect(button.classList.contains('claudian-toolbar-chip--alert')).toBe(false);
+    expect((await axe(host)).violations).toEqual([]);
+  });
+
   it('lists every Claude permission mode with its description and alerts only on YOLO', async () => {
     const { callbacks, ui } = renderToolbar({
       settings: { permissionMode: 'auto' },
@@ -553,27 +555,6 @@ describe('permission button', () => {
   it('is absent when the provider has no permission toggle', () => {
     const { ui } = renderToolbar({ permissionToggle: false });
     expect(ui.queryByRole('button', { name: /^Permission mode/ })).toBeNull();
-  });
-});
-
-describe('provider mode button', () => {
-  it('renders only when a provider supplies two modes and changes mode through its menu', async () => {
-    expect(renderToolbar().ui.queryByRole('button', { name: /^Mode:/ })).toBeNull();
-
-    const { callbacks, ui } = renderToolbar({ modeSelector: true });
-    const buttons = ui.getAllByRole('button');
-    expect(buttons.map(button => button.getAttribute('aria-label')))
-      .toEqual(['Model: Sonnet, effort High', 'Mode: Build', 'Permission mode: Safe']);
-    // The provider's active option keeps its accent.
-    expect(buttons[1].classList.contains('claudian-toolbar-chip--accent')).toBe(true);
-    fireEvent.click(buttons[1]);
-    const plan = within(ui.getByRole('menu', { name: 'Mode' })).getByRole('menuitemradio', { name: /^Plan/ });
-    expect(plan.textContent).toBe('PlanPlanning-first agent');
-    fireEvent.click(plan);
-    await flush();
-    expect(callbacks.onModeChange).toHaveBeenCalledWith('plan');
-    expect(ui.getByRole('button', { name: 'Mode: Plan' })).toBe(buttons[1]);
-    expect(buttons[1].classList.contains('claudian-toolbar-chip--accent')).toBe(false);
   });
 });
 

@@ -3,6 +3,7 @@ import '@/providers';
 
 import { axe } from '@test/helpers/accessibility';
 import { ControlledResizeObserver, triggerResize } from '@test/helpers/dom/ResizeObserver';
+import { useTranscriptGeometry } from '@test/helpers/dom/transcriptGeometry';
 import {
   cleanups,
   createChatWorkspaceFixture,
@@ -22,9 +23,10 @@ import { getToolIcon } from '@/core/tools/toolIcons';
 import type { StreamChunk } from '@/core/types';
 import { ChatState } from '@/features/chat/state/ChatState';
 import type { AssembledTabRuntime } from '@/features/chat/tabs/types';
-import { FLAVOR_TEXTS } from '@/features/chat/turns/flavorTexts';
+import { FLAVOR_TEXT_KEYS } from '@/features/chat/turns/flavorTexts';
 import type { ZenPresentationPort } from '@/features/chat/zen/types';
 import { ZenModePanel } from '@/features/chat/zen/ZenModePanel';
+import { t } from '@/i18n/i18n';
 import { adaptCodexStreamChunk } from '@/providers/codex/execution/CodexExecutionEventNormalizer';
 import { CodexNotificationRouter } from '@/providers/codex/runtime/CodexNotificationRouter';
 
@@ -247,7 +249,7 @@ function waitingIndicatorText(tab: AssembledTabRuntime): string | null {
 }
 
 async function waitForFlavor(tab: AssembledTabRuntime, timeout?: number): Promise<string> {
-  await waitFor(() => expect(FLAVOR_TEXTS).toContain(waitingIndicatorText(tab)), { timeout });
+  await waitFor(() => expect(FLAVOR_TEXT_KEYS.map(key => t(key))).toContain(waitingIndicatorText(tab)), { timeout });
   return waitingIndicatorText(tab)!;
 }
 
@@ -1043,18 +1045,30 @@ it('keeps the preview line on the main chat while a side chat is selected', asyn
 
 it('keeps the reader scroll intent through geometry-only scrolls after relocation', async () => {
   const { tab, rightSplit, setCollapsed } = await createChatWorkspaceFixture();
-  seedHistory(tab);
+  const messagesEl = tab.dom.messagesEl;
+  let grown = false;
+  const geometry = useTranscriptGeometry(messagesEl, { rowHeight: row => (grown && row.dataset.messageId === 'a7' ? 600 : 100) });
+  tab.state.messages = Array.from({ length: 8 }, (_, index) => [
+    { id: `u${index}`, role: 'user' as const, content: `Question ${index}`, timestamp: testDate().getTime() },
+    { id: `a${index}`, role: 'assistant' as const, content: `Answer ${index}`, timestamp: testDate().getTime() },
+  ]).flat();
+  tab.renderer.renderMessages(tab.state.messages, () => 'Welcome');
   setCollapsed(rightSplit, true);
   fireEvent.click(within(zenPanel()!).getByRole('button', { name: 'Show conversation' }));
   // The reader moved away from new output.
-  tab.state.autoScrollEnabled = false;
+  fireEvent.wheel(messagesEl, { deltaY: -100 });
+  messagesEl.scrollTop = 300;
+  fireEvent.scroll(messagesEl);
 
   setCollapsed(rightSplit, false);
-  fireEvent.scroll(tab.dom.messagesEl);
-  expect(tab.state.autoScrollEnabled).toBe(true);
+  // Relocation reports the bottom before the transcript has its final layout.
+  messagesEl.scrollTop = geometry.bottom();
+  fireEvent.scroll(messagesEl);
   await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  grown = true;
+  geometry.layout();
 
-  expect(tab.state.autoScrollEnabled).toBe(false);
+  expect(messagesEl.scrollTop).toBe(300);
 });
 
 it('keeps the last visible reading position when collapsing the sidebar hides the transcript', async () => {
@@ -1074,7 +1088,6 @@ it('keeps the last visible reading position when collapsing the sidebar hides th
   fireEvent.wheel(messagesEl, { deltaY: -100 });
   messagesEl.scrollTop = 300;
   fireEvent.scroll(messagesEl);
-  expect(tab.state.autoScrollEnabled).toBe(false);
 
   collapse();
   setCollapsed(rightSplit, false);

@@ -6,12 +6,13 @@ import type { Mock } from 'vitest';
 import { ChatState } from '@/features/chat/state/ChatState';
 import { ThinkingIndicator } from '@/features/chat/turns/ThinkingIndicator';
 import { TurnCoordinator } from '@/features/chat/turns/TurnCoordinator';
+import { t } from '@/i18n/i18n';
+import { formatDurationMmSs } from '@/utils/date';
 
 describe('ThinkingIndicator', () => {
   let turns: TurnCoordinator;
   let state: ChatState;
   let updateQueueIndicator: Mock;
-  let scrollToBottom: Mock;
   let indicator: ThinkingIndicator;
   let contentEl: HTMLElement;
   const shown = (): HTMLElement | null => contentEl.querySelector<HTMLElement>('.claudian-thinking');
@@ -24,12 +25,10 @@ describe('ThinkingIndicator', () => {
     contentEl = messagesEl.createDiv();
     state.currentContentEl = contentEl;
     updateQueueIndicator = vi.fn();
-    scrollToBottom = vi.fn();
     indicator = new ThinkingIndicator({
       state,
       getMessagesEl: () => messagesEl,
       updateQueueIndicator,
-      scrollToBottom,
     });
   });
 
@@ -41,16 +40,14 @@ describe('ThinkingIndicator', () => {
     vi.useRealTimers();
   });
 
-  it('appears after its debounce delay and scrolls it into view', () => {
+  it('appears after its debounce delay', () => {
     indicator.show();
     vi.advanceTimersByTime(399);
     expect(shown()).toBeNull();
-    expect(scrollToBottom).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(1);
     expect(shown()).not.toBeNull();
     expect(state.waitingStatus).not.toBeNull();
-    expect(scrollToBottom).toHaveBeenCalled();
   });
 
   it('returns after a text pause only while the response streams', async () => {
@@ -293,7 +290,7 @@ describe('ThinkingIndicator', () => {
 
     vi.advanceTimersByTime(1000);
     expect(vi.getTimerCount()).toBe(1);
-    expect(timerSpan.textContent).toContain('esc to interrupt');
+    expect(timerSpan.textContent).toBe(t('chat.busyIndicator.hint', { duration: formatDurationMmSs(1) }));
 
     timerSpan.remove();
     vi.advanceTimersByTime(1000);

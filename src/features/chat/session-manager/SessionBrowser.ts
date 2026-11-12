@@ -48,7 +48,8 @@ import {
   type SessionStatusIndicatorKind,
   sessionStatusText,
 } from '@/features/chat/session-manager/SessionStatusPresentation';
-import { bindMenuToggle, runSessionAction, showMenuAt } from '@/features/chat/session-manager/SessionSurfaceShared';
+import { bindMenuToggle, showMenuAt } from '@/features/chat/session-manager/SessionSurfaceShared';
+import { runSessionAction } from '@/features/chat/utils/runSessionAction';
 import { t } from '@/i18n/i18n';
 import { LiveListSorter } from '@/shared/components/LiveListSorter';
 
@@ -99,7 +100,6 @@ type HistoryRenderOptions = SessionActionOptions & SessionStatusDisplay & Sessio
   historyHeaderLabel?: string;
   allowConversationSelection?: boolean;
   searchQuery?: string;
-  onBeforeRestoreListState?: (container: HTMLElement) => void;
   onRequestInlineRename?: (request: {
     beginRename: (item: HTMLElement) => void;
     conversationId: string;
@@ -330,7 +330,6 @@ export class SessionBrowser {
     );
     recordVisibleCount(list, visibleCount);
     const restorePosition = (): void => {
-      options.onBeforeRestoreListState?.(container);
       restoreRename?.();
       restoreSessionListPosition(
         previousPosition,

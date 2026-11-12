@@ -27,6 +27,7 @@ import {
   diffOpsEqual,
 } from '@/features/inline-edit/ui/markdownLineDiff';
 import { normalizeInsertionText } from '@/features/inline-edit/ui/normalizeInsertionText';
+import { t } from '@/i18n/i18n';
 import { MarkdownRenderScope } from '@/shared/components/MarkdownRenderScope';
 import { hideSelectionHighlight, showSelectionHighlight } from '@/shared/components/SelectionHighlight';
 import {
@@ -54,14 +55,9 @@ const showInlineEdit = StateEffect.define<{
   widget: InlineEditSession;
   isInbetween?: boolean;
 }>();
-const showDiff = StateEffect.define<{
-  from: number;
-  to: number;
-  diffOps: DiffOp[];
-  previewPos: number;
-  widget: InlineEditSession;
-}>();
-const showInsertion = StateEffect.define<{
+const showReview = StateEffect.define<{
+  /** The source the preview stands in for, or null when the source stays visible. */
+  hidden: { from: number; to: number } | null;
   diffOps: DiffOp[];
   previewPos: number;
   widget: InlineEditSession;
@@ -139,22 +135,17 @@ const inlineEditField = StateField.define<DecorationSet>({
           isInbetween: e.value.isInbetween,
           widget: new InputWidget(e.value.widget),
         });
-      } else if (e.is(showDiff)) {
+      } else if (e.is(showReview)) {
+        // The composer stays above the preview (the lower side sorts first) for follow-up instructions.
+        const { diffOps, hidden, previewPos, widget } = e.value;
         deco = Decoration.set([
+          Decoration.widget({ widget: new InputWidget(widget), block: true, side: -2 }).range(previewPos),
           Decoration.widget({
-            widget: new MarkdownDiffWidget(e.value.diffOps, e.value.widget),
+            widget: new MarkdownDiffWidget(diffOps, widget),
             block: true,
             side: -1,
-          }).range(e.value.previewPos),
-          Decoration.replace({}).range(e.value.from, e.value.to),
-        ], true);
-      } else if (e.is(showInsertion)) {
-        deco = Decoration.set([
-          Decoration.widget({
-            widget: new MarkdownDiffWidget(e.value.diffOps, e.value.widget),
-            block: true,
-            side: -1,
-          }).range(e.value.previewPos),
+          }).range(previewPos),
+          ...(hidden ? [Decoration.replace({}).range(hidden.from, hidden.to)] : []),
         ], true);
       } else if (e.is(hideInlineEdit)) {
         deco = Decoration.none;
@@ -177,6 +168,23 @@ function getDiffBlockClass(type: DiffOp['type']): string {
 }
 
 export type InlineEditDecision = 'accept' | 'edit' | 'reject';
+
+/**
+ * The edit under review; accepting writes its text over the source range. A selection's proposal
+ * previews in place of the selection; a cursor's previews above the cursor.
+ */
+interface InlineEditProposal {
+  text: string;
+  diffOps: DiffOp[];
+}
+
+/**
+ * `generating` while a request runs; `settled` once the edit resolved, which ends every phase. A proposal
+ * stays under review while follow-ups are drafted and run, until a newer one replaces it.
+ */
+type InlineEditPhase =
+  | { name: 'editing' | 'generating'; proposal: InlineEditProposal | null }
+  | { name: 'settled' };
 
 interface InlineEditProviderContext {
   modelOverride?: string;
@@ -254,7 +262,7 @@ export class InlineEditModal {
     }
 
     if (!editorView) {
-      new Notice('Inline edit unavailable: could not access the active editor. Try reopening the note.');
+      new Notice(t('inlineEdit.editorUnavailable'));
       return { decision: 'reject' };
     }
 
@@ -292,7 +300,7 @@ export class InlineEditModal {
       ).then(() => {
         if (settled) return;
         if (editorView.state.doc !== sourceDoc) {
-          new Notice('Inline edit was not applied because the source document or selection changed.');
+          new Notice(t('inlineEdit.stale'));
           close();
           return;
         }
@@ -312,7 +320,7 @@ export class InlineEditModal {
         session.show();
       }).catch(() => {
         if (settled) return;
-        new Notice(`Inline edit unavailable: failed to start the ${providerContext.providerId} provider.`);
+        new Notice(t('inlineEdit.initialProviderFailed', { provider: providerContext.providerId }));
         close();
       });
     });
@@ -324,9 +332,11 @@ export class InlineEditSession {
   private spinnerEl: HTMLElement | null = null;
   private modelToolbarEl: HTMLElement | null = null;
   private agentReplyEl: HTMLElement | null = null;
-  private containerEl: HTMLElement | null = null;
-  private editedText: string | null = null;
-  private insertedText: string | null = null;
+  private composerEl: HTMLElement | null = null;
+  private previewEl: HTMLElement | null = null;
+  /** The agent's latest text reply and the instruction it answers, until a new proposal replaces it. */
+  private reply: { instruction: string; markdown: string } | null = null;
+  private agentReplyRenderVersion = 0;
   private selFrom = 0;
   private selTo = 0;
   private selectedText: string;
@@ -335,12 +345,11 @@ export class InlineEditSession {
   private cursorContext: CursorContext | null = null;
   /** The service requests run on, and the provider it was started for. */
   #inlineEdit: { providerId: ProviderId; service: InlineEditService };
-  /** Removes the current phase's Escape/Enter listener. */
+  /** Removes the session's key listeners, including the review's Enter/Escape handling once installed. */
   private releaseKeyHandler: (() => void) | null = null;
   private selectionListener: ((e: Event) => void) | null = null;
   private instructionDraft = '';
   private inputPlaceholder: string | null = null;
-  private replyMarkdown: string | null = null;
   /** The provider the model chip shows; requests wait until its service runs. */
   private pickedProviderId: ProviderId;
   private inputResources: {
@@ -356,15 +365,17 @@ export class InlineEditSession {
   private reasoningOverride: string | undefined;
   private mentionDataProvider: VaultMentionDataProvider;
   private releaseMentionCacheEvents: (() => void) | null = null;
-  private agentReplyRenderVersion = 0;
   private readonly previewScopes = new Map<HTMLElement, MarkdownRenderScope>();
   /** The document the edit was computed against; CodeMirror documents are immutable. */
   private sourceDoc: Text | null = null;
-  /** `generating` while a request runs; `settled` once the edit resolved, which ends every phase. */
-  private phase: 'editing' | 'generating' | 'settled' = 'editing';
+  #phase: InlineEditPhase = { name: 'editing', proposal: null };
 
   get #isSettled(): boolean {
-    return this.phase === 'settled';
+    return this.#phase.name === 'settled';
+  }
+
+  get #proposal(): InlineEditProposal | null {
+    return this.#phase.name === 'settled' ? null : this.#phase.proposal;
   }
   private releaseEditorLifetime: (() => void) | null = null;
   private editorDestroyed = false;
@@ -387,7 +398,7 @@ export class InlineEditSession {
     this.pickedProviderId = providerId;
     this.mentionDataProvider = new VaultMentionDataProvider(this.app, {
       onFileLoadError: () => {
-        new Notice('Failed to load vault files. Vault @-mentions may be unavailable.');
+        new Notice(t('inlineEdit.vaultFailed'));
       },
     });
     this.mentionDataProvider.initializeInBackground();
@@ -446,7 +457,8 @@ export class InlineEditSession {
     }
 
     // !e.isComposing: skip during IME composition (Chinese, Japanese, Korean, etc.)
-    // Bubble phase, so the instruction's suggestion menu and the model menu close on Escape first.
+    // Bubble phase, so the instruction's suggestion menu and the model menu close on Escape first and
+    // stop it there. The note editor's own keymap also handles Escape, so a handled event still rejects.
     const ownerDocument = this.getOwnerDocument();
     const onKeydown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.isComposing && this.isKeyboardEventInContext(e)) {
@@ -514,7 +526,7 @@ export class InlineEditSession {
     this.spinnerEl = null;
     this.modelToolbarEl = null;
     this.agentReplyEl = null;
-    if (this.containerEl === container) this.containerEl = null;
+    if (this.composerEl === container) this.composerEl = null;
   }
 
   createInputDOM(): HTMLElement {
@@ -524,7 +536,7 @@ export class InlineEditSession {
       cls: 'claudian-inline-input-container',
       attr: { 'data-provider': this.#inlineEdit.providerId },
     });
-    this.containerEl = container;
+    this.composerEl = container;
 
     // The widget root only spaces the card: Obsidian zeroes editor widget margins.
     const cardEl = container.createDiv({ cls: 'claudian-inline-composer' });
@@ -536,9 +548,9 @@ export class InlineEditSession {
       cls: 'claudian-inline-input',
       attr: {
         type: 'text',
-        'aria-label': this.mode === 'cursor' ? 'Insert instructions' : 'Edit instructions',
+        'aria-label': this.mode === 'cursor' ? t('inlineEdit.insertLabel') : t('inlineEdit.editLabel'),
         placeholder: this.inputPlaceholder
-          ?? (this.mode === 'cursor' ? 'Insert instructions...' : 'Edit instructions...'),
+          ?? (this.mode === 'cursor' ? t('inlineEdit.insertPlaceholder') : t('inlineEdit.editPlaceholder')),
         spellcheck: 'false',
       },
     });
@@ -555,7 +567,7 @@ export class InlineEditSession {
     });
     const modelSelector = new ModelSelector(this.modelToolbarEl, this.#modelPickerCallbacks(), menus, menuLayer);
     const effortSelector = new EffortSelector(modelSelector, this.#modelPickerCallbacks());
-    this.#showGenerating(this.phase === 'generating');
+    this.#showGenerating(this.#phase.name === 'generating');
 
     // The composer's commands and brand belong to the provider requests run on.
     const commandProviderId = this.#inlineEdit.providerId;
@@ -614,7 +626,7 @@ export class InlineEditSession {
         discovery?.invalidate();
       },
     };
-    if (this.replyMarkdown !== null) this.showAgentReply(this.replyMarkdown);
+    if (this.reply) this.#showAgentReply();
     return container;
   }
 
@@ -627,7 +639,7 @@ export class InlineEditSession {
       onModelChange: async (model) => {
         const providerId = this.#getModelProvider(model);
         if (!providerId) {
-          new Notice('Select an available model in Claudian settings.');
+          new Notice(t('inlineEdit.modelUnavailable'));
           return;
         }
         // The chip shows the pick at once; another provider starts behind it.
@@ -716,7 +728,7 @@ export class InlineEditSession {
     if (providerId !== this.#inlineEdit.providerId) {
       this.#inlineEdit.service.end();
       this.#inlineEdit = { providerId, service: ProviderRegistry.createInlineEditService(this.host.providerHost, providerId) };
-      this.#updateHighlight();
+      this.#render();
     }
     return true;
   }
@@ -727,7 +739,7 @@ export class InlineEditSession {
       return true;
     } catch {
       if (!this.#isSettled && providerId === this.pickedProviderId) {
-        new Notice(`Failed to start the ${ProviderRegistry.getProviderDisplayName(providerId)} provider.`);
+        new Notice(t('inlineEdit.providerFailed', { provider: ProviderRegistry.getProviderDisplayName(providerId) }));
       }
       return false;
     }
@@ -776,7 +788,7 @@ export class InlineEditSession {
 
   destroyDiffPreviewDOM(container: HTMLElement): void {
     this.releasePreviews(container);
-    if (this.containerEl === container) this.containerEl = null;
+    if (this.previewEl === container) this.previewEl = null;
   }
 
   private releasePreviews(container?: HTMLElement): void {
@@ -789,21 +801,21 @@ export class InlineEditSession {
 
   createDiffPreviewDOM(diffOps: DiffOp[]): HTMLElement {
     const previewEl = createDiv({ cls: 'claudian-inline-diff-preview' });
-    this.containerEl = previewEl;
+    this.previewEl = previewEl;
 
     const bodyEl = previewEl.createDiv({ cls: 'claudian-inline-diff-preview-body markdown-rendered' });
 
     const actionsEl = previewEl.createDiv({ cls: 'claudian-inline-preview-actions' });
     actionsEl.setAttribute('role', 'toolbar');
-    actionsEl.setAttribute('aria-label', 'Inline edit actions');
+    actionsEl.setAttribute('aria-label', t('inlineEdit.actionsLabel'));
     const statsEl = actionsEl.createDiv({ cls: 'claudian-inline-diff-stats' });
     const removed = countDiffLines(diffOps, 'delete');
     const added = countDiffLines(diffOps, 'insert');
     if (removed > 0) statsEl.createSpan({ cls: 'claudian-inline-diff-stat-del', text: `−${removed}` });
     if (added > 0) statsEl.createSpan({ cls: 'claudian-inline-diff-stat-ins', text: `+${added}` });
-    statsEl.createSpan({ text: removed + added === 1 ? 'line' : 'lines' });
-    actionsEl.appendChild(this.#createPreviewActionButton('Reject', 'reject', 'Esc', () => this.reject()));
-    actionsEl.appendChild(this.#createPreviewActionButton('Accept', 'accept', '↵', () => this.accept()));
+    statsEl.createSpan({ text: t(removed + added === 1 ? 'inlineEdit.lineOne' : 'inlineEdit.lineOther') });
+    actionsEl.appendChild(this.#createPreviewActionButton(t('inlineEdit.reject'), 'reject', 'Esc', () => this.reject()));
+    actionsEl.appendChild(this.#createPreviewActionButton(t('inlineEdit.accept'), 'accept', '↵', () => this.accept()));
 
     void this.#renderMarkdownDiffPreview(bodyEl, diffOps);
     return previewEl;
@@ -820,7 +832,7 @@ export class InlineEditSession {
       text: label,
       attr: {
         type: 'button',
-        'aria-label': `${label} inline edit`,
+        'aria-label': t(variant === 'accept' ? 'inlineEdit.acceptLabel' : 'inlineEdit.rejectLabel'),
         'aria-keyshortcuts': variant === 'accept' ? 'Enter' : 'Escape',
       },
     });
@@ -856,7 +868,7 @@ export class InlineEditSession {
   async #renderMarkdownDiffPreview(container: HTMLElement, diffOps: DiffOp[]): Promise<void> {
     container.empty();
     for (const document of buildMarkdownDiffDocuments(diffOps)) {
-      if (this.#isSettled || !this.containerEl?.contains(container)) return;
+      if (this.#isSettled || !this.previewEl?.contains(container)) return;
       if (!document.markdown) continue;
 
       const opEl = container.createDiv({ cls: `claudian-diff-block ${getDiffBlockClass(document.type)}` });
@@ -865,14 +877,15 @@ export class InlineEditSession {
   }
 
   private async generate(): Promise<void> {
-    if (this.phase !== 'editing' || !this.inputEl || !this.spinnerEl) return;
+    if (this.#phase.name !== 'editing' || !this.inputEl || !this.spinnerEl) return;
+    const { proposal } = this.#phase;
     const userMessage = this.inputEl.value.trim();
     if (!userMessage) return;
     if (!this.#isSourceUnchanged()) {
       this.#rejectStaleSource();
       return;
     }
-    this.phase = 'generating';
+    this.#phase = { name: 'generating', proposal };
 
     this.#removeSelectionListeners();
 
@@ -885,7 +898,7 @@ export class InlineEditSession {
       if (this.#isSettled) return;
       if (!running) {
         // Its start failed with a notice; the instruction stays for a retry.
-        if (this.mode === 'selection') this.#attachSelectionListeners();
+        if (this.mode === 'selection' && !proposal) this.#attachSelectionListeners();
         return;
       }
       // Slash commands stay in the instruction for the provider to handle.
@@ -898,12 +911,12 @@ export class InlineEditSession {
     } catch (error) {
       if (!this.#isSettled) {
         if (!this.#isSourceUnchanged()) this.#rejectStaleSource();
-        else this.#handleError(error instanceof Error ? error.message : 'Error - try again');
+        else this.#handleError(error instanceof Error ? error.message : t('inlineEdit.retryFallback'));
       }
       return;
     } finally {
       if (!this.#isSettled) {
-        this.phase = 'editing';
+        this.#phase = { name: 'editing', proposal };
         this.#showGenerating(false);
       }
     }
@@ -917,27 +930,26 @@ export class InlineEditSession {
     }
 
     if (result.success) {
-      if (result.editedText !== undefined) {
-        this.editedText = result.editedText;
-        this.#showDiffInPlace();
-      } else if (result.insertedText !== undefined) {
-        this.insertedText = result.insertedText;
-        this.#showInsertionInPlace();
-      } else if (result.clarification) {
-        this.instructionDraft = '';
-        this.inputPlaceholder = 'Reply to continue...';
-        this.showAgentReply(result.clarification);
-        if (this.inputEl) {
-          this.inputEl.disabled = false;
-          this.inputEl.value = '';
-          this.inputEl.placeholder = this.inputPlaceholder;
-          this.inputEl.focus();
+      const proposedText = result.editedText ?? result.insertedText;
+      if (proposedText !== undefined) {
+        // The mode, not the wrapper the model chose, decides what accepting does: a selection is
+        // replaced and a cursor receives an insertion, so the preview must show exactly that.
+        if (this.mode === 'cursor') {
+          const text = normalizeInsertionText(proposedText);
+          this.#showProposal({ text, diffOps: [{ type: 'insert', text }] });
+        } else {
+          this.#showProposal({
+            text: proposedText,
+            diffOps: computeMarkdownDiff(this.selectedText, proposedText),
+          });
         }
+      } else if (result.clarification) {
+        this.#showReply(userMessage, result.clarification);
       } else {
-        this.#handleError('No response from agent');
+        this.#handleError(t('inlineEdit.noResponseFallback'));
       }
     } else {
-      this.#handleError(result.error || 'Error - try again');
+      this.#handleError(result.error || t('inlineEdit.retryFallback'));
     }
   }
 
@@ -963,23 +975,65 @@ export class InlineEditSession {
     };
   }
 
-  private showAgentReply(message: string) {
-    this.replyMarkdown = message;
-    if (!this.agentReplyEl || !this.containerEl) return;
-    const replyEl = this.agentReplyEl;
-    const renderVersion = ++this.agentReplyRenderVersion;
-    this.releasePreviews(replyEl);
-    const renderedEl = this.agentReplyEl.createDiv();
+  /** A text reply replaces the previous one; a proposal under review stays pending. */
+  #showReply(instruction: string, markdown: string): void {
+    this.#clearInstruction(this.#proposal ? t('inlineEdit.followUpPlaceholder') : t('inlineEdit.replyPlaceholder'));
+    this.reply = { instruction, markdown };
+    this.#showAgentReply();
+    this.inputEl?.focus();
+  }
 
+  /** A new proposal replaces the one under review, and the reply about it; the composer stays above it. */
+  #showProposal(proposal: InlineEditProposal): void {
+    const firstProposal = this.#proposal === null;
+    this.#phase = { name: 'editing', proposal };
+    this.reply = null;
+    this.#clearInstruction(t('inlineEdit.followUpPlaceholder'));
+    this.#render();
+    if (firstProposal) this.#installReviewKeyHandler();
+  }
+
+  #clearInstruction(placeholder: string): void {
+    this.instructionDraft = '';
+    this.inputPlaceholder = placeholder;
+    if (!this.inputEl) return;
+    this.inputEl.disabled = false;
+    this.inputEl.value = '';
+    this.inputEl.placeholder = placeholder;
+  }
+
+  /** Shows the reply under the instruction it answers; a slower earlier render never overwrites it. */
+  #showAgentReply(): void {
+    const replyEl = this.agentReplyEl;
+    const reply = this.reply;
+    if (!replyEl || !reply) return;
+    const renderVersion = ++this.agentReplyRenderVersion;
+    const renderedEl = createDiv();
     replyEl.removeClass('claudian-hidden');
     replyEl.empty();
-    void this.#renderMarkdownPreview(renderedEl, message, replyEl).then(() => {
-      if (renderVersion !== this.agentReplyRenderVersion || replyEl !== this.agentReplyEl) {
-        return;
-      }
-      replyEl.replaceChildren(...Array.from(renderedEl.childNodes));
+    void this.#renderMarkdownPreview(renderedEl, reply.markdown, replyEl).then(() => {
+      if (renderVersion !== this.agentReplyRenderVersion || replyEl !== this.agentReplyEl) return;
+      const instructionEl = createEl('p', { cls: 'claudian-inline-reply-instruction', text: reply.instruction });
+      replyEl.replaceChildren(instructionEl, ...Array.from(renderedEl.childNodes));
     });
-    this.containerEl.classList.add('has-agent-reply');
+  }
+
+  /** Shows the composer alone while instructions are drafted, or above the proposal under review. */
+  #render(): void {
+    const proposal = this.#proposal;
+    if (!proposal) {
+      this.#updateHighlight();
+      return;
+    }
+    hideSelectionHighlight(this.editorView);
+    this.editorView.dispatch({
+      effects: showReview.of({
+        hidden: this.mode === 'selection' ? { from: this.selFrom, to: this.selTo } : null,
+        diffOps: proposal.diffOps,
+        previewPos: this.editorView.state.doc.lineAt(this.selFrom).from,
+        widget: this,
+      }),
+    });
   }
 
   #handleError(errorMessage: string) {
@@ -987,7 +1041,8 @@ export class InlineEditSession {
     if (!this.inputEl) return;
     this.inputEl.disabled = false;
     this.inputEl.placeholder = errorMessage;
-    if (!this.#inlineEdit.service.isConversing) {
+    // Until a proposal or a conversation pins the source, the edit follows the selection again.
+    if (!this.#proposal && !this.#inlineEdit.service.isConversing) {
       this.#updatePositionsFromEditor();
       this.#updateHighlight();
       this.#attachSelectionListeners();
@@ -995,78 +1050,39 @@ export class InlineEditSession {
     this.inputEl.focus();
   }
 
-  #showDiffInPlace() {
-    if (this.editedText === null) return;
-
-    hideSelectionHighlight(this.editorView);
-
-    const diffOps = computeMarkdownDiff(this.selectedText, this.editedText);
-    const previewPos = this.editorView.state.doc.lineAt(this.selFrom).from;
-
-    this.editorView.dispatch({
-      effects: showDiff.of({
-        from: this.selFrom,
-        to: this.selTo,
-        diffOps,
-        previewPos,
-        widget: this,
-      }),
-    });
-
-    this.#installAcceptRejectHandler();
-  }
-
-  #showInsertionInPlace() {
-    if (this.insertedText === null) return;
-
-    hideSelectionHighlight(this.editorView);
-
-    const trimmedText = normalizeInsertionText(this.insertedText);
-    this.insertedText = trimmedText;
-
-    const diffOps: DiffOp[] = [{ type: 'insert', text: trimmedText }];
-    const previewPos = this.editorView.state.doc.lineAt(this.selFrom).from;
-
-    this.editorView.dispatch({
-      effects: showInsertion.of({
-        diffOps,
-        previewPos,
-        widget: this,
-      }),
-    });
-
-    this.#installAcceptRejectHandler();
-  }
-
   /**
    * Window capture runs ahead of CodeMirror, which would insert a newline on Enter and so turn the
-   * accept into a stale-source rejection, and ahead of Obsidian's keymap, which handles Escape.
+   * accept into a stale-source rejection, and ahead of Obsidian's keymap, which handles Escape. In the
+   * composer, plain Enter sends a follow-up and Escape rejects on bubbling, after its menus close.
    */
-  #installAcceptRejectHandler() {
-    this.releaseKeyHandler?.();
+  #installReviewKeyHandler() {
+    const releaseEditingKeys = this.releaseKeyHandler;
     const keyTarget = this.getOwnerDocument().defaultView ?? window;
     const onKeydown = (e: KeyboardEvent) => {
-      if (e.isComposing || !this.isKeyboardEventInContext(e)) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        this.reject();
-      } else if (e.key === 'Enter' && !this.containerEl?.contains(e.target as Node)) {
-        // Preview controls keep their native Enter activation.
-        e.preventDefault();
-        e.stopPropagation();
-        this.accept();
-      }
+      if (e.isComposing || (e.key !== 'Enter' && e.key !== 'Escape') || !this.isKeyboardEventInContext(e)) return;
+      const target = e.target as Node;
+      const inComposer = this.composerEl?.contains(target) === true;
+      const modEnter = e.key === 'Enter' && (e.ctrlKey || e.metaKey);
+      // Preview controls keep their native Enter activation.
+      if ((inComposer && !modEnter) || (e.key === 'Enter' && !modEnter && this.previewEl?.contains(target))) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') this.reject();
+      // While a follow-up runs, Enter neither accepts the proposal it may replace nor edits the source.
+      else if (this.#phase.name === 'editing') this.accept();
     };
     keyTarget.addEventListener('keydown', onKeydown, true);
-    this.releaseKeyHandler = () => keyTarget.removeEventListener('keydown', onKeydown, true);
+    this.releaseKeyHandler = () => {
+      releaseEditingKeys?.();
+      keyTarget.removeEventListener('keydown', onKeydown, true);
+    };
   }
 
   accept() {
     if (this.#isSettled) {
       return;
     }
-    const textToInsert = this.editedText ?? this.insertedText;
+    const textToInsert = this.#proposal?.text ?? null;
     if (textToInsert !== null) {
       if (!this.#isSourceUnchanged()) {
         this.#rejectStaleSource();
@@ -1079,13 +1095,13 @@ export class InlineEditSession {
       const from = { line: fromLine.number - 1, ch: this.selFrom - fromLine.from };
       const to = { line: toLine.number - 1, ch: this.selTo - toLine.from };
 
-      this.phase = 'settled';
+      this.#phase = { name: 'settled' };
       this.cleanup();
       this.editor.replaceRange(textToInsert, from, to);
       this.#focusEditor();
       this.resolve({ decision: 'accept', editedText: textToInsert });
     } else {
-      this.phase = 'settled';
+      this.#phase = { name: 'settled' };
       this.cleanup();
       this.resolve({ decision: 'reject' });
     }
@@ -1095,7 +1111,7 @@ export class InlineEditSession {
     if (this.#isSettled) {
       return;
     }
-    this.phase = 'settled';
+    this.#phase = { name: 'settled' };
     this.cleanup({ keepSelectionHighlight: true });
     this.#restoreSelectionHighlight();
     this.#focusEditor();
@@ -1105,7 +1121,7 @@ export class InlineEditSession {
   /** Ends ownership without restoring selection or stealing focus during teardown. */
   close(): void {
     if (this.#isSettled) return;
-    this.phase = 'settled';
+    this.#phase = { name: 'settled' };
     this.cleanup();
     this.resolve({ decision: 'reject' });
   }
@@ -1154,8 +1170,8 @@ export class InlineEditSession {
     if (this.#isSettled) {
       return;
     }
-    new Notice('Inline edit was not applied because the source document or selection changed.');
-    this.phase = 'settled';
+    new Notice(t('inlineEdit.stale'));
+    this.#phase = { name: 'settled' };
     this.cleanup();
     this.#focusEditor();
     this.resolve({ decision: 'reject' });
@@ -1168,8 +1184,8 @@ export class InlineEditSession {
       return false;
     }
     return target === this.getOwnerDocument().body
-      || target === this.containerEl
-      || this.containerEl?.contains(target) === true
+      || this.composerEl?.contains(target) === true
+      || this.previewEl?.contains(target) === true
       || target === this.editorView.dom
       || this.editorView.dom.contains(target);
   }
@@ -1180,12 +1196,18 @@ export class InlineEditSession {
 
   private handleKeydown(e: KeyboardEvent) {
     if (this.inputResources?.dropdown.handleKeydown(e)) {
+      // An Escape that closed the suggestion menu ends there instead of also rejecting the edit.
+      if (e.key === 'Escape') e.stopPropagation();
       return;
     }
 
-    if (e.key === 'Enter' && !e.isComposing) {
-      e.preventDefault();
-      void this.generate();
+    if (e.key !== 'Enter' || e.isComposing) return;
+    e.preventDefault();
+    // Under review, Enter on an empty composer accepts; anything typed is a follow-up.
+    if (this.#proposal && !this.inputEl?.value.trim()) {
+      this.accept();
+      return;
     }
+    void this.generate();
   }
 }

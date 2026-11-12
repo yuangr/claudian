@@ -5,11 +5,11 @@ import { StartupProfiler } from '@/core/performance/StartupProfiler';
 import { getHiddenCommandSet } from '@/core/providers/commands/hiddenCommands';
 import { DEFAULT_CHAT_PROVIDER_ID, type ProviderId } from '@/core/providers/types';
 import { VIEW_TYPE_CLAUDIAN } from '@/core/types';
-import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import type { ChatFeatureHost, TabId } from '@/features/chat/ChatFeatureHost';
 import { SessionManagerSurface, setControlAvailability } from '@/features/chat/session-manager/SessionManagerSurface';
 import { SessionNavigation } from '@/features/chat/session-manager/SessionNavigation';
 import { getSessionProviderId } from '@/features/chat/sessions/sessionProvider';
-import type { ChatTab, TabId } from '@/features/chat/tabs/ChatTab';
+import type { ChatTab } from '@/features/chat/tabs/ChatTab';
 import { inheritedDraftSeed } from '@/features/chat/tabs/draftSeed';
 import { TabWorkspaceLifecycle } from '@/features/chat/tabs/persistence/TabWorkspaceLifecycle';
 import { TabBar } from '@/features/chat/tabs/TabBar';
@@ -307,6 +307,13 @@ export class ClaudianView extends ItemView implements ZenModeSource {
           if (isTabWorkspaceInitialized()) this.updateTabBar();
           persist();
         },
+        onTabOrderChanged: () => {
+          if (isTabWorkspaceInitialized()) {
+            this.updateTabBar();
+            this.notifyConversationNavigationChanged();
+          }
+          persist();
+        },
         onTabWorkChanged: () => {
           if (isTabWorkspaceInitialized()) {
             this.updateTabBar();
@@ -430,6 +437,7 @@ export class ClaudianView extends ItemView implements ZenModeSource {
         void this.handleTabClose(tabId);
       },
       onTabLabelChange: (tabId, label) => this.tabManager?.setTabLabel(tabId, label),
+      onTabMove: (tabId, beforeTabId) => this.tabManager?.moveTab(tabId, beforeTabId),
       onDisplayStateChanged: () => this.tabWorkspace.persist(),
     });
 
@@ -642,6 +650,7 @@ export class ClaudianView extends ItemView implements ZenModeSource {
       const activeTab = this.tabManager?.getActiveTab();
       if (this.sessions.handleEscape()) return false;
       if (this.tabBar?.handleEscape()) return false;
+      if (activeTab?.ui.navigationSidebar.handleEscape()) return false;
       // Menus also consume Escape in the capture phase; this covers a keymap that sees it first.
       if (activeTab?.composer.closeOpenMenu()) return false;
       if (!e.defaultPrevented && activeTab) {

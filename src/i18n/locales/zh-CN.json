@@ -25,6 +25,7 @@
     "promptSuggestionHint": "按 Tab 接受",
     "selectAvailableModel": "请先选择可用的模型再发送。",
     "reloadingHistory": "此对话在 Claudian 之外发生了变化，正在重新加载。加载完成后请重新发送。",
+    "changedOutsideWithBackgroundTask": "此对话在 Claudian 之外继续进行，而先前会话的后台任务仍在运行。请停止该任务或等待其完成，然后重新发送。",
     "selectAvailableTitleModel": "请在 Claudian 设置中选择可用的标题生成模型。",
     "rewind": {
       "confirmMessage": "回退到此处？此消息之后的文件更改可能被覆盖或删除。此操作无法撤销。",
@@ -172,7 +173,12 @@
       "resume": "继续对话",
       "loading": "正在加载对话…",
       "current": "当前会话",
-      "loadFailed": "加载对话失败"
+      "loadFailed": "加载对话失败",
+      "search": "搜索会话",
+      "searchArchived": "搜索已归档会话",
+      "clearSearch": "清除搜索",
+      "showArchive": "显示已归档会话",
+      "showSessions": "显示活跃会话"
     },
     "linkedContent": {
       "label": "关联内容：",
@@ -184,6 +190,12 @@
       "noContent": "无关联内容",
       "missingNotice": "关联内容缺失：{path}",
       "openFailed": "打开关联内容失败：{error}"
+    },
+    "selectedContext": {
+      "line": "已选择 {count} 行",
+      "lines": "已选择 {count} 行",
+      "node": "已选择 {count} 个节点",
+      "nodes": "已选择 {count} 个节点"
     },
     "questions": {
       "title": "问题",
@@ -303,6 +315,10 @@
       "label": "权限模式",
       "current": "权限模式：{mode}",
       "changeFailed": "切换权限模式失败",
+      "antigravity": {
+        "auto": "自动",
+        "autoDesc": "批准工作区编辑和沙盒命令；审查额外访问"
+      },
       "claude": {
         "auto": "自动",
         "manual": "手动",
@@ -328,6 +344,87 @@
       "completed": "思考了 {seconds} 秒",
       "label": "思考过程"
     },
+    "busyIndicator": {
+      "flavors": {
+        "thinking": "思考中…",
+        "pondering": "琢磨中…",
+        "processing": "处理中…",
+        "analyzing": "分析中…",
+        "considering": "考虑中…",
+        "workingOnIt": "正在努力…",
+        "vibing": "进入状态中…",
+        "oneMoment": "稍等片刻…",
+        "onIt": "马上处理…",
+        "ruminating": "反复推敲中…",
+        "contemplating": "沉思中…",
+        "reflecting": "反思中…",
+        "mullingItOver": "仔细斟酌中…",
+        "letMeThink": "让我想想…",
+        "hmm": "嗯…",
+        "cogitating": "思索中…",
+        "deliberating": "审慎思考中…",
+        "weighingOptions": "权衡选项中…",
+        "gatheringThoughts": "整理思路中…",
+        "brewingIdeas": "酝酿点子中…",
+        "connectingDots": "串联线索中…",
+        "assemblingThoughts": "组织思路中…",
+        "spinningUpNeurons": "启动脑细胞…",
+        "loadingBrilliance": "加载灵感中…",
+        "consultingTheOracle": "请教先知中…",
+        "summoningKnowledge": "召唤知识中…",
+        "crunchingThoughts": "消化想法中…",
+        "dustingOffNeurons": "唤醒脑细胞…",
+        "wranglingIdeas": "梳理点子中…",
+        "herdingThoughts": "收拢思绪中…",
+        "jugglingConcepts": "玩转概念中…",
+        "untanglingThis": "理清头绪中…",
+        "piecingItTogether": "拼合思路中…",
+        "sippingCoffee": "喝口咖啡…",
+        "warmingUp": "热身中…",
+        "gettingCozyWithThis": "慢慢进入状态…",
+        "settlingIn": "安顿思绪中…",
+        "makingTea": "泡杯茶…",
+        "grabbingASnack": "拿点零食…",
+        "parsing": "解析中…",
+        "compilingThoughts": "编译思绪中…",
+        "runningInference": "推理运算中…",
+        "queryingTheVoid": "向虚空查询…",
+        "defragmentingBrain": "整理大脑碎片中…",
+        "allocatingMemory": "分配记忆空间中…",
+        "optimizing": "优化中…",
+        "indexing": "建立索引中…",
+        "syncingNeurons": "同步神经元中…",
+        "breathing": "深呼吸…",
+        "findingClarity": "寻找清晰思路…",
+        "channelingFocus": "集中注意力…",
+        "centering": "凝神静心…",
+        "aligningChakras": "调整能量中…",
+        "meditatingOnThis": "静心思考中…",
+        "askingTheStars": "向星辰提问…",
+        "readingTeaLeaves": "解读茶叶图案…",
+        "shakingTheMagic8Ball": "摇一摇魔法八号球…",
+        "consultingAncientScrolls": "查阅古老卷轴…",
+        "decodingTheMatrix": "解码矩阵中…",
+        "communingWithTheEther": "与以太交流…",
+        "peeringIntoTheAbyss": "凝望深渊中…",
+        "channelingTheCosmos": "连接宇宙灵感…",
+        "divingIn": "深入探索中…",
+        "rollingUpSleeves": "撸起袖子…",
+        "gettingToWork": "开始干活…",
+        "tacklingThis": "着手解决中…",
+        "onTheCase": "正在调查…",
+        "investigating": "探究中…",
+        "exploring": "探索中…",
+        "diggingDeeper": "深挖线索中…",
+        "bearWithMe": "请稍等…",
+        "hangTight": "耐心等一下…",
+        "justASec": "只需片刻…",
+        "workingMyMagic": "施展魔法中…",
+        "almostThere": "快好了…",
+        "giveMeAMoment": "给我一点时间…"
+      },
+      "hint": "（按 esc 中断 · {duration}）"
+    },
     "contextUsage": {
       "label": "上下文用量",
       "details": "上下文用量：{details}",
@@ -339,7 +436,14 @@
       "loadFailed": "无法加载建议",
       "retryHint": "再次输入以重试",
       "providerLoading": "正在加载提供商命令…",
-      "providerRetry": "重新查找提供商命令"
+      "providerRetry": "重新查找提供商命令",
+      "builtInDescriptions": {
+        "new": "开始新对话",
+        "compact": "压缩对话历史",
+        "sessions": "恢复之前的对话",
+        "fast": "切换快速模式",
+        "side": "基于最新回复临时提问"
+      }
     },
     "approval": {
       "title": "需要授权",
@@ -385,6 +489,15 @@
     },
     "removeItem": "移除{item}",
     "agent": "代理：{agent}",
+    "executionNotices": {
+      "initializeFailed": "无法初始化代理执行。请重试。",
+      "unavailable": "代理执行不可用。请重新加载插件。",
+      "missingDeleted": "提供商会话已不存在。其 Claudian 记录已移除；请重新发送以开始新会话。",
+      "missingReset": "提供商会话已不存在。Claudian 已保留可恢复的历史；请重新发送以重建会话。",
+      "missingPreserved": "提供商会话已不存在。由于无法验证剩余历史，Claudian 保留了其记录。",
+      "missingNotFound": "提供商会话已不存在。请重新发送以开始新会话。",
+      "unsentFallback": "消息未发送。请重试。"
+    },
     "images": {
       "unsupportedProvider": "此提供商不支持图片附件。",
       "tooLarge": "图片超过 {size} 的大小限制。",
@@ -463,6 +576,8 @@
       "showNumber": "显示编号",
       "showName": "显示名称",
       "showTitle": "显示标题",
+      "moveLeft": "向左移动",
+      "moveRight": "向右移动",
       "closeTab": "关闭标签页",
       "active": "当前",
       "needsInput": "需要您输入",
@@ -565,6 +680,33 @@
         "emptyHint": "代理会随着项目推进填写这里。"
       }
     }
+  },
+  "inlineEdit": {
+    "commandName": "行内编辑",
+    "viewUnavailable": "行内编辑不可用：无法访问当前 Markdown 视图。",
+    "inserted": "已插入",
+    "applied": "已应用编辑",
+    "editorUnavailable": "行内编辑不可用：无法访问当前编辑器。请尝试重新打开笔记。",
+    "stale": "源文档或选区已更改，未应用行内编辑。",
+    "initialProviderFailed": "行内编辑不可用：无法启动 {provider} 提供商。",
+    "vaultFailed": "无法加载仓库文件。仓库 @ 提及可能不可用。",
+    "editLabel": "编辑指令",
+    "insertLabel": "插入指令",
+    "editPlaceholder": "编辑指令…",
+    "insertPlaceholder": "插入指令…",
+    "modelUnavailable": "请在 Claudian 设置中选择可用模型。",
+    "providerFailed": "无法启动 {provider} 提供商。",
+    "actionsLabel": "行内编辑操作",
+    "lineOne": "行",
+    "lineOther": "行",
+    "reject": "拒绝",
+    "accept": "接受",
+    "rejectLabel": "拒绝行内编辑",
+    "acceptLabel": "接受行内编辑",
+    "retryFallback": "出错了，请重试",
+    "replyPlaceholder": "回复以继续…",
+    "noResponseFallback": "代理未返回响应",
+    "followUpPlaceholder": "提出修改要求，或按 Enter 接受"
   },
   "settings": {
     "tabs": {

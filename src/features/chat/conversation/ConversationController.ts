@@ -7,6 +7,7 @@ import type {
   ProviderId,
 } from '@/core/types';
 import type { ChatFeatureHost } from '@/features/chat/ChatFeatureHost';
+import type { SessionComposerPort } from '@/features/chat/composer/SessionComposer';
 import { ConversationBranching } from '@/features/chat/conversation/ConversationBranching';
 import { ConversationRewind, type ConversationSaveOptions } from '@/features/chat/conversation/ConversationRewind';
 import { resolveChatSystemInstructions } from '@/features/chat/execution/chatExecutionConfiguration';
@@ -14,14 +15,12 @@ import type { ChatExecutionCoordinator } from '@/features/chat/execution/ChatExe
 import { resolveSessionInstructions } from '@/features/chat/execution/projectInstructions';
 import type { LinkedContentController, LinkedContentSubmissionToken } from '@/features/chat/linked-content';
 import type { MessageRenderer } from '@/features/chat/rendering/MessageRenderer';
+import type { SubagentManager } from '@/features/chat/rendering/subagents/SubagentManager';
 import {
   pickWelcomeGreeting,
   renderWelcomeContent,
 } from '@/features/chat/rendering/WelcomeRenderer';
-import type { ChatSessionRuntime } from '@/features/chat/sessions/ChatSessionRuntime';
-import type { SessionComposerPort } from '@/features/chat/sessions/SessionComposer';
 import type { ChatState } from '@/features/chat/state/ChatState';
-import type { SubagentManager } from '@/features/chat/subagents/SubagentManager';
 
 /** Longest a progress-only change waits for its coalesced save. */
 const PROGRESS_SAVE_DELAY_MS = 1_000;
@@ -38,11 +37,11 @@ export interface ConversationCallbacks {
 }
 
 /** The tab session capabilities conversation transitions coordinate with. */
-export type ConversationSession = Pick<
-  ChatSessionRuntime,
-  'canNavigateConversation' | 'runConversationNavigation' | 'hasActiveTurn' | 'cancelTurn' | 'isIdle'
-  | 'hasBackgroundWork'
->;
+export interface ConversationSession {
+  readonly canNavigateConversation: boolean;
+  readonly hasActiveTurn: boolean;
+  runConversationNavigation(operation: (signal: AbortSignal) => Promise<unknown>): Promise<void>;
+}
 
 export interface ConversationControllerDeps {
   plugin: ChatFeatureHost;
@@ -364,13 +363,12 @@ export class ConversationController {
    * Shared logic for restoring a conversation into the current tab.
    */
   #restoreConversation(conversation: Conversation): void {
-    const { plugin, state } = this.deps;
+    const { state } = this.deps;
 
     this.#branching.reset();
     state.currentConversationId = conversation.id;
     state.messages = [...conversation.messages];
     state.usage = conversation.usage ?? null;
-    state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.discardPendingConversationSave();
 
     this.deps.getLinkedContentController().lock(conversation.linkedContentPath);
@@ -381,12 +379,11 @@ export class ConversationController {
 
   /** Clears the tab back to the blank entry point; a conversation is created on first send. */
   async #resetToEntryState(): Promise<void> {
-    const { plugin, state } = this.deps;
+    const { state } = this.deps;
     this.#branching.reset();
     state.currentConversationId = null;
     state.clearMessages();
     state.usage = null;
-    state.autoScrollEnabled = plugin.settings.enableAutoScroll ?? true;
     state.discardPendingConversationSave();
 
     await this.#getExecutionCoordinator()?.bindConversation(null);
